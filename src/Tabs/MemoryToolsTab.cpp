@@ -92,6 +92,7 @@ void MemoryToolsTab::firstScan(AppContext& ctx) {
     size_t scannedBytes = 0;
     const size_t kByteBudget = 512ull << 20; // don't scan more than 512 MB
 
+    const double needleNum = asNum(needle);   // loop-invariant: hoist out of the byte scan
     for (auto& rg : regions) {
         if (!rg.read) continue;
         for (uint64_t off = 0; off < rg.size && scannedBytes < kByteBudget; off += kChunk) {
@@ -105,8 +106,8 @@ void MemoryToolsTab::firstScan(AppContext& ctx) {
                 // First "bigger/smaller than X" scan compares the current value to the
                 // entered value X (the needle), Cheat-Engine style — there is no prev yet.
                 bool keep = wantValue ? (scanType_ == ST_Exact   ? cur == needle
-                                        : scanType_ == ST_Bigger  ? asNum(cur) > asNum(needle)
-                                        : asNum(cur) < asNum(needle))
+                                        : scanType_ == ST_Bigger  ? asNum(cur) > needleNum
+                                        : asNum(cur) < needleNum)
                                       : true; // Changed/Unchanged/Unknown -> capture all on first scan
                 if (keep) {
                     results_.push_back({ rg.base + off + i, cur });

@@ -176,7 +176,8 @@ bool parseOperand(const std::string& in, Operand& out) {
 
 std::string immText(long long v) {
     char b[32];
-    if (v < 0)        std::snprintf(b, sizeof(b), "-0x%llX", (unsigned long long)(-v));
+    // Negate in unsigned space so v == INT64_MIN doesn't overflow (-v is UB).
+    if (v < 0)        std::snprintf(b, sizeof(b), "-0x%llX", 0ull - (unsigned long long)v);
     else if (v < 16)  std::snprintf(b, sizeof(b), "%lld", v);
     else              std::snprintf(b, sizeof(b), "0x%llX", (unsigned long long)v);
     return b;
@@ -485,7 +486,16 @@ struct Analyzer {
             std::string idx = renderLoc(e, regLoc(m.idxCanon), reads, deps);
             add(m.scale > 1 ? (idx + " * " + std::to_string(m.scale)) : idx, false);
         }
-        if (m.disp || first) add(immText(m.disp < 0 ? -m.disp : m.disp), m.disp < 0);
+        if (m.disp || first) {
+            // Magnitude in unsigned space so disp == INT64_MIN doesn't overflow.
+            const bool neg = m.disp < 0;
+            const unsigned long long mag = neg ? (0ull - (unsigned long long)m.disp)
+                                               : (unsigned long long)m.disp;
+            char b[32];
+            if (!neg && mag < 16) std::snprintf(b, sizeof(b), "%llu", mag);
+            else                  std::snprintf(b, sizeof(b), "0x%llX", mag);
+            add(b, neg);
+        }
         return s;
     }
 

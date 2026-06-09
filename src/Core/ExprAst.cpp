@@ -71,9 +71,14 @@ bool EvalConst(const ExprRef& e, uint64_t& out) {
             if (!EvalConst(k[0], a) || !EvalConst(k[1], b)) return false;
             break;
 
-        case ExprOp::Concat:
+        case ExprOp::Concat: {
             if (!EvalConst(k[0], a) || !EvalConst(k[1], b)) return false;
-            out = MaskToBits((a << k[1]->bits) | b, e->bits); return true;
+            // Shifting a 64-bit value left by 64 (a full-width low operand) is UB;
+            // in that case the hi part is fully shifted out of the 64-bit result.
+            const uint32_t loBits = k[1] ? k[1]->bits : 0;
+            const uint64_t hiShifted = (loBits >= 64) ? 0 : (a << loBits);
+            out = MaskToBits(hiShifted | b, e->bits); return true;
+        }
         case ExprOp::Extract:
             if (!EvalConst(k[0], a)) return false;
             out = MaskToBits(a >> e->val, e->bits); return true;

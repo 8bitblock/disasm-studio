@@ -4,8 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <map>
-#include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace ds {
@@ -99,12 +98,14 @@ FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
     size_t exportSeeds = seeds.size();
     prologueScan(bin, seeds);
 
-    std::map<uint64_t,std::string> nameMap;
+    std::unordered_map<uint64_t,std::string> nameMap;
     for (auto& n : named) nameMap[n.first] = n.second;
 
     // Recursive descent: starting from seeds, follow direct calls to find more
     // function entries. We mark every call target + seed as a function start.
-    std::set<uint64_t> starts;
+    // unordered_set: membership/cap logic is order-independent and the result is
+    // sorted into `sorted` below, so hashing is a straight win over a red-black tree.
+    std::unordered_set<uint64_t> starts;
     std::unordered_set<uint64_t> visited;
     std::vector<uint64_t> work = seeds;
 
