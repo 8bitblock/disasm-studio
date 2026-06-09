@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{B3F1A8C2-1D4E-4A7B-9C2E-5F6A7B8C9D01}</ProjectGuid>
+    <RootNamespace>DisasmStudio</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <!-- vcpkg manifest mode: deps are read from vcpkg.json -->
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgEnabled>true</VcpkgEnabled>
+    <!-- Build deps as static libs against the static CRT so the app is a single
+         self-contained exe that needs no VC++ Redistributable / vcpkg DLLs. -->
+    <VcpkgTriplet>x64-windows-static</VcpkgTriplet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\int\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <!-- Opt-in symbolic-execution engines (Triton + Z3) for F1 clean-room synthesis and
+       F3 path exploration. Build with /p:DsEngines=true to pull the 'engines' vcpkg
+       manifest feature (heavy first build) and define DS_HAVE_SYMENGINE so SymEngine.cpp
+       compiles its Triton backend. Default (false) builds fast with the stub engine. -->
+  <PropertyGroup>
+    <DsEngines Condition="'$(DsEngines)'==''">false</DsEngines>
+    <DsInlineC Condition="'$(DsInlineC)'==''">false</DsInlineC>
+    <DsPython  Condition="'$(DsPython)'==''">false</DsPython>
+    <VcpkgManifestFeatures Condition="'$(DsEngines)'=='true' And '$(DsPython)'=='true'">engines;embed-python</VcpkgManifestFeatures>
+    <VcpkgManifestFeatures Condition="'$(DsEngines)'=='true' And '$(DsPython)'!='true'">engines</VcpkgManifestFeatures>
+    <VcpkgManifestFeatures Condition="'$(DsEngines)'!='true' And '$(DsPython)'=='true'">embed-python</VcpkgManifestFeatures>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(DsEngines)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>DS_HAVE_SYMENGINE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <!-- F2 inline Python tier: embed CPython (vcpkg 'embed-python' feature). -->
+  <ItemDefinitionGroup Condition="'$(DsPython)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>DS_HAVE_PYTHON;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <!-- F2 inline C tier: vendor libtcc under third_party\tcc (libtcc.h + libtcc.lib);
+       not in vcpkg. Build with /p:DsInlineC=true once vendored. -->
+  <ItemDefinitionGroup Condition="'$(DsInlineC)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>DS_HAVE_LIBTCC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)third_party\tcc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>libtcc.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)third_party\tcc;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;psapi.lib;iphlpapi.lib;ws2_32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\App.cpp" />
+    <ClCompile Include="src\Ui\Theme.cpp" />
+    <ClCompile Include="src\Ui\Fonts.cpp" />
+    <ClCompile Include="src\Core\BinaryFile.cpp" />
+    <ClCompile Include="src\Core\ProcessManager.cpp" />
+    <ClCompile Include="src\Core\FunctionAnalyzer.cpp" />
+    <ClCompile Include="src\Core\FunctionNamer.cpp" />
+    <ClCompile Include="src\Core\Debugger.cpp" />
+    <ClCompile Include="src\Core\SymbolResolver.cpp" />
+    <ClCompile Include="src\Core\CFG.cpp" />
+    <ClCompile Include="src\Core\Cond.cpp" />
+    <ClCompile Include="src\Core\Json.cpp" />
+    <ClCompile Include="src\Core\Project.cpp" />
+    <ClCompile Include="src\Core\Decompiler.cpp" />
+    <ClCompile Include="src\Core\DataFlow.cpp" />
+    <ClCompile Include="src\Core\TechScan.cpp" />
+    <ClCompile Include="src\Core\XrefIndex.cpp" />
+    <ClCompile Include="src\Core\AnalysisJobs.cpp" />
+    <ClCompile Include="src\Core\AnalysisService.cpp" />
+    <ClCompile Include="src\Core\LiveScanService.cpp" />
+    <ClCompile Include="src\Core\AlgoScan.cpp" />
+    <ClCompile Include="src\Core\SigMatch.cpp" />
+    <ClCompile Include="src\Core\PatchPlacer.cpp" />
+    <ClCompile Include="src\Core\ExprAst.cpp" />
+    <ClCompile Include="src\Core\Simplify.cpp" />
+    <ClCompile Include="src\Core\Synthesis.cpp" />
+    <ClCompile Include="src\Core\PathExplore.cpp" />
+    <ClCompile Include="src\Core\SymEngine.cpp" />
+    <ClCompile Include="src\Core\SynthesisJob.cpp" />
+    <ClCompile Include="src\Core\PathExploreJob.cpp" />
+    <ClCompile Include="src\Core\PatchCompiler.cpp" />
+    <ClCompile Include="src\Core\Report.cpp" />
+    <ClCompile Include="src\Disasm\ZydisDisassembler.cpp" />
+    <ClCompile Include="src\Disasm\CapstoneDisassembler.cpp" />
+    <ClCompile Include="src\Disasm\DisassemblerFactory.cpp" />
+    <ClCompile Include="src\Disasm\Assembler.cpp" />
+    <ClCompile Include="src\Tabs\ProjectsTab.cpp" />
+    <ClCompile Include="src\Tabs\CommunicationsTab.cpp" />
+    <ClCompile Include="src\Tabs\SigScannerTab.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewTab.cpp" />
+    <ClCompile Include="src\Tabs\MemoryToolsTab.cpp" />
+    <ClCompile Include="src\Tabs\BinaryDiffTab.cpp" />
+    <ClCompile Include="src\Tabs\BinaryTechTab.cpp" />
+    <ClCompile Include="src\Hv\HvDbgClient.cpp" />
+    <ClCompile Include="src\Hv\HvDbgLoader.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="src\app.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\resource.h" />
+    <ClInclude Include="src\App.h" />
+    <ClInclude Include="src\Ui\Theme.h" />
+    <ClInclude Include="src\Ui\Fonts.h" />
+    <ClInclude Include="src\Core\BinaryFile.h" />
+    <ClInclude Include="src\Core\Debugger.h" />
+    <ClInclude Include="src\Core\SymbolResolver.h" />
+    <ClInclude Include="src\Core\CFG.h" />
+    <ClInclude Include="src\Core\Cond.h" />
+    <ClInclude Include="src\Core\Json.h" />
+    <ClInclude Include="src\Core\Project.h" />
+    <ClInclude Include="src\Core\Decompiler.h" />
+    <ClInclude Include="src\Core\DataFlow.h" />
+    <ClInclude Include="src\Core\TechScan.h" />
+    <ClInclude Include="src\Core\XrefIndex.h" />
+    <ClInclude Include="src\Core\AnalysisJobs.h" />
+    <ClInclude Include="src\Core\AnalysisService.h" />
+    <ClInclude Include="src\Core\LiveScanService.h" />
+    <ClInclude Include="src\Core\ModuleRegistry.h" />
+    <ClInclude Include="src\Core\AlgoScan.h" />
+    <ClInclude Include="src\Core\SigMatch.h" />
+    <ClInclude Include="src\Core\PatchPlacer.h" />
+    <ClInclude Include="src\Core\ExprAst.h" />
+    <ClInclude Include="src\Core\Simplify.h" />
+    <ClInclude Include="src\Core\SymEngine.h" />
+    <ClInclude Include="src\Core\Synthesis.h" />
+    <ClInclude Include="src\Core\PathExplore.h" />
+    <ClInclude Include="src\Core\SynthesisJob.h" />
+    <ClInclude Include="src\Core\PathExploreJob.h" />
+    <ClInclude Include="src\Core\PatchCompiler.h" />
+    <ClInclude Include="src\Core\MemCompare.h" />
+    <ClInclude Include="src\Core\DbgHelpLock.h" />
+    <ClInclude Include="src\Core\Report.h" />
+    <ClInclude Include="src\Tabs\DataRef.h" />
+    <ClInclude Include="src\Core\StepLogic.h" />
+    <ClInclude Include="src\Core\ProcessManager.h" />
+    <ClInclude Include="src\Core\FunctionAnalyzer.h" />
+    <ClInclude Include="src\Core\FunctionNamer.h" />
+    <ClInclude Include="src\Disasm\IDisassembler.h" />
+    <ClInclude Include="src\Disasm\ZydisDisassembler.h" />
+    <ClInclude Include="src\Disasm\CapstoneDisassembler.h" />
+    <ClInclude Include="src\Disasm\DisassemblerFactory.h" />
+    <ClInclude Include="src\Disasm\Assembler.h" />
+    <ClInclude Include="src\Tabs\ITab.h" />
+    <ClInclude Include="src\Tabs\ProjectsTab.h" />
+    <ClInclude Include="src\Tabs\CommunicationsTab.h" />
+    <ClInclude Include="src\Tabs\SigScannerTab.h" />
+    <ClInclude Include="src\Tabs\BinaryViewTab.h" />
+    <ClInclude Include="src\Tabs\MemoryToolsTab.h" />
+    <ClInclude Include="src\Tabs\BinaryDiffTab.h" />
+    <ClInclude Include="src\Tabs\BinaryTechTab.h" />
+    <ClInclude Include="src\Hv\HvDbgClient.h" />
+    <ClInclude Include="src\Hv\HvDbgLoader.h" />
+    <ClInclude Include="src\Hv\HvDbgProtocol.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

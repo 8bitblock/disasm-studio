@@ -1,0 +1,24 @@
+# Build output
+build/
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# vcpkg
+vcpkg_installed/
+vcpkg/
+vcpkg_install.log
+build_msbuild.log
+
+# IDE
+.idea/
+*.VC.db
+*.VC.opendb
+
+# Local full-project backup/snapshot copies (not part of the tracked project)
+correctnress check/
+dissassembler/
+dissassembler_partupdate/

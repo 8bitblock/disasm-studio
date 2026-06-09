@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "disasm-studio",
+  "version": "0.1.0",
+  "description": "ImGui + DirectX11 disassembler / reverse-engineering workbench.",
+  "dependencies": [
+    {
+      "name": "imgui",
+      "features": [
+        "dx11-binding",
+        "win32-binding",
+        "docking-experimental"
+      ]
+    },
+    "zydis",
+    "capstone",
+    "keystone"
+  ],
+  "features": {
+    "engines": {
+      "description": "Symbolic-execution engines (Triton + Z3) for F1 clean-room synthesis and F3 path exploration. Heavy: the first build recompiles them from source (~30+ min). Enable with the 'engines' manifest feature AND define DS_HAVE_SYMENGINE; the default build uses the stub engine + the pure DefaultSolver so it stays fast.",
+      "dependencies": [
+        "z3",
+        "triton"
+      ]
+    },
+    "embed-python": {
+      "description": "Embed CPython for the F2 hot-patch Python tier (a snippet sets `patch = bytes([...])`). Enable with the 'embed-python' manifest feature AND /p:DsPython=true (defines DS_HAVE_PYTHON). Adds ~25MB to the exe; the Asm tier needs none of this.",
+      "dependencies": [
+        "python3"
+      ]
+    }
+  }
+}

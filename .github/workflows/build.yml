@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # The hosted Windows runner ships a vcpkg at $VCPKG_INSTALLATION_ROOT.
+      # Enabling MSBuild integration makes the project's manifest (vcpkg.json)
+      # resolve imgui[dx11/win32/docking], zydis, and capstone automatically.
+      - name: Enable vcpkg MSBuild integration
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install
+
+      - name: Build (Release | x64)
+        shell: pwsh
+        run: |
+          msbuild DisasmStudio.sln `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:VcpkgEnableManifest=true
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisasmStudio-x64-Release
+          path: build/x64/Release/DisasmStudio.exe
+          if-no-files-found: error

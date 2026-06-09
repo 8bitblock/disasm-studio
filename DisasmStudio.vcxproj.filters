@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000001}</UniqueIdentifier></Filter>
+    <Filter Include="Source\Core"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000002}</UniqueIdentifier></Filter>
+    <Filter Include="Source\Disasm"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000003}</UniqueIdentifier></Filter>
+    <Filter Include="Source\Tabs"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000004}</UniqueIdentifier></Filter>
+    <Filter Include="Headers"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000005}</UniqueIdentifier></Filter>
+    <Filter Include="Headers\Core"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000006}</UniqueIdentifier></Filter>
+    <Filter Include="Headers\Disasm"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000007}</UniqueIdentifier></Filter>
+    <Filter Include="Headers\Tabs"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000008}</UniqueIdentifier></Filter>
+    <Filter Include="Source\Ui"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000009}</UniqueIdentifier></Filter>
+    <Filter Include="Headers\Ui"><UniqueIdentifier>{1a000000-0000-0000-0000-00000000000a}</UniqueIdentifier></Filter>
+    <Filter Include="Source\Hv"><UniqueIdentifier>{1a000000-0000-0000-0000-00000000000b}</UniqueIdentifier></Filter>
+    <Filter Include="Headers\Hv"><UniqueIdentifier>{1a000000-0000-0000-0000-00000000000c}</UniqueIdentifier></Filter>
+    <Filter Include="Resources"><UniqueIdentifier>{1a000000-0000-0000-0000-00000000000d}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\App.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\Ui\Theme.cpp"><Filter>Source\Ui</Filter></ClCompile>
+    <ClCompile Include="src\Ui\Fonts.cpp"><Filter>Source\Ui</Filter></ClCompile>
+    <ClCompile Include="src\Core\BinaryFile.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\ProcessManager.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\FunctionAnalyzer.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\FunctionNamer.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Debugger.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\CFG.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Cond.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Json.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Project.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Decompiler.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\TechScan.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\XrefIndex.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Report.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Disasm\ZydisDisassembler.cpp"><Filter>Source\Disasm</Filter></ClCompile>
+    <ClCompile Include="src\Disasm\CapstoneDisassembler.cpp"><Filter>Source\Disasm</Filter></ClCompile>
+    <ClCompile Include="src\Disasm\DisassemblerFactory.cpp"><Filter>Source\Disasm</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\ProjectsTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\CommunicationsTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\SigScannerTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\BinaryViewTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\MemoryToolsTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\BinaryDiffTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\BinaryTechTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Hv\HvDbgClient.cpp"><Filter>Source\Hv</Filter></ClCompile>
+    <ClCompile Include="src\Hv\HvDbgLoader.cpp"><Filter>Source\Hv</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\app.rc"><Filter>Resources</Filter></ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="src\app.ico"><Filter>Resources</Filter></Image>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\resource.h"><Filter>Resources</Filter></ClInclude>
+    <ClInclude Include="src\App.h"><Filter>Headers</Filter></ClInclude>
+    <ClInclude Include="src\Ui\Theme.h"><Filter>Headers\Ui</Filter></ClInclude>
+    <ClInclude Include="src\Ui\Fonts.h"><Filter>Headers\Ui</Filter></ClInclude>
+    <ClInclude Include="src\Core\BinaryFile.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Debugger.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\CFG.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Cond.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Json.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Project.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Decompiler.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\TechScan.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\XrefIndex.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Report.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\DataRef.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Core\StepLogic.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\ProcessManager.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\FunctionAnalyzer.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\FunctionNamer.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Disasm\IDisassembler.h"><Filter>Headers\Disasm</Filter></ClInclude>
+    <ClInclude Include="src\Disasm\ZydisDisassembler.h"><Filter>Headers\Disasm</Filter></ClInclude>
+    <ClInclude Include="src\Disasm\CapstoneDisassembler.h"><Filter>Headers\Disasm</Filter></ClInclude>
+    <ClInclude Include="src\Disasm\DisassemblerFactory.h"><Filter>Headers\Disasm</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\ITab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\ProjectsTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\CommunicationsTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\SigScannerTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\BinaryViewTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\MemoryToolsTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\BinaryDiffTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\BinaryTechTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Hv\HvDbgClient.h"><Filter>Headers\Hv</Filter></ClInclude>
+    <ClInclude Include="src\Hv\HvDbgLoader.h"><Filter>Headers\Hv</Filter></ClInclude>
+    <ClInclude Include="src\Hv\HvDbgProtocol.h"><Filter>Headers\Hv</Filter></ClInclude>
+  </ItemGroup>
+</Project>

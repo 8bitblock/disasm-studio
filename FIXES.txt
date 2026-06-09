@@ -1,0 +1,79 @@
+================================================================================
+STATUS 2026-06-08 — ALL ITEMS BELOW ADDRESSED (build clean, 10/10 unit tests pass),
+except two consciously deferred (noted ▼). Two extra HIGH live-view bugs were found
+by a live-view audit and also fixed. An adversarial pass re-verified every fix.
+
+  DONE (HIGH):   loader rd<T> overflow + ELF OOB (BinaryFile rd<T>/containment),
+                 ProcessManager pumpDebugEvent handle leaks, Debugger setActiveThread
+                 Paused guard + 0xCC-orig preservation, TechScan mask guard,
+                 SigScanner live cap.
+  DONE (MED):    BinaryFile/FunctionAnalyzer 64-bit no-wrap, Debugger pause/read/write/
+                 regions TOCTOU (new hProcMtx_), setTempBp write-check, step-out RSP
+                 anchor, WOW64 already handled, Project parseU64/patch-validate/dup-bp,
+                 Decompiler ipdom==-1 if & switch overrun + nested-loop break/continue,
+                 main.cpp ResizeBuffers/null-RTV guard, MemoryTools signed scans,
+                 Communications PID-stable selection, BinaryViewTab nav-history +
+                 live-runtime-VA routing.
+  DONE (LOW):    Project + BinaryViewTab hex lone-nibble, PushID 64-bit ids,
+                 Capstone non-x86 isRet (+ CFG isReturn honors it), PPC -> little-endian.
+  DONE (extra, found by live-view audit — HIGH): live view never masked our 0xCC
+                 software breakpoints (showed int3 / desynced) -> Debugger::readMemoryMasked
+                 used by all live decode/string/selection/signature paths; live decoder
+                 bitness now follows the debuggee (x86 for WOW64) via liveDecoder().
+
+  DEFERRED (with rationale):
+  ▼ CFG.cpp branch-target leaders landing mid-instruction are still dropped. A proper
+    fix is overlapping-instruction re-decode at the unaligned target — a feature, not a
+    one-liner, with real regression risk to normal-code CFGs. Left as a known limit.
+  ▼ Decompiler legacy (non-dataflow) "hi:lo = .." pseudo-syntax and the "flags == 0"
+    placeholder condition: cosmetic only, and only on the non-default legacy path; the
+    data-flow path already renders cleanly. Skipped to avoid churning the golden-string
+    decompiler unit tests for negligible gain.
+================================================================================
+
+🔴 HIGH — fix first
+Loaders (untrusted PE/ELF/Mach-O) — one root cause + two reachable OOB reads
+
+BinaryFile.cpp:108 — root cause. rd<T>'s bounds check off + sizeof(T) <= d.size() can wrap when off is near SIZE_MAX, so a wild memcpy passes the guard. Fix: off <= d.size() && sizeof(T) <= d.size() - off. This one fix neutralizes the two below at every call site.
+BinaryFile.cpp:402 — ELF e_shoff (64-bit, attacker-controlled) never bounds-checked before indexing the section-name strtab header → OOB read via the wrap above.
+BinaryFile.cpp:416 — ELF section-name read from unvalidated strOff + sh_name → OOB read.
+Debugger / process control
+
+ProcessManager.cpp:121 — pumpDebugEvent never CloseHandles the handles from CREATE_PROCESS/CREATE_THREAD/LOAD_DLL debug events → a kernel handle leaked per thread-create / DLL-load in the debuggee.
+Debugger.cpp:93 — setActiveThread calls GetThreadContext even when the target is running (no state_ == Paused guard, unlike setRegisters) → garbage register values.
+Debugger.cpp:552 — when the target byte already reads 0xCC (a second temp bp, or a real int3 in the program), the "original" byte is fabricated as 0x90; on removal it writes a NOP back → silent code corruption.
+Detection & scanning
+
+TechScan.cpp:21 — findPattern indexes mask[j] for all j < pat.size() without checking mask.size() >= pat.size() → OOB on vector<bool> (UB) for any mis-sized mask.
+SigScannerTab.cpp:86 — live-scan result cap is unenforceable: the inner break only escapes the byte loop, so results_ grows unbounded past 4096 and rescans chunks on a large attached process.
+🟡 MEDIUM — correctness / races / leaks
+Integer overflow (same class as the HIGHs, lower reachability)
+
+BinaryFile.cpp:263 & :288 — section-containment tests va >= base && va < base + size wrap on 64-bit ELF/Mach-O fields → range confusion; breaks the vaToOffset/offsetToVA inverse. Use no-wrap form va - base < size.
+FunctionAnalyzer.cpp:24 — edEnd = edRVA + exportDirSize() wraps in uint32_t → bogus forwarder classification. Compute in 64-bit.
+Debugger
+
+Debugger.cpp:170 — pause() TOCTOU: the debug thread can CloseHandle between the atomic load and DebugBreakProcess. Same pattern affects readMemory/writeMemory/regions.
+WOW64: the debugger uses the 64-bit CONTEXT/Rip unconditionally — wrong for 32-bit targets (should use Wow64GetThreadContext or reject them).
+Debugger.cpp:601 — writeByteRPM/setTempBp ignore the write result → records a breakpoint that was never written (missed stop or stranded 0xCC).
+Step-out anchors on "first ret" with no RSP check → stops in the wrong frame for recursive / tail-call code.
+Persistence
+
+Project.cpp:22 — parseU64 ignores sscanf return and has no overflow detection; "0xZZ" silently becomes address 0.
+Project.cpp:143 — loaded patches aren't validated (orig.size() == bytes.size(), no cap) before the file splicer writes them.
+Project.cpp:135 — duplicate breakpoint addresses break the implicit vector↔bpConditions 1:1 invariant.
+Decompiler
+
+Decompiler.cpp:496 — ipdom[n] == -1 (no join) is fed as the stop arg; stop == -1 never matches, so switch/if arm bodies overrun the join. Also :443 — continue/break only recognized for the innermost loop → duplicated bodies in nested loops.
+UI / host
+
+main.cpp:118 — ResizeBuffers HRESULT ignored; on device-removed, CreateRenderTarget leaves a null RTV and the loop calls ClearRenderTargetView(nullptr,…).
+MemoryToolsTab.cpp:80 — asNum reads integers as unsigned, so Bigger/Smaller scans treat -1 as 4.29e9.
+CommunicationsTab.cpp:80 — selProc_ is a row index not remapped after Refresh re-sorts/resizes procs_ → modules/connections shown for the wrong PID.
+BinaryViewTab: nav-history desync (panel clicks set cursorVA_ directly, bypassing navigateTo) and live-runtime-VA results fed to static (file-VA) views.
+🟢 LOW (notable)
+CFG.cpp:79 — branch-target leaders that land mid-instruction are silently dropped (lost CFG edges on obfuscated code).
+Hex parsers in Project.cpp:33 and BinaryViewTab accept a lone trailing nibble as a byte ("4" → 0x04) → silently-wrong patch bytes.
+PushID((int)address) truncates 64-bit addresses to 32 bits → ImGui row-ID collisions under high/ASLR bases.
+Disasm backends: PPC endianness hardcoded big-endian; isRet only set from CS_GRP_RET (misses ARM/MIPS/PPC/RISC-V returns → breaks non-x86 step-out).
+Verified clean: the Zydis/Capstone/Keystone decode paths (no OOB/leaks — lengths and instr.length advances are honest), the hand-rolled JSON parser (bounds-checked, depth-limited), SymbolResolver, DataFlow, the dominator core (terminates on cyclic/irreducible CFGs), the Hv client (RAII handles), and the IP Helper call-twice pattern.
