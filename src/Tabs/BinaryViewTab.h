@@ -8,6 +8,8 @@
 #include "../Core/Synthesis.h"         // SynthResult (F1 "Synthesis" lower tab)
 #include "../Core/PathExplore.h"       // PathTree (F3 "Path Explorer" lower tab)
 #include <cstdint>
+#include <deque>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -65,6 +67,8 @@ private:
     void renderXrefsTab(AppContext& ctx);      // "Xrefs" lower sub-tab: who references the cursor / its function
     void exportAnalysis(AppContext& ctx);      // File > Export Analysis: write Markdown/HTML report
     std::string decompileFunctionText(AppContext& ctx, uint64_t fnStart, uint32_t fnSize); // structured pseudo-C for one fn
+    const std::string* decompLruGet(uint64_t va);                 // recently-decompiled cache lookup (nav back/fwd)
+    void               decompLruPut(uint64_t va, const std::string& text);
     std::string symbolFor(AppContext& ctx, uint64_t addr);   // address -> function/export name
     // Per-stop memo key (register snapshot + liveGen_ + state). Shared by the live-view
     // caches (ptrDescCache_, strCmtCache_) so they invalidate together on step / re-stop / edit.
@@ -140,13 +144,18 @@ private:
     uint64_t cursorVA_  = 0;     // current focus address
     int      mainView_  = 0;     // 0=asm 1=pseudo 2=hex 3=cfg 4=live asm 5=callgraph
 
-    // Pop-out state: when set, the panel renders as its own OS window (multi-viewport)
-    // instead of inline, and the inline slot collapses + reflows. Toggled by a small
-    // "Pop out"/"Dock" button on each panel; closing the window docks it back.
-    bool     sidePoppedOut_   = false;   // Bookmarks/Functions/Strings side panel
-    bool     lowerPoppedOut_  = false;   // Breakpoints/Registers/... debug panels
+    // The main/side/lower panels are dockable windows in a per-page DockSpace (drag to
+    // float/re-dock/stack); dockInitDone_ guards the one-time default-layout build.
+    bool     dockInitDone_    = false;
+    // Sub-view pop-out: pop a SPECIFIC main-view rendering (CFG / pseudocode) into its
+    // own OS window (multi-viewport). Orthogonal to panel docking; closing it docks back.
     bool     graphPoppedOut_  = false;   // Graph (CFG) main view
     bool     pseudoPoppedOut_ = false;   // Pseudocode main view
+
+    // Drag-resizable widths for the two in-panel sub-splits (VSplitter); scaled for
+    // HiDPI in the ctor-equivalent first use. Session-only (not persisted).
+    float    regsSplitW_ = 360.0f;       // Registers | Stack split (lower Registers tab)
+    float    liveBoxW_   = 252.0f;       // Live listing | register-box split
 
     // Multi-line selection in the full assembly listing: click = single,
     // Shift+click = range from the anchor, Ctrl+click = toggle one line.
@@ -170,9 +179,12 @@ private:
     // Render-thread-only cache of decoded visible rows: the full listing stores only
     // addresses and re-decodes per visible row every frame, so a fast scroll redecodes
     // the same ~50 rows repeatedly. Keyed by VA; the whole cache is dropped when the
-    // image (load/patch), arch, or engine changes (decodeCacheKey_). Bounded, not LRU:
-    // cleared wholesale when it exceeds the cap (cheap, re-warms in a frame).
+    // image (load/patch), arch, or engine changes (decodeCacheKey_). Bounded by FIFO:
+    // when it exceeds the cap, the oldest insertions are evicted (decodeOrder_) instead
+    // of clearing wholesale, so a long fast-scroll keeps recent rows warm.
+    static constexpr size_t kDecodeCacheCap = 32768;
     std::unordered_map<uint64_t, Instruction> decodeCache_;
+    std::deque<uint64_t>                      decodeOrder_;   // insertion order for FIFO eviction
     uint64_t                                  decodeCacheKey_ = ~0ull;
     bool                 functionsDirty_ = false;   // a patch changed code: re-run analyzeFunctions before the next decompile/CFG
 
@@ -277,9 +289,16 @@ private:
     uint64_t              pseudoVA_ = 0;
     std::string           pseudoText_;
 
-    // Decompiler (structured pseudo-C) cache, keyed by the enclosing function.
+    // Decompiler (structured pseudo-C) for the static Pseudocode view. The decompile
+    // runs off the render thread (K_Decompile); decompVA_ is the function currently
+    // shown, decompText_ its result, decompPending_ true while the worker is running.
+    // decompLru_ keeps the few most-recently decompiled functions so nav back/forward
+    // is instant (no re-decompile); a small linear list (front = most recent), capped.
     uint64_t              decompVA_ = 0;
     std::string           decompText_;
+    bool                  decompPending_ = false;
+    static constexpr size_t kDecompLruCap = 16;
+    std::list<std::pair<uint64_t, std::string>> decompLru_;
 
     // User annotations (persist via ctx.project). comments_ render in the
     // listing; names_ override symbol resolution everywhere names appear.
@@ -338,8 +357,11 @@ private:
     uint64_t               callStackSig_ = 0;
     int                    stackRows_ = 24;   // qwords shown in the live Stack tab
 
-    // Goto-by-name: symbol index (addr, "module.name") + the picker popup.
-    std::vector<std::pair<uint64_t, std::string>> symbolIndex_;
+    // Goto-by-name: symbol index (addr, "module.name") + the picker popup. `lower`
+    // is a pre-lowercased copy of `name`, built once, so filtering doesn't re-lower
+    // every (up to 120k) entry on each keystroke.
+    struct SymEntry { uint64_t addr; std::string name; std::string lower; };
+    std::vector<SymEntry>                         symbolIndex_;
     uint64_t                                      symbolIndexSig_ = ~0ull;
     bool                                          openGotoPopup_ = false;
     char                                          gotoNameBuf_[96] = "";
@@ -391,11 +413,18 @@ private:
     std::string           fnSummary_;
     char                  fnFilter_[64] = "";
     char                  strFilter_[64] = "";
-    // Filtered row indices for the side lists, rebuilt per frame then clipper-rendered
-    // (these lists can hold thousands of entries; rendering all of them was wasteful).
+    // Filtered row indices for the side lists, clipper-rendered (these lists can hold
+    // thousands of entries; rendering all of them was wasteful). Rebuilt ONLY when the
+    // filter text or the underlying data changes — not every frame — since the rebuild
+    // copies a std::string + probes the rename map per function (see fnVisSig_).
     std::vector<int>      fnVisible_;
     std::vector<int>      strVisible_;
     std::vector<int>      impVisible_;
+    char                  fnFilterLast_[64] = "\x01";   // sentinel != "" forces a first build
+    char                  strFilterLast_[64] = "\x01";
+    uint64_t              fnVisSig_  = ~0ull;   // data signature of fnVisible_'s last build
+    uint64_t              strVisSig_ = ~0ull;   // data signature of strVisible_'s last build
+    uint32_t              namesGen_  = 0;       // bumped when names_ (renames) change
     bool                  stringsLive_ = false;    // scan debuggee memory instead of the file
     bool                  stringsScanned_ = false;
     bool                  stringsScanning_ = false; // a live (off-thread) string scan is in flight

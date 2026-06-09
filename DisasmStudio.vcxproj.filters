@@ -57,6 +57,7 @@
     <ClInclude Include="src\App.h"><Filter>Headers</Filter></ClInclude>
     <ClInclude Include="src\Ui\Theme.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Ui\Fonts.h"><Filter>Headers\Ui</Filter></ClInclude>
+    <ClInclude Include="src\Ui\Splitter.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Core\BinaryFile.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\Debugger.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\CFG.h"><Filter>Headers\Core</Filter></ClInclude>

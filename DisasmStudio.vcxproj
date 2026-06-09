@@ -170,6 +170,7 @@
     <ClInclude Include="src\App.h" />
     <ClInclude Include="src\Ui\Theme.h" />
     <ClInclude Include="src\Ui\Fonts.h" />
+    <ClInclude Include="src\Ui\Splitter.h" />
     <ClInclude Include="src\Core\BinaryFile.h" />
     <ClInclude Include="src\Core\Debugger.h" />
     <ClInclude Include="src\Core\SymbolResolver.h" />

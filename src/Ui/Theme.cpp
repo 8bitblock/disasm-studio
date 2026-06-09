@@ -96,13 +96,25 @@ static Palette PaletteFor(ThemeId id) {
 
 // Current theme + its resolved palette. Initialized to the default so the col::*
 // helpers are valid even before ApplyTheme() is first called.
-static ThemeId g_theme = ThemeId::Midnight;
-static Palette g_pal   = PaletteFor(ThemeId::Midnight);
-static float   g_scale = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
+static ThemeId g_theme   = ThemeId::Midnight;
+static Palette g_pal     = PaletteFor(ThemeId::Midnight);
+static float   g_scale   = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
+static Density g_density = Density::Comfortable;   // roomier default
+
+// Spacing/padding multiplier for the current density (applied on top of HiDPI k).
+// Comfortable = 1.0 is the new baseline; Compact is the old tighter look.
+static float densityFactor() {
+    switch (g_density) {
+        case Density::Compact:  return 0.88f;
+        case Density::Spacious: return 1.18f;
+        default:                return 1.0f;
+    }
+}
 
 static void applyMetrics() {
     ImGuiStyle& s = ImGui::GetStyle();
     const float k = g_scale;     // scale every pixel metric so HiDPI stays crisp
+    const float d = k * densityFactor();   // spacing/padding also scale with density
     s.WindowRounding    = 6.0f * k;
     s.ChildRounding     = 6.0f * k;
     s.FrameRounding     = 5.0f * k;
@@ -117,14 +129,14 @@ static void applyMetrics() {
     s.TabBorderSize     = 0.0f;
     s.PopupBorderSize   = 1.0f;
 
-    s.WindowPadding     = ImVec2(12 * k, 12 * k);
-    s.FramePadding      = ImVec2(10 * k, 6 * k);
-    s.CellPadding       = ImVec2(8 * k, 5 * k);
-    s.ItemSpacing       = ImVec2(10 * k, 8 * k);
-    s.ItemInnerSpacing  = ImVec2(8 * k, 6 * k);
-    s.IndentSpacing     = 20.0f * k;
-    s.ScrollbarSize     = 14.0f * k;
-    s.GrabMinSize       = 12.0f * k;
+    s.WindowPadding     = ImVec2(12 * d, 12 * d);
+    s.FramePadding      = ImVec2(10 * d, 6 * d);
+    s.CellPadding       = ImVec2(8 * d, 5 * d);
+    s.ItemSpacing       = ImVec2(10 * d, 8 * d);
+    s.ItemInnerSpacing  = ImVec2(8 * d, 6 * d);
+    s.IndentSpacing     = 20.0f * d;
+    s.ScrollbarSize     = 14.0f * d;
+    s.GrabMinSize       = 12.0f * d;
 
     s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
@@ -198,6 +210,18 @@ void ApplyTheme() { ApplyTheme(g_theme); }
 
 void SetUiScale(float scale) { g_scale = (scale > 0.5f && scale < 8.0f) ? scale : 1.0f; }
 float UiScale() { return g_scale; }
+
+void    SetDensity(Density d) { g_density = d; }
+Density CurrentDensity()      { return g_density; }
+
+const char* DensityName(Density d) {
+    switch (d) {
+        case Density::Compact:     return "Compact";
+        case Density::Comfortable: return "Comfortable";
+        case Density::Spacious:    return "Spacious";
+        default:                   return "?";
+    }
+}
 
 ThemeId CurrentTheme() { return g_theme; }
 

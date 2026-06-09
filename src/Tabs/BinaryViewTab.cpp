@@ -14,7 +14,9 @@
 #include "DataRef.h"
 #include "../Ui/Fonts.h"
 #include "../Ui/Theme.h"
+#include "../Ui/Splitter.h"   // ds::ui::VSplitter for the in-panel sub-splits
 #include "imgui.h"
+#include "imgui_internal.h"   // DockBuilder* for the per-page panel layout (C: docking)
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -1225,7 +1227,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                    ^ (liveGen_ * 0x9E3779B97F4A7C15ull)
                    ^ ((uint64_t)ctx.arch << 40)
                    ^ ((uint64_t)(ctx.disasm ? ctx.disasm->engine() : Engine::Zydis) << 44);
-    if (dcKey != decodeCacheKey_) { decodeCache_.clear(); decodeCacheKey_ = dcKey; }
+    if (dcKey != decodeCacheKey_) { decodeCache_.clear(); decodeOrder_.clear(); decodeCacheKey_ = dcKey; }
 
     ui::PushMono();
     if (ImGui::BeginTable("asm_full", 5,
@@ -1309,7 +1311,13 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                             in.mnemonic = "db";
                             char ob[8]; std::snprintf(ob, sizeof(ob), "0x%02X", b); in.operands = ob;
                         }
-                        if (decodeCache_.size() >= 4096) decodeCache_.clear();   // bounded; re-warms
+                        // FIFO eviction: drop the oldest entries (not the whole cache)
+                        // when over the cap, so a fast scroll keeps recently seen rows.
+                        while (decodeCache_.size() >= kDecodeCacheCap && !decodeOrder_.empty()) {
+                            decodeCache_.erase(decodeOrder_.front());
+                            decodeOrder_.pop_front();
+                        }
+                        decodeOrder_.push_back(row.addr);
                         dit = decodeCache_.emplace(row.addr, std::move(in)).first;
                     }
                     renderAsmRow(ctx, dit->second, snap, hoverTok, nextHoverTok, /*autoScrollHere=*/false);
@@ -1513,6 +1521,7 @@ void BinaryViewTab::revertPatchAt(AppContext& ctx, uint64_t va) {
     // As in applyPatchBytes: no synchronous UI listing sweep — the worker rebuilds
     // off-thread via functionsDirty_, and visible rows re-decode the restored bytes.
     pseudoVA_ = 0; decompVA_ = 0; functionsDirty_ = true;
+    decompPending_ = false; decompLru_.clear();   // reverted bytes: cached pseudo-C is stale
     ++liveGen_;   // a live byte changed: invalidate the cached live decode
 }
 
@@ -1668,7 +1677,7 @@ void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     functions_.clear(); funcIndexDirty_ = true; guessReason_.clear(); fnSummary_.clear();
     algos_.clear(); algosScanned_ = false; algoSel_ = -1;   // algorithm matches belonged to the old image
     symCache_.clear();
-    decompVA_ = 0; decompText_.clear();
+    decompVA_ = 0; decompText_.clear(); decompPending_ = false; decompLru_.clear();   // pseudocode belonged to the old image
     listBuilt_ = false;          // full-program listing belongs to the old image
     // IAT->"dll.func" map (cheap, read on the UI thread by symbolFor/dataRefToken).
     importMap_.clear();
@@ -1735,6 +1744,7 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
     const ProjectState& p = ctx.project;
     comments_ = p.comments;
     names_    = p.names;
+    ++namesGen_;   // renames loaded from the sidecar change the function list's display
     algoLabels_ = p.algorithmLabels;   // user-confirmed algorithm labels (evidence overlay)
     bookmarks_.clear();
     for (const auto& b : p.bookmarks) bookmarks_.push_back({ b.address, b.label });
@@ -1976,16 +1986,21 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
         return;
     }
 
-    const float boxW = 252.0f;
+    if (liveBoxW_ <= 0.0f) liveBoxW_ = 252.0f * theme::UiScale();   // scale default once for HiDPI
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::BeginChild("livemain", ImVec2(showRegBox_ ? avail.x - boxW - 8.0f : 0.0f, 0), ImGuiChildFlags_None);
+    // The register box is the RIGHT child here, so drive the split off the left
+    // (listing) width and derive the box width from it.
+    float leftW = showRegBox_ ? avail.x - liveBoxW_ - 8.0f : 0.0f;
+    ImGui::BeginChild("livemain", ImVec2(leftW, 0), ImGuiChildFlags_None);
     if (liveMode_ == 1) renderLivePseudocode(ctx, snap, base);
     else                renderLiveListing(ctx, snap, base);
     ImGui::EndChild();
 
     if (showRegBox_) {
-        ImGui::SameLine();
-        ImGui::BeginChild("liveregbox", ImVec2(boxW, 0), ImGuiChildFlags_Borders);
+        ds::ui::VSplitter("##livesplit", &leftW, 200.0f * theme::UiScale(),
+                          160.0f * theme::UiScale(), 6.0f * theme::UiScale());
+        liveBoxW_ = avail.x - leftW - 8.0f;   // keep the box width in sync with the drag
+        ImGui::BeginChild("liveregbox", ImVec2(0, 0), ImGuiChildFlags_Borders);
         renderRegisterBox(ctx, snap);
         ImGui::EndChild();
     }
@@ -2839,6 +2854,7 @@ void BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
     // re-decode the patched image bytes immediately, and functionsDirty_ kicks the
     // worker to rebuild the row index off-thread (so a patch never freezes the UI).
     pseudoVA_ = 0; decompVA_ = 0;   // invalidate pseudocode / decompiler caches
+    decompPending_ = false; decompLru_.clear();   // patched bytes: cached pseudo-C is stale
     functionsDirty_ = true;         // boundaries may have changed: re-analyze + rebuild listing on the worker
     ++liveGen_;                     // a live byte changed: invalidate the cached live decode
 }
@@ -2983,12 +2999,13 @@ void BinaryViewTab::renderRenamePopup(AppContext& ctx) {
         else               names_.erase(annPopupVA_);
         projectDirty_ = true;
         symCache_.clear();         // resolved names changed
+        ++namesGen_;               // function-list display changed -> refilter
         decompVA_ = 0;             // pseudocode references names
         ImGui::CloseCurrentPopup();
     };
     if (ImGui::Button("Save", ImVec2(110, 0)) || enter) commit();
     ImGui::SameLine();
-    if (ImGui::Button("Clear", ImVec2(110, 0))) { names_.erase(annPopupVA_); projectDirty_ = true; symCache_.clear(); decompVA_ = 0; ImGui::CloseCurrentPopup(); }
+    if (ImGui::Button("Clear", ImVec2(110, 0))) { names_.erase(annPopupVA_); projectDirty_ = true; symCache_.clear(); ++namesGen_; decompVA_ = 0; ImGui::CloseCurrentPopup(); }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(110, 0))) ImGui::CloseCurrentPopup();
     (void)ctx;
@@ -3373,6 +3390,13 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
     symbolIndex_.clear();
     gotoFilterLast_.clear(); gotoMatches_.clear();
 
+    // Build each entry's lowercased name once here (not per keystroke in the picker).
+    auto lower = [](const std::string& s) {
+        std::string r = s;
+        for (char& c : r) c = (char)std::tolower((unsigned char)c);
+        return r;
+    };
+
     if (symAttached_) {
         if (liveModulesPid_ != symPid_ || liveModules_.empty()) {
             ProcessManager pm; liveModules_ = pm.modules(symPid_); liveModulesPid_ = symPid_;
@@ -3386,11 +3410,14 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
                 it = modExports_.emplace(m.base, std::move(ex)).first;
             }
             std::string mn = modShortName(m.name);
-            for (const auto& e : it->second) symbolIndex_.push_back({ e.first, mn + "." + e.second });
+            for (const auto& e : it->second) {
+                std::string nm = mn + "." + e.second;
+                symbolIndex_.push_back({ e.first, nm, lower(nm) });
+            }
             if (symbolIndex_.size() > 120000) break;
         }
     } else if (ctx.binary.loaded()) {
-        for (const auto& f : functions_) symbolIndex_.push_back({ f.address, f.name });
+        for (const auto& f : functions_) symbolIndex_.push_back({ f.address, f.name, lower(f.name) });
     }
 }
 
@@ -3401,12 +3428,11 @@ uint64_t BinaryViewTab::lookupSymbol(AppContext& ctx, const char* name) {
     for (char& c : q) c = (char)std::tolower((unsigned char)c);
     uint64_t sub = 0;
     for (const auto& s : symbolIndex_) {
-        std::string n = s.second;
-        for (char& c : n) c = (char)std::tolower((unsigned char)c);
-        if (n == q) return s.first;                            // exact "module.name"
+        const std::string& n = s.lower;                        // pre-lowercased at build time
+        if (n == q) return s.addr;                             // exact "module.name"
         size_t dot = n.find('.');
-        if (dot != std::string::npos && n.compare(dot + 1, std::string::npos, q) == 0) return s.first;  // bare name
-        if (!sub && n.find(q) != std::string::npos) sub = s.first;  // first substring match
+        if (dot != std::string::npos && n.compare(dot + 1, std::string::npos, q) == 0) return s.addr;  // bare name
+        if (!sub && n.find(q) != std::string::npos) sub = s.addr;  // first substring match
     }
     if (sub) return sub;
     // Fallback: ask DbgHelp to resolve the name against the PDB / export table
@@ -3447,9 +3473,7 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
         for (char& c : q) c = (char)std::tolower((unsigned char)c);
         for (int i = 0; i < (int)symbolIndex_.size() && (int)gotoMatches_.size() < 500; ++i) {
             if (q.empty()) { gotoMatches_.push_back(i); continue; }
-            std::string n = symbolIndex_[i].second;
-            for (char& c : n) c = (char)std::tolower((unsigned char)c);
-            if (n.find(q) != std::string::npos) gotoMatches_.push_back(i);
+            if (symbolIndex_[i].lower.find(q) != std::string::npos) gotoMatches_.push_back(i);  // pre-lowercased
         }
     }
 
@@ -3458,7 +3482,7 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
         unsigned long long a = 0;
         bool hexPref = gotoNameBuf_[0] == '0' && (gotoNameBuf_[1] == 'x' || gotoNameBuf_[1] == 'X');
         if (hexPref && std::sscanf(gotoNameBuf_ + 2, "%llx", &a) == 1)  go((uint64_t)a);
-        else if (!gotoMatches_.empty())                                 go(symbolIndex_[gotoMatches_[0]].first);
+        else if (!gotoMatches_.empty())                                 go(symbolIndex_[gotoMatches_[0]].addr);
         else if (std::sscanf(gotoNameBuf_, "%llx", &a) == 1)            go((uint64_t)a);
         else if (uint64_t s = lookupSymbol(ctx, gotoNameBuf_))          go(s);  // DbgHelp PDB/export fallback
     }
@@ -3468,8 +3492,8 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
     for (int idx : gotoMatches_) {
         const auto& s = symbolIndex_[idx];
         ImGui::PushID(idx);
-        char lbl[320]; std::snprintf(lbl, sizeof(lbl), "0x%llX  %s", (unsigned long long)s.first, s.second.c_str());
-        if (ImGui::Selectable(lbl)) go(s.first);
+        char lbl[320]; std::snprintf(lbl, sizeof(lbl), "0x%llX  %s", (unsigned long long)s.addr, s.name.c_str());
+        if (ImGui::Selectable(lbl)) go(s.addr);
         ImGui::PopID();
     }
     if (gotoMatches_.empty())
@@ -3930,7 +3954,7 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     panelPopToggle(&pseudoPoppedOut_, "pseudo"); ImGui::SameLine();
     ImGui::TextDisabled("Decompiler view (structured pseudo-C).");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) decompVA_ = 0;
+    if (ImGui::SmallButton("Refresh")) { decompVA_ = 0; decompLru_.clear(); }   // force a re-decompile
     ImGui::SameLine();
     ImGui::TextDisabled("if/else + while recovery via dominator analysis; goto fallback for irreducible flow.");
     ImGui::Separator();
@@ -3943,27 +3967,31 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     const Func* best = funcContaining(cursorVA_);
     if (best && cursorVA_ - best->address < 0x4000) { fnStart = best->address; fnSize = best->size; }
 
-    if (fnStart != decompVA_ || decompText_.empty()) {
+    if (fnStart != decompVA_) {
         decompVA_ = fnStart;
         size_t avail = 0;
         const uint8_t* p = ctx.binary.ptrFromVA(fnStart, avail);
         if (!p) {
             decompText_ = "// cursor address is not mapped to file data\n";
+            decompPending_ = false;
+        } else if (const std::string* hit = decompLruGet(fnStart)) {
+            decompText_ = *hit;            // already decompiled recently — instant
+            decompPending_ = false;
         } else {
-            size_t win = fnSize ? std::min<size_t>(avail, std::min<uint32_t>(fnSize + 16u, 16384u))
-                                : std::min<size_t>(avail, 4096);
-            auto jt = [this, &ctx](const Instruction& in) { return resolveJumpTable(ctx, in); };
-            ControlFlowGraph g = BuildCFG(p, win, fnStart, *ctx.disasm, 2000, jt);
-            DecompileOptions opt;
-            opt.nameFor    = [this, &ctx](uint64_t a) -> std::string { return symbolFor(ctx, a); };
-            opt.dataRefFor = [this, &ctx](uint64_t a) -> std::string { return dataRefToken(ctx, a, /*live=*/false); };
-            // Feed the inferred signature into the emitted header (name spliced in).
-            opt.x86       = ArchIsX86(ctx.arch);   // gate the arg-header to x86/x64
-            opt.signature = guessSignature(ctx, fnStart, fnSize);
-            decompText_ = Decompile(g, opt);
-            if (!opt.signature.empty())
-                decompText_ = "// signature is heuristic (no full type recovery)\n" + decompText_;
+            // Decompile off the render thread (K_Decompile); the result lands in the
+            // bulk-drain loop. Show a placeholder until then so the UI never freezes.
+            decompText_.clear();
+            decompPending_ = true;
+            uint64_t end = fnStart + (fnSize ? std::min<uint32_t>(fnSize + 16u, 16384u)
+                                             : (uint32_t)std::min<size_t>(avail, 4096));
+            ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_Decompile,
+                                     guessNames_, ctx.analysis.epoch(), 0, fnStart, end);
         }
+    }
+
+    if (decompPending_ && decompText_.empty()) {
+        ImGui::TextDisabled("Decompiling\xE2\x80\xA6 (running on the analysis worker)");
+        return;
     }
 
     ui::PushMono();
@@ -3971,6 +3999,25 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     ImGui::InputTextMultiline("##decomp", decompText_.data(), decompText_.size() + 1,
                               ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
     ui::PopMono();
+}
+
+// Small LRU over recently decompiled functions (front = most recent). Returns the
+// cached pseudo-C for `va`, moving it to the front, or nullptr on a miss.
+const std::string* BinaryViewTab::decompLruGet(uint64_t va) {
+    for (auto it = decompLru_.begin(); it != decompLru_.end(); ++it)
+        if (it->first == va) {
+            decompLru_.splice(decompLru_.begin(), decompLru_, it);   // move to front
+            return &decompLru_.front().second;
+        }
+    return nullptr;
+}
+
+// Insert/refresh `text` for `va` at the front, evicting the oldest beyond the cap.
+void BinaryViewTab::decompLruPut(uint64_t va, const std::string& text) {
+    for (auto it = decompLru_.begin(); it != decompLru_.end(); ++it)
+        if (it->first == va) { it->second = text; decompLru_.splice(decompLru_.begin(), decompLru_, it); return; }
+    decompLru_.emplace_front(va, text);
+    while (decompLru_.size() > kDecompLruCap) decompLru_.pop_back();
 }
 
 void BinaryViewTab::renderHex(AppContext& ctx) {
@@ -4435,7 +4482,7 @@ void BinaryViewTab::runByteSearch(AppContext& ctx) {
 }
 
 void BinaryViewTab::renderSidePanel(AppContext& ctx) {
-    panelPopToggle(&sidePoppedOut_, "side");
+    // (Drag the panel's tab to float/re-dock it — docking replaced the manual pop-out.)
     ImGui::SeparatorText("Byte Pattern Search");
     ImGui::SetNextItemWidth(-60);
     ImGui::InputTextWithHint("##bsearch", "DE AD BE EF", byteSearch_, sizeof(byteSearch_));
@@ -4506,15 +4553,24 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                 ImGui::BeginChild("fnlist", ImVec2(0, 0), ImGuiChildFlags_Borders);
                 ui::PushMono();   // monospace so the 0x... address column lines up
                 // Filter into an index list, then clipper-render only visible rows.
-                fnVisible_.clear();
-                for (int i = 0; i < (int)functions_.size(); ++i) {
-                    if (fnFilter_[0]) {
-                        const Func& f = functions_[i];
-                        std::string dn = annName(ctx, f.address);
-                        const std::string& nm = dn.empty() ? f.name : dn;
-                        if (nm.find(fnFilter_) == std::string::npos && f.name.find(fnFilter_) == std::string::npos) continue;
+                // Rebuild only when the filter text or the function set / rename state
+                // changes — otherwise the per-function annName() copy+probe ran every
+                // idle frame on large binaries.
+                uint64_t fnSig = (uint64_t)functions_.size() ^ ((uint64_t)namesGen_ << 40);
+                if (!functions_.empty()) fnSig ^= functions_.front().address ^ (functions_.back().address << 1);
+                if (std::strcmp(fnFilter_, fnFilterLast_) != 0 || fnSig != fnVisSig_) {
+                    std::snprintf(fnFilterLast_, sizeof(fnFilterLast_), "%s", fnFilter_);
+                    fnVisSig_ = fnSig;
+                    fnVisible_.clear();
+                    for (int i = 0; i < (int)functions_.size(); ++i) {
+                        if (fnFilter_[0]) {
+                            const Func& f = functions_[i];
+                            std::string dn = annName(ctx, f.address);
+                            const std::string& nm = dn.empty() ? f.name : dn;
+                            if (nm.find(fnFilter_) == std::string::npos && f.name.find(fnFilter_) == std::string::npos) continue;
+                        }
+                        fnVisible_.push_back(i);
                     }
-                    fnVisible_.push_back(i);
                 }
                 ImGuiListClipper fnClip;
                 fnClip.Begin((int)fnVisible_.size());
@@ -4581,9 +4637,15 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                 ImGui::TableSetupColumn("String");
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
-                strVisible_.clear();
-                for (int i = 0; i < (int)strings_.size(); ++i)
-                    if (!strFilter_[0] || strings_[i].text.find(strFilter_) != std::string::npos) strVisible_.push_back(i);
+                uint64_t strSig = (uint64_t)strings_.size();
+                if (!strings_.empty()) strSig ^= strings_.front().address ^ (strings_.back().address << 1);
+                if (std::strcmp(strFilter_, strFilterLast_) != 0 || strSig != strVisSig_) {
+                    std::snprintf(strFilterLast_, sizeof(strFilterLast_), "%s", strFilter_);
+                    strVisSig_ = strSig;
+                    strVisible_.clear();
+                    for (int i = 0; i < (int)strings_.size(); ++i)
+                        if (!strFilter_[0] || strings_[i].text.find(strFilter_) != std::string::npos) strVisible_.push_back(i);
+                }
                 ImGuiListClipper strClip;
                 strClip.Begin((int)strVisible_.size());
                 while (strClip.Step())
@@ -4801,7 +4863,7 @@ void BinaryViewTab::renderPathExplorerTab(AppContext& ctx) {
 }
 
 void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
-    panelPopToggle(&lowerPoppedOut_, "lower");
+    // (Drag the panel's tab to float/re-dock it — docking replaced the manual pop-out.)
     if (ImGui::BeginTabBar("lower")) {
         renderSynthesisTab(ctx);
         renderHotPatchTab(ctx);
@@ -4894,7 +4956,8 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                     {"R12","r12",&Registers::r12}, {"R13","r13",&Registers::r13}, {"R14","r14",&Registers::r14}, {"R15","r15",&Registers::r15},
                 };
                 ui::PushMono();
-                ImGui::BeginChild("regs", ImVec2(360, 0), ImGuiChildFlags_Borders);
+                if (regsSplitW_ <= 0.0f) regsSplitW_ = 360.0f * theme::UiScale();   // scale default once for HiDPI
+                ImGui::BeginChild("regs", ImVec2(regsSplitW_, 0), ImGuiChildFlags_Borders);
                 if (paused) ImGui::TextDisabled("double-click a value to edit");
                 else        ImGui::TextDisabled("(read-only while running)");
                 const int nRows = is32 ? 10 : (int)(sizeof(kRows) / sizeof(kRows[0]));   // hide r8-r15 for 32-bit
@@ -4943,7 +5006,8 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 }
                 ImGui::EndChild();
 
-                ImGui::SameLine();
+                ds::ui::VSplitter("##regsplit", &regsSplitW_, 220.0f * theme::UiScale(),
+                                  200.0f * theme::UiScale(), 6.0f * theme::UiScale());
                 ImGui::BeginChild("stack", ImVec2(0, 0), ImGuiChildFlags_Borders);
                 ImGui::TextDisabled(is32 ? "Stack (ESP):" : "Stack (RSP):");
                 for (int i = 0; i < 24; ++i) {
@@ -5646,6 +5710,13 @@ void BinaryViewTab::render(AppContext& ctx) {
                 pathPending_ = false; pathFocus_ = true;
                 if (!pathHave_) pathStatus_ = "No reachable paths (region did not decode to a CFG).";
             }
+            if (ar.decompValid) {           // K_Decompile (static Pseudocode) result
+                decompLruPut(ar.decompVA, ar.decompText);   // cache for nav back/forward
+                if (ar.decompVA == decompVA_) {             // still the function on screen
+                    decompText_ = std::move(ar.decompText);
+                    decompPending_ = false;
+                }
+            }
         }
     }
 
@@ -5758,66 +5829,75 @@ void BinaryViewTab::render(AppContext& ctx) {
     }
     ImGui::Separator();
 
-    // Layout: main view (left) | side panel (right), lower tabs underneath. A panel
-    // that has been popped out (its own window, rendered after this block) is skipped
-    // here so the remaining panels reflow to fill the freed space.
-    const float sideW  = 320.0f;
-    const float lowerH = 200.0f;
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float mainW = sidePoppedOut_  ? avail.x : (avail.x - sideW - 8);
-    float mainH = lowerPoppedOut_ ? avail.y : (avail.y - lowerH - 8);
+    // Layout: a per-PAGE DockSpace holding three dockable panels — Disassembly (the
+    // main view), Side Panel, and Debug Panels. The dock separators give free drag-
+    // resize; panels can be re-docked, floated as their own OS window, or stacked as
+    // tabs, and the arrangement persists in imgui.ini. Only the panels INSIDE Binary
+    // View dock; the top app-tab strip and the toolbar/status chrome are untouched.
+    ImGuiID dockId = ImGui::GetID("##binview_dock");
 
-    ImGui::BeginChild("mainview", ImVec2(mainW, mainH), ImGuiChildFlags_Borders);
-    // selVAs_ is shared by the static and live listings (file-base vs runtime VAs),
-    // so drop the selection when crossing between them to avoid ghost highlights.
-    if ((mainView_ == 0 || mainView_ == 4) && mainView_ != selView_) {
-        if (selView_ == 0 || selView_ == 4) { selVAs_.clear(); selAnchorVA_ = 0; }
-        selView_ = mainView_;
-    }
-    switch (mainView_) {
-        case 0: renderAssembly(ctx);   break;
-        case 1: if (pseudoPoppedOut_) { ImGui::TextDisabled("Pseudocode is open in a separate window.");
-                                        if (ImGui::SmallButton("Dock back")) pseudoPoppedOut_ = false; }
-                else renderPseudocode(ctx); break;
-        case 2: renderHex(ctx);        break;
-        case 3: if (graphPoppedOut_)  { ImGui::TextDisabled("Graph is open in a separate window.");
-                                        if (ImGui::SmallButton("Dock back")) graphPoppedOut_ = false; }
-                else renderGraph(ctx); break;
-        case 4: renderLiveAssembly(ctx); break;
-        case 5: renderCallGraph(ctx);  break;
-    }
-    ImGui::EndChild();
-
-    if (!sidePoppedOut_) {
-        ImGui::SameLine();
-        ImGui::BeginChild("sidepanel", ImVec2(sideW, mainH), ImGuiChildFlags_Borders);
-        renderSidePanel(ctx);
-        ImGui::EndChild();
+    // View > Reset Layout: drop the saved node so the default split is rebuilt below.
+    if (ctx.requestResetDockLayout) {
+        ImGui::DockBuilderRemoveNode(dockId);
+        dockInitDone_ = false;
+        ctx.requestResetDockLayout = false;
     }
 
-    if (!lowerPoppedOut_) {
-        ImGui::BeginChild("lowertabs", ImVec2(0, 0), ImGuiChildFlags_Borders);
-        renderLowerTabs(ctx);
-        ImGui::EndChild();
+    ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
+
+    // First-run default layout (only when no node exists yet, so a restored ini layout
+    // is never stomped): center = Disassembly, right 28% = Side Panel, bottom 28% =
+    // Debug Panels. Size the node before splitting so the ratios apply to real pixels.
+    if (!dockInitDone_ && ImGui::DockBuilderGetNode(dockId) == nullptr) {
+        ImGui::DockBuilderRemoveNode(dockId);
+        ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace);
+        ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetContentRegionAvail());
+        ImGuiID center = dockId, right = 0, bottom = 0;
+        right  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.28f, nullptr, &center);
+        bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down,  0.28f, nullptr, &center);
+        ImGui::DockBuilderDockWindow("Disassembly##binview", center);
+        ImGui::DockBuilderDockWindow("Side Panel##binview",   right);
+        ImGui::DockBuilderDockWindow("Debug Panels##binview", bottom);
+        ImGui::DockBuilderFinish(dockId);
+        dockInitDone_ = true;
     }
 
-    // Popped-out panels render as standalone windows (their own OS window when
-    // viewports are enabled). Closing the window (the title-bar X) docks it back.
+    // Disassembly panel — the main view dispatch. Bind to the dockspace on first use
+    // (ImGuiCond_FirstUseEver) so a restored layout wins thereafter.
+    ImGui::SetNextWindowDockID(dockId, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Disassembly##binview")) {
+        // selVAs_ is shared by the static and live listings (file-base vs runtime VAs),
+        // so drop the selection when crossing between them to avoid ghost highlights.
+        if ((mainView_ == 0 || mainView_ == 4) && mainView_ != selView_) {
+            if (selView_ == 0 || selView_ == 4) { selVAs_.clear(); selAnchorVA_ = 0; }
+            selView_ = mainView_;
+        }
+        switch (mainView_) {
+            case 0: renderAssembly(ctx);   break;
+            case 1: if (pseudoPoppedOut_) { ImGui::TextDisabled("Pseudocode is open in a separate window.");
+                                            if (ImGui::SmallButton("Dock back")) pseudoPoppedOut_ = false; }
+                    else renderPseudocode(ctx); break;
+            case 2: renderHex(ctx);        break;
+            case 3: if (graphPoppedOut_)  { ImGui::TextDisabled("Graph is open in a separate window.");
+                                            if (ImGui::SmallButton("Dock back")) graphPoppedOut_ = false; }
+                    else renderGraph(ctx); break;
+            case 4: renderLiveAssembly(ctx); break;
+            case 5: renderCallGraph(ctx);  break;
+        }
+    }
+    ImGui::End();
+
+    ImGui::SetNextWindowDockID(dockId, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Side Panel##binview")) renderSidePanel(ctx);
+    ImGui::End();
+
+    ImGui::SetNextWindowDockID(dockId, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Debug Panels##binview")) renderLowerTabs(ctx);
+    ImGui::End();
+
+    // The Graph / Pseudocode "pop out a sub-view" buttons stay (orthogonal to docking:
+    // they pop a specific main-view rendering into its own window).
     const float ds = theme::UiScale();
-    if (sidePoppedOut_) {
-        ImGui::SetNextWindowSize(ImVec2(360 * ds, 640 * ds), ImGuiCond_FirstUseEver);
-        bool open = true;
-        if (ImGui::Begin("Side Panel - DisasmStudio", &open)) renderSidePanel(ctx);
-        ImGui::End();
-        if (!open) sidePoppedOut_ = false;
-    }
-    if (lowerPoppedOut_) {
-        ImGui::SetNextWindowSize(ImVec2(900 * ds, 320 * ds), ImGuiCond_FirstUseEver);
-        bool open = true;
-        if (ImGui::Begin("Debug Panels - DisasmStudio", &open)) renderLowerTabs(ctx);
-        ImGui::End();
-        if (!open) lowerPoppedOut_ = false;
-    }
     if (graphPoppedOut_) {
         ImGui::SetNextWindowSize(ImVec2(900 * ds, 720 * ds), ImGuiCond_FirstUseEver);
         bool open = true;

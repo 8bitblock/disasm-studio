@@ -35,6 +35,7 @@ struct AppContext {
     std::unique_ptr<IDisassembler> disasm;
     std::string                    requestedTab;
     bool                           requestedLiveAssembly = false;
+    bool                           requestResetDockLayout = false; // View > Reset Layout, consumed by Binary View's dockspace
     bool                           requestedExportAnalysis = false; // File > Export Analysis, consumed by Binary View
     bool                           binaryJustLoaded      = false; // set on load, consumed by Binary View
     uint64_t                       requestedGotoVA       = 0;     // cross-tab "view this address" request
@@ -161,6 +162,7 @@ private:
     bool                                showDemo_  = false;
     bool                                showAbout_ = false;
     theme::ThemeId                      theme_     = theme::ThemeId::Midnight;
+    theme::Density                      density_   = theme::Density::Comfortable;
 
     // Raw-load prompt state.
     bool                                openRawPopup_ = false;

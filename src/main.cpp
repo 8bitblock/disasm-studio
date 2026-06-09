@@ -14,6 +14,7 @@
 
 #include <d3d11.h>
 #include <fstream>
+#include <string>
 #include <tchar.h>
 #include <windows.h>
 
@@ -74,8 +75,27 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // windows — so enable multi-viewport. The platform-window pump at the bottom of
     // the render loop is gated on this same flag.
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Docking for the panels INSIDE Binary View (a per-page DockSpace): drag-resize,
+    // re-dock, float as an OS window, or stack as tabs. Combined with ViewportsEnable,
+    // a panel dragged out of the window becomes its own OS viewport for free.
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigViewportsNoTaskBarIcon = true;   // popped panels are tools, not separate apps
-    io.IniFilename = nullptr; // don't persist/restore window layout
+
+    // Persist the panel layout across sessions in %APPDATA%\DisasmStudio\imgui.ini.
+    // ImGui stores the pointer (not a copy), so the path must outlive the context —
+    // a function-local static is fine for the program's lifetime.
+    static std::string iniPath;
+    {
+        char appdata[MAX_PATH] = {0};
+        if (GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata))) {
+            std::string dir = std::string(appdata) + "\\DisasmStudio";
+            CreateDirectoryA(dir.c_str(), nullptr);
+            iniPath = dir + "\\imgui.ini";
+            io.IniFilename = iniPath.c_str();
+        } else {
+            io.IniFilename = nullptr;   // no APPDATA: don't persist
+        }
+    }
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
@@ -191,6 +211,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         else if (framesToRender > 0)
             --framesToRender;
     }
+
+    // Flush the panel layout now: ImGui's ~5 s autosave timer may not have fired for a
+    // change made just before exit, and DestroyContext() does not save.
+    if (io.IniFilename) ImGui::SaveIniSettingsToDisk(io.IniFilename);
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
