@@ -43,7 +43,7 @@ void AnalysisService::requestBulk(const BinaryFile* bin, Engine engine, Arch arc
                 j.arch   = arch;
                 j.guess  = guessNames;
                 j.epoch  = epoch;
-                if (kinds & (K_Synthesis | K_PathExplore)) { j.regionLo = regionLo; j.regionHi = regionHi; }
+                if (kinds & (K_Synthesis | K_PathExplore | K_Decompile)) { j.regionLo = regionLo; j.regionHi = regionHi; }
                 merged = true;
                 break;
             }
@@ -272,6 +272,19 @@ void AnalysisService::runJob(const BulkJob& job) {
         PathTree pt = PathExploreJob(*job.bin, *dis, job.arch, job.regionLo);
         if (!superseded()) {
             AnalysisResult r; r.pathTree = std::move(pt); r.pathValid = true;
+            r.regionLo = job.regionLo; r.regionHi = job.regionHi;
+            emit(std::move(r));
+        }
+    }
+
+    // Structured pseudo-C for the function in [regionLo, regionHi) (off the render
+    // thread). Base name resolution only (imports + string literals); the UI re-applies
+    // nothing — user renames still show in the listing, not here (documented default).
+    if ((job.kinds & K_Decompile) && !superseded() && job.regionHi > job.regionLo) {
+        std::string t = DecompileRegion(*job.bin, *dis, ArchIsX86(job.arch), job.regionLo, job.regionHi);
+        if (!superseded()) {
+            AnalysisResult r; r.decompText = std::move(t); r.decompValid = true;
+            r.decompVA = job.regionLo;
             r.regionLo = job.regionLo; r.regionHi = job.regionHi;
             emit(std::move(r));
         }

@@ -26,7 +26,8 @@
 namespace ds {
 
 App::App() {
-    loadPrefs();                 // restore the last-used theme, if any
+    loadPrefs();                 // restore the last-used theme + density, if any
+    theme::SetDensity(density_);
     theme::ApplyTheme(theme_);
     ctx_.rebuildDisassembler();
 
@@ -64,6 +65,10 @@ void App::loadPrefs() {
         if (line.rfind("theme=", 0) == 0) {
             int v = std::atoi(line.c_str() + 6);
             if (v >= 0 && v < (int)theme::ThemeId::Count) theme_ = (theme::ThemeId)v;
+        } else if (line.rfind("density=", 0) == 0) {
+            int v = std::atoi(line.c_str() + 8);
+            if (v >= (int)theme::Density::Compact && v <= (int)theme::Density::Spacious)
+                density_ = (theme::Density)v;
         }
     }
 }
@@ -72,7 +77,8 @@ void App::savePrefs() const {
     std::string path = prefsPath();
     if (path.empty()) return;
     std::ofstream f(path, std::ios::trunc);
-    if (f) f << "theme=" << (int)theme_ << "\n";
+    if (f) f << "theme=" << (int)theme_ << "\n"
+             << "density=" << (int)density_ << "\n";
 }
 
 static Arch archFromMachine(MachineArch m, bool is64) {
@@ -381,6 +387,22 @@ void App::renderMenuBar() {
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Density")) {
+                const theme::Density opts[] = { theme::Density::Compact,
+                                                theme::Density::Comfortable,
+                                                theme::Density::Spacious };
+                for (theme::Density d : opts) {
+                    if (ImGui::MenuItem(theme::DensityName(d), nullptr, density_ == d)) {
+                        density_ = d;
+                        theme::SetDensity(d);
+                        theme::ApplyTheme();   // re-derive spacing live (same as theme switch)
+                        savePrefs();
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Reset Layout"))
+                ctx_.requestResetDockLayout = true;
             ImGui::MenuItem("ImGui Demo", nullptr, &showDemo_);
             ImGui::EndMenu();
         }

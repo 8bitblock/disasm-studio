@@ -9,6 +9,8 @@
 #include "FunctionNamer.h"
 #include "AlgoScan.h"
 #include "XrefIndex.h"
+#include "CFG.h"
+#include "Decompiler.h"
 #include "../Disasm/IDisassembler.h"
 
 #include <algorithm>
@@ -227,6 +229,62 @@ std::vector<CallEdgeR> BuildCallEdges(const BinaryFile& bin, IDisassembler& dis,
 std::vector<AlgoMatch> ScanAlgorithmsJob(const BinaryFile& bin, const XrefIndex* xref,
                                          const std::vector<FuncResult>& functions) {
     return ScanAlgorithms(bin, xref, functions.empty() ? nullptr : &functions);
+}
+
+std::string DecompileRegion(const BinaryFile& bin, IDisassembler& dis,
+                            bool x86, uint64_t lo, uint64_t hi) {
+    if (!bin.loaded() || hi <= lo) return std::string();
+    size_t avail = 0;
+    const uint8_t* p = bin.ptrFromVA(lo, avail);
+    if (!p) return std::string();
+    uint32_t fnSize = (uint32_t)std::min<uint64_t>(hi - lo, 0xFFFFFFFFull);
+    size_t win = std::min<size_t>(avail, std::min<uint32_t>(fnSize + 16u, 16384u));
+
+    // Base import resolution: IAT slot VA -> "dll.name" (no UI rename map here).
+    std::unordered_map<uint64_t, std::string> imports;
+    for (const auto& im : bin.imports()) imports[im.iatVA] = im.dll + "." + im.name;
+
+    // Read a short, escaped, quoted C-string literal at `va`, or "" if not printable.
+    auto stringAt = [&bin](uint64_t va) -> std::string {
+        size_t av = 0;
+        const uint8_t* d = bin.ptrFromVA(va, av);
+        if (!d) return std::string();
+        size_t n = std::min<size_t>(av, 128);
+        std::string s;
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char c = d[i];
+            if (c == 0) break;
+            if (!((c >= 0x20 && c < 0x7f) || c == '\t' || c == '\n' || c == '\r')) return std::string();
+            s.push_back((char)c);
+        }
+        if (s.size() < 3) return std::string();
+        std::string q = "\"";
+        for (char c : s) {
+            if (q.size() > 48) { q += "..."; break; }
+            if (c == '"' || c == '\\') q += '\\';
+            if (c == '\n') { q += "\\n"; continue; }
+            if (c == '\t') { q += "\\t"; continue; }
+            if (c == '\r') { q += "\\r"; continue; }
+            q += c;
+        }
+        q += "\"";
+        return q;
+    };
+
+    ControlFlowGraph g = BuildCFG(p, win, lo, dis, 2000);
+    DecompileOptions opt;
+    opt.nameFor    = [&imports](uint64_t a) -> std::string {
+        auto it = imports.find(a);
+        return it != imports.end() ? it->second : std::string();
+    };
+    opt.dataRefFor = [&imports, &stringAt](uint64_t a) -> std::string {
+        if (!a) return std::string();
+        auto it = imports.find(a);
+        if (it != imports.end()) return it->second;
+        return stringAt(a);
+    };
+    opt.x86 = x86;   // gate the arg-header to x86/x64 (avoid spurious args on other arches)
+    return Decompile(g, opt);
 }
 
 } // namespace ds

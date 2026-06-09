@@ -39,6 +39,14 @@ const char* ThemeName(ThemeId id);   // human label for menus
 void  SetUiScale(float scale);
 float UiScale();
 
+// UI density. Only the spacing/padding metrics are scaled by this (on top of the
+// HiDPI UiScale); rounding/borders are unaffected. Comfortable is the roomier
+// default. SetDensity takes effect on the next ApplyTheme().
+enum class Density { Compact, Comfortable, Spacious };
+void        SetDensity(Density d);
+Density     CurrentDensity();
+const char* DensityName(Density d);   // human label for menus
+
 // Shared accent colors (resolved against the *current* theme), so tabs don't
 // each invent their own and recolor automatically when the theme changes.
 namespace col {
