@@ -39,6 +39,12 @@ int main() {
     st.patches.push_back({ 0x1400005000ull, { 0x01, 0x02 }, { 0x90, 0x90 } });
     st.watches.push_back("rax");
     st.watches.push_back("[rsp+8]");
+    st.labels.push_back({ "java_method", "Crackme.check:(Ljava/lang/String;)Z", "check_password", 0.8f, "analyst label" });
+    st.connection.enabled = true;
+    st.connection.authEnabled = true;
+    st.connection.accessToken = "tok";
+    st.connectionEvents.push_back({ "event", "tool", "proj", "artifact", "0x1400002000",
+                                    "breakpoint.hit", "{\"tid\":7}", "2026-06-12T00:00:00Z" });
 
     std::string text = SerializeProject(st);
     ProjectState rt;
@@ -72,10 +78,19 @@ int main() {
     CHECK(rt.patches.size() == 1 && rt.patches[0].address == 0x1400005000ull
           && rt.patches[0].bytes.size() == 2 && rt.patches[0].bytes[0] == 0x90);
     CHECK(rt.watches.size() == 2 && rt.watches[0] == "rax" && rt.watches[1] == "[rsp+8]");
+    CHECK(rt.labels.size() == 1 && rt.labels[0].targetKind == "java_method"
+          && rt.labels[0].label == "check_password");
+    CHECK(rt.connection.enabled && rt.connection.authEnabled
+          && rt.connection.localhostOnly && rt.connection.accessToken == "tok");
+    CHECK(rt.connectionEvents.size() == 1 && rt.connectionEvents[0].type == "event"
+          && rt.connectionEvents[0].address == "0x1400002000"
+          && rt.connectionEvents[0].payloadJson.find("\"tid\"") != std::string::npos);
 
     // watches alone count as content (so a watch-only project still saves).
     ProjectState w; w.hash = 2; w.watches.push_back("rcx");
     CHECK(w.hasContent());
+    ProjectState ev; ev.hash = 3; ev.connectionEvents.push_back({ "event", "tool" });
+    CHECK(ev.hasContent());
 
     // hasContent() gates the empty-project save guard.
     ProjectState empty; empty.hash = 1; empty.arch = "x64"; empty.engine = "Zydis";

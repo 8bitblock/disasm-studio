@@ -50,6 +50,39 @@ int main() {
     CHECK(!EvalCondition("rax < 0x10", cc, true));
     CHECK(EvalCondition("", cc, false));                        // empty == unconditional (true)
 
+    // ---- signed comparison operators (s< s<= s> s>=) -----------------------
+    {
+        CondContext sc;
+        // neg = -1 (0xFFFF...), pos = 1, rflags = 3 (name ends in 's': tokenizer trap).
+        sc.reg = [](const std::string& n, uint64_t& o) -> bool {
+            if (n == "neg")    { o = (uint64_t)-1; return true; }
+            if (n == "pos")    { o = 1; return true; }
+            if (n == "rflags") { o = 3; return true; }
+            return false;
+        };
+        sc.mem = [](uint64_t) -> uint64_t { return 0; };
+
+        CHECK(EvalCondition("neg s< 0", sc, false));        // -1 < 0 signed
+        CHECK(!EvalCondition("neg < 0", sc, true));         // unsigned: 0xFFFF... not < 0
+        CHECK(EvalCondition("neg s<= -1", sc, false));      // boundary (strtoull wraps -1)
+        CHECK(!EvalCondition("neg s< -1", sc, true));
+        CHECK(EvalCondition("pos s> 0", sc, false));
+        CHECK(EvalCondition("pos s> -5", sc, false));       // 1 > -5 signed
+        CHECK(!EvalCondition("pos > -5", sc, true));        // unsigned: 1 not > 0xFFFF...FB
+        CHECK(EvalCondition("neg s>= -1", sc, false));
+        CHECK(!EvalCondition("neg s>= 0", sc, true));
+        // Word-boundary guard: a register ending in 's' followed by < / <= must
+        // stay an UNSIGNED compare on the full name, never "rflag s< ...".
+        CHECK(!EvalCondition("rflags<1", sc, true));            // 3 < 1 -> false; onError=true would
+                                                                // leak through if it had MIS-parsed
+        CHECK(EvalCondition("rflags < 4", sc, false));          // 3 < 4
+        CHECK(EvalCondition("rflags<=3", sc, false));           // 3 <= 3
+        // No-spaces signed form still parses at a real boundary.
+        CHECK(EvalCondition("neg s<0", sc, false));
+        // Operator without an lhs operand is invalid -> onError.
+        CHECK(EvalCondition("s< 5", sc, true) && !EvalCondition("s< 5", sc, false));
+    }
+
     // Pre-compiled conditions evaluate identically to the string path (parse once,
     // evaluate per hit). See cond_compiled_test.cpp for the exhaustive sweep.
     CHECK(EvalCompiled(CompileCondition("rax == 0x1000"), cc, false));

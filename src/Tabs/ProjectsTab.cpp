@@ -1,4 +1,7 @@
 #include "ProjectsTab.h"
+#include "../Ui/Icons.h"
+#include "../Ui/Theme.h"
+#include "../Ui/Widgets.h"
 #include "imgui.h"
 
 #include <ctime>
@@ -33,18 +36,26 @@ void ProjectsTab::render(AppContext& ctx) {
     // (so a newly opened/saved target appears without a manual refresh).
     if (!loaded_ || lastSeenHash_ != ctx.project.hash) { refresh(); lastSeenHash_ = ctx.project.hash; }
 
-    ImGui::TextDisabled("Recent analysis projects (persisted as JSON sidecars keyed by binary hash).");
-    if (ImGui::Button("Open Binary...")) { if (ctx.openBinaryDialog()) ctx.requestedTab = "Binary View"; }
+    if (ui::ToolbarIconButton(DS_ICON_FOLDER, "Open Binary...", "Pick a binary to analyze (Ctrl+O)")) {
+        if (ctx.openBinaryDialog()) ctx.requestedTab = "Binary View";
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Refresh")) refresh();
+    if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh", "Re-read the recent projects index")) refresh();
     ImGui::SameLine();
-    ImGui::TextDisabled("Use File > Open as Raw... for shellcode/firmware.");
-    if (!openError_.empty()) ImGui::TextColored(ImVec4(0.9f, 0.4f, 0.4f, 1), "%s", openError_.c_str());
+    ImGui::TextDisabled("Recent analysis projects auto-save as JSON sidecars. Use File > Open as Raw... for shellcode/firmware.");
+    if (!openError_.empty()) ImGui::TextColored(theme::col::bad(), "%s", openError_.c_str());
     ImGui::Separator();
 
     // Left: recent project list. Right: details.
     ImGui::BeginChild("proj_list", ImVec2(420, 0), ImGuiChildFlags_Borders);
-    if (ImGui::BeginTable("projects", 3,
+    if (recents_.empty()) {
+        // First run / cleared index: a hero card instead of an empty table.
+        if (ui::EmptyState(DS_ICON_FOLDER, "No recent projects",
+                           "Open a binary to start an analysis project - it saves automatically.",
+                           "Open Binary...")) {
+            if (ctx.openBinaryDialog()) ctx.requestedTab = "Binary View";
+        }
+    } else if (ImGui::BeginTable("projects", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("Arch",   ImGuiTableColumnFlags_WidthFixed, 50);
@@ -78,7 +89,6 @@ void ProjectsTab::render(AppContext& ctx) {
         ImGui::EndTable();
         if (removeAt >= 0) { RemoveRecent(recents_[removeAt].hash); refresh(); selected_ = -1; }
     }
-    if (recents_.empty()) ImGui::TextDisabled("No recent projects yet. Open a binary to start one.");
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -87,11 +97,11 @@ void ProjectsTab::render(AppContext& ctx) {
     ImGui::SeparatorText("Selected");
     if (selected_ >= 0 && selected_ < (int)recents_.size()) {
         const auto& r = recents_[selected_];
-        ImGui::Text("Name: %s", r.name.empty() ? baseName(r.path) : r.name.c_str());
-        ImGui::TextWrapped("Path: %s", r.path.c_str());
-        ImGui::Text("Arch: %s", r.arch.c_str());
-        ImGui::Text("Hash: %016llX", (unsigned long long)r.hash);
-        ImGui::Text("Last opened: %s", whenStr(r.lastOpenedUnix).c_str());
+        ui::KeyValueRow("Name", "%s", r.name.empty() ? baseName(r.path) : r.name.c_str());
+        ui::KeyValueRow("Path", "%s", r.path.c_str());
+        ui::KeyValueRow("Arch", "%s", r.arch.empty() ? "-" : r.arch.c_str());
+        ui::KeyValueRow("Hash", "%016llX", (unsigned long long)r.hash);
+        ui::KeyValueRow("Last opened", "%s", whenStr(r.lastOpenedUnix).c_str());
         if (ImGui::Button("Open this project")) {
             openError_ = ctx.loadBinaryPath(r.path) ? "" : ("Could not open " + r.path);
             if (openError_.empty()) ctx.requestedTab = "Binary View";
@@ -102,12 +112,19 @@ void ProjectsTab::render(AppContext& ctx) {
 
     ImGui::SeparatorText("Loaded Binary");
     if (ctx.binary.loaded()) {
-        ImGui::Text("Path: %s", ctx.binary.path().c_str());
-        ImGui::Text("Format: %s", ctx.binary.formatName());
-        ImGui::Text("Image base: 0x%llX", (unsigned long long)ctx.binary.imageBase());
-        ImGui::Text("Entry point: 0x%llX",
-                    (unsigned long long)(ctx.binary.imageBase() + ctx.binary.entryPoint()));
-        ImGui::Text("Sections: %d", (int)ctx.binary.sections().size());
+        ui::KeyValueRow("Path", "%s", ctx.binary.path().c_str());
+        ui::KeyValueRow("Format", "%s", ctx.binary.formatName());
+        ui::KeyValueRow("Image base", "0x%llX", (unsigned long long)ctx.binary.imageBase());
+        ui::KeyValueRow("Entry point", "0x%llX",
+                        (unsigned long long)(ctx.binary.imageBase() + ctx.binary.entryPoint()));
+        ui::KeyValueRow("Sections", "%d", (int)ctx.binary.sections().size());
+        if (ctx.runtimeInfo.wrapperLikely)
+            ui::KeyValueRow("Runtime", "%s \xE2\x80\x94 wrapper, %.0f%%",
+                            ctx.runtimeInfo.wrapperRuntime.c_str(),
+                            ctx.runtimeInfo.wrapperConfidence * 100.0f);
+        else if (ctx.runtimeInfo.isStandaloneArchive)
+            ui::KeyValueRow("Runtime", "ZIP/JAR archive \xE2\x80\x94 %zu entries",
+                            ctx.javaInfo.entries.size());
         ImGui::Separator();
         const ProjectState& p = ctx.project;
         ImGui::TextDisabled("Saved analysis:");

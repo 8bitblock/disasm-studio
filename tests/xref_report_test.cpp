@@ -25,7 +25,9 @@ static int g_fail = 0;
 // A tiny stub decoder over a toy encoding, enough to exercise the xref sweep:
 //   0xE8 rel32      -> call,  branchTarget = va + 5 + rel32
 //   0xE9 rel32      -> jmp,   branchTarget = va + 5 + rel32
-//   0xA1 .. .. .. ..-> mov eax, [0x2000]   (absolute data ref, length 5)
+//   0xA1 .. .. .. ..-> mov eax, [0x2000]   (absolute data READ, length 5)
+//   0xA3 .. .. .. ..-> mov [0x2000], eax   (absolute data WRITE, length 5)
+//   0x8D .. .. .. ..-> lea rax, [0x2000]   (address taken, length 5)
 //   anything else   -> nop                 (length 1, no refs)
 struct StubDis : IDisassembler {
     Engine engine() const override { return Engine::Zydis; }
@@ -45,6 +47,14 @@ struct StubDis : IDisassembler {
         }
         if (op == 0xA1 && n >= 5) {
             out.length = 5; out.mnemonic = "mov"; out.operands = "eax, [0x2000]";
+            return true;
+        }
+        if (op == 0xA3 && n >= 5) {
+            out.length = 5; out.mnemonic = "mov"; out.operands = "[0x2000], eax";
+            return true;
+        }
+        if (op == 0x8D && n >= 5) {
+            out.length = 5; out.mnemonic = "lea"; out.operands = "rax, [0x2000]";
             return true;
         }
         out.length = 1; out.mnemonic = "nop";
@@ -90,6 +100,32 @@ static void testXref() {
     // Idempotent finalize (sort/unique must not duplicate or drop).
     FinalizeXrefIndex(idx);
     CHECK(idx.sources(0x1015)->size() == 2);
+
+    // Branch/call sources carry NO data-access kind; the data read defaults Read.
+    CHECK(idx.accessOf.count(0x1000) == 0);
+    CHECK(idx.access(0x1005) == 0);              // mov eax,[0x2000] -> Read
+}
+
+// Access-kind classification: read vs write vs address-taken on the same target.
+static void testXrefAccessKinds() {
+    StubDis dis;
+    uint8_t code[15] = {0};
+    code[0]  = 0xA1;     // 0x1000: mov eax, [0x2000]   -> Read
+    code[5]  = 0xA3;     // 0x1005: mov [0x2000], eax   -> Write
+    code[10] = 0x8D;     // 0x100A: lea rax, [0x2000]   -> Ref
+
+    XrefIndex idx;
+    BuildXrefInto(idx, code, sizeof(code), 0x1000, dis);
+    FinalizeXrefIndex(idx);
+
+    const auto* refs = idx.sources(0x2000);
+    CHECK(refs && refs->size() == 3);
+    CHECK(idx.access(0x1000) == 0);              // Read
+    CHECK(idx.access(0x1005) == 1);              // Write
+    CHECK(idx.access(0x100A) == 2);              // Ref (lea)
+    CHECK(idx.access(0xDEAD) == 0);              // unknown source defaults to Read
+    idx.clear();
+    CHECK(idx.accessOf.empty() && idx.toTarget.empty());
 }
 
 static void testReport() {
@@ -125,6 +161,7 @@ static void testReport() {
 
 int main() {
     testXref();
+    testXrefAccessKinds();
     testReport();
     if (g_fail) { std::printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     std::printf("xref_report_test: all checks passed\n");

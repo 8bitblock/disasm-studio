@@ -46,6 +46,31 @@ SynthResult SynthesizeJob(const BinaryFile& bin, IDisassembler& dis, Arch arch,
     blk.perms = P_R | P_X;
     seed.mem.push_back(std::move(blk));
 
+    // Also seed every readable section so RIP-relative loads into .rdata/.data/etc.
+    // resolve to concrete bytes instead of faulting on unmapped memory. Section blocks
+    // may overlap the code block above; that's fine — reads just resolve either way.
+    for (const Section& sec : bin.sections()) {
+        const uint64_t secVA = bin.imageBase() + sec.virtualAddress;
+        size_t secAvail = 0;
+        const uint8_t* sp = bin.ptrFromVA(secVA, secAvail);
+        if (!sp || secAvail == 0) continue;
+        MemBlock sb;
+        sb.base  = secVA;
+        sb.bytes.assign(sp, sp + secAvail);
+        sb.perms = sec.executable ? (P_R | P_X) : P_R;
+        seed.mem.push_back(std::move(sb));
+    }
+
+    // Seed a stack so stack-local reads/writes land in mapped, writable memory.
+    seed.regs.rsp = 0x7FFFFFFF0000ull;        // sane 16-byte-aligned base
+    {
+        MemBlock stk;
+        stk.base = seed.regs.rsp - 0x4000;
+        stk.bytes.assign(0x8000, 0);          // [rsp-0x4000, rsp+0x4000) zero-filled
+        stk.perms = P_R | P_W;
+        seed.mem.push_back(std::move(stk));
+    }
+
     std::vector<SymbolicInput> inputs;
     if (arch == Arch::X64) {                       // Win64 integer arg registers
         static const char* kArgs[] = { "rcx", "rdx", "r8", "r9" };

@@ -58,7 +58,7 @@ class BinaryFile;
 // passed to requestBulk; the live-debugger-seeded F3 explore runs on its own thread.
 enum BulkKind : uint32_t {
     K_Funcs = 1, K_Strings = 2, K_Listing = 4, K_Xref = 8, K_Intent = 16, K_CallGraph = 32,
-    K_Synthesis = 64, K_PathExplore = 128
+    K_Synthesis = 64, K_PathExplore = 128, K_Decompile = 256
 };
 
 // Coarse "what is the pool doing right now" indicator for the progress bar.
@@ -89,6 +89,9 @@ struct AnalysisResult {
     std::vector<CallEdgeR>  callEdges;     bool callGraphValid = false; // K_CallGraph results
     SynthResult             synth;         bool synthValid   = false;  // K_Synthesis (F1) result
     PathTree                pathTree;      bool pathValid    = false;  // K_PathExplore (F3) result
+    std::string             decompText;    bool decompValid  = false;  // K_Decompile (pseudocode) result
+    std::vector<uint64_t>   decompLineVA;  // per-line source VAs (DecompResult::lineVA)
+    uint64_t                decompVA      = 0;                          // function start the pseudocode is for
     uint64_t                regionLo = 0, regionHi = 0;                // the region these targeted
 };
 

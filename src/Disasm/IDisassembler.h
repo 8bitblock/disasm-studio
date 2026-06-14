@@ -22,9 +22,18 @@ struct Instruction {
     bool        isRet     = false; // ret/retf/iret family (returns from a call frame)
     bool        isRepString = false; // has a REP/REPE/REPNE prefix (rep movs/stos/cmps/scas/...)
     uint64_t    branchTarget = 0;  // resolved target if statically known, else 0
+    // Decoder-supplied inline annotation (rendered as a "; ..." comment). The
+    // JVM backend fills it with resolved constant-pool text (method/field refs,
+    // string literals); the x86/ARM backends leave it empty.
+    std::string comment;
+    // Additional statically-known control-flow targets beyond branchTarget:
+    // tableswitch/lookupswitch case targets (JVM). branchTarget holds the
+    // switch default. Empty for ordinary instructions; CFG links these as
+    // switch-case successors.
+    std::vector<uint64_t> extraTargets;
 };
 
-enum class Arch  { X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV32, RISCV64 };
+enum class Arch  { X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV32, RISCV64, JVM };
 enum class Engine { Zydis, Capstone };
 
 // True for the architectures Zydis can decode (x86 family); everything else
@@ -43,6 +52,7 @@ inline const char* ArchName(Arch a) {
         case Arch::PPC64:   return "PPC64";
         case Arch::RISCV32: return "RISC-V 32";
         case Arch::RISCV64: return "RISC-V 64";
+        case Arch::JVM:     return "JVM";
     }
     return "?";
 }
@@ -62,6 +72,7 @@ inline bool ArchFromName(const char* s, Arch& out) {
     else if (n == "PPC64")     out = Arch::PPC64;
     else if (n == "RISC-V 32") out = Arch::RISCV32;
     else if (n == "RISC-V 64") out = Arch::RISCV64;
+    else if (n == "JVM")       out = Arch::JVM;
     else return false;
     return true;
 }

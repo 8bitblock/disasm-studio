@@ -66,6 +66,36 @@ inline uint64_t instrDataRef(const Instruction& in) {
     return 0;
 }
 
+// How an instruction ACCESSES the data address instrDataRef() reports: does it
+// read the memory, write (modify) it, or merely take/transfer through the
+// address (lea, or an immediate that happens to be a pointer). Drives the Xrefs
+// panel's Writers / Readers grouping ("who modifies this global?"). Pure
+// operand-shape + mnemonic classification; unit-tested with the xref tests.
+enum class XrefAccess : uint8_t { Read = 0, Write = 1, Ref = 2 };
+
+inline XrefAccess instrDataAccess(const Instruction& in) {
+    const std::string& m = in.mnemonic;
+    if (m == "lea") return XrefAccess::Ref;              // address taken, memory untouched
+    const std::string& o = in.operands;
+    size_t lb = o.find('[');
+    if (lb == std::string::npos) return XrefAccess::Ref; // bare immediate pointer (no deref)
+    size_t comma = o.find(',');
+    const bool memIsFirst = (comma == std::string::npos) || lb < comma;
+    if (!memIsFirst) return XrefAccess::Read;            // [mem] as a source operand
+    // Memory is the first operand. Compare/test and push only read it; an
+    // indirect call/jmp reads the slot; single-operand RMW and two-operand
+    // "op [mem], src" forms (mov/add/and/...) write it.
+    if (m == "cmp" || m == "test" || m == "push" || m == "call" || m == "jmp")
+        return XrefAccess::Read;
+    if (comma == std::string::npos) {
+        if (m == "pop" || m == "inc" || m == "dec" || m == "neg" || m == "not" ||
+            m.rfind("set", 0) == 0)
+            return XrefAccess::Write;
+        return XrefAccess::Read;                          // unknown single-operand: assume read
+    }
+    return XrefAccess::Write;                             // op [mem], src -> stores
+}
+
 // The address an instruction loads as an IMMEDIATE (not through a memory operand):
 // the source of `mov reg, 0x..` / `movabs reg, 0x..` or the operand of `push 0x..`
 // (the 32-bit "mov reg, offset aString" / "push offset aString" idioms). Returns 0

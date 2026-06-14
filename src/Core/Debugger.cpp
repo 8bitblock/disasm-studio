@@ -1,6 +1,8 @@
 #include "Debugger.h"
 #include "Cond.h"
 #include "DbgHelpLock.h"      // serialize DbgHelp against the UI thread's SymbolResolver
+#include "ExcName.h"          // semantic exception-code names for lastEvent_
+#include "JvmAware.h"         // JVM module detection / JNI_CreateJavaVM resolution
 #include "StepLogic.h"
 #include "../Disasm/IDisassembler.h"
 #include "../Disasm/ZydisDisassembler.h"
@@ -9,6 +11,9 @@
 #include <dbghelp.h>          // StackWalk64 + Sym* callbacks for real call-stack unwinding
 
 #include <algorithm>          // std::sort / std::lower_bound (breakpoint-address cache)
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -16,6 +21,46 @@ namespace ds {
 
 static constexpr uint32_t TRAP_FLAG = 0x100;
 static constexpr size_t   kStepOutCap = 500000; // safety cap for depth stepping
+static constexpr size_t   kMaxDbgModules = 2048;   // live-module list bound
+static constexpr size_t   kDbgOutputCap  = 1000;   // OutputDebugString ring bound
+static constexpr size_t   kDbgOutputLine = 8192;   // per-message read cap (bytes)
+
+static std::wstring widenUtf8(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n > 0 ? n : 0, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
+    return w;
+}
+
+static void writePrintablePayload(std::FILE* f, const std::vector<uint8_t>& bytes) {
+    for (uint8_t b : bytes) {
+        if (b == '\r' || b == '\n' || b == '\t') std::fputc((int)b, f);
+        else if (b >= 0x20 && b < 0x7F)          std::fputc((int)b, f);
+        else                                     std::fputc('.', f);
+    }
+    if (bytes.empty() || bytes.back() != '\n') std::fputc('\n', f);
+}
+
+static void writeHexPayload(std::FILE* f, const std::vector<uint8_t>& bytes) {
+    for (size_t off = 0; off < bytes.size(); off += 16) {
+        std::fprintf(f, "%08zX  ", off);
+        char ascii[17] = {};
+        for (size_t i = 0; i < 16; ++i) {
+            if (off + i < bytes.size()) {
+                uint8_t b = bytes[off + i];
+                std::fprintf(f, "%02X ", b);
+                ascii[i] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
+            } else {
+                std::fputs("   ", f);
+                ascii[i] = ' ';
+            }
+            if (i == 7) std::fputc(' ', f);
+        }
+        ascii[16] = '\0';
+        std::fprintf(f, " %s\n", ascii);
+    }
+}
 
 // In a 32-bit (WOW64) target, int3 / single-step in the 32-bit code are reported as
 // these WX86 status codes, not the usual EXCEPTION_BREAKPOINT / EXCEPTION_SINGLE_STEP.
@@ -72,11 +117,12 @@ bool Debugger::launchAndAttach(const std::string& exePath, std::string& err, boo
 }
 
 void Debugger::detach() {
-    if (!thread_.joinable()) return;
+    if (!thread_.joinable()) { closeNetCaptureLogFile(); return; }
     freeAllRemote();                 // release F2 detour allocations while the handle is valid
     quit_ = true;
     postCommand(Cmd::Detach);
     thread_.join();
+    closeNetCaptureLogFile();
     std::lock_guard<std::mutex> lk(mtx_);
     state_ = DbgState::Detached;
     bps_.clear();
@@ -88,6 +134,11 @@ void Debugger::detach() {
     threadHandles_.clear();
     frames_.clear();
     suspended_.clear();
+    dbgModules_.clear();
+    dbgOutput_.clear();
+    jvmLoaded_ = false;
+    jvmPath_.clear();
+    jvmExceptionsPassed_ = 0;
     activeTid_ = 0;
     hProcessShared_ = nullptr;
     isWow64_.store(false);
@@ -206,6 +257,290 @@ bool Debugger::hasBreakpoint(uint64_t va) {
 void Debugger::setBreakpointCondition(uint64_t va, const std::string& condition) {
     std::lock_guard<std::mutex> lk(mtx_);
     pendingBpConds_.push_back({ va, condition });
+}
+
+void Debugger::setBreakpointEveryN(uint64_t va, uint32_t n) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    pendingBpEveryN_.push_back({ va, n });
+}
+
+void Debugger::addFirstChanceCode(uint32_t code) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    fcWhitelist_.insert(code);
+}
+void Debugger::removeFirstChanceCode(uint32_t code) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    fcWhitelist_.erase(code);
+}
+std::vector<uint32_t> Debugger::firstChanceCodes() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return std::vector<uint32_t>(fcWhitelist_.begin(), fcWhitelist_.end());
+}
+
+void Debugger::clearDebugOutput() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    dbgOutput_.clear();
+}
+
+// Defined further down (the RPM byte helpers); forward-declared so the net-tap
+// methods above their definitions can use them.
+static bool readByteRPM(HANDLE h, uint64_t va, uint8_t& b);
+static bool writeByteRPM(HANDLE h, uint64_t va, uint8_t b);
+
+// ---- network data tap (public, thread-safe) -----------------------------------
+// enableNetTap only sets intent; the debug thread arms/disarms in its loop (it owns
+// the breakpoint bytes). This keeps all 0xCC writes on the one thread that services
+// debug events, matching the rest of the engine.
+void Debugger::enableNetTap(bool on) { netTapWant_.store(on); }
+
+bool Debugger::setNetCaptureLogFile(const std::string& utf8Path, bool append, std::string* err) {
+    if (err) err->clear();
+    if (utf8Path.empty()) {
+        if (err) *err = "empty log path";
+        return false;
+    }
+
+    std::wstring wpath = widenUtf8(utf8Path);
+    if (wpath.empty()) {
+        if (err) *err = "could not convert log path";
+        return false;
+    }
+
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, wpath.c_str(), append ? L"ab" : L"wb") != 0 || !f) {
+        if (err) *err = "could not open log file";
+        return false;
+    }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    std::fprintf(f,
+                 "# DisasmStudio network payload log\n"
+                 "# started %04u-%02u-%02u %02u:%02u:%02u.%03u local\n"
+                 "# each record: API direction, pid/tid, SOCKET handle, API byte count, captured byte count\n\n",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    std::fflush(f);
+
+    std::lock_guard<std::mutex> lk(netLogMtx_);
+    if (netLogFile_) std::fclose(netLogFile_);
+    netLogFile_ = f;
+    netLogPath_ = utf8Path;
+    return true;
+}
+
+void Debugger::closeNetCaptureLogFile() {
+    std::lock_guard<std::mutex> lk(netLogMtx_);
+    if (netLogFile_) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        std::fprintf(netLogFile_, "\n# stopped %04u-%02u-%02u %02u:%02u:%02u.%03u local\n",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        std::fclose(netLogFile_);
+        netLogFile_ = nullptr;
+    }
+    netLogPath_.clear();
+}
+
+bool Debugger::netCaptureLogEnabled() {
+    std::lock_guard<std::mutex> lk(netLogMtx_);
+    return netLogFile_ != nullptr;
+}
+
+std::string Debugger::netCaptureLogPath() {
+    std::lock_guard<std::mutex> lk(netLogMtx_);
+    return netLogPath_;
+}
+
+std::vector<NetCapture> Debugger::netCaptures() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const size_t n = netCaps_.size(), keep = 300, start = n > keep ? n - keep : 0;
+    return std::vector<NetCapture>(netCaps_.begin() + start, netCaps_.end());
+}
+size_t Debugger::netCaptureCount() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return netCapSeq_;
+}
+void Debugger::clearNetCaptures() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    netCaps_.clear();
+    netCapSeq_ = 0;
+}
+void Debugger::pushNetCapture(NetCapture&& c) {
+    if (!c.pid) c.pid = pid_;
+    writeNetCaptureLog(c);
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        netCaps_.push_back(std::move(c));
+        ++netCapSeq_;
+        while (netCaps_.size() > 1000) netCaps_.pop_front();
+    }
+}
+
+void Debugger::writeNetCaptureLog(const NetCapture& c) {
+    std::lock_guard<std::mutex> lk(netLogMtx_);
+    if (!netLogFile_) return;
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    const char* dir = c.dir == 0 ? "SEND" : "RECV";
+    const char* api = c.api == TAP_send    ? "send"
+                    : c.api == TAP_recv    ? "recv"
+                    : c.api == TAP_WSASend ? "WSASend"
+                    : c.api == TAP_WSARecv ? "WSARecv"
+                                            : "socket";
+    std::fprintf(netLogFile_,
+                 "=== %04u-%02u-%02u %02u:%02u:%02u.%03u %s api=%s pid=%u tid=%u sock=0x%llX total=%u captured=%zu%s ===\n",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                 dir, api, c.pid, c.tid, (unsigned long long)c.sock, c.total, c.bytes.size(),
+                 c.bytes.size() < c.total ? " truncated" : "");
+    std::fputs("TEXT:\n", netLogFile_);
+    writePrintablePayload(netLogFile_, c.bytes);
+    std::fputs("HEX:\n", netLogFile_);
+    writeHexPayload(netLogFile_, c.bytes);
+    std::fputc('\n', netLogFile_);
+    std::fflush(netLogFile_);
+}
+
+// Resolve ws2_32 send/recv/WSASend/WSARecv and plant 0xCC hooks (as tap-flagged
+// bps_ entries, so the existing step-over/re-arm machinery services them). The
+// export addresses are valid in the debuggee because ws2_32 is a system DLL mapped
+// at the same base session-wide (the same basis as the JDWP-injection thunks).
+void Debugger::armNetTap() {
+    if (netTapArmed_ || !hProcess_) return;
+    if (isWow64_.load()) { std::lock_guard<std::mutex> lk(mtx_); lastEvent_ = "net tap: 64-bit targets only"; return; }
+    HMODULE ws = ::GetModuleHandleW(L"ws2_32.dll");
+    if (!ws) { std::lock_guard<std::mutex> lk(mtx_); lastEvent_ = "net tap: ws2_32 not present"; return; }
+    const struct { const char* n; uint8_t api; } fns[] = {
+        {"send", TAP_send}, {"recv", TAP_recv}, {"WSASend", TAP_WSASend}, {"WSARecv", TAP_WSARecv} };
+    int armed = 0;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto& f : fns) {
+            uint64_t addr = (uint64_t)::GetProcAddress(ws, f.n);
+            if (!addr || bps_.count(addr)) continue;     // missing, or a user bp owns this addr
+            uint8_t orig = 0;
+            if (!readByteRPM((HANDLE)hProcess_, addr, orig)) continue;
+            if (orig == 0xCC) continue;                  // already hooked (e.g. another debugger)
+            if (!writeByteRPM((HANDLE)hProcess_, addr, 0xCC)) continue;
+            SwBp b; b.orig = orig; b.tapApi = f.api;
+            bps_[addr] = b;
+            ++armed;
+        }
+        rebuildBpAddrs_();
+        lastEvent_ = armed ? "net data tap armed (ws2_32 send/recv)" : "net tap: no ws2_32 hooks installed";
+    }
+    netTapArmed_ = armed > 0;
+}
+
+void Debugger::disarmNetTap() {
+    if (hProcess_) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto it = bps_.begin(); it != bps_.end(); ) {
+            if (it->second.tapApi) { writeByteRPM((HANDLE)hProcess_, it->first, it->second.orig); it = bps_.erase(it); }
+            else ++it;
+        }
+        for (auto& [addr, orig] : recvRetBytes_) writeByteRPM((HANDLE)hProcess_, addr, orig);
+        recvRetBytes_.clear();
+        pendingRecv_.clear();
+        rebuildBpAddrs_();
+        lastEvent_ = "net data tap off";
+    }
+    netTapArmed_ = false;
+}
+
+// Entry hit on a hooked send/recv/WSASend/WSARecv (x64 arg registers). send/WSASend
+// data is present now; recv/WSARecv data isn't filled until the call returns, so we
+// stash the buffer info and plant a one-shot return hook.
+void Debugger::netTapCapture(uint64_t /*addr*/, uint32_t tid, uint8_t api) {
+    auto th = threads_.find(tid);
+    if (th == threads_.end()) return;
+    Registers r;
+    if (!ctxReadFull(th->second, r)) return;
+    HANDLE hp = (HANDLE)hProcess_;
+    const uint32_t now = ::GetTickCount();
+
+    auto grab = [&](uint64_t buf, uint32_t len, uint8_t dir, uint8_t apiId, uint64_t sock) {
+        if (!buf || !len) return;
+        size_t take = len < kNetCaptureByteCap ? len : kNetCaptureByteCap;
+        NetCapture c; c.tickMs = now; c.pid = pid_; c.tid = tid; c.dir = dir; c.api = apiId; c.sock = sock; c.total = len;
+        c.bytes.resize(take);
+        SIZE_T got = 0;
+        if (::ReadProcessMemory(hp, (LPCVOID)buf, c.bytes.data(), take, &got) && got) {
+            c.bytes.resize((size_t)got);
+            pushNetCapture(std::move(c));
+        }
+    };
+
+    if (api == TAP_send) {
+        grab(r.rdx, (uint32_t)r.r8, 0, api, r.rcx);              // send(s=rcx, buf=rdx, len=r8)
+    } else if (api == TAP_WSASend) {
+        uint32_t count = (uint32_t)r.r8; if (count > 16) count = 16;   // WSASend(s, lpBuffers=rdx, count=r8)
+        for (uint32_t i = 0; i < count; ++i) {
+            uint8_t wb[16];                                     // WSABUF{ULONG len; char* buf;} x64 stride 16
+            if (!::ReadProcessMemory(hp, (LPCVOID)(r.rdx + (uint64_t)i * 16), wb, 16, nullptr)) break;
+            uint32_t blen; std::memcpy(&blen, wb, 4);
+            uint64_t bptr; std::memcpy(&bptr, wb + 8, 8);
+            grab(bptr, blen, 0, api, r.rcx);
+        }
+    } else { // recv / WSARecv: capture on return
+        uint64_t retAddr = 0;
+        if (!::ReadProcessMemory(hp, (LPCVOID)r.rsp, &retAddr, 8, nullptr) || !retAddr) return;
+        PendingRecv pr;
+        pr.retAddr = retAddr; pr.sock = r.rcx; pr.wsa = (api == TAP_WSARecv);
+        pr.buf = r.rdx; pr.len = (uint32_t)r.r8;                // recv: len; WSARecv: buffer count
+        if (api == TAP_WSARecv) pr.numBytesPtr = r.r9;          // WSARecv(s, lpBuffers=rdx, count=r8, recvd=r9)
+        pendingRecv_[tid] = pr;
+        if (!recvRetBytes_.count(retAddr)) {
+            uint8_t orig = 0;
+            if (readByteRPM(hp, retAddr, orig) && orig != 0xCC && writeByteRPM(hp, retAddr, 0xCC))
+                recvRetBytes_[retAddr] = orig;
+        }
+    }
+}
+
+// One-shot recv/WSARecv return hook: the buffer is filled now. Restore the byte,
+// back RIP onto the return instruction, then capture what was received.
+void Debugger::netTapOnReturn(uint64_t addr, uint32_t tid) {
+    HANDLE hp = (HANDLE)hProcess_;
+    if (auto rb = recvRetBytes_.find(addr); rb != recvRetBytes_.end()) {
+        writeByteRPM(hp, addr, rb->second);
+        recvRetBytes_.erase(rb);
+    }
+    auto th = threads_.find(tid);
+    if (th != threads_.end()) ctxSetRip(th->second, addr);     // re-execute the real instruction
+
+    auto pit = pendingRecv_.find(tid);
+    if (pit == pendingRecv_.end() || th == threads_.end()) return;   // not our pending
+    PendingRecv pr = pit->second;
+    pendingRecv_.erase(pit);
+
+    Registers r;
+    if (!ctxReadFull(th->second, r)) return;
+    const uint32_t now = ::GetTickCount();
+    auto grab = [&](uint64_t buf, uint32_t len, uint8_t apiId, uint64_t sock) {
+        if (!buf || !len) return;
+        size_t take = len < kNetCaptureByteCap ? len : kNetCaptureByteCap;
+        NetCapture c; c.tickMs = now; c.pid = pid_; c.tid = tid; c.dir = 1; c.api = apiId; c.sock = sock; c.total = len;
+        c.bytes.resize(take);
+        SIZE_T got = 0;
+        if (::ReadProcessMemory(hp, (LPCVOID)buf, c.bytes.data(), take, &got) && got) {
+            c.bytes.resize((size_t)got); pushNetCapture(std::move(c));
+        }
+    };
+    if (!pr.wsa) {
+        int32_t n = (int32_t)(uint32_t)r.rax;                  // recv() returns bytes received
+        if (n > 0) grab(pr.buf, ((uint32_t)n < pr.len) ? (uint32_t)n : pr.len, TAP_recv, pr.sock);
+    } else {
+        uint32_t nbytes = 0;                                   // WSARecv: *lpNumberOfBytesRecvd
+        if (pr.numBytesPtr) ::ReadProcessMemory(hp, (LPCVOID)pr.numBytesPtr, &nbytes, 4, nullptr);
+        if (nbytes) {
+            uint8_t wb[16];
+            if (::ReadProcessMemory(hp, (LPCVOID)pr.buf, wb, 16, nullptr)) {
+                uint64_t bptr; std::memcpy(&bptr, wb + 8, 8);
+                grab(bptr, nbytes, TAP_WSARecv, pr.sock);
+            }
+        }
+    }
 }
 
 bool Debugger::addHardwareBreakpoint(uint64_t va, HwKind kind, uint8_t size) {
@@ -363,13 +698,18 @@ DbgSnapshot Debugger::snapshot() {
     s.regs = regs_;
     s.lastEvent = lastEvent_;
     s.breakpoints.reserve(bps_.size());
-    for (auto& kv : bps_) s.breakpoints.push_back({ kv.first, kv.second.cond });
+    for (auto& kv : bps_) s.breakpoints.push_back({ kv.first, kv.second.cond, kv.second.hits, kv.second.stops, kv.second.everyN });
     for (auto& hs : hwSlots_) if (hs.used) s.hwBreakpoints.push_back({ hs.addr, hs.kind, hs.size });
     s.threads = threadList_;
     for (auto& t : s.threads) t.suspended = suspended_.count(t.tid) != 0;
     s.frames = frames_;
+    s.modules = dbgModules_;
+    s.debugOutput.assign(dbgOutput_.begin(), dbgOutput_.end());
     s.activeTid = activeTid_;
     s.is32 = isWow64_.load();
+    s.jvmLoaded = jvmLoaded_;
+    s.jvmPath = jvmPath_;
+    s.jvmExceptionsPassed = jvmExceptionsPassed_;
     return s;
 }
 
@@ -833,6 +1173,15 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
     bool   loaderPhase = true;
     uint32_t mainTid = 0;   // the process main thread (shown when the user hits Pause)
 
+    // --- JVM awareness (Java EXEs) ---
+    // The VM module's mapped range, captured from its LOAD_DLL event; bounds
+    // IsJvmInternalException so HotSpot's intentional AVs (null checks, safepoint
+    // polls) pass through without pausing or spamming events.
+    uint64_t jvmBase = 0, jvmSize = 0;
+    // JNI_CreateJavaVM one-shot waiting for the single temp-bp slot to free up
+    // (a step's temp bp may be in flight when jvm.dll loads).
+    uint64_t pendingJvmInitVA = 0;
+
     auto applyPendingBps = [&]() {
         std::vector<PendingBp> adds, conds;
         std::vector<uint64_t>  rems;
@@ -864,6 +1213,15 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
             auto it = bps_.find(cset.va);
             if (it != bps_.end()) { it->second.cond = cset.cond; it->second.prog = CompileCondition(cset.cond); }
         }
+        {   // every-Nth-hit updates (applied after adds so a fresh bp can be tuned).
+            std::vector<std::pair<uint64_t, uint32_t>> everyNs;
+            { std::lock_guard<std::mutex> lk(mtx_); everyNs.swap(pendingBpEveryN_); }
+            for (auto& [va, n] : everyNs) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                auto it = bps_.find(va);
+                if (it != bps_.end()) it->second.everyN = n;
+            }
+        }
         for (uint64_t va : rems) {
             auto it = bps_.find(va);
             if (it == bps_.end()) continue;
@@ -889,6 +1247,10 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
             for (auto& s : hwSlots_) if (!s.used) { std::lock_guard<std::mutex> lk(mtx_); s = add; hwChanged = true; placed = true; break; }
         }
         if (hwChanged) applyHwAllThreads();
+
+        // Network data tap: install / remove the ws2_32 hooks to match the request.
+        if (netTapWant_.load() && !netTapArmed_)      armNetTap();
+        else if (!netTapWant_.load() && netTapArmed_) disarmNetTap();
     };
 
     // Publish a one-line status for the UI (locks mtx_; never called while held).
@@ -927,8 +1289,32 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
         clearTempBp();
         steppingOut = false; stepPause = false; stepOutFinishing = false;
         disarmBreakpoint(a);
-        ctxSetRip(threads_[tid], a);
-        if (evalConditionFor(a, tid)) {
+        // find(), not operator[]: an unknown tid must not insert a null HANDLE
+        // into threads_ (it would linger and get CloseHandle(nullptr)'d at cleanup).
+        if (auto th = threads_.find(tid); th != threads_.end()) ctxSetRip(th->second, a);
+        // Network data tap: this bp is a ws2_32 hook, not a user stop. Capture the
+        // buffer (or, for recv, arm a one-shot return bp), then take the same
+        // step-over + re-arm + free-run path as a condition-false hit. Never pauses.
+        if (auto bt = bps_.find(a); bt != bps_.end() && bt->second.tapApi) {
+            netTapCapture(a, tid, bt->second.tapApi);
+            reArmAddr = a; reArmAfter = AfterReArm::FreeRun;
+            stepTid = tid;
+            setTrapFlag(tid, true);
+            return false;
+        }
+        bool stop = evalConditionFor(a, tid);
+        {   // Hit accounting (under mtx_: snapshot() reads bps_ concurrently). The
+            // every-Nth gate composes with the condition: the bp parks only when the
+            // condition holds AND this is the Nth raw hit (hits counts every fire).
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (auto it = bps_.find(a); it != bps_.end()) {
+                ++it->second.hits;
+                if (stop && it->second.everyN > 1 && (it->second.hits % it->second.everyN) != 0)
+                    stop = false;
+                if (stop) ++it->second.stops;
+            }
+        }
+        if (stop) {
             // Park on it; how we step off + re-arm is decided by the next command.
             pausedOnBp = true; pausedOnBpAddr = a;
             setEvent("breakpoint");
@@ -1022,9 +1408,132 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
                     threads_.erase(it);
                 }
                 break;
-            case LOAD_DLL_DEBUG_EVENT:
-                if (ev.u.LoadDll.hFile) CloseHandle(ev.u.LoadDll.hFile);
+            case LOAD_DLL_DEBUG_EVENT: {
+                DbgModule m;
+                m.base = (uint64_t)(uintptr_t)ev.u.LoadDll.lpBaseOfDll;
+                // Resolve the path from the file handle Windows hands us (most
+                // reliable); fall back to the debuggee-side lpImageName pointer.
+                if (ev.u.LoadDll.hFile) {
+                    wchar_t wpath[1024];
+                    DWORD n = GetFinalPathNameByHandleW(ev.u.LoadDll.hFile, wpath,
+                                                        (DWORD)(sizeof(wpath) / sizeof(wpath[0])), FILE_NAME_NORMALIZED);
+                    if (n > 0 && n < sizeof(wpath) / sizeof(wpath[0])) {
+                        const wchar_t* p = wpath;
+                        if (wcsncmp(p, L"\\\\?\\", 4) == 0) p += 4;   // strip the NT prefix
+                        char buf[2048] = {0};
+                        if (WideCharToMultiByte(CP_UTF8, 0, p, -1, buf, sizeof(buf), nullptr, nullptr) > 0)
+                            m.path = buf;
+                    }
+                    CloseHandle(ev.u.LoadDll.hFile);
+                }
+                if (m.path.empty() && ev.u.LoadDll.lpImageName) {
+                    // lpImageName points (in DEBUGGEE memory) to a pointer to the name.
+                    uint64_t namePtr = 0;
+                    const size_t psz = isWow64_.load() ? 4 : 8;
+                    if (readMemory((uint64_t)(uintptr_t)ev.u.LoadDll.lpImageName, &namePtr, psz) == psz && namePtr) {
+                        if (ev.u.LoadDll.fUnicode) {
+                            wchar_t wbuf[512] = {0};
+                            readMemory(namePtr, wbuf, sizeof(wbuf) - sizeof(wchar_t));
+                            char buf[2048] = {0};
+                            if (wbuf[0] && WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, sizeof(buf), nullptr, nullptr) > 0)
+                                m.path = buf;
+                        } else {
+                            char abuf[1024] = {0};
+                            readMemory(namePtr, abuf, sizeof(abuf) - 1);
+                            m.path = abuf;
+                        }
+                    }
+                }
+                {   // File name from the path; a nameless module is labelled by base.
+                    size_t s = m.path.find_last_of("/\\");
+                    m.name = m.path.empty() ? std::string()
+                           : (s == std::string::npos ? m.path : m.path.substr(s + 1));
+                    if (m.name.empty()) {
+                        char b[32]; std::snprintf(b, sizeof(b), "<0x%llX>", (unsigned long long)m.base);
+                        m.name = b;
+                    }
+                }
+                {   // SizeOfImage from the mapped PE header (same slot in PE32/PE32+).
+                    IMAGE_DOS_HEADER dos{}; DWORD soi = 0;
+                    if (m.base && readMemory(m.base, &dos, sizeof(dos)) == sizeof(dos) &&
+                        dos.e_magic == IMAGE_DOS_SIGNATURE &&
+                        readMemory(m.base + dos.e_lfanew + 24 + 56, &soi, 4) == 4)
+                        m.size = soi;
+                }
+                // JVM awareness: capture the VM module's range and (when armed) plant
+                // the one-shot JNI_CreateJavaVM breakpoint. jli.dll lights the badge
+                // but doesn't bound exceptions (IsJvmVmModuleName excludes it).
+                if (IsJvmVmModuleName(m.name)) {
+                    jvmBase = m.base;
+                    jvmSize = m.size ? m.size : (32ull << 20);   // header unreadable: generous bound
+                    { std::lock_guard<std::mutex> lk(mtx_);
+                      jvmLoaded_ = true; jvmPath_ = m.path.empty() ? m.name : m.path; }
+                    if (breakOnJvmInit_.load()) {
+                        RemoteReader rr = [this](uint64_t va, void* out, size_t n) {
+                            return readMemory(va, out, n) == n;
+                        };
+                        if (uint32_t rva = FindExportRVA(rr, m.base, "JNI_CreateJavaVM")) {
+                            // Only one temp-bp slot exists; if a step's temp bp is in
+                            // flight, defer arming until the slot frees (see the
+                            // armDeferredJvmInit ticks after applyPendingBps below).
+                            if (!tempBpSet) setTempBp(m.base + rva, TempKind::JvmInit);
+                            else            pendingJvmInitVA = m.base + rva;
+                        }
+                    }
+                } else if (IsJvmModuleName(m.name)) {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    jvmLoaded_ = true;
+                    if (jvmPath_.empty()) jvmPath_ = m.path.empty() ? m.name : m.path;
+                }
+                {   // Publish to the UI-visible list (bounded against load/unload churn).
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (dbgModules_.size() < kMaxDbgModules) dbgModules_.push_back(std::move(m));
+                }
                 break;
+            }
+            case UNLOAD_DLL_DEBUG_EVENT: {
+                const uint64_t b = (uint64_t)(uintptr_t)ev.u.UnloadDll.lpBaseOfDll;
+                if (b && b == jvmBase) { jvmBase = 0; jvmSize = 0; }
+                std::lock_guard<std::mutex> lk(mtx_);
+                for (size_t i = 0; i < dbgModules_.size(); )
+                    if (dbgModules_[i].base == b) dbgModules_.erase(dbgModules_.begin() + i);
+                    else ++i;
+                break;
+            }
+            case OUTPUT_DEBUG_STRING_EVENT: {
+                const OUTPUT_DEBUG_STRING_INFO& od = ev.u.DebugString;
+                if (od.lpDebugStringData && od.nDebugStringLength) {
+                    std::string text;
+                    if (od.fUnicode) {
+                        size_t chars = od.nDebugStringLength;        // length in WCHARs
+                        if (chars * 2 > kDbgOutputLine) chars = kDbgOutputLine / 2;
+                        std::vector<wchar_t> wb(chars + 1, 0);
+                        size_t got = readMemory((uint64_t)(uintptr_t)od.lpDebugStringData, wb.data(), chars * 2);
+                        int wn = (int)(got / 2);
+                        while (wn > 0 && wb[wn - 1] == 0) --wn;
+                        if (wn > 0) {
+                            int k = WideCharToMultiByte(CP_UTF8, 0, wb.data(), wn, nullptr, 0, nullptr, nullptr);
+                            if (k > 0) {
+                                text.resize(k);
+                                WideCharToMultiByte(CP_UTF8, 0, wb.data(), wn, text.data(), k, nullptr, nullptr);
+                            }
+                        }
+                    } else {
+                        size_t len = od.nDebugStringLength;          // length in bytes
+                        if (len > kDbgOutputLine) len = kDbgOutputLine;
+                        text.resize(len);
+                        text.resize(readMemory((uint64_t)(uintptr_t)od.lpDebugStringData, text.data(), len));
+                        while (!text.empty() && text.back() == '\0') text.pop_back();
+                    }
+                    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+                    if (!text.empty()) {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        dbgOutput_.push_back(std::move(text));
+                        while (dbgOutput_.size() > kDbgOutputCap) dbgOutput_.pop_front();
+                    }
+                }
+                break;
+            }
             case EXIT_PROCESS_DEBUG_EVENT:
                 { std::lock_guard<std::mutex> lk(mtx_); state_ = DbgState::Terminated; lastEvent_ = "process exited"; }
                 alive = false;
@@ -1058,7 +1567,8 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
                         // call/rep skipped during step-out). Remove it and back RIP onto
                         // the target instruction.
                         writeByteRPM((HANDLE)hProcess_, tempBpAddr, tempBpOrig);
-                        ctxSetRip(threads_[ev.dwThreadId], tempBpAddr);
+                        if (auto th = threads_.find(ev.dwThreadId); th != threads_.end())
+                            ctxSetRip(th->second, tempBpAddr);
                         tempBpSet = false;
                         TempKind tk = tempKind; tempKind = TempKind::None;
                         // If this temp bp also stood in for a user bp we stepped off of,
@@ -1073,10 +1583,15 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
                         } else {
                             pause = true;
                             setEvent(tk == TempKind::RunTo      ? "run to cursor"
-                                   : tk == TempKind::EntryPoint ? "entry point" : "step over");
+                                   : tk == TempKind::EntryPoint ? "entry point"
+                                   : tk == TempKind::JvmInit    ? "JVM init (JNI_CreateJavaVM)"
+                                                                : "step over");
                         }
                     } else if (bps_.count(addr)) {
                         if (handleUserBp(addr, ev.dwThreadId)) pause = true;
+                    } else if (recvRetBytes_.count(addr)) {
+                        // A one-shot recv/WSARecv return hook: the buffer is now filled.
+                        netTapOnReturn(addr, ev.dwThreadId);   // captures, restores byte, no pause
                     } else if (breakRequested_.exchange(false)) {
                         // User pressed Pause: DebugBreakProcess put this int3 in a helper
                         // thread (ntdll!DbgBreakPoint). Consume it and show/step a real user
@@ -1154,6 +1669,33 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
                         stepPause = false; pause = true; setEvent("step");
                     }
                 } else {
+                    // A real exception. Always passed back to the app (we never
+                    // swallow it), but three policies decide what the USER sees:
+                    //   1. JVM-internal faults (HotSpot null checks / safepoint polls
+                    //      inside jvm.dll) are counted and passed through silently.
+                    //   2. A whitelisted code, or break-on-first-chance, pauses on
+                    //      the first chance with a semantic label.
+                    //   3. Otherwise only a last-chance (unhandled) exception updates
+                    //      the status line - no pause, no per-event spam.
+                    const uint32_t code = er.ExceptionCode;
+                    bool whitelisted = false;
+                    { std::lock_guard<std::mutex> lk(mtx_); whitelisted = fcWhitelist_.count(code) != 0; }
+                    if (IsJvmInternalException(code, addr, jvmBase, jvmSize) && !whitelisted) {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        ++jvmExceptionsPassed_;
+                    } else if (ev.u.Exception.dwFirstChance &&
+                               (breakOnFirstChance_.load() || whitelisted)) {
+                        char lbl[128];
+                        std::snprintf(lbl, sizeof(lbl), "first-chance %s at 0x%llX",
+                                      ExceptionCodeLabel(code).c_str(), (unsigned long long)addr);
+                        setEvent(lbl);
+                        pause = true;
+                    } else if (!ev.u.Exception.dwFirstChance) {
+                        char lbl[128];
+                        std::snprintf(lbl, sizeof(lbl), "unhandled %s at 0x%llX",
+                                      ExceptionCodeLabel(code).c_str(), (unsigned long long)addr);
+                        setEvent(lbl);
+                    }
                     contStatus = DBG_EXCEPTION_NOT_HANDLED; // real exception -> let app handle
                 }
                 break;
@@ -1163,6 +1705,12 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
 
         // We are stopped at an event here, so it's safe to touch debuggee memory.
         applyPendingBps();
+        // A JNI_CreateJavaVM one-shot that was deferred because the single temp-bp
+        // slot was busy: arm it as soon as the slot is free.
+        if (pendingJvmInitVA && !tempBpSet) {
+            setTempBp(pendingJvmInitVA, TempKind::JvmInit);
+            pendingJvmInitVA = 0;
+        }
 
         if (pause && alive) {
             loaderPhase = false;   // a user-visible stop ends startup; later int3s are real
@@ -1176,6 +1724,10 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
             Cmd c = waitForCommand();
             if (c == Cmd::Detach || quit_) { ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE); break; }
             applyPendingBps();
+            if (pendingJvmInitVA && !tempBpSet) {   // deferred JVM-init one-shot (see above)
+                setTempBp(pendingJvmInitVA, TempKind::JvmInit);
+                pendingJvmInitVA = 0;
+            }
             { std::lock_guard<std::mutex> lk(mtx_); state_ = DbgState::Running; }
 
             // Step/continue commands act on the displayed thread; ContinueDebugEvent still
@@ -1269,8 +1821,19 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring launchPath, bo
     }
 
     // Cleanup: restore all breakpoint bytes, clear DR registers, stop debugging.
+    {   // Drop the UI-visible handle FIRST: a pause() (DebugBreakProcess) landing after
+        // DebugActiveProcessStop would inject an int3 into a process that no longer has
+        // a debugger and kill it. Nulling under hProcMtx_ makes the UI see "gone" before
+        // we stop debugging; the restores below use hProcess_ directly so they still work.
+        std::lock_guard<std::mutex> lk(hProcMtx_);
+        hProcessShared_ = nullptr;
+    }
+    breakRequested_ = false;   // a pause that raced the teardown must not leak into a reattach
     for (auto& kv : bps_) writeByteRPM((HANDLE)hProcess_, kv.first, kv.second.orig);
     if (tempBpSet) writeByteRPM((HANDLE)hProcess_, tempBpAddr, tempBpOrig);
+    // Net-tap one-shot recv-return hooks aren't in bps_; restore them too.
+    for (auto& [addr, orig] : recvRetBytes_) writeByteRPM((HANDLE)hProcess_, addr, orig);
+    recvRetBytes_.clear(); pendingRecv_.clear(); netTapArmed_ = false;
     for (auto& s : hwSlots_) s = HwSlot{};
     applyHwAllThreads();                       // walks threads_, so close handles after it
     {   // Thaw any user-frozen threads so the process isn't left with suspended

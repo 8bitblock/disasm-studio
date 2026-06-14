@@ -67,7 +67,6 @@ static CompileResult CompileC(const std::string& src, const PatchCtx&) {
     const size_t off = (size_t)((uint8_t*)fn - r.bytes.data());
     if (off >= r.bytes.size()) { r.diagnostics = "could not locate 'hot' in the compiled image"; r.bytes.clear(); tcc_delete(s); return r; }
     r.bytes.erase(r.bytes.begin(), r.bytes.begin() + off);   // start at 'hot'
-    r.entryOffset = 0;
     r.ok = true;
     r.diagnostics = "compiled " + std::to_string(r.bytes.size()) + " bytes \xE2\x80\x94 must be position-independent + leaf";
     tcc_delete(s);

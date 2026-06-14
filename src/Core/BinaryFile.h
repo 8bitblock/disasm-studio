@@ -5,10 +5,13 @@
 // disassembler and views have section/entry-point context to work with.
 //
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace ds {
+
+struct JvmClassFile;
 
 struct Section {
     std::string name;
@@ -20,12 +23,12 @@ struct Section {
     bool        executable      = false;
 };
 
-enum class BinFormat { Unknown, PE32, PE32Plus, ELF, MachO, Raw };
+enum class BinFormat { Unknown, PE32, PE32Plus, ELF, MachO, Raw, JavaClass };
 
 // The CPU the image targets, recovered from the format header so the UI can
 // auto-pick the right disassembler arch (and so ELF/Mach-O ARM images route to
 // Capstone rather than defaulting to x86/x64 off the 32/64-bit class alone).
-enum class MachineArch { Unknown, X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV, RISCV64 };
+enum class MachineArch { Unknown, X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV, RISCV64, JVM };
 
 class BinaryFile {
 public:
@@ -92,16 +95,46 @@ public:
     uint32_t exportDirRVA()  const { return exportRVA_; }
     uint32_t exportDirSize() const { return exportSize_; }
 
+    // x64 PE exception directory (.pdata): the linker-emitted RUNTIME_FUNCTION
+    // table, one [begin, end) VA range per function (chained-unwind continuation
+    // entries are folded away). Authoritative function boundaries for function
+    // discovery. Empty for non-x64 / non-PE images (ARM64 .pdata differs).
+    std::vector<std::pair<uint64_t, uint64_t>> pdataRanges() const;
+
+    // PE overlay: file bytes appended past the end of every section's raw data
+    // (installers, self-extractors, and Java launchers like launch4j/jpackage
+    // stash payloads there — it has no VA, so vaToOffset never reaches it).
+    // Zero for ELF/Mach-O/raw and for live mappings (rawOffset is an RVA there).
+    uint64_t overlayOffset() const { return overlayOffset_; }
+    uint64_t overlaySize()   const { return overlaySize_; }
+    bool     hasOverlay()    const { return overlaySize_ != 0; }
+
+    // PE security directory (data directory [4], the Authenticode certificate
+    // table). Uniquely among directories its first field is a FILE OFFSET, not
+    // an RVA — needed to carve a trailing cert off an appended-payload scan.
+    uint32_t securityDirOffset() const { return securityOff_; }
+    uint32_t securityDirSize()   const { return securitySize_; }
+
+    // PE data directory [14] (CLR/COM descriptor). Nonzero RVA => .NET assembly.
+    uint32_t clrDirRVA() const { return clrRva_; }
+    uint32_t clrDirSize() const { return clrSize_; }
+
     // Resolved PE imports: each IAT slot's VA + the DLL and function it binds to.
     struct Import { uint64_t iatVA = 0; std::string dll, name; };
     const std::vector<Import>& imports() const { return imports_; }
     // PE base relocations as (VA, type) pairs (type = IMAGE_REL_BASED_*).
     const std::vector<std::pair<uint64_t, int>>& relocations() const { return relocs_; }
 
+    // Parsed Java class file (constant pool, method table) when the loaded
+    // image is BinFormat::JavaClass; null otherwise. Shared so the worker's
+    // JvmDisassembler can hold it across the analysis job safely.
+    std::shared_ptr<const JvmClassFile> javaClass() const { return javaClass_; }
+
 private:
     bool parsePE();
     bool parseELF();
     bool parseMachO();
+    bool parseJavaClass();
     void parseImports();   // PE data directory [1]
     void parseRelocs();    // PE data directory [5]
 
@@ -123,8 +156,17 @@ private:
     uint32_t             importSize_ = 0;
     uint32_t             relocRVA_   = 0;
     uint32_t             relocSize_  = 0;
+    uint32_t             exceptRVA_  = 0;   // data dir [3]: exception directory (.pdata)
+    uint32_t             exceptSize_ = 0;
+    uint64_t             overlayOffset_ = 0;   // file offset of PE overlay data (0 = none)
+    uint64_t             overlaySize_   = 0;
+    uint32_t             securityOff_   = 0;   // data dir [4]: file offset (not RVA!)
+    uint32_t             securitySize_  = 0;
+    uint32_t             clrRva_        = 0;   // data dir [14]: CLR/COM descriptor
+    uint32_t             clrSize_       = 0;
     std::vector<Import>                    imports_;
     std::vector<std::pair<uint64_t, int>>  relocs_;
+    std::shared_ptr<const JvmClassFile>    javaClass_;   // set for BinFormat::JavaClass
 };
 
 } // namespace ds

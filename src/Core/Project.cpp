@@ -75,6 +75,40 @@ std::string SerializeProject(const ProjectState& st) {
     root.set("comments", dumpMap(st.comments));
     root.set("algorithmLabels", dumpMap(st.algorithmLabels));
 
+    {   // Labels for non-address targets (Java classes/methods/fields/resources/events).
+        Value arr = Value::Arr();
+        auto labels = st.labels;
+        std::sort(labels.begin(), labels.end(), [](const PjLabel& a, const PjLabel& b) {
+            if (a.targetKind != b.targetKind) return a.targetKind < b.targetKind;
+            if (a.target != b.target) return a.target < b.target;
+            return a.label < b.label;
+        });
+        for (const auto& l : labels) {
+            Value e = Value::Obj();
+            e.set("kind", Value::Str(l.targetKind));
+            e.set("target", Value::Str(l.target));
+            e.set("label", Value::Str(l.label));
+            e.set("confidence", Value::Num(l.confidence));
+            e.set("note", Value::Str(l.note));
+            arr.push(std::move(e));
+        }
+        root.set("labels", std::move(arr));
+    }
+
+    {   // Local connection framework config + accepted event timeline.
+        Value c = Value::Obj();
+        c.set("enabled", Value::Bool(st.connection.enabled));
+        c.set("localhostOnly", Value::Bool(st.connection.localhostOnly));
+        c.set("authEnabled", Value::Bool(st.connection.authEnabled));
+        c.set("accessToken", Value::Str(st.connection.accessToken));
+        root.set("connection", std::move(c));
+
+        Value arr = Value::Arr();
+        for (const ConnectionEnvelope& e : st.connectionEvents)
+            arr.push(ConnectionEnvelopeToJsonValue(e));
+        root.set("connectionEvents", std::move(arr));
+    }
+
     {
         Value arr = Value::Arr();
         auto bm = st.bookmarks;
@@ -91,6 +125,8 @@ std::string SerializeProject(const ProjectState& st) {
             e.set("a", Value::Str(hexU64(a)));
             auto it = st.bpConditions.find(a);
             if (it != st.bpConditions.end() && !it->second.empty()) e.set("cond", Value::Str(it->second));
+            auto en = st.bpEveryN.find(a);
+            if (en != st.bpEveryN.end() && en->second > 1) e.set("everyN", Value::Int(en->second));
             arr.push(std::move(e));
         }
         root.set("breakpoints", std::move(arr));
@@ -168,6 +204,38 @@ bool DeserializeProject(const std::string& text, ProjectState& out) {
     loadMap("comments", st.comments);
     loadMap("algorithmLabels", st.algorithmLabels);
 
+    if (const Value* a = root.find("labels"); a && a->isArr())
+        for (const auto& e : a->arr) if (e.isObj()) {
+            PjLabel l;
+            l.targetKind = e.getStr("kind");
+            l.target     = e.getStr("target");
+            l.label      = e.getStr("label");
+            l.confidence = (float)e.getInt("confidence", 1);
+            if (const Value* cv = e.find("confidence"); cv && cv->isNum())
+                l.confidence = (float)cv->num;
+            if (l.confidence < 0.0f) l.confidence = 0.0f;
+            if (l.confidence > 1.0f) l.confidence = 1.0f;
+            l.note = e.getStr("note");
+            if (!l.targetKind.empty() && !l.target.empty() && !l.label.empty())
+                st.labels.push_back(std::move(l));
+        }
+
+    if (const Value* c = root.find("connection"); c && c->isObj()) {
+        st.connection.enabled       = c->getBool("enabled", false);
+        st.connection.localhostOnly = c->getBool("localhostOnly", true);
+        st.connection.authEnabled   = c->getBool("authEnabled", false);
+        st.connection.accessToken   = c->getStr("accessToken");
+        std::string ignored;
+        if (!ValidateConnectionConfig(st.connection, &ignored)) st.connection = ConnectionConfig{};
+    }
+    if (const Value* a = root.find("connectionEvents"); a && a->isArr())
+        for (const auto& e : a->arr) {
+            ConnectionEnvelope ev;
+            std::string ignored;
+            if (ConnectionEnvelopeFromJsonValue(e, ev, &ignored))
+                st.connectionEvents.push_back(std::move(ev));
+        }
+
     if (const Value* a = root.find("bookmarks"); a && a->isArr())
         for (const auto& e : a->arr) if (e.isObj()) st.bookmarks.push_back({ parseU64(e.getStr("a", "0")), e.getStr("label") });
 
@@ -180,6 +248,8 @@ bool DeserializeProject(const std::string& text, ProjectState& out) {
             st.breakpoints.push_back(addr);
             std::string c = e.getStr("cond");
             if (!c.empty()) st.bpConditions[addr] = c;
+            int64_t n = e.getInt("everyN");
+            if (n > 1 && n <= 0x7FFFFFFF) st.bpEveryN[addr] = (uint32_t)n;
         }
 
     if (const Value* a = root.find("patches"); a && a->isArr())

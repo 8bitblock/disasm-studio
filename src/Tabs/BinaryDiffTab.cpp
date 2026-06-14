@@ -31,6 +31,7 @@ static Arch archOf(const BinaryFile& bf) {
         case MachineArch::PPC64:   return Arch::PPC64;
         case MachineArch::RISCV:   return Arch::RISCV32;
         case MachineArch::RISCV64: return Arch::RISCV64;
+        case MachineArch::JVM:     return Arch::JVM;
         default:                   return bf.is64Bit() ? Arch::X64 : Arch::X86;
     }
 }

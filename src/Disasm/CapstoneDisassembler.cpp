@@ -74,6 +74,7 @@ static uint64_t branchTargetFor(const cs_insn* insn, Arch arch) {
                 if (a.operands[i].type == RISCV_OP_IMM) return (uint64_t)a.operands[i].imm;
             break;
         }
+        case Arch::JVM: break;   // never decoded by Capstone (JvmDisassembler backend)
     }
     return 0;
 }
@@ -108,6 +109,7 @@ bool CapstoneDisassembler::open() {
         case Arch::PPC64:   a = CS_ARCH_PPC;   m = (cs_mode)(CS_MODE_64 | CS_MODE_LITTLE_ENDIAN); break;
         case Arch::RISCV32: a = CS_ARCH_RISCV; m = CS_MODE_RISCV32; break;
         case Arch::RISCV64: a = CS_ARCH_RISCV; m = CS_MODE_RISCV64; break;
+        case Arch::JVM:     ok_ = false; return false;   // routed to JvmDisassembler by the factory
     }
     csh h;
     if (cs_open(a, m, &h) != CS_ERR_OK) { ok_ = false; return false; }

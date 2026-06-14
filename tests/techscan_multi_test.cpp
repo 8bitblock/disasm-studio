@@ -8,7 +8,8 @@
 //
 // Build & run (Windows, from project root, in a VS dev shell):
 //   cl /std:c++20 /EHsc /I src tests\techscan_multi_test.cpp ^
-//       src\Core\TechScan.cpp src\Core\SigMatch.cpp src\Core\BinaryFile.cpp
+//       src\Core\TechScan.cpp src\Core\JavaScan.cpp src\Core\RuntimeScan.cpp src\Core\Inflate.cpp ^
+//       src\Core\SigMatch.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp
 //   .\techscan_multi_test.exe
 //
 #include "Core/TechScan.h"
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -119,6 +121,61 @@ int main() {
         CHECK(loadBlob(bf, blob, base));
         auto caps = ScanCapabilities(bf);
         CHECK(find(caps, kStubName) == nullptr);
+        // ...and no fabricated "java" capability on a clean blob either.
+        for (const auto& c : caps) CHECK(c.category != "java");
+    }
+
+    // ---- Java launcher: PE with an appended JAR -> a "java" capability -----------
+    {
+        // Minimal PE32 (same shape as binaryfile_pe_va_test) + a tiny stored-entry
+        // JAR (local header + central directory + EOCD) appended as overlay.
+        std::vector<uint8_t> b(0x600, 0);
+        auto put16 = [&](size_t off, uint16_t v) { std::memcpy(b.data() + off, &v, 2); };
+        auto put32 = [&](size_t off, uint32_t v) { std::memcpy(b.data() + off, &v, 4); };
+        b[0] = 'M'; b[1] = 'Z';
+        put32(0x3C, 0x80); put32(0x80, 0x00004550);
+        const size_t coff = 0x84;
+        put16(coff + 0, 0x014C); put16(coff + 2, 1); put16(coff + 16, 0xE0); put16(coff + 18, 0x102);
+        const size_t opt = coff + 20;
+        put16(opt + 0, 0x10B); put32(opt + 16, 0x1000); put32(opt + 28, 0x400000);
+        put32(opt + 32, 0x1000); put32(opt + 36, 0x200); put32(opt + 56, 0x2000);
+        put32(opt + 60, 0x400); put32(opt + 92, 16);
+        const size_t sec = opt + 0xE0;
+        std::memcpy(b.data() + sec, ".text\0\0\0", 8);
+        put32(sec + 8, 0x1000); put32(sec + 12, 0x1000); put32(sec + 16, 0x200);
+        put32(sec + 20, 0x400); put32(sec + 36, 0x60000020u);
+
+        auto a16 = [&](uint16_t v) { size_t o = b.size(); b.resize(o + 2); put16(o, v); };
+        auto a32 = [&](uint32_t v) { size_t o = b.size(); b.resize(o + 4); put32(o, v); };
+        auto aS  = [&](const std::string& s) { b.insert(b.end(), s.begin(), s.end()); };
+        const std::string nm = "META-INF/MANIFEST.MF";
+        const std::string mf = "Manifest-Version: 1.0\r\nMain-Class: a.B\r\n\r\n";
+        const uint32_t zipBase = (uint32_t)b.size();              // 0x600
+        a32(0x04034b50); a16(20); a16(0); a16(0); a16(0); a16(0); a32(0);
+        a32((uint32_t)mf.size()); a32((uint32_t)mf.size()); a16((uint16_t)nm.size()); a16(0);
+        aS(nm); aS(mf);
+        const uint32_t cdOff = (uint32_t)b.size() - zipBase;
+        a32(0x02014b50); a16(20); a16(20); a16(0); a16(0); a16(0); a16(0); a32(0);
+        a32((uint32_t)mf.size()); a32((uint32_t)mf.size()); a16((uint16_t)nm.size());
+        a16(0); a16(0); a16(0); a16(0); a32(0); a32(0);
+        aS(nm);
+        const uint32_t cdSize = (uint32_t)b.size() - zipBase - cdOff;
+        a32(0x06054b50); a16(0); a16(0); a16(1); a16(1); a32(cdSize); a32(cdOff); a16(0);
+
+        const std::string tmp = "techscan_java.bin";
+        { std::ofstream f(tmp, std::ios::binary); f.write((const char*)b.data(), (std::streamsize)b.size()); }
+        BinaryFile bf;
+        CHECK(bf.load(tmp));
+        std::remove(tmp.c_str());
+        auto caps = ScanCapabilities(bf);
+        const Capability* jc = nullptr;
+        for (const auto& c : caps) if (c.category == "java") jc = &c;
+        CHECK(jc != nullptr);
+        if (jc) {
+            CHECK(jc->name.find("Java launcher") != std::string::npos);
+            CHECK(jc->confidence > 0.7f);
+            CHECK(!jc->detail.empty());
+        }
     }
 
     if (g_fail == 0) std::printf("ALL TECHSCAN MULTI TESTS PASSED\n");

@@ -73,7 +73,11 @@ bool EvalConst(const ExprRef& e, uint64_t& out) {
 
         case ExprOp::Concat:
             if (!EvalConst(k[0], a) || !EvalConst(k[1], b)) return false;
-            out = MaskToBits((a << k[1]->bits) | b, e->bits); return true;
+            {
+                const uint32_t loW = k[1]->bits;   // shift count >= 64 is UB; high part contributes 0
+                out = MaskToBits(((loW >= 64) ? 0ull : (a << loW)) | b, e->bits);
+            }
+            return true;
         case ExprOp::Extract:
             if (!EvalConst(k[0], a)) return false;
             out = MaskToBits(a >> e->val, e->bits); return true;

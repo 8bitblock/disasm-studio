@@ -1,5 +1,7 @@
 #include "TechScan.h"
 #include "BinaryFile.h"
+#include "JavaScan.h"
+#include "RuntimeScan.h"
 #include "SigMatch.h"
 
 #include <algorithm>
@@ -178,6 +180,40 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
             c.detail += tail;
         }
         out.push_back(std::move(c));
+    }
+
+    // Provenance: everything above came from TechScan's own rules.
+    for (auto& c : out) c.analyzer = "TechScan";
+
+    // ---- 4) Java launcher / embedded JAR (JavaScan) ----
+    {
+        JavaScanResult jr = ScanJava(bin);
+        if (jr.kind != JavaWrapKind::None) {
+            Capability c;
+            c.name       = std::string("Java launcher: ") + JavaWrapKindName(jr.kind);
+            c.category   = "java";
+            c.confidence = jr.confidence;
+            c.address    = 0;   // the appended archive is overlay data: it has no VA
+            c.detail     = jr.detail;
+            c.analyzer   = "JavaScan";
+            out.push_back(std::move(c));
+        }
+
+        // ---- 5) Multi-runtime wrapper/container detection (RuntimeScan) ----
+        // Reuses the JavaScan result already computed above. Its mirrored Java
+        // finding (analyzer "JavaScan") is skipped: the merge above covers it.
+        RuntimeScanResult rr = ScanRuntimes(bin, jr);
+        for (auto& f : rr.findings) {
+            if (f.analyzer == "JavaScan") continue;
+            Capability c;
+            c.name       = f.title;
+            c.category   = f.category;
+            c.confidence = f.confidence;
+            c.address    = f.address;
+            c.detail     = f.detail;
+            c.analyzer   = f.analyzer;
+            out.push_back(std::move(c));
+        }
     }
 
     std::sort(out.begin(), out.end(), [](const Capability& a, const Capability& b) { return a.confidence > b.confidence; });

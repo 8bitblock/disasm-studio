@@ -1,17 +1,24 @@
 #pragma once
 #include "ITab.h"
+#include "../Core/JdwpClient.h"
+#include "../Core/JvmAttach.h"
+#include "../Core/JvmClass.h"
 #include "../Core/ProcessManager.h"
+#include "../Disasm/IDisassembler.h"
 #include "../Hv/HvDbgClient.h"
 #include "../Hv/HvDbgLoader.h"
 #include "../Hv/HvDbgProtocol.h"
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ds {
 
 // Communications tab: native-process side. Real Win32 process enumeration and
-// attach (debug API), module listing for the selected process, plus the
-// connections/channels model used to talk to external agents/drivers.
+// attach (debug API), module listing for the selected process, the
+// connections/channels model used to talk to external agents/drivers, and the
+// Java debug (JDWP) console for bytecode-level JVM debugging.
 class CommunicationsTab final : public ITab {
 public:
     const char* name() const override { return "Communications"; }
@@ -22,7 +29,10 @@ private:
     void renderModules();
     void renderConnections();
     void renderHvDbg();                       // AMD-V (SVM) hypervisor channel: \\.\HvDbg
-    void refreshConnections(uint32_t pid);   // live TCP/UDP endpoints owned by pid
+    void renderJdwp(AppContext& ctx);         // Java debug (JDWP) console
+    void loadJdwpMethod(AppContext& ctx, uint64_t classID, uint64_t methodID,
+                        const std::string& label);
+    void refreshConnections(uint32_t pid);   // live per-process TCP/UDP endpoints
 
     struct Conn { std::string endpoint; std::string type; std::string state; };
 
@@ -51,6 +61,35 @@ private:
     HvDbgLoader::State       hvState_      = HvDbgLoader::State::Unknown;
     bool                     hvStateValid_ = false;
     int                      hvElevated_   = -1;   // -1 = unknown, else cached isElevated()
+
+    // ---- Java debug (JDWP) console state ----
+    char        jdwpHost_[64]        = "127.0.0.1";
+    int         jdwpPort_            = 5005;
+    std::string jdwpStatus_;                       // last attach/RPC error, empty = fine
+    // dynamic-attach (inject) path: VM flavor/bitness of the selected process, cached by pid
+    uint32_t    jdwpInjectPid_  = 0;
+    JvmInfo     jdwpInjectInfo_;                    // flavor None until a JVM process is selected
+    double      jdwpInjectNextPoll_ = 0.0;          // re-InspectJvm() deadline while no VM seen yet
+                                                    // (an EXE launcher loads jvm.dll after startup)
+    bool        jdwpSuspendOnAttach_ = true;        // freeze all VM threads right after connecting
+                                                    // (so an EXE-launcher's Java main logic can be
+                                                    // breakpointed before it runs on)
+    char        jdwpClassFilter_[64] = "";
+    uint64_t    jdwpSelClass_  = 0;                // selected class typeID
+    std::string jdwpSelClassName_;
+    std::vector<JdwpMethodRow> jdwpMethods_;       // methods of the selected class
+    std::vector<Instruction>   jdwpInsns_;         // disassembled live bytecode (VA == bci)
+    uint64_t    jdwpInsnsClass_ = 0, jdwpInsnsMethod_ = 0;   // what jdwpInsns_ shows
+    std::string jdwpInsnsLabel_;                   // "Bar.main" header for the listing
+    std::shared_ptr<JvmClassFile> jdwpCp_;         // per-class constant pool (symbolication)
+    uint64_t    jdwpCpClass_ = 0;
+    // last stop already reacted to (auto-follow + scroll happen once per stop)
+    uint64_t    jdwpSeenStopClass_ = 0, jdwpSeenStopMethod_ = 0, jdwpSeenStopBci_ = ~0ull;
+    bool        jdwpScrollToStop_ = false;
+    // class-filter result cache (rebuilt when the list or the filter changes)
+    std::shared_ptr<const std::vector<JdwpClassRow>> jdwpClassesRef_;
+    std::string jdwpFilterCache_ = "\x01";         // never matches a real filter initially
+    std::vector<int> jdwpFiltered_;                // indices into *jdwpClassesRef_
 };
 
 } // namespace ds

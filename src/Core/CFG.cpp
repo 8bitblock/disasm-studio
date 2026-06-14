@@ -16,7 +16,8 @@ static bool isRet(const Instruction& in) {
     return in.isRet || in.mnemonic == "ret" || in.mnemonic == "retn" || in.mnemonic == "retf";
 }
 static bool isUncondJmp(const Instruction& in) {
-    return in.mnemonic == "jmp" || in.mnemonic == "jmpq";
+    return in.mnemonic == "jmp" || in.mnemonic == "jmpq" ||
+           in.mnemonic == "goto" || in.mnemonic == "goto_w";   // JVM unconditionals
 }
 
 ControlFlowGraph BuildCFG(const uint8_t* code, size_t size, uint64_t va,
@@ -70,6 +71,8 @@ ControlFlowGraph BuildCFG(const uint8_t* code, size_t size, uint64_t va,
         if (fall >= lo && fall < hi) leaders.insert(fall);
         if (in.branchTarget && in.branchTarget >= lo && in.branchTarget < hi)
             leaders.insert(in.branchTarget);
+        for (uint64_t t : in.extraTargets)                      // in-encoding switch cases (JVM)
+            if (t >= lo && t < hi) leaders.insert(t);
     }
     for (const auto& t : tables) for (uint64_t tgt : t.second) leaders.insert(tgt);
 
@@ -118,6 +121,21 @@ ControlFlowGraph BuildCFG(const uint8_t* code, size_t size, uint64_t va,
                     std::find(b.succ.begin(), b.succ.end(), bo->second) == b.succ.end())
                     b.succ.push_back(bo->second);
             }
+            continue;
+        }
+        // In-encoding switch (JVM tableswitch/lookupswitch): every case plus the
+        // default (branchTarget) is a successor; switches never fall through.
+        if (!last.extraTargets.empty()) {
+            b.isSwitch = true;
+            b.caseTargets = last.extraTargets;
+            auto link = [&](uint64_t tgt) {
+                auto bo = blockOf.find(tgt);
+                if (bo != blockOf.end() &&
+                    std::find(b.succ.begin(), b.succ.end(), bo->second) == b.succ.end())
+                    b.succ.push_back(bo->second);
+            };
+            for (uint64_t tgt : last.extraTargets) link(tgt);
+            if (last.branchTarget) link(last.branchTarget);
             continue;
         }
         if (last.branchTarget) {

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -191,6 +192,81 @@ std::string lhsFor(const std::string& nm, int width, bool high8) {
     return width == 2 ? "LOWORD(" + nm + ")" : "LOBYTE(" + nm + ")";
 }
 
+// ---- tiny constant-expression evaluator (folded-constant comments) ----------
+// When inter-block const-prop inlines only constants into an assignment's RHS
+// (e.g. "v1 = (0x1000 + 0x234);"), the human still has to do the arithmetic.
+// This evaluates such an expression so the emitter can append "/* = 0x1234 */".
+// Strictly numeric: any identifier, cast, deref, comparison, or string makes it
+// bail (no comment). `lits` counts numeric literals so a bare constant (or a
+// parenthesized one) never gets a redundant comment.
+struct ConstEval {
+    const char* p; const char* e; bool ok = true; int lits = 0;
+    explicit ConstEval(const std::string& s) : p(s.c_str()), e(s.c_str() + s.size()) {}
+    void ws() { while (p < e && *p == ' ') ++p; }
+    bool eat(char c) { ws(); if (p < e && *p == c) { ++p; return true; } return false; }
+    bool peek2(const char* two) { ws(); return p + 1 < e && p[0] == two[0] && p[1] == two[1]; }
+    long long prim() {
+        ws();
+        if (eat('(')) { long long v = expr(); if (!eat(')')) ok = false; return v; }
+        if (p < e && (std::isdigit((unsigned char)*p))) {
+            char* endp = nullptr;
+            long long v = (long long)std::strtoull(p, &endp, 0);   // 0x-aware
+            if (endp == p) { ok = false; return 0; }
+            p = endp; ++lits;
+            return v;
+        }
+        ok = false; return 0;
+    }
+    long long unary() {
+        ws();
+        if (eat('-')) return -unary();
+        if (eat('~')) return ~unary();
+        return prim();
+    }
+    long long mul() {
+        long long v = unary();
+        for (;;) {
+            ws();
+            if (p < e && *p == '*' && (p + 1 >= e || p[1] != '(')) { ++p; v *= unary(); }   // "*(" is a deref
+            else if (p < e && *p == '/') { ++p; long long r = unary(); if (!r) { ok = false; return 0; } v /= r; }
+            else if (p < e && *p == '%') { ++p; long long r = unary(); if (!r) { ok = false; return 0; } v %= r; }
+            else return v;
+        }
+    }
+    long long add() {
+        long long v = mul();
+        for (;;) {
+            ws();
+            if (p < e && *p == '+') { ++p; v += mul(); }
+            else if (p < e && *p == '-') { ++p; v -= mul(); }
+            else return v;
+        }
+    }
+    long long shift() {
+        long long v = add();
+        for (;;) {
+            if (peek2("<<")) { p += 2; long long r = add(); if (r < 0 || r > 63) { ok = false; return 0; } v = (long long)((unsigned long long)v << r); }
+            else if (peek2(">>")) { p += 2; long long r = add(); if (r < 0 || r > 63) { ok = false; return 0; } v = (long long)((unsigned long long)v >> r); }
+            else return v;
+        }
+    }
+    long long band() { long long v = shift(); while (ok) { ws(); if (p < e && *p == '&' && (p + 1 >= e || p[1] != '&')) { ++p; v &= shift(); } else break; } return v; }
+    long long bxor() { long long v = band();  while (ok) { ws(); if (p < e && *p == '^') { ++p; v ^= band(); } else break; } return v; }
+    long long expr() { long long v = bxor();  while (ok) { ws(); if (p < e && *p == '|' && (p + 1 >= e || p[1] != '|')) { ++p; v |= bxor(); } else break; } return v; }
+};
+
+// Evaluate `s` as a pure constant expression. True only when the WHOLE string
+// parses and at least two literals took part (folding actually happened).
+static bool tryFoldConst(const std::string& s, long long& out) {
+    if (s.empty() || s.size() > 128) return false;
+    ConstEval ev(s);
+    long long v = ev.expr();
+    ev.ws();
+    if (!ev.ok || ev.p != ev.e || ev.lits < 2) return false;
+    out = v;
+    return true;
+}
+
 // ----------------------------------------------------------- the analyzer ---
 
 struct Val { std::string expr; std::set<std::string> reads; std::set<std::string> deps; };
@@ -207,7 +283,15 @@ struct Analyzer {
     const ControlFlowGraph& g;
     const std::function<std::string(uint64_t)>& nameFor;
     const std::function<std::string(uint64_t)>& dataRefFor;
+    bool callArgs_;                                       // recover/inline call arguments
+    bool is32_ = false;                                   // 32-bit (x86) calling convention
     int N;
+
+    // A pending pushed value (32-bit cdecl/stdcall arg marshalling). Collected
+    // since the last call / frame manipulation, consumed (reversed: last push =
+    // first arg) at the next call. `reads` keeps the def alive through DCE.
+    struct PushArg { std::string text; std::set<std::string> reads; };
+    std::vector<PushArg> pendingPush_;
 
     std::unordered_map<std::string, std::string> name_;   // loc id -> variable name
     std::unordered_map<std::string, std::string> argName_; // reg loc -> a1..a4
@@ -230,8 +314,8 @@ struct Analyzer {
     std::vector<std::set<std::string>> retReads_;    // vars a return reads (liveness seed)
 
     Analyzer(const ControlFlowGraph& cfg, const std::function<std::string(uint64_t)>& nf,
-             const std::function<std::string(uint64_t)>& dr)
-        : g(cfg), nameFor(nf), dataRefFor(dr), N((int)cfg.blocks.size()) {}
+             const std::function<std::string(uint64_t)>& dr, bool callArgs)
+        : g(cfg), nameFor(nf), dataRefFor(dr), callArgs_(callArgs), N((int)cfg.blocks.size()) {}
 
     // Resolve a constant data address to a display token (quoted string / import /
     // global name), or "" if not meaningful.
@@ -317,7 +401,7 @@ struct Analyzer {
     // pointer, or [esp+4+4k] without) — both detected as read-before-write slots.
     void detectArgs() {
         if (N == 0) return;
-        if (looksLike32()) { detectArgsX86(); return; }
+        if (is32_) { detectArgsX86(); return; }
 
         const int win64[4] = { RCX, RDX, 8, 9 };
         std::unordered_set<int> written;
@@ -489,6 +573,39 @@ struct Analyzer {
         return s;
     }
 
+    // Recover the argument list passed to a call at the current program point and
+    // render it as the inside of "callee(...)". Heuristic, no callee prototypes:
+    //   x86 (cdecl/stdcall): the values pushed since the last call/frame setup, in
+    //     call order (cdecl/stdcall push right-to-left, so the last push is arg1).
+    //   Win64: the propagated values still live in the integer arg registers
+    //     rcx, rdx, r8, r9 — a CONTIGUOUS run from rcx (stop at the first one with
+    //     no tracked value, so a stale higher register can't fabricate a gap arg).
+    // Volatile registers are cleared after every call, so a value in an arg
+    // register here was set since the last call (or must-reach from predecessors)
+    // — strong evidence it is being passed. Each argument's reads are unioned into
+    // `reads` so the value (incl. a string literal) survives DCE and folds in.
+    std::string renderCallArgs(Env& e, std::set<std::string>& reads) {
+        if (!callArgs_) return "";
+        std::vector<std::string> argv;
+        if (is32_) {
+            for (auto it = pendingPush_.rbegin(); it != pendingPush_.rend() && argv.size() < 8; ++it) {
+                argv.push_back(it->text);
+                reads.insert(it->reads.begin(), it->reads.end());
+            }
+        } else {
+            const int win64[4] = { RCX, RDX, 8, 9 };
+            for (int k = 0; k < 4; ++k) {
+                auto it = e.v.find(regLoc(win64[k]));
+                if (it == e.v.end() || it->second.expr.empty()) break;   // contiguity from rcx
+                argv.push_back(it->second.expr);
+                reads.insert(it->second.reads.begin(), it->second.reads.end());
+            }
+        }
+        std::string s;
+        for (size_t i = 0; i < argv.size(); ++i) { if (i) s += ", "; s += argv[i]; }
+        return s;
+    }
+
     // Invalidate cached values when something they depend on changes.
     void killDep(Env& e, const std::string& dep) {
         for (auto it = e.v.begin(); it != e.v.end();) {
@@ -517,6 +634,7 @@ struct Analyzer {
         if (!dry) out.clear();
         Env e = inEnv;
         FlagState fl;
+        pendingPush_.clear();   // x86 pushed-arg accumulator is per-block
 
         size_t count = b.insns.size();
         if (!b.insns.empty()) {
@@ -551,6 +669,12 @@ struct Analyzer {
                 killDep(e, loc);                          // invalidate anything depending on this loc
                 if (width >= 4) {                         // full (32-bit zero-extends) def: propagatable
                     Stmt s; s.dst = nm; s.text = nm + " = " + rhsExpr + ";";
+                    // Const-prop folded the RHS down to pure arithmetic on
+                    // constants: spell out the result ("/* = 0x1234 */") so the
+                    // reader doesn't have to. Display-only — the propagated
+                    // value (Val.expr below) stays the uncommented expression.
+                    if (long long cv = 0; tryFoldConst(rhsExpr, cv))
+                        s.text += " /* = " + immText(cv) + " */";
                     s.reads.assign(rd.begin(), rd.end());
                     out.push_back(std::move(s));
                     Val v; v.expr = rhsExpr; v.reads = rd; v.deps = dp; e.v[loc] = std::move(v);
@@ -580,10 +704,33 @@ struct Analyzer {
                 continue;
             }
 
+            // --- x86 call-arg marshalling (32-bit) ---
+            // A write to esp/ebp ends a pushed-argument group: the prologue's
+            // `mov ebp,esp` / `sub esp,N`, or the post-call `add esp,N` cleanup. So
+            // the next call only sees the pushes that follow this point.
+            if (is32_ && callArgs_ && okA && da.kind == OK::Reg &&
+                (da.reg.canon == RSP || da.reg.canon == RBP)) {
+                bool w = false, rmw = false; classifyDst(m, w, rmw);
+                if (w) pendingPush_.clear();
+            }
+            // A pushed value is a candidate cdecl/stdcall argument: render it now and
+            // queue it for the next call (the stack itself stays unmodeled, so push
+            // still emits no statement — it's just remembered).
+            if (m == "push") {
+                if (is32_ && callArgs_ && okA) {
+                    std::set<std::string> rd, dp; bool ml2 = false;
+                    std::string val;
+                    if (da.kind == OK::Imm && (uint64_t)da.imm > 0x1000) val = dref((uint64_t)da.imm);  // string/global
+                    if (val.empty()) val = renderRValue(e, da, rd, dp, ml2);
+                    pendingPush_.push_back({ val, rd });
+                }
+                continue;
+            }
+
             // --- mnemonic dispatch ---
             if (m == "nop" || m == "endbr64" || m == "endbr32" || m == "leave" || m == "hlt" ||
-                m == "int3" || m == "cdqe" || m == "cdq" || m == "cqo" || m == "push" || m == "pop")
-                continue;   // no statement (push/pop: stack not modeled, mirrors the legacy lift)
+                m == "int3" || m == "cdqe" || m == "cdq" || m == "cqo" || m == "pop")
+                continue;   // no statement (pop: stack not modeled, mirrors the legacy lift)
 
             if (m == "mov" || m == "movzx" || m == "movsx" || m == "movsxd" || m == "movabs" ||
                 m == "movq" || m == "movd") {
@@ -716,24 +863,29 @@ struct Analyzer {
                 continue;
             }
             if (m == "call") {
+                // Recover the call's arguments BEFORE clobbering the volatile arg
+                // registers below (rcx/rdx/r8/r9 hold the Win64 integer args here).
+                std::string args = renderCallArgs(e, reads);
                 std::string callee;
                 if (in.branchTarget) { std::string nm = nameFor ? nameFor(in.branchTarget) : std::string();
                     if (nm.empty()) { char c[24]; std::snprintf(c, sizeof(c), "sub_%llX", (unsigned long long)in.branchTarget); nm = c; }
-                    callee = nm + "()"; }
+                    callee = nm; }
                 else {
                     // Indirect call: resolve `call [iat]` to the import name when known.
                     std::string tok = (da.kind == OK::Mem && da.mem.dispOnly) ? dref((uint64_t)da.mem.disp) : std::string();
-                    if (!tok.empty() && tok.front() != '"') callee = tok + "()";
-                    else { std::set<std::string> rd; bool ml2 = false; callee = "(*" + renderRValue(e, da, rd, deps, ml2) + ")()"; reads.insert(rd.begin(), rd.end()); }
+                    if (!tok.empty() && tok.front() != '"') callee = tok;
+                    else { std::set<std::string> rd; bool ml2 = false; callee = "(*" + renderRValue(e, da, rd, deps, ml2) + ")"; reads.insert(rd.begin(), rd.end()); }
                 }
+                std::string callExpr = callee + "(" + args + ")";
                 // A call returns in rax (Win64) and clobbers the volatile registers.
                 std::string raxNm = nameOf(regLoc(RAX)); markAssigned(raxNm); noteWidth(raxNm, 8);
-                Stmt s; s.side = true; s.dst = raxNm; s.callRhs = callee; s.text = raxNm + " = " + callee + ";";
+                Stmt s; s.side = true; s.dst = raxNm; s.callRhs = callExpr; s.text = raxNm + " = " + callExpr + ";";
                 s.reads.assign(reads.begin(), reads.end());
                 out.push_back(std::move(s));
                 const int vol[] = { RAX, RCX, RDX, 8, 9, 10, 11 };
                 for (int r : vol) { e.v.erase(regLoc(r)); killDep(e, regLoc(r)); }
                 killMemory(e); killStackSlots(e);   // callee may write through a passed &local
+                pendingPush_.clear();               // consumed: the next call starts a fresh group
                 continue;
             }
             if (m.size() > 3 && m.rfind("set", 0) == 0) {        // setcc (8-bit dst)
@@ -864,6 +1016,8 @@ struct Analyzer {
         termFlag_.assign(N, {});
         retHasInline_.assign(N, false); retInline_.assign(N, {}); retInlineReads_.assign(N, {});
         retExpr_.assign(N, {}); retReads_.assign(N, {});
+        r.retComment.assign(N, {});
+        is32_ = looksLike32();   // settle the ABI once (arg detection + call-arg recovery)
         detectArgs();
 
         // ---- inter-block reaching-definitions (sparse constant/copy propagation) ----
@@ -916,6 +1070,10 @@ struct Analyzer {
                 if (!g.blocks[i].isReturn) continue;
                 if (retHasInline_[i]) { retExpr_[i] = retInline_[i]; retReads_[i] = retInlineReads_[i]; }
                 else                  { retExpr_[i] = raxNm; retReads_[i] = { raxNm }; }
+                // The inlined return expression folded to pure constant math:
+                // spell out the value as a trailing comment (display-only).
+                if (long long cv = 0; tryFoldConst(retExpr_[i], cv))
+                    r.retComment[i] = " /* = " + immText(cv) + " */";
             }
 
         eliminateDead();
@@ -953,9 +1111,10 @@ struct Analyzer {
 
 DataFlowResult AnalyzeDataFlow(const ControlFlowGraph& g,
                                const std::function<std::string(uint64_t)>& nameFor,
-                               const std::function<std::string(uint64_t)>& dataRefFor) {
+                               const std::function<std::string(uint64_t)>& dataRefFor,
+                               bool recoverCallArgs) {
     if (g.blocks.empty()) return {};
-    Analyzer a(g, nameFor, dataRefFor);
+    Analyzer a(g, nameFor, dataRefFor, recoverCallArgs);
     return a.run();
 }
 

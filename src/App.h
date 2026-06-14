@@ -12,15 +12,21 @@
 #include "Core/AnalysisService.h"
 #include "Core/BinaryFile.h"
 #include "Core/Debugger.h"
+#include "Core/JavaScan.h"
+#include "Core/JdwpClient.h"
 #include "Core/LiveScanService.h"
 #include "Core/ModuleRegistry.h"
 #include "Core/Project.h"
+#include "Core/RuntimeScan.h"
 #include "Disasm/DisassemblerFactory.h"
+#include "Disasm/JvmDisassembler.h"   // AttachJvmClass (JavaClass symbolication)
+#include "Ui/CommandPalette.h"
 #include "Ui/Theme.h"
 
 namespace ds {
 
 class ITab;
+class BinaryViewTab;
 
 // Shared, app-wide state passed by reference to every tab.
 struct AppContext {
@@ -35,6 +41,7 @@ struct AppContext {
     std::unique_ptr<IDisassembler> disasm;
     std::string                    requestedTab;
     bool                           requestedLiveAssembly = false;
+    bool                           requestResetDockLayout = false; // View > Reset Layout, consumed by Binary View's dockspace
     bool                           requestedExportAnalysis = false; // File > Export Analysis, consumed by Binary View
     bool                           binaryJustLoaded      = false; // set on load, consumed by Binary View
     uint64_t                       requestedGotoVA       = 0;     // cross-tab "view this address" request
@@ -42,6 +49,32 @@ struct AppContext {
     bool                           requestedGotoLive     = false; // goto target is a runtime VA -> open the live view (no file-VA translation)
     std::string                    pendingSignature;             // Binary View -> Sig Scanner pattern handoff
     bool                           pendingSignatureLive  = false; // pendingSignature was built from live process memory -> scan live, not the file
+
+    // Live JVM debugger (JDWP over a socket): attach via the Communications
+    // tab's "Java debug (JDWP)" console. Independent of `debug` (the Win32
+    // debugger) — a JVM target can have both attached at once (native frames
+    // via debug, bytecode-level control via jdwp).
+    JdwpClient                     jdwp;
+    // PID of the JVM the JDWP session is attached to (0 = none). JDWP itself is a
+    // socket and carries no PID, so the inject path records it here so other views
+    // (e.g. the Connections tab's "attached process only") can scope to it.
+    uint32_t                       jdwpTargetPid = 0;
+
+    // Java wrapper / embedded-JAR detection for the loaded binary. Recomputed on
+    // every load (cheap, synchronous after cancelAndWaitIdle) and deliberately
+    // NOT persisted to the sidecar. kind == None for non-Java targets.
+    JavaScanResult                 javaInfo;
+    // Multi-runtime wrapper/container verdict (RuntimeScan over javaInfo).
+    // Recomputed with javaInfo on every load; not persisted.
+    RuntimeScanResult              runtimeInfo;
+    bool                           requestedExtractJava  = false; // banner button -> App::extractEmbeddedJar (same pattern as requestedExportAnalysis)
+    bool                           requestedBrowseArchive = false; // banner/menu -> App opens the archive-entries popup
+
+    // A tab sets this true during render() when it needs the UI to keep redrawing
+    // even while idle (e.g. the live connection monitor's auto-refresh). Reset to
+    // false at the top of every App::render(), so only a tab rendered this frame
+    // can keep it on. Read by App::wantsContinuousRedraw().
+    bool                           wantContinuousRedraw = false;
 
     // Binary View cursor, mirrored here each frame so the status bar can show it
     // (the tab's cursorVA_ is private). cursorFuncName is the enclosing function.
@@ -79,12 +112,33 @@ struct AppContext {
 
     void rebuildDisassembler() {
         disasm = MakeDisassembler(engine, arch);
+        // Java class: attach the parsed class file so the UI decoder resolves
+        // constant-pool operands (no-op for every other backend).
+        if (arch == Arch::JVM && binary.javaClass())
+            AttachJvmClass(*disasm, binary.javaClass());
         // The Debugger owns its own decoder, so it is not wired to the UI engine.
     }
 
     void openLiveAssemblyView() {
         requestedTab = "Binary View";
         requestedLiveAssembly = true;
+    }
+
+    // True when Launch & Debug can hand the loaded binary to CreateProcess: a PE
+    // image opened from disk. Live memory mappings have no launchable file behind
+    // them, and Windows can't start ELF/Mach-O/.class/raw images directly.
+    bool binaryLaunchable() const {
+        return binary.loaded() && !binary.isMappedImage() &&
+               (binary.format() == BinFormat::PE32 || binary.format() == BinFormat::PE32Plus);
+    }
+
+    // Launch the loaded binary under the debugger (break at entry) and open the
+    // live view. The one shared path for the toolbar / command palette / Binary
+    // View Run button. Returns false with `err` set on failure.
+    bool launchAndDebug(std::string& err) {
+        if (!debug.launchAndAttach(binary.path(), err)) return false;
+        openLiveAssemblyView();
+        return true;
     }
 
     // Opens a Win32 file dialog and loads the chosen binary. Returns true on
@@ -145,22 +199,32 @@ public:
 private:
     void renderMenuBar();
     void renderDebugToolbar(const DbgSnapshot& snap);
-    void renderMainWindow();
+    void renderMainWindow(const DbgSnapshot& snap);
+    void renderTabCardStrip(const DbgSnapshot& snap);  // horizontal tab-card strip (section switcher)
     void renderStatusBar(const DbgSnapshot& snap);
+    void openCommandPalette(const DbgSnapshot& snap);  // build the Ctrl+K action list + symbol snapshot
     void openFileDialog();
     void openRawFileDialog();   // pick a file, then prompt for base + arch
     void renderRawLoadPopup();
-    void saveBinaryAs();        // splice accumulated patches into a copy on disk
-    void renderSaveResultPopup();
+    void saveBinaryAs();        // splice accumulated patches into a copy on disk (result -> toast)
+    void extractEmbeddedJar();  // carve ctx_.javaInfo's jar/zip span to a file (result -> toast)
+    void openArchiveBrowser();  // snapshot ctx_.javaInfo's archive into archiveBrowser_ + open the popup
+    void renderArchiveBrowser(); // "Archive Entries" modal: list / open-as-binary / extract one entry
+    void extractArchiveEntryToFile(const JavaZipEntry& e);  // Save dialog writing the DECOMPRESSED entry bytes
     void loadPrefs();           // read persisted UI prefs (theme) from %APPDATA%
     void savePrefs() const;     // write them back
+    void closeBinary();         // flush + unload the current binary (menu / file tab / palette)
 
     AppContext                          ctx_;
     std::vector<std::unique_ptr<ITab>>  tabs_;
+    BinaryViewTab*                      binaryView_ = nullptr;  // typed handle into tabs_ (symbol source for the palette)
+    ui::CommandPalette                  palette_;               // Ctrl+K command palette
+    int                                 activeTab_ = 0;   // index into tabs_ (rail selection)
     bool                                exit_      = false;
     bool                                showDemo_  = false;
     bool                                showAbout_ = false;
-    theme::ThemeId                      theme_     = theme::ThemeId::Midnight;
+    theme::ThemeId                      theme_     = theme::ThemeId::Paper;
+    theme::Density                      density_   = theme::Density::Comfortable;
 
     // Raw-load prompt state.
     bool                                openRawPopup_ = false;
@@ -168,12 +232,20 @@ private:
     char                                rawBaseBuf_[32] = "0x140000000";
     int                                 rawArchSel_   = 1;   // 0=x86 1=x64 2=ARM 3=ARM64
 
-    // Save-binary result message.
-    bool                                openSaveResult_ = false;
-    std::string                         saveResultMsg_;
+    // Archive-entries browser state, snapshotted at open time: "Open as binary"
+    // replaces the loaded binary while the popup is up, so entry extraction always
+    // re-reads sourcePath from disk instead of touching ctx_.binary.
+    struct ArchiveBrowserState {
+        bool        open = false;          // open-request flag, consumed by renderArchiveBrowser
+        std::string sourcePath;            // file containing the archive (UTF-8, as BinaryFile::path)
+        std::string sourceName;            // display base name of sourcePath
+        uint64_t    zipBase = 0;           // file offset of the zip start (javaInfo.jarOffset)
+        std::vector<JavaZipEntry> entries; // central-directory snapshot (capped upstream)
+        char        filter[128] = {};
+        int         selected = -1;
+    };
+    ArchiveBrowserState                 archiveBrowser_;
 
-    // Last "Launch & Debug" error, shown in the toolbar until the next launch.
-    std::string                         launchMsg_;
 };
 
 } // namespace ds

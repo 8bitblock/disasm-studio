@@ -11,6 +11,8 @@
 // guessFunctionNames, and buildFullListing respectively; keep them in lock-step
 // with those if the originals change.
 //
+#include "Decompiler.h"   // DecompResult (DecompileRegion's text + per-line VA map)
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -100,5 +102,15 @@ std::vector<CallEdgeR> BuildCallEdges(const BinaryFile& bin, IDisassembler& dis,
 // ScanAlgorithms — kept here so the background worker invokes it like the other passes.
 std::vector<AlgoMatch> ScanAlgorithmsJob(const BinaryFile& bin, const XrefIndex* xref,
                                          const std::vector<FuncResult>& functions);
+
+// Decompile the function in [lo, hi) to structured pseudo-C off the UI thread (the
+// K_Decompile pass). Mirrors BinaryViewTab::decompileFunctionText's pipeline (BuildCFG
+// then Decompile), but resolves call/data names with BASE resolution only — imported
+// API names from bin.imports() and inline string literals — because the worker can't
+// see the UI's user renames or jump-table heuristics. `x86` gates the arg-header (set
+// false for non-x86 so no spurious params are listed). Returns {"",{}} if [lo,hi) is
+// unmapped. The per-line VA map (DecompResult::lineVA) backs pseudocode->asm clicks.
+DecompResult DecompileRegion(const BinaryFile& bin, IDisassembler& dis,
+                             bool x86, uint64_t lo, uint64_t hi);
 
 } // namespace ds

@@ -38,6 +38,7 @@ struct DataFlowResult {
     std::vector<FlagState>                termFlag;       // flags feeding each block's terminator
     std::vector<std::string>              decls;          // inferred local declarations
     std::vector<std::string>              retExpr;        // per block: `return <expr>` text ("" => bare return)
+    std::vector<std::string>              retComment;     // per block: trailing "/* = 0x.. */" when retExpr folds to a constant ("" => none)
     std::unordered_map<int, DfForLoop>    forLoops;       // header block index -> for-loop triple
     std::vector<std::string>              args;           // detected parameter names a1..aN (for the function header)
 };
@@ -45,8 +46,11 @@ struct DataFlowResult {
 // Analyze a function CFG and produce named, propagated, type-annotated pseudo-C
 // per basic block. `nameFor` resolves a call/branch target VA to a display name;
 // `dataRefFor` resolves a constant data address to a string/import/global token.
+// `recoverCallArgs` enables per-call argument recovery (Win64 register args /
+// x86 push-chain args inlined at the call site); false keeps bare `callee()`.
 DataFlowResult AnalyzeDataFlow(const ControlFlowGraph& g,
                                const std::function<std::string(uint64_t)>& nameFor,
-                               const std::function<std::string(uint64_t)>& dataRefFor = {});
+                               const std::function<std::string(uint64_t)>& dataRefFor = {},
+                               bool recoverCallArgs = true);
 
 } // namespace ds

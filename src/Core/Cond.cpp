@@ -101,43 +101,63 @@ static bool evalOperand(const std::string& tokIn, const CondContext& ctx, uint64
     return evalCompiledOperand(o, ctx, out);
 }
 
-// Find the comparison operator in `expr`. Returns its position + fills `op`
-// (two-char operators take priority, then the single-char < / >), or npos.
+// Find the comparison operator in `expr`. Returns its position + fills `op`.
+// Earliest occurrence wins; on a same-position tie the longer operator wins
+// ("s<=" beats "s<" beats "<"). The signed forms are 's'-prefixed and accepted
+// only at a word boundary, so a register name ending in 's' can never donate
+// its trailing letter to the operator ("rflags<0" must parse as rflags < 0,
+// not "rflag s< 0").
 static size_t findCompareOp(const std::string& expr, std::string& op) {
-    static const char* ops2[] = { "==", "!=", "<=", ">=" };
+    auto boundaryOk = [&](size_t p) {
+        return p == 0 || !(std::isalnum((unsigned char)expr[p - 1]) || expr[p - 1] == '_');
+    };
+    // First occurrence of `tok`; for the s-prefixed forms, skip non-boundary hits.
+    auto findTok = [&](const char* tok, bool guarded) {
+        size_t p = expr.find(tok);
+        while (guarded && p != std::string::npos && !boundaryOk(p)) p = expr.find(tok, p + 1);
+        return p;
+    };
+    struct Cand { const char* tok; bool guarded; };
+    // Longer forms listed first so a same-position tie keeps the longer operator.
+    static const Cand cands[] = { {"s<=", true}, {"s>=", true},
+                                  {"==", false}, {"!=", false}, {"<=", false}, {">=", false},
+                                  {"s<", true},  {"s>", true},
+                                  {"<", false},  {">", false} };
     size_t pos = std::string::npos;
     op.clear();
-    for (const char* o : ops2) {
-        size_t p = expr.find(o);
-        if (p != std::string::npos && (pos == std::string::npos || p < pos)) { pos = p; op = o; }
-    }
-    if (pos == std::string::npos) {
-        for (char c : {'<', '>'}) {
-            size_t p = expr.find(c);
-            if (p != std::string::npos && (pos == std::string::npos || p < pos)) { pos = p; op = std::string(1, c); }
-        }
+    for (const auto& c : cands) {
+        size_t p = findTok(c.tok, c.guarded);
+        if (p != std::string::npos && (pos == std::string::npos || p < pos)) { pos = p; op = c.tok; }
     }
     return pos;
 }
 
 static bool opFromStr(const std::string& s, CondOp& out) {
-    if (s == "==") { out = CondOp::Eq; return true; }
-    if (s == "!=") { out = CondOp::Ne; return true; }
-    if (s == "<")  { out = CondOp::Lt; return true; }
-    if (s == ">")  { out = CondOp::Gt; return true; }
-    if (s == "<=") { out = CondOp::Le; return true; }
-    if (s == ">=") { out = CondOp::Ge; return true; }
+    if (s == "==")  { out = CondOp::Eq;  return true; }
+    if (s == "!=")  { out = CondOp::Ne;  return true; }
+    if (s == "<")   { out = CondOp::Lt;  return true; }
+    if (s == ">")   { out = CondOp::Gt;  return true; }
+    if (s == "<=")  { out = CondOp::Le;  return true; }
+    if (s == ">=")  { out = CondOp::Ge;  return true; }
+    if (s == "s<")  { out = CondOp::SLt; return true; }
+    if (s == "s>")  { out = CondOp::SGt; return true; }
+    if (s == "s<=") { out = CondOp::SLe; return true; }
+    if (s == "s>=") { out = CondOp::SGe; return true; }
     return false;
 }
 
 static bool applyOp(CondOp op, uint64_t lhs, uint64_t rhs) {
     switch (op) {
-        case CondOp::Eq: return lhs == rhs;
-        case CondOp::Ne: return lhs != rhs;
-        case CondOp::Lt: return lhs <  rhs;
-        case CondOp::Gt: return lhs >  rhs;
-        case CondOp::Le: return lhs <= rhs;
-        case CondOp::Ge: return lhs >= rhs;
+        case CondOp::Eq:  return lhs == rhs;
+        case CondOp::Ne:  return lhs != rhs;
+        case CondOp::Lt:  return lhs <  rhs;
+        case CondOp::Gt:  return lhs >  rhs;
+        case CondOp::Le:  return lhs <= rhs;
+        case CondOp::Ge:  return lhs >= rhs;
+        case CondOp::SLt: return (int64_t)lhs <  (int64_t)rhs;
+        case CondOp::SGt: return (int64_t)lhs >  (int64_t)rhs;
+        case CondOp::SLe: return (int64_t)lhs <= (int64_t)rhs;
+        case CondOp::SGe: return (int64_t)lhs >= (int64_t)rhs;
     }
     return false;
 }

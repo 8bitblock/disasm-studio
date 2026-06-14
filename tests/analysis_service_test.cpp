@@ -189,6 +189,47 @@ int main() {
         CHECK(reset, "module batch resets after the last module completes");
     }
 
+    // ---- DecompileRegion (the K_Decompile job body) ----
+    // The stub decodes every byte as a nop, so [base, base+8) builds a trivial CFG that
+    // Decompile turns into a small but non-empty function body.
+    {
+        StubDisasm stub;
+        DecompResult t = DecompileRegion(bin, stub, /*x86=*/true, base, base + 8);
+        CHECK(!t.text.empty(), "DecompileRegion produced non-empty pseudo-C");
+        // The per-line VA map parallels the text: one entry per '\n'-line.
+        size_t nl = 0; for (char c : t.text) if (c == '\n') ++nl;
+        CHECK(t.lineVA.size() == nl, "DecompileRegion lineVA parallels the text lines");
+        // hi <= lo and unmapped regions yield an empty result (no crash).
+        CHECK(DecompileRegion(bin, stub, true, base, base).text.empty(), "DecompileRegion empty for hi<=lo");
+        CHECK(DecompileRegion(bin, stub, true, 0xDEAD0000ull, 0xDEAD0010ull).text.empty(),
+              "DecompileRegion empty for an unmapped region");
+    }
+
+    // ---- K_Decompile bulk pass ----
+    // A single-region job delivers a decompValid result tagged with the function VA and
+    // the region it targeted (mirrors the K_Synthesis/K_PathExplore region-job contract).
+    {
+        uint64_t e = svc.epoch();
+        svc.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile, false, e,
+                        /*moduleBase=*/0, /*regionLo=*/base, /*regionHi=*/base + 8);
+        AnalysisResult got; got.epoch = e;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+        bool have = false;
+        while (std::chrono::steady_clock::now() < deadline && !have) {
+            AnalysisResult tmp;
+            while (svc.tryTakeBulk(tmp)) {
+                if (tmp.epoch != e) continue;
+                if (tmp.decompValid) { got = tmp; have = true; }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(have, "K_Decompile delivered a decompValid result");
+        CHECK(got.decompVA == base, "K_Decompile result tagged with the region start VA");
+        CHECK(got.regionLo == base && got.regionHi == base + 8, "K_Decompile result carries its region");
+        CHECK(!got.decompText.empty(), "K_Decompile result has pseudo-C text");
+        svc.cancelAndWaitIdle();
+    }
+
     // cancelAndWaitIdle leaves the pool idle (no pending work, progress back to Idle).
     {
         svc.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings, false, svc.epoch());

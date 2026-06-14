@@ -3,7 +3,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -47,6 +51,10 @@ static bool split2(const std::string& ops, std::string& a, std::string& b) {
 // Defined further down; forward-declared so liftStmt can render setcc / cmovcc
 // (which read the flags a preceding cmp/test set) as real conditions.
 static std::string condString(const std::string& mnem, const FlagState& fl, bool negate);
+
+// Defined in the Python section below; forward-declared so the Structurer's
+// condition-gloss post-pass can match an `if (...)` condition's parentheses.
+static size_t pyMatchParen(const std::string& s, size_t open);
 
 // Lift one instruction to a C-ish statement. Returns "" for instructions that
 // produce no statement (nop, leave, the cmp/test that only set flags). Updates
@@ -265,7 +273,11 @@ struct Structurer {
 
     int N;
     std::unordered_map<uint64_t, int> startToIdx;
-    std::vector<std::vector<std::string>> stmts;   // lifted body statements per block
+    // Lifted body statements per block, each tagged with its source VA: the
+    // instruction address in the legacy lift, the block start in the deep
+    // data-flow path (whose const-prop/DCE merges statements, so only block
+    // granularity survives). Feeds DecompResult::lineVA.
+    std::vector<std::vector<std::pair<std::string, uint64_t>>> stmts;
     std::vector<FlagState>  flag;                  // flag state feeding the terminator
     std::vector<std::string> condMnem;             // terminator Jcc mnemonic (cond blocks)
     std::vector<Term::Kind>  term;
@@ -285,7 +297,10 @@ struct Structurer {
     struct LoopCtx { int header, follow; };
     std::vector<LoopCtx> loopStack;
 
-    std::string out;
+    // Output is collected as parallel line / source-VA vectors (one entry per
+    // emitted line; va 0 = synthetic) and joined into the final text by run().
+    std::vector<std::string> lines_;
+    std::vector<uint64_t>    lineVAs_;
     bool collecting = false;     // pass 1: discover labels; pass 2: emit
     int  emitted = 0;            // guard against pathological blow-up
 
@@ -295,7 +310,7 @@ struct Structurer {
     Structurer(const ControlFlowGraph& cfg, const DecompileOptions& o) : g(cfg), opt(o) {
         N = (int)g.blocks.size();
         deep_ = o.deepDataFlow;
-        if (deep_) { df_ = AnalyzeDataFlow(cfg, o.nameFor, o.dataRefFor); if (!df_.ok) deep_ = false; }
+        if (deep_) { df_ = AnalyzeDataFlow(cfg, o.nameFor, o.dataRefFor, o.callArgs); if (!df_.ok) deep_ = false; }
         build();
     }
 
@@ -317,7 +332,10 @@ struct Structurer {
             // the per-instruction string lift. The terminator (ret/jmp/jcc) is
             // handled by the structuring below in both cases.
             if (deep_) {
-                stmts[i] = df_.blockStmts[i];
+                // Data-flow statements have no 1:1 instruction origin (const-prop /
+                // DCE rewrote them); tag each with the block start.
+                stmts[i].reserve(df_.blockStmts[i].size());
+                for (auto& s : df_.blockStmts[i]) stmts[i].emplace_back(s, b.start);
                 flag[i]  = df_.termFlag[i];
             } else {
                 FlagState fl;
@@ -327,7 +345,7 @@ struct Structurer {
                 if (isTerm && bodyCount > 0) --bodyCount;  // exclude terminator
                 for (size_t k = 0; k < bodyCount; ++k) {
                     std::string s = liftStmt(b.insns[k], fl, opt.nameFor);
-                    if (!s.empty()) stmts[i].push_back(std::move(s));
+                    if (!s.empty()) stmts[i].emplace_back(std::move(s), b.insns[k].address);
                 }
                 flag[i] = fl;
             }
@@ -445,8 +463,21 @@ struct Structurer {
     std::string locLabel(int idx) const {
         char b[32]; std::snprintf(b, sizeof(b), "loc_%llX", (unsigned long long)g.blocks[idx].start); return b;
     }
-    void line(int depth, const std::string& s) { if (!collecting) { out.append((size_t)depth * 4, ' '); out += s; out += '\n'; } }
-    void rawline(const std::string& s)         { if (!collecting) { out += s; out += '\n'; } }
+    void line(int depth, const std::string& s, uint64_t va = 0) {
+        if (collecting) return;
+        std::string l((size_t)depth * 4, ' '); l += s;
+        lines_.push_back(std::move(l)); lineVAs_.push_back(va);
+    }
+    void rawline(const std::string& s, uint64_t va = 0) {
+        if (collecting) return;
+        lines_.push_back(s); lineVAs_.push_back(va);
+    }
+    // Source VA for block n's terminator lines (return/goto/if/switch/while):
+    // its last instruction, or the block start for an empty block.
+    uint64_t termVA(int n) const {
+        if (n < 0 || n >= N) return 0;
+        return g.blocks[n].insns.empty() ? g.blocks[n].start : g.blocks[n].insns.back().address;
+    }
 
     // A control transfer to block t from inside the current context: returns a
     // full statement (continue/break/goto) or "" meaning "emit t inline here".
@@ -472,11 +503,11 @@ struct Structurer {
         return "";
     }
 
-    void emitStmts(int n, int depth) { for (auto& s : stmts[n]) line(depth, s); }
+    void emitStmts(int n, int depth) { for (auto& s : stmts[n]) line(depth, s.first, s.second); }
 
     void emitFrom(int n, int stop, int depth) {
         while (n >= 0 && n != stop) {
-            if (visited[n]) { needLabel[n] = 1; line(depth, "goto " + locLabel(n) + ";"); return; }
+            if (visited[n]) { needLabel[n] = 1; line(depth, "goto " + locLabel(n) + ";", g.blocks[n].start); return; }
             if (isHeader[n] && (loopStack.empty() || loopStack.back().header != n)) {
                 emitLoop(n, depth);
                 int f = loopFollow[n];
@@ -486,7 +517,7 @@ struct Structurer {
             }
             visited[n] = 1;
             if (++emitted > 100000) { line(depth, "/* output truncated */"); return; }
-            if (needLabel[n]) rawline(locLabel(n) + ":");
+            if (needLabel[n]) rawline(locLabel(n) + ":", g.blocks[n].start);
             emitStmts(n, depth);
             n = emitTerminator(n, depth);
         }
@@ -494,37 +525,41 @@ struct Structurer {
 
     // Emit block n's terminator. Returns the next block to continue inline, or -1.
     int emitTerminator(int n, int depth) {
+        const uint64_t tva = termVA(n);
         switch (term[n]) {
             case Term::Return:
-                if (deep_ && n < (int)df_.retExpr.size() && !df_.retExpr[n].empty())
-                    line(depth, "return " + df_.retExpr[n] + ";");
-                else
-                    line(depth, "return;");
+                if (deep_ && n < (int)df_.retExpr.size() && !df_.retExpr[n].empty()) {
+                    // retComment carries "/* = 0x.. */" when the inlined return
+                    // expression folded to a constant (display-only suffix).
+                    std::string cmt = (n < (int)df_.retComment.size()) ? df_.retComment[n] : std::string();
+                    line(depth, "return " + df_.retExpr[n] + ";" + cmt, tva);
+                } else
+                    line(depth, "return;", tva);
                 return -1;
             case Term::External: {
                 char b[40]; std::snprintf(b, sizeof(b), "goto loc_%llX; /* tail */", (unsigned long long)extTarget[n]);
-                line(depth, b); return -1;
+                line(depth, b, tva); return -1;
             }
             case Term::Uncond: {
                 int t = uncondIdx[n];
                 std::string a = goTo(t);
                 if (a.empty()) return t;
                 if (a == "continue;") return -1;   // natural loop-back; the while `}` re-loops
-                line(depth, a); return -1;
+                line(depth, a, tva); return -1;
             }
             case Term::Switch: {
                 // Recovered jump table -> switch/case. Cases are labelled by table
                 // index; each body runs to the switch's post-dominator (the join),
                 // then breaks. Already-emitted targets become goto/continue/break.
                 int join = ipdom[n];
-                line(depth, "switch (" + (switchExpr[n].empty() ? std::string("switch_index") : switchExpr[n]) + ") {");
+                line(depth, "switch (" + (switchExpr[n].empty() ? std::string("switch_index") : switchExpr[n]) + ") {", tva);
                 for (size_t c = 0; c < caseIdx[n].size(); ++c) {
                     char cl[32]; std::snprintf(cl, sizeof(cl), "case %zu:", c);
-                    line(depth, cl);
+                    line(depth, cl, tva);
                     int t = caseIdx[n][c];
-                    if (t < 0) { line(depth + 1, "break; /* unresolved case */"); continue; }
+                    if (t < 0) { line(depth + 1, "break; /* unresolved case */", tva); continue; }
                     std::string a = goTo(t);
-                    if (!a.empty()) { line(depth + 1, a); continue; }
+                    if (!a.empty()) { line(depth + 1, a, g.blocks[t].start); continue; }
                     // Stop bound for this case body: the post-dominator join when one
                     // exists, else (no reconvergence; join == -1) the NEAREST distinct
                     // sibling-case entry by address. A -1 ("run to exit") stop would let
@@ -544,9 +579,9 @@ struct Structurer {
                         }
                     }
                     emitFrom(t, stop, depth + 1);
-                    line(depth + 1, "break;");
+                    line(depth + 1, "break;", tva);
                 }
-                line(depth, "}");
+                line(depth, "}", tva);
                 return join;
             }
             case Term::Fall: {
@@ -554,7 +589,7 @@ struct Structurer {
                 std::string a = goTo(t);
                 if (a.empty()) return t;
                 if (a == "continue;") return -1;
-                line(depth, a); return -1;
+                line(depth, a, tva); return -1;
             }
             case Term::Cond: {
                 int ct = trueIdx[n], cf = falseIdx[n];
@@ -562,23 +597,23 @@ struct Structurer {
                 // External taken target.
                 if (ct < 0) {
                     char tgt[24]; std::snprintf(tgt, sizeof(tgt), "%llX", (unsigned long long)extTarget[n]);
-                    line(depth, "if (" + cond + ") goto loc_" + tgt + ";");  // don't truncate an unbounded condition
+                    line(depth, "if (" + cond + ") goto loc_" + tgt + ";", tva);  // don't truncate an unbounded condition
                     std::string af = goTo(cf);
                     if (af.empty()) return cf;
-                    line(depth, af); return -1;
+                    line(depth, af, tva); return -1;
                 }
                 std::string at = goTo(ct), af = goTo(cf);
                 if (!at.empty() && !af.empty()) {                 // both branches exit
-                    line(depth, "if (" + cond + ") " + at);
-                    line(depth, af);
+                    line(depth, "if (" + cond + ") " + at, tva);
+                    line(depth, af, tva);
                     return -1;
                 }
                 if (!at.empty()) {                                 // taken exits; fall continues inline
-                    line(depth, "if (" + cond + ") " + at);
+                    line(depth, "if (" + cond + ") " + at, tva);
                     return cf;
                 }
                 if (!af.empty()) {                                 // fallthrough exits; invert
-                    line(depth, "if (" + condString(condMnem[n], flag[n], true) + ") " + af);
+                    line(depth, "if (" + condString(condMnem[n], flag[n], true) + ") " + af, tva);
                     return ct;
                 }
                 // Structured if / if-else with a post-dominator join.
@@ -588,27 +623,27 @@ struct Structurer {
                     // Bound the then-arm by the else's entry so it can't overrun and
                     // swallow the else / tail, then continue inline from cf. (-1 as the
                     // stop would never match a real block, so the then would run away.)
-                    line(depth, "if (" + cond + ") {");
+                    line(depth, "if (" + cond + ") {", tva);
                     emitFrom(ct, cf, depth + 1);
-                    line(depth, "}");
+                    line(depth, "}", tva);
                     return cf;
                 }
                 bool thenEmpty = (ct == f);
                 bool elseEmpty = (cf == f);
                 if (thenEmpty && elseEmpty) return f;          // condition has no body
                 if (thenEmpty) {                               // invert so the body isn't an empty 'then'
-                    line(depth, "if (" + condString(condMnem[n], flag[n], true) + ") {");
+                    line(depth, "if (" + condString(condMnem[n], flag[n], true) + ") {", tva);
                     emitFrom(cf, f, depth + 1);
-                    line(depth, "}");
+                    line(depth, "}", tva);
                     return f;
                 }
-                line(depth, "if (" + cond + ") {");
+                line(depth, "if (" + cond + ") {", tva);
                 emitFrom(ct, f, depth + 1);
-                line(depth, "}");
+                line(depth, "}", tva);
                 if (!elseEmpty) {
-                    line(depth, "else {");
+                    line(depth, "else {", tva);
                     emitFrom(cf, f, depth + 1);
-                    line(depth, "}");
+                    line(depth, "}", tva);
                 }
                 return f;
             }
@@ -618,7 +653,7 @@ struct Structurer {
 
     void emitLoop(int h, int depth) {
         visited[h] = 1;
-        if (needLabel[h]) rawline(locLabel(h) + ":");
+        if (needLabel[h]) rawline(locLabel(h) + ":", g.blocks[h].start);
         int follow = loopFollow[h];
 
         // Pre-tested if the header itself is the 2-way test with one arm leaving
@@ -641,15 +676,15 @@ struct Structurer {
         loopStack.push_back({ h, follow });
         if (pretested) {
             std::string cond = condString(condMnem[h], flag[h], /*negate=*/!bodyIsTrue);
-            line(depth, "while (" + cond + ") {");
+            line(depth, "while (" + cond + ") {", termVA(h));
             emitFrom(bodyEntry, h, depth + 1);
-            line(depth, "}");
+            line(depth, "}", termVA(h));
         } else {
-            line(depth, "while (1) {");
+            line(depth, "while (1) {", g.blocks[h].start);
             emitStmts(h, depth + 1);
             int nxt = emitTerminator(h, depth + 1);
             emitFrom(nxt, h, depth + 1);
-            line(depth, "}");
+            line(depth, "}", g.blocks[h].start);
         }
         loopStack.pop_back();
     }
@@ -657,11 +692,10 @@ struct Structurer {
     // Stage 4: post-pass that turns a `while (COND) { ...; i++; }` whose induction
     // variable `i` (incremented/decremented as the last body statement and tested
     // in COND) into `for (; COND; i++) { ... }`. Purely textual and conservative:
-    // any loop that doesn't match the exact shape is left as a while.
-    static std::string reconstructForLoops(const std::string& in) {
-        std::vector<std::string> L;
-        for (size_t s = 0, i = 0; i <= in.size(); ++i)
-            if (i == in.size() || in[i] == '\n') { L.push_back(in.substr(s, i - s)); s = i + 1; }
+    // any loop that doesn't match the exact shape is left as a while. Operates on
+    // the line/VA vectors in place (the rewritten `for` keeps the while header's
+    // VA; the hoisted step line's VA entry is erased with it).
+    static void reconstructForLoops(std::vector<std::string>& L, std::vector<uint64_t>& V) {
         auto indentOf = [](const std::string& l) { size_t i = 0; while (i < l.size() && (l[i] == ' ' || l[i] == '\t')) ++i; return l.substr(0, i); };
         auto trimd = [](const std::string& l) { size_t a = l.find_first_not_of(" \t"); size_t b = l.find_last_not_of(" \t"); return a == std::string::npos ? std::string() : l.substr(a, b - a + 1); };
         auto isIdent = [](const std::string& s) {
@@ -720,29 +754,274 @@ struct Structurer {
             if (!wordIn(cond, id)) continue;
             L[i] = ind + "for (; " + cond + "; " + step + ") {";
             L.erase(L.begin() + s);
+            V.erase(V.begin() + s);
         }
-        std::string out;
-        for (size_t i = 0; i < L.size(); ++i) { out += L[i]; if (i + 1 < L.size()) out += '\n'; }
-        return out;
     }
 
-    std::string run(uint64_t funcStart) {
+    // ---- readability post-passes (Stage 5) -----------------------------------
+    // All three operate in place on the parallel line / VA vectors. They never
+    // touch the legacy lift (run() gates them behind deep_) and each keeps
+    // L.size() == V.size() so the per-line VA invariant holds.
+
+    static std::string ind_of(const std::string& l) { size_t i = 0; while (i < l.size() && (l[i] == ' ' || l[i] == '\t')) ++i; return l.substr(0, i); }
+    static std::string trim_(const std::string& l) { size_t a = l.find_first_not_of(" \t"); size_t b = l.find_last_not_of(" \t"); return a == std::string::npos ? std::string() : l.substr(a, b - a + 1); }
+    static bool identCh(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
+    // Whole-word occurrence count of `w` in `hay`.
+    static int wordCount(const std::string& hay, const std::string& w) {
+        int n = 0;
+        for (size_t p = hay.find(w); p != std::string::npos; p = hay.find(w, p + 1)) {
+            bool lok = p == 0 || !identCh(hay[p - 1]);
+            size_t e = p + w.size();
+            bool rok = e >= hay.size() || !identCh(hay[e]);
+            if (lok && rok) ++n;
+        }
+        return n;
+    }
+    // Replace every whole-word occurrence of `from` with `to` in `s`.
+    static std::string wordReplace(const std::string& s, const std::string& from, const std::string& to) {
+        std::string o; o.reserve(s.size());
+        for (size_t i = 0; i < s.size();) {
+            if (s.compare(i, from.size(), from) == 0) {
+                bool lok = i == 0 || !identCh(s[i - 1]);
+                size_t e = i + from.size();
+                bool rok = e >= s.size() || !identCh(s[e]);
+                if (lok && rok) { o += to; i = e; continue; }
+            }
+            o += s[i++];
+        }
+        return o;
+    }
+    // A "vN" temporary (decompiler-minted, safe to rename/fold): 'v' + digits.
+    static bool isTempVar(const std::string& id) {
+        if (id.size() < 2 || id[0] != 'v') return false;
+        for (size_t i = 1; i < id.size(); ++i) if (!std::isdigit((unsigned char)id[i])) return false;
+        return true;
+    }
+
+    // (A) Rename loop-counter temporaries (the `vN` driven by a reconstructed
+    // `for (; COND; vN++/--/+=)` header) to i / j / k. Pure whole-word token
+    // rename across every line — line count and VA map are untouched.
+    static void prettyNamesPass(std::vector<std::string>& L, std::vector<uint64_t>& V) {
+        (void)V;
+        std::vector<std::string> counters;   // discovered order -> i, j, k, ...
+        auto noteCounter = [&](const std::string& id) {
+            if (!isTempVar(id)) return;
+            for (auto& c : counters) if (c == id) return;
+            counters.push_back(id);
+        };
+        for (const std::string& l : L) {
+            std::string t = trim_(l);
+            if (t.rfind("for (; ", 0) != 0) continue;
+            size_t semi = t.rfind("; ");                       // step clause start
+            if (semi == std::string::npos) continue;
+            std::string step = t.substr(semi + 2);             // "vN++) {" / "vN += k) {"
+            // identifier at the head of the step
+            size_t e = 0; while (e < step.size() && identCh(step[e])) ++e;
+            if (e == 0) continue;
+            noteCounter(step.substr(0, e));
+        }
+        if (counters.empty()) return;
+        static const char* kNames[] = { "i", "j", "k", "m", "n" };
+        for (size_t c = 0; c < counters.size() && c < 5; ++c) {
+            const std::string& to = kNames[c];
+            // Don't collide with a name already present as a different identifier.
+            bool clash = false;
+            for (const std::string& l : L) if (wordCount(l, to) && wordCount(l, counters[c]) == 0) { clash = true; break; }
+            if (clash) continue;
+            for (std::string& l : L) l = wordReplace(l, counters[c], to);
+        }
+    }
+
+    // (B) Expression folding. Two intra-block, conservative rewrites that each
+    // erase one line and its matching VA entry (vectors stay equal length):
+    //
+    //   B1 coalesce  `vN = E;` + `vN OP= R;`  ->  `vN = (E) OP R;`   (the data-flow
+    //                pass emits accumulators as an init + compound-assign chain;
+    //                fusing them reads like real C). Only when the two lines are
+    //                adjacent (same depth), R does not itself reference vN, and the
+    //                init RHS has no side effect (no call).
+    //   B2 inline    after B1, a `vN = EXPR;` whose vN is used EXACTLY once more in
+    //                the whole function — on the very next statement at the same
+    //                depth (a store / if / return / assignment) — folds into that
+    //                use, deleting the dead def.
+    //
+    // Both refuse to cross a call/store-bearing RHS into a position that would
+    // change evaluation order, and never touch args (a<N>) or stack locals.
+    static void foldTempsPass(std::vector<std::string>& L, std::vector<uint64_t>& V) {
+        auto rhsHasCall = [](const std::string& rhs) {
+            for (size_t k = 0; k + 1 < rhs.size(); ++k)
+                if (rhs[k] == '(' && k > 0 && identCh(rhs[k - 1])) return true;
+            return false;
+        };
+        // Split "lhs OP= rhs;" / "lhs = rhs;" -> (lhs, op-or-empty, rhs) without ';'.
+        // op is "" for a plain '=', otherwise the compound operator ("+","<<",...).
+        auto parseAssign = [](const std::string& t, std::string& lhs, std::string& op, std::string& rhs) -> bool {
+            if (t.empty() || t.back() != ';') return false;
+            std::string body = t.substr(0, t.size() - 1);
+            // find the assignment '=' that isn't '==', '!=', '<=', '>='.
+            for (size_t p = 0; p + 1 < body.size(); ++p) {
+                if (body[p] != '=' || body[p + 1] == '=') continue;
+                if (p > 0 && (body[p - 1] == '!' || body[p - 1] == '<' || body[p - 1] == '>' || body[p - 1] == '=')) continue;
+                // compound op chars sit just before " = "
+                size_t ls = p;                       // points at '='
+                // require " = " spacing
+                if (p == 0 || body[p - 1] != ' ' || p + 1 >= body.size() || body[p + 1] != ' ') {
+                    // compound form "lhs OP= rhs": op char immediately precedes '='
+                    if (p == 0) return false;
+                    // collect the (1-2 char) operator just before '='
+                    size_t oe = p; size_t os = p; while (os > 0 && std::string("+-&|^<>*/%").find(body[os - 1]) != std::string::npos) --os;
+                    if (os == p) return false;        // not a recognised compound
+                    std::string left = body.substr(0, os);
+                    while (!left.empty() && left.back() == ' ') left.pop_back();
+                    lhs = left; op = body.substr(os, oe - os);
+                    std::string r = body.substr(p + 1);
+                    size_t rs = r.find_first_not_of(' '); rhs = (rs == std::string::npos) ? "" : r.substr(rs);
+                    return !lhs.empty();
+                }
+                lhs = body.substr(0, ls); while (!lhs.empty() && lhs.back() == ' ') lhs.pop_back();
+                op = "";
+                std::string r = body.substr(p + 1);
+                size_t rs = r.find_first_not_of(' '); rhs = (rs == std::string::npos) ? "" : r.substr(rs);
+                return !lhs.empty();
+            }
+            return false;
+        };
+
+        // ---- B1: coalesce init + compound-assign chains ----
+        for (size_t i = 0; i + 1 < L.size();) {
+            std::string ind = ind_of(L[i]);
+            std::string a = trim_(L[i]);
+            std::string lhs1, op1, rhs1;
+            if (parseAssign(a, lhs1, op1, rhs1) && op1.empty() && isTempVar(lhs1) && !rhsHasCall(rhs1)) {
+                size_t j = i + 1; while (j < L.size() && trim_(L[j]).empty()) ++j;
+                if (j < L.size() && ind_of(L[j]) == ind) {
+                    std::string lhs2, op2, rhs2;
+                    if (parseAssign(trim_(L[j]), lhs2, op2, rhs2) && lhs2 == lhs1 && !op2.empty() &&
+                        wordCount(rhs2, lhs1) == 0 && !rhsHasCall(rhs2)) {
+                        // fuse into "vN = E OP R;" keeping the init line's VA. Wrap E
+                        // in parens only when it's a compound expression (operator
+                        // precedence safety); a bare identifier / number / *(...) /
+                        // mem[...] needs none.
+                        auto atomic = [&](const std::string& e) {
+                            int depth = 0;
+                            for (size_t k = 0; k < e.size(); ++k) {
+                                char ch = e[k];
+                                if (ch == '(' || ch == '[') ++depth;
+                                else if (ch == ')' || ch == ']') --depth;
+                                else if (depth == 0 && k > 0 && e[k] == ' ') return false;  // a top-level space = operator
+                            }
+                            return true;
+                        };
+                        std::string E = atomic(rhs1) ? rhs1 : ("(" + rhs1 + ")");
+                        L[i] = ind + lhs1 + " = " + E + " " + op2 + " " + rhs2 + ";";
+                        L.erase(L.begin() + j);
+                        V.erase(V.begin() + j);
+                        continue;     // re-examine in case of a longer chain
+                    }
+                }
+            }
+            ++i;
+        }
+
+        // ---- B2: inline a single-use temp into the next statement ----
+        for (size_t i = 0; i + 1 < L.size();) {
+            std::string ind = ind_of(L[i]);
+            std::string a = trim_(L[i]);
+            std::string lhs, op, rhs;
+            bool advanced = false;
+            if (parseAssign(a, lhs, op, rhs) && op.empty() && isTempVar(lhs) && !rhsHasCall(rhs)) {
+                size_t j = i + 1; while (j < L.size() && trim_(L[j]).empty()) ++j;
+                if (j < L.size() && ind_of(L[j]) == ind) {
+                    int total = 0; for (const std::string& l : L) total += wordCount(l, lhs);
+                    int onJ = wordCount(L[j], lhs);
+                    std::string ut = trim_(L[j]);
+                    bool destOk = !ut.empty() && (ut.back() == ';' || ut.back() == '{');
+                    if (total == 2 && onJ == 1 && destOk) {
+                        L[j] = wordReplace(L[j], lhs, "(" + rhs + ")");
+                        L.erase(L.begin() + i);
+                        V.erase(V.begin() + i);
+                        advanced = true;
+                    }
+                }
+            }
+            if (!advanced) ++i;
+        }
+    }
+
+    // (C) Condition gloss: append a short plain-language `/* ... */` to a simple
+    // relational `if (VAR OP IMM) {` (or one-line `if (...) ...;`). Heuristic and
+    // purely additive — the condition text is unchanged, line count unchanged.
+    static void conditionGlossPass(std::vector<std::string>& L, std::vector<uint64_t>& V) {
+        (void)V;
+        auto hexOrDec = [](const std::string& s, long long& out) -> bool {
+            if (s.empty()) return false;
+            char* end = nullptr;
+            errno = 0;
+            if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+                // Parse hex unsigned (full 64-bit), then only gloss values that fit a
+                // signed decimal — a huge mask like 0x8000000000000000 isn't a
+                // meaningful "threshold" and would print a wrong-signed number.
+                unsigned long long u = std::strtoull(s.c_str(), &end, 16);
+                if (end == s.c_str() || *end != '\0' || errno == ERANGE) return false;
+                if (u > (unsigned long long)INT64_MAX) return false;
+                out = (long long)u; return true;
+            }
+            long long v = std::strtoll(s.c_str(), &end, 10);
+            if (end == s.c_str() || *end != '\0' || errno == ERANGE) return false;
+            out = v; return true;
+        };
+        for (std::string& l : L) {
+            if (l.find("/*") != std::string::npos) continue;          // already glossed
+            std::string ind = ind_of(l), t = trim_(l);
+            // locate "if (" ... ")" condition
+            if (t.rfind("if (", 0) != 0) continue;
+            size_t close = pyMatchParen(t, 3);
+            if (close == std::string::npos) continue;
+            std::string cond = t.substr(4, close - 4);
+            // Only a single, simple `LHS OP RHS` relational (no &&/||).
+            if (cond.find("&&") != std::string::npos || cond.find("||") != std::string::npos) continue;
+            struct Op { const char* sym; const char* word; };
+            static const Op kOps[] = {
+                { " == ", "equals" }, { " != ", "is not" }, { " <= ", "at most" },
+                { " >= ", "at least" }, { " < ", "below" }, { " > ", "above" },
+            };
+            const Op* hit = nullptr; size_t op = std::string::npos;
+            for (auto& o : kOps) {
+                size_t p = cond.find(o.sym);
+                if (p != std::string::npos && (op == std::string::npos || p < op)) { op = p; hit = &o; }
+            }
+            if (!hit) continue;
+            std::string lhs = trim_(cond.substr(0, op));
+            std::string rhs = trim_(cond.substr(op + std::strlen(hit->sym)));
+            // LHS a plain identifier (var / arg), RHS a small literal -> human gloss.
+            bool lhsId = !lhs.empty() && (std::isalpha((unsigned char)lhs[0]) || lhs[0] == '_');
+            for (char c : lhs) if (!identCh(c)) { lhsId = false; break; }
+            long long rv;
+            if (!lhsId || !hexOrDec(rhs, rv)) continue;
+            char dec[48]; std::snprintf(dec, sizeof(dec), "%lld", rv);
+            std::string gloss = " /* " + lhs + " " + hit->word + " " + dec + " */";
+            // Append at end of line (keeps any trailing "{" or one-line body intact).
+            l += gloss;
+        }
+    }
+
+    DecompResult run(uint64_t funcStart) {
         // Header line with a resolved name when available.
         std::string fname;
         if (opt.nameFor) fname = opt.nameFor(funcStart);
         if (fname.empty()) { char b[32]; std::snprintf(b, sizeof(b), "sub_%llX", (unsigned long long)funcStart); fname = b; }
 
-        if (N == 0) return "// nothing decoded at this address\n";
+        if (N == 0) return { "// nothing decoded at this address\n", { 0 } };
 
         // Pass 1: discover which blocks need labels (goto targets).
         needLabel.assign(N, 0);
         visited.assign(N, 0);
-        loopStack.clear(); collecting = true; emitted = 0; out.clear();
+        loopStack.clear(); collecting = true; emitted = 0; lines_.clear(); lineVAs_.clear();
         emitFrom(0, -1, 1);
 
         // Pass 2: emit for real with labels in place.
         visited.assign(N, 0);
-        loopStack.clear(); collecting = false; emitted = 0; out.clear();
+        loopStack.clear(); collecting = false; emitted = 0; lines_.clear(); lineVAs_.clear();
         // Header: when the data-flow pass detected parameters, list exactly those (the
         // body names them a1..aN, so the header matches the body) — this surfaces the
         // x86 cdecl/stdcall + Win64 register args. Keep guessSignature's inferred return
@@ -768,25 +1047,350 @@ struct Structurer {
         } else {
             header = "__int64 " + fname + "()";
         }
-        out += header + "\n{\n";
+        rawline(header);
+        rawline("{");
         // Inferred local declarations (data-flow pass): one per assigned non-arg var.
         if (deep_ && !df_.decls.empty()) {
-            for (const std::string& d : df_.decls) { out.append(4, ' '); out += d; out += '\n'; }
-            out += "\n";
+            for (const std::string& d : df_.decls) line(1, d);
+            rawline("");
         }
         emitFrom(0, -1, 1);
-        out += "}\n";
-        if (deep_) out = reconstructForLoops(out);
-        return out;
+        rawline("}");
+        if (deep_) {
+            reconstructForLoops(lines_, lineVAs_);
+            // Readability post-passes A -> B -> C (deep path only). Order matters:
+            // rename counters first (so folding/gloss see the friendly names), then
+            // fold single-use temps, then gloss the surviving conditions.
+            if (opt.prettyNames)    prettyNamesPass(lines_, lineVAs_);
+            if (opt.foldTemps)      foldTempsPass(lines_, lineVAs_);
+            if (opt.conditionGloss) conditionGlossPass(lines_, lineVAs_);
+        }
+
+        // Join with '\n' + trailing '\n' — byte-identical to the legacy string
+        // builder (every line() / rawline() appended its own '\n').
+        DecompResult r;
+        for (const std::string& l : lines_) { r.text += l; r.text += '\n'; }
+        r.lineVA = std::move(lineVAs_);
+        return r;
     }
 };
 
+// ----------------------- C -> Python pseudocode (DecompileToPython) ---------
+//
+// A line-by-line text transform over the structurer's pseudo-C, driven by the
+// (machine-generated, hence well-formed) brace/indent shape: "X {" openers turn
+// into "X:" headers, "}" closers vanish, statements lose ';' and get operator /
+// token rewrites. The C emitter stays byte-identical; only the display differs.
+
+// Find the ')' matching the '(' at s[open] (quote-aware), or npos.
+static size_t pyMatchParen(const std::string& s, size_t open) {
+    int depth = 0; bool q = false;
+    for (size_t i = open; i < s.size(); ++i) {
+        char c = s[i];
+        if (q) { if (c == '\\') ++i; else if (c == '"') q = false; continue; }
+        if (c == '"') q = true;
+        else if (c == '(') ++depth;
+        else if (c == ')') { if (--depth == 0) return i; }
+    }
+    return std::string::npos;
+}
+
+static bool pyIdentChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
+
+// Expression rewrite: *(X) -> mem[X], &(X) -> addr(X), strip C casts, ! -> not,
+// && / || -> and / or, " / " -> " // " (integer division), hi:lo -> (hi, lo).
+// Quote-aware so string literals inlined by dataRefFor pass through untouched.
+static std::string pyExpr(std::string s) {
+    // *(X) -> mem[X]. The C lift only ever emits the literal "*(" for a memory
+    // dereference (multiplication always has spaces around '*').
+    bool q = false;
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+        char c = s[i];
+        if (q) { if (c == '\\') ++i; else if (c == '"') q = false; continue; }
+        if (c == '"') { q = true; continue; }
+        if (c == '*' && s[i + 1] == '(') {
+            size_t close = pyMatchParen(s, i + 1);
+            if (close == std::string::npos) break;
+            s = s.substr(0, i) + "mem[" + s.substr(i + 2, close - (i + 2)) + "]" + s.substr(close + 1);
+            // continue scanning forward; inner derefs (now inside mem[...]) still match
+        }
+    }
+    static const char* kCasts[] = {
+        "(int64_t)", "(uint64_t)", "(int32_t)", "(uint32_t)", "(int16_t)", "(uint16_t)",
+        "(int8_t)", "(uint8_t)", "(__int64)", "(int)", "(unsigned)", "(char)", "(short)", "(long)",
+    };
+    std::string o; o.reserve(s.size());
+    q = false;
+    for (size_t i = 0; i < s.size();) {
+        char c = s[i];
+        if (q) {
+            o += c;
+            if (c == '\\' && i + 1 < s.size()) { o += s[i + 1]; i += 2; continue; }
+            if (c == '"') q = false;
+            ++i; continue;
+        }
+        if (c == '"') { q = true; o += c; ++i; continue; }
+        // C constants -> Python literals, word-boundary safe (so a variable like
+        // `truth` or `null_ptr` is never partially rewritten). Only fires at the
+        // start of an identifier run whose previous output char isn't an ident char.
+        if ((std::isalpha((unsigned char)c) || c == '_') && (o.empty() || !pyIdentChar(o.back()))) {
+            static const std::pair<const char*, const char*> kConst[] = {
+                { "true", "True" }, { "false", "False" }, { "nullptr", "None" }, { "NULL", "None" },
+            };
+            bool did = false;
+            for (auto& kv : kConst) {
+                size_t n = std::strlen(kv.first);
+                if (s.compare(i, n, kv.first) == 0 && (i + n >= s.size() || !pyIdentChar(s[i + n]))) {
+                    o += kv.second; i += n; did = true; break;
+                }
+            }
+            if (did) continue;
+        }
+        if (c == '&' && i + 1 < s.size() && s[i + 1] == '&') { o += "and"; i += 2; continue; }
+        if (c == '|' && i + 1 < s.size() && s[i + 1] == '|') { o += "or";  i += 2; continue; }
+        if (c == '&' && i + 1 < s.size() && s[i + 1] == '(') { o += "addr"; ++i; continue; }   // lea: &(X) -> addr(X)
+        if (c == '!' && (i + 1 >= s.size() || s[i + 1] != '=')) { o += "not "; ++i; continue; }
+        if (c == '/' && i > 0 && s[i - 1] == ' ' && i + 1 < s.size() && s[i + 1] == ' '
+            && (i < 2 || s[i - 2] != '/')) { o += "//"; ++i; continue; }   // " / " -> " // "
+        if (c == '(') {   // strip C casts
+            bool stripped = false;
+            for (const char* cast : kCasts) {
+                size_t n = std::strlen(cast);
+                if (s.compare(i, n, cast) == 0) { i += n; stripped = true; break; }
+            }
+            if (stripped) continue;
+        }
+        if (c == ':' && !o.empty() && pyIdentChar(o.back())
+            && i + 1 < s.size() && (std::isalpha((unsigned char)s[i + 1]) || s[i + 1] == '_')) {
+            // hi:lo register pair (1-operand mul/div lift) -> a (hi, lo) tuple
+            size_t bs = o.size(); while (bs > 0 && pyIdentChar(o[bs - 1])) --bs;
+            std::string hi = o.substr(bs);
+            size_t j = i + 1; while (j < s.size() && pyIdentChar(s[j])) ++j;
+            std::string lo = s.substr(i + 1, j - (i + 1));
+            o.resize(bs); o += "(" + hi + ", " + lo + ")";
+            i = j; continue;
+        }
+        o += c; ++i;
+    }
+    return o;
+}
+
+// One C statement (trailing ';' already removed) -> a Python statement.
+static std::string pyStmt(const std::string& tin) {
+    std::string t = tin;
+    if (t.empty()) return "pass";
+    // The 1-operand div lift packs two statements into one line; translate both.
+    {   // split on top-level "; "
+        int depth = 0; bool q = false;
+        for (size_t i = 0; i + 1 < t.size(); ++i) {
+            char c = t[i];
+            if (q) { if (c == '\\') ++i; else if (c == '"') q = false; continue; }
+            if (c == '"') q = true;
+            else if (c == '(' || c == '[') ++depth;
+            else if (c == ')' || c == ']') --depth;
+            else if (c == ';' && depth == 0 && t[i + 1] == ' ')
+                return pyStmt(t.substr(0, i)) + "; " + pyStmt(t.substr(i + 2));
+        }
+    }
+    if (t == "return")               return "return";
+    if (t.rfind("return ", 0) == 0)  return "return " + pyExpr(t.substr(7));
+    if (t == "break" || t == "continue" || t.rfind("goto ", 0) == 0) return t;   // goto stays a pseudo-statement
+    if (t.rfind("__asm { ", 0) == 0 && t.size() > 10 && t.compare(t.size() - 2, 2, " }") == 0)
+        return "asm('" + t.substr(8, t.size() - 10) + "')";
+    if (t.rfind("swap(", 0) == 0 && t.back() == ')') {
+        std::string inner = t.substr(5, t.size() - 6), a, b;
+        if (split2(inner, a, b)) {
+            std::string A = pyExpr(a), B = pyExpr(b);
+            return A + ", " + B + " = " + B + ", " + A;
+        }
+    }
+    if (t.size() > 2 && t.compare(t.size() - 2, 2, "++") == 0) return pyExpr(t.substr(0, t.size() - 2)) + " += 1";
+    if (t.size() > 2 && t.compare(t.size() - 2, 2, "--") == 0) return pyExpr(t.substr(0, t.size() - 2)) + " -= 1";
+    return pyExpr(t);
+}
+
+// Is this whole line a local-variable declaration ("__int64 v0;", "void *v1;")?
+static bool pyIsDecl(const std::string& t) {
+    if (t.empty() || t.back() != ';') return false;
+    if (t.find('=') != std::string::npos || t.find('(') != std::string::npos) return false;
+    size_t sp = t.find(' ');
+    if (sp == std::string::npos) return false;
+    static const char* kTypes[] = {
+        "void", "int", "char", "short", "long", "unsigned", "signed", "float", "double", "bool",
+        "__int64", "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t",
+    };
+    std::string w = t.substr(0, sp);
+    for (const char* k : kTypes) if (w == k) return true;
+    return false;
+}
+
+static bool pyIsLabel(const std::string& t) {
+    if (t.size() < 2 || t.back() != ':' || t.rfind("loc_", 0) != 0) return false;
+    for (size_t i = 4; i + 1 < t.size(); ++i) if (!std::isxdigit((unsigned char)t[i])) return false;
+    return true;
+}
+
 } // namespace
 
-std::string Decompile(const ControlFlowGraph& g, const DecompileOptions& opt) {
-    if (g.blocks.empty()) return "// no code\n";
+DecompResult DecompileWithMap(const ControlFlowGraph& g, const DecompileOptions& opt) {
+    if (g.blocks.empty()) return { "// no code\n", { 0 } };
     Structurer s(g, opt);
     return s.run(g.funcStart);
+}
+
+std::string Decompile(const ControlFlowGraph& g, const DecompileOptions& opt) {
+    return DecompileWithMap(g, opt).text;
+}
+
+DecompResult DecompileToPython(const DecompResult& c) {
+    // Split into lines (DecompResult convention: no entry for the empty segment
+    // after the trailing '\n').
+    std::vector<std::string> L; std::vector<uint64_t> V;
+    for (size_t s = 0, i = 0; i <= c.text.size(); ++i)
+        if (i == c.text.size() || c.text[i] == '\n') {
+            if (i == c.text.size() && s == i) break;
+            L.push_back(c.text.substr(s, i - s));
+            s = i + 1;
+        }
+    V = c.lineVA; V.resize(L.size(), 0);
+
+    DecompResult r;
+    std::vector<std::string> out; std::vector<uint64_t> outVA;
+    struct Blk { size_t indent; int kind; std::string step; uint64_t stepVA; };   // kind 0=other 1=loop 2=switch
+    std::vector<Blk> stack;
+    auto switchDepth = [&]() { size_t n = 0; for (const Blk& b : stack) if (b.kind == 2) ++n; return n; };
+    auto emitAt = [&](size_t indent, const std::string& s, uint64_t va) {
+        out.push_back(std::string(indent + 4 * switchDepth(), ' ') + s);
+        outVA.push_back(va);
+    };
+
+    for (size_t i = 0; i < L.size(); ++i) {
+        const std::string& raw = L[i];
+        const uint64_t va = V[i];
+        size_t ind = 0; while (ind < raw.size() && raw[ind] == ' ') ++ind;
+        std::string t = raw.substr(ind);
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+
+        if (t.empty()) { out.push_back(""); outVA.push_back(va); continue; }
+
+        // Split a trailing /* ... */ into a Python # comment suffix.
+        std::string cmt;
+        if (t.size() > 4 && t.compare(t.size() - 2, 2, "*/") == 0) {
+            size_t cs = t.rfind("/*");
+            if (cs != std::string::npos) {
+                std::string inner = t.substr(cs + 2, t.size() - cs - 4);
+                size_t a = inner.find_first_not_of(' '), b = inner.find_last_not_of(' ');
+                if (a != std::string::npos) cmt = "  # " + inner.substr(a, b - a + 1);
+                t = t.substr(0, cs);
+                while (!t.empty() && t.back() == ' ') t.pop_back();
+            }
+        }
+
+        if (t.rfind("//", 0) == 0) { emitAt(ind, "#" + t.substr(2), va); continue; }   // comment line
+        if (t.empty()) { if (!cmt.empty()) emitAt(ind, cmt.substr(2), va); continue; } // comment-only /* */ line
+
+        if (i == 0) {   // function header: "<ret> name(args)" -> "def name(args):"
+            size_t p = t.find('(');
+            size_t close = (p == std::string::npos) ? std::string::npos : pyMatchParen(t, p);
+            if (p != std::string::npos && close != std::string::npos) {
+                size_t ns = p; while (ns > 0 && pyIdentChar(t[ns - 1])) --ns;
+                std::string name = t.substr(ns, p - ns);
+                if (name.empty()) name = "func";
+                // Keep arg NAMES only (an inferred signature may carry C types).
+                std::string args = t.substr(p + 1, close - p - 1), alist;
+                size_t s0 = 0;
+                while (s0 <= args.size()) {
+                    size_t comma = args.find(',', s0);
+                    std::string a1 = args.substr(s0, comma == std::string::npos ? std::string::npos : comma - s0);
+                    size_t ae = a1.find_last_not_of(" *");
+                    if (ae != std::string::npos) {
+                        size_t as = ae; while (as > 0 && pyIdentChar(a1[as - 1])) --as;
+                        if (pyIdentChar(a1[as]) || as < ae) {
+                            if (!alist.empty()) alist += ", ";
+                            alist += a1.substr(as, ae - as + 1);
+                        }
+                    }
+                    if (comma == std::string::npos) break;
+                    s0 = comma + 1;
+                }
+                emitAt(ind, "def " + name + "(" + alist + "):" + cmt, va);
+                continue;
+            }
+        }
+
+        if (t == "{") { stack.push_back({ ind, 0, "", 0 }); continue; }
+        if (t == "}") {
+            if (!stack.empty()) {
+                Blk b = stack.back(); stack.pop_back();
+                if (b.kind == 1 && !b.step.empty()) emitAt(b.indent + 4, b.step, b.stepVA);   // for-loop step
+            }
+            continue;
+        }
+
+        if (t.size() > 2 && t.compare(t.size() - 2, 2, " {") == 0) {   // block opener "X {"
+            std::string head = t.substr(0, t.size() - 2);
+            while (!head.empty() && head.back() == ' ') head.pop_back();
+            if (head == "while (1)") { emitAt(ind, "while True:" + cmt, va); stack.push_back({ ind, 1, "", 0 }); }
+            else if (head.rfind("for (; ", 0) == 0 && head.back() == ')') {
+                std::string inner = head.substr(7, head.size() - 8);     // "COND; STEP"
+                size_t semi = inner.rfind("; ");
+                std::string cond = semi == std::string::npos ? inner : inner.substr(0, semi);
+                std::string step = semi == std::string::npos ? std::string() : inner.substr(semi + 2);
+                emitAt(ind, "while " + pyExpr(cond) + ":" + cmt, va);
+                stack.push_back({ ind, 1, step.empty() ? std::string() : pyStmt(step), va });
+            }
+            else if (head.rfind("while (", 0) == 0 && head.back() == ')') {
+                emitAt(ind, "while " + pyExpr(head.substr(7, head.size() - 8)) + ":" + cmt, va);
+                stack.push_back({ ind, 1, "", 0 });
+            }
+            else if (head == "else") { emitAt(ind, "else:" + cmt, va); stack.push_back({ ind, 0, "", 0 }); }
+            else if (head.rfind("if (", 0) == 0 && head.back() == ')') {
+                emitAt(ind, "if " + pyExpr(head.substr(4, head.size() - 5)) + ":" + cmt, va);
+                stack.push_back({ ind, 0, "", 0 });
+            }
+            else if (head.rfind("switch (", 0) == 0 && head.back() == ')') {
+                emitAt(ind, "match " + pyExpr(head.substr(8, head.size() - 9)) + ":" + cmt, va);
+                stack.push_back({ ind, 2, "", 0 });   // push AFTER emit: the match line sits outside
+            }
+            else { emitAt(ind, head + ":" + cmt, va); stack.push_back({ ind, 0, "", 0 }); }
+            continue;
+        }
+
+        if (pyIsLabel(t)) { emitAt(ind, "# " + t, va); continue; }       // goto target marker
+        if (t.rfind("case ", 0) == 0 && t.back() == ':') { emitAt(ind, t + cmt, va); continue; }
+        if (pyIsDecl(t)) continue;                                       // Python needs no declarations
+
+        if (!t.empty() && t.back() == ';') {                             // plain statement
+            std::string stmt = t.substr(0, t.size() - 1);
+            while (!stmt.empty() && stmt.back() == ' ') stmt.pop_back();
+            if (stmt.rfind("if (", 0) == 0) {                            // one-liner "if (C) S;"
+                size_t close = pyMatchParen(stmt, 3);
+                if (close != std::string::npos) {
+                    std::string cond = stmt.substr(4, close - 4);
+                    std::string rest = close + 1 < stmt.size() ? stmt.substr(close + 1) : std::string();
+                    size_t rs = rest.find_first_not_of(' ');
+                    rest = rs == std::string::npos ? std::string() : rest.substr(rs);
+                    emitAt(ind, "if " + pyExpr(cond) + ": " + pyStmt(rest) + cmt, va);
+                    continue;
+                }
+            }
+            if (stmt == "break") {   // match-case needs no break; loop break stays
+                bool inSwitch = false;
+                for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+                    if (it->kind == 1) break; else if (it->kind == 2) { inSwitch = true; break; }
+                if (inSwitch) { if (!cmt.empty()) emitAt(ind, "pass" + cmt, va); continue; }
+            }
+            emitAt(ind, pyStmt(stmt) + cmt, va);
+            continue;
+        }
+
+        emitAt(ind, pyExpr(t) + cmt, va);   // anything else: best-effort expression rewrite
+    }
+
+    for (const std::string& l : out) { r.text += l; r.text += '\n'; }
+    r.lineVA = std::move(outVA);
+    return r;
 }
 
 } // namespace ds

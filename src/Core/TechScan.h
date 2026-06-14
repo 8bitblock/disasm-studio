@@ -21,6 +21,7 @@ struct Capability {
     float       confidence = 0.0f;  // 0..1
     uint64_t    address    = 0;     // representative VA (IAT slot or first pattern hit), 0 = none
     std::string detail;             // human-readable evidence (APIs / section / pattern)
+    std::string analyzer;           // source analyzer name (additions.md: findings carry provenance)
     // For byte-pattern capabilities: every VA the pattern was found at, bounded by an
     // internal cap; hitCount == addresses.size() (so it is the capped count, not the
     // uncapped total -- the detail string shows "N+" when the cap was reached). Empty

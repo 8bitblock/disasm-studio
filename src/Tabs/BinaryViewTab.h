@@ -5,9 +5,16 @@
 #include "../Core/XrefIndex.h"         // whole-program cross-reference index (Xrefs tab)
 #include "../Core/AlgoScan.h"          // AlgoMatch (Algorithms sub-tab / K_Intent results)
 #include "../Core/CFG.h"               // ControlFlowGraph (cached CFG graph view)
+#include "../Core/Decompiler.h"        // DecompResult (pseudocode + per-line VA map)
+#include "../Core/FuncAnnotate.h"      // FuncAnnotations ("Annotations" lower tab + inline notes)
+#include "../Core/GameContext.h"       // game/crackme workflow context panel
+#include "../Core/JvmAnnotate.h"       // JvmMethodAnalysis ("Java" lower tab + inline stack effects)
 #include "../Core/Synthesis.h"         // SynthResult (F1 "Synthesis" lower tab)
 #include "../Core/PathExplore.h"       // PathTree (F3 "Path Explorer" lower tab)
+#include "../Core/Cond.h"              // CondOperand (compiled Watch expressions)
 #include <cstdint>
+#include <deque>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -24,6 +31,15 @@ class BinaryViewTab final : public ITab {
 public:
     const char* name() const override { return "Binary View"; }
     void render(AppContext& ctx) override;
+
+    // Symbol entries exposed to the command palette: address + display name +
+    // a pre-lowercased copy for fuzzy matching. Backed by the signature-cached
+    // goto-symbol index (rebuilt only when the target/process changes).
+    struct SymEntry { uint64_t addr; std::string name; std::string lower; };
+    const std::vector<SymEntry>& paletteSymbols(AppContext& ctx) {
+        buildSymbolIndex(ctx);
+        return symbolIndex_;
+    }
 
 private:
     void renderWelcome(AppContext& ctx);
@@ -65,6 +81,8 @@ private:
     void renderXrefsTab(AppContext& ctx);      // "Xrefs" lower sub-tab: who references the cursor / its function
     void exportAnalysis(AppContext& ctx);      // File > Export Analysis: write Markdown/HTML report
     std::string decompileFunctionText(AppContext& ctx, uint64_t fnStart, uint32_t fnSize); // structured pseudo-C for one fn
+    const DecompResult* decompLruGet(uint64_t va);                // recently-decompiled cache lookup (nav back/fwd)
+    void                decompLruPut(uint64_t va, const DecompResult& r);
     std::string symbolFor(AppContext& ctx, uint64_t addr);   // address -> function/export name
     // Per-stop memo key (register snapshot + liveGen_ + state). Shared by the live-view
     // caches (ptrDescCache_, strCmtCache_) so they invalidate together on step / re-stop / edit.
@@ -92,7 +110,9 @@ private:
     // a hovered word token is written to `nextHover` (for next frame's highlight).
     void renderHoverTokens(const char* s, unsigned int col, const std::string& hl, std::string& nextHover);
     void renderPseudocode(AppContext& ctx);
+    void renderDecompiler(AppContext& ctx);   // side-by-side decompiled pseudo-C | synced asm pane
     void renderHex(AppContext& ctx);
+    void hexCommitByte(AppContext& ctx, uint64_t off, uint8_t value);   // route an edit into the patch system
     void renderGraph(AppContext& ctx);
     void renderCallGraph(AppContext& ctx);             // callers/callees around the cursor fn
     void buildCallGraph(AppContext& ctx);              // cached call edges between functions (UI-thread fallback)
@@ -140,13 +160,32 @@ private:
     uint64_t cursorVA_  = 0;     // current focus address
     int      mainView_  = 0;     // 0=asm 1=pseudo 2=hex 3=cfg 4=live asm 5=callgraph
 
-    // Pop-out state: when set, the panel renders as its own OS window (multi-viewport)
-    // instead of inline, and the inline slot collapses + reflows. Toggled by a small
-    // "Pop out"/"Dock" button on each panel; closing the window docks it back.
-    bool     sidePoppedOut_   = false;   // Bookmarks/Functions/Strings side panel
-    bool     lowerPoppedOut_  = false;   // Breakpoints/Registers/... debug panels
+    // The body is a FIXED wireframe layout (disassembler-wireframes.html .wf-body.va):
+    // LEFT side panel | CENTER code views | GRAPH column | RIGHT register rail, over a
+    // BOTTOM debug dock. Each region is a bordered child (a .wf-panel); the column
+    // widths + dock height below are drag-resizable (VSplitter / a local HSplitter) and
+    // persist across frames. layoutScaled_ guards the one-time HiDPI scaling of the
+    // pixel defaults (replaces the old DockSpace's dockInitDone_ role).
+    bool     dockInitDone_    = false;   // retained (unused by the fixed layout)
+    bool     layoutScaled_    = false;   // multiply the width defaults by UiScale() once
+    float    leftColW_    = 218.0f;      // .va-left  side panel width
+    float    graphColW_   = 400.0f;      // .va-graphcol CFG/Call-Graph column width
+    float    rightRailW_  = 250.0f;      // .va-rightrail Registers/Stack width
+    float    bottomDockH_ = 200.0f;      // .wf-bottomdock lower-tabs height
+    int      graphView_   = 0;           // graph column tab: 0 = CFG, 1 = Call Graph
+    // Sub-view pop-out: pop a SPECIFIC main-view rendering (CFG / pseudocode) into its
+    // own OS window (multi-viewport). Orthogonal to panel docking; closing it docks back.
     bool     graphPoppedOut_  = false;   // Graph (CFG) main view
     bool     pseudoPoppedOut_ = false;   // Pseudocode main view
+
+    // Drag-resizable widths for the two in-panel sub-splits (VSplitter); scaled for
+    // HiDPI in the ctor-equivalent first use. Session-only (not persisted).
+    float    regsSplitW_ = 360.0f;       // Registers | Stack split (lower Registers tab)
+    float    liveBoxW_   = 252.0f;       // Live listing | register-box split
+    // Decompiler view: pseudo-C pane | synced asm pane split, and the asm VA hovered
+    // (or whose pseudo line is hovered) so the two panes cross-highlight each other.
+    float    decompSplitW_ = 360.0f;     // pseudo pane width (decompiler view)
+    uint64_t decompHoverVA_ = 0;         // VA cross-highlighted between the two panes
 
     // Multi-line selection in the full assembly listing: click = single,
     // Shift+click = range from the anchor, Ctrl+click = toggle one line.
@@ -170,9 +209,12 @@ private:
     // Render-thread-only cache of decoded visible rows: the full listing stores only
     // addresses and re-decodes per visible row every frame, so a fast scroll redecodes
     // the same ~50 rows repeatedly. Keyed by VA; the whole cache is dropped when the
-    // image (load/patch), arch, or engine changes (decodeCacheKey_). Bounded, not LRU:
-    // cleared wholesale when it exceeds the cap (cheap, re-warms in a frame).
+    // image (load/patch), arch, or engine changes (decodeCacheKey_). Bounded by FIFO:
+    // when it exceeds the cap, the oldest insertions are evicted (decodeOrder_) instead
+    // of clearing wholesale, so a long fast-scroll keeps recent rows warm.
+    static constexpr size_t kDecodeCacheCap = 32768;
     std::unordered_map<uint64_t, Instruction> decodeCache_;
+    std::deque<uint64_t>                      decodeOrder_;   // insertion order for FIFO eviction
     uint64_t                                  decodeCacheKey_ = ~0ull;
     bool                 functionsDirty_ = false;   // a patch changed code: re-run analyzeFunctions before the next decompile/CFG
 
@@ -184,6 +226,22 @@ private:
     std::vector<AsmFlowRow> asmFlow_;
     float                   asmLaneX_ = 0.0f, asmAddrX_ = 0.0f;
     bool                    asmGotLaneX_ = false, asmGotAddrX_ = false;
+
+    // Row "glow" highlights: per-frame geometry collected during row rendering
+    // (static + live listings share the sink) and painted over the table after
+    // EndTable — same late-draw approach as the branch arrows, since an in-row
+    // window-drawlist rect would clip to the current CELL, not the row. Distinct
+    // theme-routed colors per cause: RIP (good/green), cursor = what the user
+    // clicked (accent), the cursor instruction's branch target (jump/violet),
+    // plus a decaying white-hot navigation-arrival flash on top.
+    struct RowGlow { float y; float h; unsigned int colorPacked; float intensity; };
+    std::vector<RowGlow> rowGlow_;
+    void  drawRowGlows(float x0, float y0, float x1, float y1);   // paint + clear rowGlow_
+    void  pushRowGlow(float yCenter, bool rowAtRip, bool rowSel, bool rowJump, float flash);
+    float navFlashAt(uint64_t addr);   // 1..0 decaying flash if addr was just navigated to
+    uint64_t hlJumpVA_   = 0;          // branch target of the cursor's instruction (per frame)
+    uint64_t navFlashVA_ = 0;          // navigation arrival flash target (0 = none)
+    double   navFlashT0_ = 0.0;        // ImGui::GetTime() when the flash started
     bool     followLiveRip_ = true;
     char     gotoBuf_[32] = "";
     char     byteSearch_[128] = "";
@@ -237,13 +295,15 @@ private:
     uint64_t                         liveCacheSig_   = ~0ull;
     uint32_t                         liveGen_        = 0;  // bumped on live write / patch / re-analyze / detach
     bool                             wasAttached_    = false; // detach-edge detector (clear caches once)
+    bool                             runtimeBannerDismissed_ = false; // runtime-wrapper/archive banner [x], reset per load
 
     // Decoder for the LIVE view, selected to match the DEBUGGEE's bitness. The static
     // ctx.disasm follows the loaded file's arch, which can differ from the attached
     // process (e.g. a 32-bit WOW64 target debugged while an x64 file — or no file — is
     // loaded). Rebuilt only when the bitness changes; falls back to ctx.disasm.
     std::unique_ptr<IDisassembler>   liveDisasm_;
-    int                              liveDisasmArch_ = -1;   // Arch of liveDisasm_, -1 = none built
+    int                              liveDisasmArch_   = -1; // Arch of liveDisasm_, -1 = none built
+    int                              liveDisasmEngine_ = -1; // Engine of liveDisasm_ (a UI engine switch rebuilds it)
     IDisassembler*                   liveDecoder(AppContext& ctx, bool is32);
 
     // Live process search (strings / hex / values in committed memory).
@@ -277,9 +337,45 @@ private:
     uint64_t              pseudoVA_ = 0;
     std::string           pseudoText_;
 
-    // Decompiler (structured pseudo-C) cache, keyed by the enclosing function.
+    // Decompiler (structured pseudo-C) for the static Pseudocode view. The decompile
+    // runs off the render thread (K_Decompile); decompVA_ is the function currently
+    // shown, decompText_ its result, decompPending_ true while the worker is running.
+    // decompLines_/decompLineVA_ are decompText_ split per line + the per-line source
+    // VAs (DecompResult::lineVA; 0 = synthetic) backing click-to-navigate.
+    // decompLru_ keeps the few most-recently decompiled functions so nav back/forward
+    // is instant (no re-decompile); a small linear list (front = most recent), capped.
     uint64_t              decompVA_ = 0;
     std::string           decompText_;
+    std::vector<std::string> decompLines_;
+    std::vector<uint64_t>    decompLineVA_;
+    bool                  decompPending_ = false;
+    static constexpr size_t kDecompLruCap = 16;
+    std::list<std::pair<uint64_t, DecompResult>> decompLru_;
+    void setDecompContent(std::string text, std::vector<uint64_t> lineVA);
+    // Pseudocode output language (0 = pseudo-C, 1 = Python). The worker/LRU always
+    // hold pseudo-C; applyDecompLang translates on display (DecompileToPython is a
+    // pure text transform), so switching languages never re-decompiles.
+    int  pseudoLang_ = 0;
+    void applyDecompLang(const DecompResult& c);
+
+    // ---- Hex editor (main view 2) ----
+    // Whole-file clipper-rendered hex view addressed by FILE OFFSET (uniform rows;
+    // VA gaps don't fragment the view), with per-row VA via offsetToVA. Edits go
+    // through applyPatchBytes (one PjPatch per byte) so they revert/save like any
+    // other patch. hexCursorOff_ is the canonical hex cursor; cursorVA_ syncs both
+    // ways (external navigation scrolls the hex view; clicking a mapped byte moves
+    // the global cursor).
+    uint64_t hexCursorOff_   = 0;
+    uint64_t hexLastScroll_  = ~0ull;   // last cursorVA_ we auto-scrolled to
+    uint64_t hexPendScroll_  = ~0ull;   // pending scroll-to file offset (~0 = none)
+    int      hexEditNibble_  = -1;      // -1 idle; 0 = high nibble typed (in hexEditByte_)
+    uint8_t  hexEditByte_    = 0;
+    bool     hexAsciiCol_    = false;   // typing targets the ascii column
+    bool     hexDragging_    = false;   // mouse selection drag in progress
+    uint64_t hexSelA_ = ~0ull, hexSelB_ = ~0ull;   // selection anchor/end (file offsets, inclusive)
+    char     hexGotoOff_[20] = "";
+    std::vector<std::pair<uint64_t, uint64_t>> hexPatchedIv_;  // sorted [offLo,offHi) patched spans
+    uint64_t hexPatchedSig_  = ~0ull;
 
     // User annotations (persist via ctx.project). comments_ render in the
     // listing; names_ override symbol resolution everywhere names appear.
@@ -338,8 +434,11 @@ private:
     uint64_t               callStackSig_ = 0;
     int                    stackRows_ = 24;   // qwords shown in the live Stack tab
 
-    // Goto-by-name: symbol index (addr, "module.name") + the picker popup.
-    std::vector<std::pair<uint64_t, std::string>> symbolIndex_;
+    // Goto-by-name: symbol index (addr, "module.name") + the picker popup. `lower`
+    // is a pre-lowercased copy of `name`, built once, so filtering doesn't re-lower
+    // every (up to 120k) entry on each keystroke. (SymEntry is declared in the
+    // public section so the command palette can consume the index.)
+    std::vector<SymEntry>                         symbolIndex_;
     uint64_t                                      symbolIndexSig_ = ~0ull;
     bool                                          openGotoPopup_ = false;
     char                                          gotoNameBuf_[96] = "";
@@ -383,6 +482,9 @@ private:
     bool                                 funcIndexDirty_ = true;
     const Func* funcContaining(uint64_t addr);   // greatest function start <= addr (binary search), or nullptr
     std::unordered_map<uint64_t, std::string> condBuf_; // per-bp condition edit text
+    std::unordered_map<uint64_t, uint32_t> everyNBuf_;  // per-bp "break every Nth hit" (0/1 = every)
+    char                  fcCodeBuf_[16] = "";          // first-chance whitelist hex-code entry
+    size_t                dbgOutSeen_ = 0;              // Debug Output auto-scroll watermark
     // Heuristic function naming: address -> the basis for the guessed name (tooltip).
     // Guesses live in Func::name (so they flow through symbolFor everywhere) but are
     // never persisted — they are recomputed from the image on each analyze.
@@ -391,11 +493,18 @@ private:
     std::string           fnSummary_;
     char                  fnFilter_[64] = "";
     char                  strFilter_[64] = "";
-    // Filtered row indices for the side lists, rebuilt per frame then clipper-rendered
-    // (these lists can hold thousands of entries; rendering all of them was wasteful).
+    // Filtered row indices for the side lists, clipper-rendered (these lists can hold
+    // thousands of entries; rendering all of them was wasteful). Rebuilt ONLY when the
+    // filter text or the underlying data changes — not every frame — since the rebuild
+    // copies a std::string + probes the rename map per function (see fnVisSig_).
     std::vector<int>      fnVisible_;
     std::vector<int>      strVisible_;
     std::vector<int>      impVisible_;
+    char                  fnFilterLast_[64] = "\x01";   // sentinel != "" forces a first build
+    char                  strFilterLast_[64] = "\x01";
+    uint64_t              fnVisSig_  = ~0ull;   // data signature of fnVisible_'s last build
+    uint64_t              strVisSig_ = ~0ull;   // data signature of strVisible_'s last build
+    uint32_t              namesGen_  = 0;       // bumped when names_ (renames) change
     bool                  stringsLive_ = false;    // scan debuggee memory instead of the file
     bool                  stringsScanned_ = false;
     bool                  stringsScanning_ = false; // a live (off-thread) string scan is in flight
@@ -413,10 +522,64 @@ private:
     char                   algoFilter_[64] = "";
     std::unordered_map<uint64_t, std::string> algoLabels_;
 
+    // Per-function annotation engine (Core/FuncAnnotate): heuristic calling
+    // convention / args / frame / branch-meaning / loop / pattern notes, cached
+    // in a tiny LRU keyed by function start. Only the cursor's function (and the
+    // Annotations tab) builds eagerly; the per-row inline path returns cache
+    // hits only (buildIfMissing=false), so fast scrolling never triggers CFG
+    // builds. Invalidated when the listing signature changes.
+    struct AnnEntry {
+        uint64_t        fn = 0;
+        FuncAnnotations ann;
+        std::unordered_map<uint64_t, std::string> inlineText;   // va -> joined note text
+        std::unordered_map<uint64_t, std::string> inlineTip;    // va -> kind/confidence/evidence tooltip
+    };
+    std::list<AnnEntry>     annLru_;            // front = most recent
+    uint64_t                annSig_ = ~0ull;    // listingSig the cache was built for
+    static constexpr size_t kAnnLruCap = 8;
+    bool showFnNotes_ = true;                   // "Notes" toolbar toggle (inline annotations)
+    int  annSel_ = -1;                          // Annotations tab: selected note row
+    const AnnEntry* annotationsFor(AppContext& ctx, uint64_t va, bool buildIfMissing);
+    void renderAnnotationsTab(AppContext& ctx);  // "Annotations" lower sub-tab
+
+    // Java bytecode annotations (Core/JvmAnnotate): per-method stack effects /
+    // depth / call-field-string extraction / category + check-method findings.
+    // Same LRU discipline as annLru_ but for Arch::JVM methods, keyed by the
+    // method's code offset. inlineEffect/inlineBranch index notes by bci for the
+    // per-row inline path (cache-hit-only while scrolling).
+    struct JvmAnnEntry {
+        uint64_t          fn = 0;
+        JvmMethodAnalysis ann;
+        std::unordered_map<uint64_t, std::string> inlineEffect;  // bci -> stack effect text
+        std::unordered_map<uint64_t, std::string> inlineBranch;  // bci -> branch meaning
+        std::unordered_map<uint64_t, int>         depthBefore;   // bci -> operand-stack depth
+    };
+    std::list<JvmAnnEntry>  jvmAnnLru_;
+    uint64_t                jvmAnnSig_ = ~0ull;
+    int                     jvmMethodSel_ = -1;   // Java tab: selected note/method row
+    char                    jvmCpFilter_[64] = "";
+    const JvmAnnEntry* jvmAnnotationsFor(AppContext& ctx, uint64_t va, bool buildIfMissing);
+    void renderJavaTab(AppContext& ctx);        // "Java" lower sub-tab (static .class / JVM)
+
+    // Game/crackme context (additions.md D/H): grouped strings, likely gameplay
+    // functions, runtime boundaries, and "where to start" hints. The analyzer is
+    // pure Core; the UI only adapts current tab state into GameContextInput.
+    GameContextReport gameCtx_;
+    uint64_t          gameCtxSig_ = ~0ull;
+    char              gameCtxFilter_[64] = "";
+    uint64_t gameContextSig(AppContext& ctx) const;
+    const GameContextReport& gameContextFor(AppContext& ctx);
+    void renderGameContextTab(AppContext& ctx);
+
     // Watch expressions (lower "Watch" sub-tab): evaluated while paused via the
     // conditional-breakpoint expression evaluator. Persist via ctx.project.watches.
+    // Each expression is compiled ONCE (watchProgs_, parallel to watches_) and
+    // evaluated per frame via EvalCompiled; watchOk_[i] = parsed successfully.
     std::vector<std::string> watches_;
+    std::vector<CondOperand> watchProgs_;   // parallel to watches_ (compiled once)
+    std::vector<bool>        watchOk_;      // parallel: expression parsed OK
     char                     watchEntry_[160] = "";
+    void recompileWatches();                // refill watchProgs_/watchOk_ from watches_
 
     // ---- F1 clean-room synthesis ("Synthesis" lower tab) ----
     SynthResult synth_;

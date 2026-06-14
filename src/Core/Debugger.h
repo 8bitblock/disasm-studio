@@ -17,7 +17,9 @@
 //
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -57,6 +59,19 @@ struct ThreadInfo {
 struct SwBreakpointInfo {
     uint64_t    address = 0;
     std::string condition;   // empty = unconditional
+    uint32_t    hits  = 0;   // every time the 0xCC fired (incl. condition-false passes)
+    uint32_t    stops = 0;   // hits where the condition held and we parked
+    uint32_t    everyN = 0;  // 0/1 = stop on every (condition-true) hit; N = every Nth
+};
+
+// One loaded module of the debuggee, tracked live from LOAD_DLL/UNLOAD_DLL
+// debug events (the Communications tab's Toolhelp list is a one-shot snapshot;
+// this one follows dynamic loads/unloads during the session).
+struct DbgModule {
+    std::string name;        // file name (e.g. "jvm.dll")
+    std::string path;        // full path when resolvable (may be empty)
+    uint64_t    base = 0;
+    uint64_t    size = 0;    // SizeOfImage read from the mapped header (0 if unreadable)
 };
 
 struct HwBreakpointInfo {
@@ -76,6 +91,20 @@ struct CallStackFrame {
     std::string name;          // best-effort symbol (may be empty)
 };
 
+// One captured socket payload from the network data tap (ws2_32 send/recv/
+// WSASend/WSARecv hooks). `bytes` is a capped prefix of what the call moved;
+// `total` is the full size the API reported. Drained via Debugger::netCaptures().
+struct NetCapture {
+    uint32_t             tickMs = 0;   // GetTickCount at capture
+    uint32_t             pid    = 0;
+    uint32_t             tid    = 0;
+    uint8_t              dir    = 0;   // 0 = send (outgoing), 1 = recv (incoming)
+    uint8_t              api    = 0;   // Debugger::NetTapApi value
+    uint64_t             sock   = 0;   // SOCKET handle
+    uint32_t             total  = 0;   // bytes the API moved (may exceed bytes.size())
+    std::vector<uint8_t> bytes;        // captured prefix (<= kNetCaptureByteCap)
+};
+
 struct DbgSnapshot {
     DbgState                 state = DbgState::Detached;
     uint32_t                 pid = 0, tid = 0;     // tid = active/displayed thread
@@ -85,8 +114,14 @@ struct DbgSnapshot {
     std::vector<HwBreakpointInfo> hwBreakpoints;   // DR0-DR3 (address + kind + size)
     std::vector<ThreadInfo>  threads;
     std::vector<CallStackFrame> frames;             // real StackWalk64 unwind of the active thread
+    std::vector<DbgModule>   modules;               // live module list (LOAD/UNLOAD_DLL events)
+    std::vector<std::string> debugOutput;           // OutputDebugString capture (bounded ring)
     uint32_t                 activeTid = 0;
     bool                     is32 = false;          // target is a 32-bit (WOW64) process
+    // JVM awareness (Java EXEs): set once a jvm.dll/j9vm.dll loads in the debuggee.
+    bool                     jvmLoaded = false;
+    std::string              jvmPath;               // path of the loaded VM module
+    uint64_t                 jvmExceptionsPassed = 0; // JVM-internal AVs passed through silently
     bool                     attached() const { return state != DbgState::Detached; }
 };
 
@@ -136,6 +171,45 @@ public:
     bool removeBreakpoint(uint64_t va);
     bool hasBreakpoint(uint64_t va);
     void setBreakpointCondition(uint64_t va, const std::string& condition);
+    // Break only on every Nth (condition-true) hit; 0/1 = every hit. Evaluated
+    // next to the condition in the int3 handler; persisted with the breakpoint.
+    void setBreakpointEveryN(uint64_t va, uint32_t n);
+
+    // ---- JVM-aware debugging (Java EXEs) ----
+    // Arm a one-shot break on jvm.dll!JNI_CreateJavaVM when the VM module loads.
+    // Must be set BEFORE the JVM loads (i.e. before launch) to take effect.
+    void setBreakOnJvmInit(bool on)     { breakOnJvmInit_ = on; }
+    bool breakOnJvmInit() const         { return breakOnJvmInit_.load(); }
+
+    // ---- first-chance exception filter ----
+    // Default off: first-chance exceptions pass straight to the debuggee (the
+    // JVM-internal ones are additionally counted, not shown). When enabled (or
+    // for codes on the whitelist), the debugger pauses on first chance instead.
+    void setBreakOnFirstChance(bool on) { breakOnFirstChance_ = on; }
+    bool breakOnFirstChanceEnabled() const { return breakOnFirstChance_.load(); }
+    void addFirstChanceCode(uint32_t code);
+    void removeFirstChanceCode(uint32_t code);
+    std::vector<uint32_t> firstChanceCodes();
+
+    // Clear the captured OutputDebugString ring (Debug Output tab's Clear).
+    void clearDebugOutput();
+
+    // ---- network data tap (read socket payloads of the debugged process) ----
+    // Hooks ws2_32 send/recv/WSASend/WSARecv in the debuggee and logs each
+    // buffer (hex/text/JSON-readable) without stopping the process. x64 targets
+    // only. Off by default; turning it off restores all hooked bytes. Captures
+    // are drained with netCaptures(); the byte buffers are deliberately kept out
+    // of DbgSnapshot so the per-frame snapshot stays cheap.
+    static constexpr size_t kNetCaptureByteCap = 64u * 1024u;
+    void enableNetTap(bool on);
+    bool netTapEnabled() const { return netTapWant_.load(); }
+    std::vector<NetCapture> netCaptures();   // copy of the recent capture ring (newest last, capped)
+    size_t netCaptureCount();                // total captured this session (cheap; refetch trigger)
+    void clearNetCaptures();
+    bool setNetCaptureLogFile(const std::string& utf8Path, bool append, std::string* err = nullptr);
+    void closeNetCaptureLogFile();
+    bool netCaptureLogEnabled();
+    std::string netCaptureLogPath();
 
     // Hardware breakpoint management (DR0-DR3; up to 4). Execute kind uses a
     // 1-byte length. Returns false if all 4 slots are in use (on add).
@@ -245,7 +319,10 @@ private:
     std::vector<CallStackFrame>      frames_;            // guarded: last StackWalk64 unwind
     std::unordered_set<uint32_t>     suspended_;         // user-frozen tids (guarded by mtx_)
 
-    struct SwBp { uint8_t orig = 0; std::string cond; CondProgram prog; };
+    struct SwBp { uint8_t orig = 0; std::string cond; CondProgram prog;
+                  uint32_t hits = 0, stops = 0;         // counters mutate under mtx_ (snapshot reads)
+                  uint32_t everyN = 0;                  // stop on every Nth hit (0/1 = every)
+                  uint8_t  tapApi = 0; };               // 0 = normal bp; else net-tap API (see NetTapApi)
     std::unordered_map<uint64_t, SwBp> bps_;            // va -> {original byte, condition, compiled}
     // Maintained sorted vector of breakpoint addresses, mirroring bps_'s key set,
     // so readMemoryMasked can fix up its 0xCC bytes in O(log n) per read (binary
@@ -257,6 +334,45 @@ private:
     std::vector<PendingBp>           pendingBpAdds_;
     std::vector<uint64_t>            pendingBpRems_;
     std::vector<PendingBp>           pendingBpConds_;    // condition updates
+    std::vector<std::pair<uint64_t, uint32_t>> pendingBpEveryN_; // every-Nth-hit updates
+
+    // ---- network data tap (ws2_32 send/recv/WSASend/WSARecv) ----
+    enum NetTapApi : uint8_t { TAP_send = 1, TAP_recv = 2, TAP_WSASend = 3, TAP_WSARecv = 4 };
+    std::atomic<bool>                netTapWant_{false};   // UI request (on/off)
+    bool                             netTapArmed_ = false; // debug-thread: hooks installed
+    void   armNetTap();                                    // debug thread: resolve + hook
+    void   disarmNetTap();                                 // debug thread: restore bytes
+    void   netTapCapture(uint64_t addr, uint32_t tid, uint8_t api); // entry hit (send/recv/WSA*)
+    void   netTapOnReturn(uint64_t addr, uint32_t tid);    // recv/WSARecv return hit
+    void   pushNetCapture(NetCapture&& c);
+    void   writeNetCaptureLog(const NetCapture& c);
+    // recv/WSARecv: per-thread state captured at entry, read back at the return bp.
+    struct PendingRecv { uint64_t retAddr = 0, buf = 0, numBytesPtr = 0; uint32_t len = 0;
+                         uint64_t sock = 0; bool wsa = false; };
+    std::unordered_map<uint32_t, PendingRecv> pendingRecv_;     // tid -> pending (debug thread)
+    std::unordered_map<uint64_t, uint8_t>     recvRetBytes_;    // retAddr -> original byte (one-shots)
+    std::deque<NetCapture>           netCaps_;             // capture ring (guarded by mtx_)
+    size_t                           netCapSeq_ = 0;       // total captures seen since Clear
+    std::mutex                       netLogMtx_;
+    std::FILE*                       netLogFile_ = nullptr;
+    std::string                      netLogPath_;
+
+    // ---- live module list (LOAD_DLL/UNLOAD_DLL), guarded by mtx_ ----
+    std::vector<DbgModule>           dbgModules_;
+
+    // ---- JVM awareness (published for the snapshot; jvm base/size live on the
+    //      debug thread inside threadMain). Guarded by mtx_ unless atomic. ----
+    std::atomic<bool>                breakOnJvmInit_{false};
+    bool                             jvmLoaded_ = false;
+    std::string                      jvmPath_;
+    uint64_t                         jvmExceptionsPassed_ = 0;
+
+    // ---- first-chance exception filter (whitelist guarded by mtx_) ----
+    std::atomic<bool>                breakOnFirstChance_{false};
+    std::unordered_set<uint32_t>     fcWhitelist_;
+
+    // ---- OutputDebugString capture (bounded ring, guarded by mtx_) ----
+    std::deque<std::string>          dbgOutput_;
 
     // Hardware breakpoints: up to 4 slots (DR0-DR3).
     struct HwSlot { bool used = false; uint64_t addr = 0; HwKind kind = HwKind::Execute; uint8_t size = 1; };

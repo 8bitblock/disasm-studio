@@ -63,6 +63,33 @@ int main() {
     CHECK(MemAsNumber(B, 0xDEADBEEFFFull, false) == -1.0);   // low byte 0xFF
     CHECK(MemAsNumber(B, 0xDEADBEEFFFull, true)  == 255.0);
 
+    // ---- qword precision: integers compare as integers, not via double -----
+    // Adjacent qwords above 2^53 collapse to the same double; the integer path
+    // must still order them correctly.
+    {
+        uint64_t lo = 0x20000000000000ull;       // 2^53
+        uint64_t hi = 0x20000000000001ull;       // 2^53 + 1
+        CHECK(MemGreater(Q, true,  hi, lo));
+        CHECK(!MemLess  (Q, true,  hi, lo));
+        CHECK(MemLess   (Q, true,  lo, hi));
+        CHECK(!MemGreater(Q, true, lo, hi));
+        CHECK(MemGreater(Q, false, hi, lo));     // both positive signed too
+        CHECK(!MemGreater(Q, false, lo, hi));
+    }
+    // INT64_MIN < 0 signed; max-u64 > 0 unsigned but < 0 signed (-1).
+    CHECK(MemLess   (Q, false, 0x8000000000000000ull, 0));
+    CHECK(!MemGreater(Q, false, 0x8000000000000000ull, 0));
+    CHECK(MemGreater(Q, true,  0xFFFFFFFFFFFFFFFFull, 0));
+    CHECK(MemLess   (Q, false, 0xFFFFFFFFFFFFFFFFull, 0));
+    // Sub-qword types ignore high garbage bits on the integer path too.
+    CHECK(MemLess   (B, false, 0xDEADBEEFFFull, 0));          // low byte 0xFF = -1
+    CHECK(MemGreater(B, true,  0xDEADBEEFFFull, 0));          // low byte 0xFF = 255
+    // Extension helpers.
+    CHECK(MemZeroExt(0xFFFFFFFFFFull, 4) == 0xFFFFFFFFull);
+    CHECK(MemSignExt(0x80, 1) == -128);
+    CHECK(MemSignExt(0x7F, 1) == 127);
+    CHECK(MemSignExt(0xFFFFFFFFFFFFFFFFull, 8) == -1);
+
     // ---- float / double ignore unsignedMode --------------------------------
     CHECK(MemAsNumber(F, bitsF(-3.5f), false) == -3.5);
     CHECK(MemAsNumber(F, bitsF(-3.5f), true)  == -3.5);      // mode ignored for float

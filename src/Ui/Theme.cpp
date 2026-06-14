@@ -11,7 +11,7 @@ struct Palette {
     ImVec4 bg0, bg1, bg2, bg3;   // window / frame / hovered / active backgrounds
     ImVec4 child, popup, menubar;
     ImVec4 text, muted, border;
-    ImVec4 accent, good, warn, bad, call, branch;
+    ImVec4 accent, good, warn, bad, call, branch, jump;
     bool   light = false;
 };
 
@@ -32,6 +32,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.90f,0.91f,0.93f); p.muted=V(0.55f,0.58f,0.64f); p.border=V(0.24f,0.26f,0.30f,0.60f);
             p.accent=V(0.26f,0.59f,0.98f); p.good=V(0.40f,0.85f,0.50f); p.warn=V(0.95f,0.74f,0.35f);
             p.bad=V(0.93f,0.45f,0.45f); p.call=V(0.45f,0.72f,1.00f); p.branch=V(0.95f,0.78f,0.42f);
+            p.jump=V(0.72f,0.52f,0.98f);
             break;
         case ThemeId::Slate:
             p.bg0=V(0.110f,0.118f,0.128f); p.bg1=V(0.150f,0.160f,0.172f);
@@ -40,6 +41,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.88f,0.89f,0.90f); p.muted=V(0.55f,0.57f,0.60f); p.border=V(0.30f,0.32f,0.34f,0.60f);
             p.accent=V(0.30f,0.74f,0.72f); p.good=V(0.45f,0.82f,0.52f); p.warn=V(0.92f,0.73f,0.36f);
             p.bad=V(0.90f,0.46f,0.46f); p.call=V(0.45f,0.80f,0.78f); p.branch=V(0.93f,0.76f,0.42f);
+            p.jump=V(0.76f,0.56f,0.92f);
             break;
         case ThemeId::Light:
             p.bg0=V(0.935f,0.945f,0.960f); p.bg1=V(0.985f,0.990f,1.000f);
@@ -48,6 +50,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.12f,0.14f,0.18f); p.muted=V(0.40f,0.43f,0.48f); p.border=V(0.68f,0.72f,0.78f,0.85f);
             p.accent=V(0.16f,0.50f,0.92f); p.good=V(0.16f,0.60f,0.30f); p.warn=V(0.78f,0.54f,0.10f);
             p.bad=V(0.82f,0.25f,0.25f); p.call=V(0.13f,0.44f,0.84f); p.branch=V(0.66f,0.44f,0.06f);
+            p.jump=V(0.52f,0.22f,0.78f);
             p.light=true;
             break;
         case ThemeId::Monokai:
@@ -57,6 +60,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.95f,0.95f,0.90f); p.muted=V(0.55f,0.55f,0.50f); p.border=V(0.33f,0.33f,0.28f,0.60f);
             p.accent=V(0.65f,0.89f,0.18f); p.good=V(0.65f,0.89f,0.18f); p.warn=V(0.99f,0.59f,0.12f);
             p.bad=V(0.98f,0.15f,0.45f); p.call=V(0.40f,0.85f,0.94f); p.branch=V(0.99f,0.84f,0.36f);
+            p.jump=V(0.68f,0.51f,0.98f);
             break;
         case ThemeId::SolarizedDark:
             p.bg0=V(0.000f,0.169f,0.212f); p.bg1=V(0.027f,0.212f,0.259f);
@@ -65,6 +69,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.58f,0.63f,0.63f); p.muted=V(0.40f,0.48f,0.51f); p.border=V(0.10f,0.31f,0.36f,0.70f);
             p.accent=V(0.149f,0.545f,0.824f); p.good=V(0.522f,0.600f,0.000f); p.warn=V(0.710f,0.537f,0.000f);
             p.bad=V(0.863f,0.196f,0.184f); p.call=V(0.165f,0.631f,0.596f); p.branch=V(0.827f,0.212f,0.510f);
+            p.jump=V(0.424f,0.443f,0.769f);
             break;
         case ThemeId::Dracula:
             p.bg0=V(0.157f,0.165f,0.212f); p.bg1=V(0.196f,0.207f,0.275f);
@@ -73,6 +78,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.95f,0.95f,0.96f); p.muted=V(0.55f,0.56f,0.66f); p.border=V(0.33f,0.34f,0.44f,0.60f);
             p.accent=V(0.741f,0.576f,0.976f); p.good=V(0.314f,0.980f,0.482f); p.warn=V(0.945f,0.980f,0.549f);
             p.bad=V(1.000f,0.333f,0.400f); p.call=V(0.545f,0.914f,0.992f); p.branch=V(1.000f,0.722f,0.424f);
+            p.jump=V(1.000f,0.475f,0.776f);
             break;
         case ThemeId::Nord:
             p.bg0=V(0.180f,0.204f,0.251f); p.bg1=V(0.231f,0.259f,0.322f);
@@ -81,6 +87,7 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.85f,0.87f,0.91f); p.muted=V(0.50f,0.55f,0.62f); p.border=V(0.30f,0.34f,0.42f,0.60f);
             p.accent=V(0.506f,0.631f,0.757f); p.good=V(0.639f,0.745f,0.549f); p.warn=V(0.922f,0.796f,0.545f);
             p.bad=V(0.749f,0.380f,0.416f); p.call=V(0.561f,0.737f,0.733f); p.branch=V(0.851f,0.616f,0.510f);
+            p.jump=V(0.706f,0.557f,0.678f);
             break;
         case ThemeId::Matrix:
             p.bg0=V(0.020f,0.040f,0.020f); p.bg1=V(0.040f,0.070f,0.040f);
@@ -89,6 +96,20 @@ static Palette PaletteFor(ThemeId id) {
             p.text=V(0.40f,0.95f,0.45f); p.muted=V(0.30f,0.55f,0.32f); p.border=V(0.12f,0.30f,0.14f,0.70f);
             p.accent=V(0.20f,0.90f,0.30f); p.good=V(0.30f,0.95f,0.40f); p.warn=V(0.85f,0.95f,0.30f);
             p.bad=V(0.95f,0.45f,0.30f); p.call=V(0.40f,0.95f,0.55f); p.branch=V(0.70f,0.95f,0.40f);
+            p.jump=V(0.35f,0.90f,0.80f);
+            break;
+        case ThemeId::Paper:
+            // Warm paper + ink with an amber accent (the wireframe palette):
+            // page = warm off-white, panels slightly brighter, lines are soft
+            // warm grays, and the single accent is amber.
+            p.bg0=V(0.925f,0.918f,0.894f); p.bg1=V(0.938f,0.931f,0.908f);
+            p.bg2=V(0.905f,0.896f,0.868f); p.bg3=V(0.862f,0.850f,0.816f);
+            p.child=V(0.972f,0.966f,0.948f); p.popup=V(0.984f,0.980f,0.964f,0.98f); p.menubar=V(0.938f,0.931f,0.908f);
+            p.text=V(0.245f,0.230f,0.200f); p.muted=V(0.520f,0.500f,0.455f); p.border=V(0.700f,0.685f,0.640f,0.95f);
+            p.accent=V(0.875f,0.565f,0.220f); p.good=V(0.270f,0.560f,0.300f); p.warn=V(0.760f,0.520f,0.090f);
+            p.bad=V(0.780f,0.270f,0.230f); p.call=V(0.230f,0.430f,0.700f); p.branch=V(0.700f,0.460f,0.090f);
+            p.jump=V(0.530f,0.290f,0.700f);
+            p.light=true;
             break;
     }
     return p;
@@ -96,13 +117,25 @@ static Palette PaletteFor(ThemeId id) {
 
 // Current theme + its resolved palette. Initialized to the default so the col::*
 // helpers are valid even before ApplyTheme() is first called.
-static ThemeId g_theme = ThemeId::Midnight;
-static Palette g_pal   = PaletteFor(ThemeId::Midnight);
-static float   g_scale = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
+static ThemeId g_theme   = ThemeId::Paper;
+static Palette g_pal     = PaletteFor(ThemeId::Paper);
+static float   g_scale   = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
+static Density g_density = Density::Comfortable;   // roomier default
+
+// Spacing/padding multiplier for the current density (applied on top of HiDPI k).
+// Comfortable = 1.0 is the new baseline; Compact is the old tighter look.
+static float densityFactor() {
+    switch (g_density) {
+        case Density::Compact:  return 0.88f;
+        case Density::Spacious: return 1.18f;
+        default:                return 1.0f;
+    }
+}
 
 static void applyMetrics() {
     ImGuiStyle& s = ImGui::GetStyle();
     const float k = g_scale;     // scale every pixel metric so HiDPI stays crisp
+    const float d = k * densityFactor();   // spacing/padding also scale with density
     s.WindowRounding    = 6.0f * k;
     s.ChildRounding     = 6.0f * k;
     s.FrameRounding     = 5.0f * k;
@@ -117,14 +150,14 @@ static void applyMetrics() {
     s.TabBorderSize     = 0.0f;
     s.PopupBorderSize   = 1.0f;
 
-    s.WindowPadding     = ImVec2(12 * k, 12 * k);
-    s.FramePadding      = ImVec2(10 * k, 6 * k);
-    s.CellPadding       = ImVec2(8 * k, 5 * k);
-    s.ItemSpacing       = ImVec2(10 * k, 8 * k);
-    s.ItemInnerSpacing  = ImVec2(8 * k, 6 * k);
-    s.IndentSpacing     = 20.0f * k;
-    s.ScrollbarSize     = 14.0f * k;
-    s.GrabMinSize       = 12.0f * k;
+    s.WindowPadding     = ImVec2(12 * d, 12 * d);
+    s.FramePadding      = ImVec2(10 * d, 6 * d);
+    s.CellPadding       = ImVec2(8 * d, 5 * d);
+    s.ItemSpacing       = ImVec2(10 * d, 8 * d);
+    s.ItemInnerSpacing  = ImVec2(8 * d, 6 * d);
+    s.IndentSpacing     = 20.0f * d;
+    s.ScrollbarSize     = 14.0f * d;
+    s.GrabMinSize       = 12.0f * d;
 
     s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
@@ -199,6 +232,18 @@ void ApplyTheme() { ApplyTheme(g_theme); }
 void SetUiScale(float scale) { g_scale = (scale > 0.5f && scale < 8.0f) ? scale : 1.0f; }
 float UiScale() { return g_scale; }
 
+void    SetDensity(Density d) { g_density = d; }
+Density CurrentDensity()      { return g_density; }
+
+const char* DensityName(Density d) {
+    switch (d) {
+        case Density::Compact:     return "Compact";
+        case Density::Comfortable: return "Comfortable";
+        case Density::Spacious:    return "Spacious";
+        default:                   return "?";
+    }
+}
+
 ThemeId CurrentTheme() { return g_theme; }
 
 const char* ThemeName(ThemeId id) {
@@ -211,6 +256,7 @@ const char* ThemeName(ThemeId id) {
         case ThemeId::Dracula:       return "Dracula";
         case ThemeId::Nord:          return "Nord";
         case ThemeId::Matrix:        return "Matrix";
+        case ThemeId::Paper:         return "Paper";
         default:                     return "?";
     }
 }
@@ -223,9 +269,15 @@ namespace col {
     ImVec4 muted()     { return g_pal.muted; }
     ImVec4 call()      { return g_pal.call; }
     ImVec4 branch()    { return g_pal.branch; }
+    ImVec4 jump()      { return g_pal.jump; }
     ImVec4 selection() { return ImVec4(g_pal.accent.x, g_pal.accent.y, g_pal.accent.z, 1.0f); }
     ImVec4 menubar()   { return g_pal.menubar; }
     ImVec4 windowBg()  { return g_pal.bg0; }
+
+    ImVec4 panel()       { return g_pal.child; }
+    ImVec4 panelHeader() { return g_pal.menubar; }
+    ImVec4 line()        { return ImVec4(g_pal.border.x, g_pal.border.y, g_pal.border.z, 1.0f); }
+    ImVec4 lineSoft()    { return mix(g_pal.border, g_pal.bg1, 0.45f); }
 }
 
 } // namespace ds::theme

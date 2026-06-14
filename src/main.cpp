@@ -14,6 +14,7 @@
 
 #include <d3d11.h>
 #include <fstream>
+#include <string>
 #include <tchar.h>
 #include <windows.h>
 
@@ -74,8 +75,27 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // windows — so enable multi-viewport. The platform-window pump at the bottom of
     // the render loop is gated on this same flag.
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Docking for the panels INSIDE Binary View (a per-page DockSpace): drag-resize,
+    // re-dock, float as an OS window, or stack as tabs. Combined with ViewportsEnable,
+    // a panel dragged out of the window becomes its own OS viewport for free.
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigViewportsNoTaskBarIcon = true;   // popped panels are tools, not separate apps
-    io.IniFilename = nullptr; // don't persist/restore window layout
+
+    // Persist the panel layout across sessions in %APPDATA%\DisasmStudio\imgui.ini.
+    // ImGui stores the pointer (not a copy), so the path must outlive the context —
+    // a function-local static is fine for the program's lifetime.
+    static std::string iniPath;
+    {
+        char appdata[MAX_PATH] = {0};
+        if (GetEnvironmentVariableA("APPDATA", appdata, sizeof(appdata))) {
+            std::string dir = std::string(appdata) + "\\DisasmStudio";
+            CreateDirectoryA(dir.c_str(), nullptr);
+            iniPath = dir + "\\imgui.ini";
+            io.IniFilename = iniPath.c_str();
+        } else {
+            io.IniFilename = nullptr;   // no APPDATA: don't persist
+        }
+    }
 
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
@@ -93,25 +113,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     const float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
     ds::theme::SetUiScale(dpi);
 
-    // Prefer crisp Windows system fonts; fall back to the built-in font.
-    // A proportional face for the UI and a monospace face for code/hex views.
-    {
-        auto fileExists = [](const char* p) { std::ifstream f(p); return f.good(); };
-        const float uiPx   = 17.0f * dpi;
-        const float monoPx = 16.0f * dpi;
-        ImFont* uiFont = nullptr;
-        if (fileExists("C:\\Windows\\Fonts\\segoeui.ttf"))
-            uiFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", uiPx);
-        if (!uiFont) uiFont = io.Fonts->AddFontDefault();
-        ds::ui::gUiFont = uiFont;
-
-        ImFont* mono = nullptr;
-        if (fileExists("C:\\Windows\\Fonts\\consola.ttf"))
-            mono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", monoPx);
-        else if (fileExists("C:\\Windows\\Fonts\\cour.ttf"))
-            mono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\cour.ttf", monoPx);
-        ds::ui::gMonoFont = mono; // null -> PushMono() uses the default font
-    }
+    // UI + mono faces, with the Segoe MDL2 icon font merged in (see Fonts.cpp).
+    ds::ui::LoadFonts(dpi);
 
     ds::App app;   // ctor applies the saved theme (which now picks up the UI scale)
 
@@ -191,6 +194,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         else if (framesToRender > 0)
             --framesToRender;
     }
+
+    // Flush the panel layout now: ImGui's ~5 s autosave timer may not have fired for a
+    // change made just before exit, and DestroyContext() does not save.
+    if (io.IniFilename) ImGui::SaveIniSettingsToDisk(io.IniFilename);
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

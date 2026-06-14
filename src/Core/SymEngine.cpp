@@ -301,7 +301,6 @@ public:
             out.regs.rax = static_cast<uint64_t>(ctx.getConcreteRegisterValue(R.x86_rax));
             out.regs.rcx = static_cast<uint64_t>(ctx.getConcreteRegisterValue(R.x86_rcx));
             out.regs.rdx = static_cast<uint64_t>(ctx.getConcreteRegisterValue(R.x86_rdx));
-            out.exitVA = va;
             out.status = SymStatus::Ok;
             return out.status;
         } catch (...) {

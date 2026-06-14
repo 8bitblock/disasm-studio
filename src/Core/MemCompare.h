@@ -43,13 +43,32 @@ inline double MemAsNumber(int valueType, uint64_t bits, bool unsignedMode) {
     }
 }
 
-// a > b under the chosen interpretation.
-inline bool MemGreater(int valueType, bool unsignedMode, uint64_t a, uint64_t b) {
-    return MemAsNumber(valueType, a, unsignedMode) > MemAsNumber(valueType, b, unsignedMode);
+// Zero-/sign-extend the low `sz` bytes of `bits` to the full 64-bit width.
+inline uint64_t MemZeroExt(uint64_t bits, size_t sz) {
+    return sz >= 8 ? bits : (bits & ((1ull << (sz * 8)) - 1));
 }
-// a < b under the chosen interpretation.
+inline int64_t MemSignExt(uint64_t bits, size_t sz) {
+    const int shift = (int)(64 - sz * 8);
+    return shift <= 0 ? (int64_t)bits : ((int64_t)(bits << shift)) >> shift;
+}
+
+// a > b under the chosen interpretation. Integer types compare as integers (a
+// double round-trip would lose precision above 2^53 for qwords); float/double
+// compare by IEEE value.
+inline bool MemGreater(int valueType, bool unsignedMode, uint64_t a, uint64_t b) {
+    if (valueType == (int)MemValType::Float || valueType == (int)MemValType::Double)
+        return MemAsNumber(valueType, a, unsignedMode) > MemAsNumber(valueType, b, unsignedMode);
+    const size_t sz = MemTypeSize(valueType);
+    return unsignedMode ? MemZeroExt(a, sz) > MemZeroExt(b, sz)
+                        : MemSignExt(a, sz) > MemSignExt(b, sz);
+}
+// a < b under the chosen interpretation (same integer/float split as MemGreater).
 inline bool MemLess(int valueType, bool unsignedMode, uint64_t a, uint64_t b) {
-    return MemAsNumber(valueType, a, unsignedMode) < MemAsNumber(valueType, b, unsignedMode);
+    if (valueType == (int)MemValType::Float || valueType == (int)MemValType::Double)
+        return MemAsNumber(valueType, a, unsignedMode) < MemAsNumber(valueType, b, unsignedMode);
+    const size_t sz = MemTypeSize(valueType);
+    return unsignedMode ? MemZeroExt(a, sz) < MemZeroExt(b, sz)
+                        : MemSignExt(a, sz) < MemSignExt(b, sz);
 }
 
 } // namespace ds

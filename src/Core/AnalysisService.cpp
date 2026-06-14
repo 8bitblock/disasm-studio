@@ -5,6 +5,7 @@
 #include "BinaryFile.h"
 #include "SynthesisJob.h"     // K_Synthesis (F1)
 #include "PathExploreJob.h"   // K_PathExplore (F3, static)
+#include "../Disasm/JvmDisassembler.h"   // AttachJvmClass (JavaClass symbolication)
 
 #include <algorithm>
 
@@ -43,7 +44,7 @@ void AnalysisService::requestBulk(const BinaryFile* bin, Engine engine, Arch arc
                 j.arch   = arch;
                 j.guess  = guessNames;
                 j.epoch  = epoch;
-                if (kinds & (K_Synthesis | K_PathExplore)) { j.regionLo = regionLo; j.regionHi = regionHi; }
+                if (kinds & (K_Synthesis | K_PathExplore | K_Decompile)) { j.regionLo = regionLo; j.regionHi = regionHi; }
                 merged = true;
                 break;
             }
@@ -153,6 +154,12 @@ void AnalysisService::runJob(const BulkJob& job) {
     if (superseded() || !job.bin) return;
     std::unique_ptr<IDisassembler> dis = factory_ ? factory_(job.engine, job.arch) : nullptr;
     if (!dis) return;
+    // Java class: hand the worker's own decoder the parsed class so listing
+    // operands symbolicate (constant pool) and switch padding is exact. The
+    // shared_ptr keeps the class alive for the job even across a concurrent
+    // unload (the epoch check still drops the stale result).
+    if (job.arch == Arch::JVM && job.bin->javaClass())
+        AttachJvmClass(*dis, job.bin->javaClass());
 
     // Emit one result per pass, the moment it finishes, so the consumer can apply the
     // cheap functions/strings immediately and the heavier listing/xref later.
@@ -272,6 +279,20 @@ void AnalysisService::runJob(const BulkJob& job) {
         PathTree pt = PathExploreJob(*job.bin, *dis, job.arch, job.regionLo);
         if (!superseded()) {
             AnalysisResult r; r.pathTree = std::move(pt); r.pathValid = true;
+            r.regionLo = job.regionLo; r.regionHi = job.regionHi;
+            emit(std::move(r));
+        }
+    }
+
+    // Structured pseudo-C for the function in [regionLo, regionHi) (off the render
+    // thread). Base name resolution only (imports + string literals); the UI re-applies
+    // nothing — user renames still show in the listing, not here (documented default).
+    if ((job.kinds & K_Decompile) && !superseded() && job.regionHi > job.regionLo) {
+        DecompResult t = DecompileRegion(*job.bin, *dis, ArchIsX86(job.arch), job.regionLo, job.regionHi);
+        if (!superseded()) {
+            AnalysisResult r; r.decompText = std::move(t.text); r.decompLineVA = std::move(t.lineVA);
+            r.decompValid = true;
+            r.decompVA = job.regionLo;
             r.regionLo = job.regionLo; r.regionHi = job.regionHi;
             emit(std::move(r));
         }

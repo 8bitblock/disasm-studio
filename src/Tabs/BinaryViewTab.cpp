@@ -10,11 +10,18 @@
 #include "../Core/SynthesisJob.h"   // F1 synthesize a region
 #include "../Core/PatchCompiler.h"  // F2 compile editor source -> bytes
 #include "../Core/PatchPlacer.h"    // F2 cave-finder + detour placement
+#include "../Core/ExcName.h"        // semantic names for the first-chance filter UI
+#include "../Core/JvmClass.h"       // JvmClassFile facts for the Java-class banner
+#include "../Core/ApiInfo.h"        // ApiPurpose(): one-line API behavior (shared with FuncAnnotate)
 #include "../Disasm/Assembler.h"
 #include "DataRef.h"
 #include "../Ui/Fonts.h"
+#include "../Ui/Icons.h"   // DS_ICON_FOLDER for the archive banner
 #include "../Ui/Theme.h"
+#include "../Ui/Widgets.h"   // ui::Toast for one-shot patch/revert results
+#include "../Ui/Splitter.h"   // ds::ui::VSplitter for the in-panel sub-splits
 #include "imgui.h"
+#include "imgui_internal.h"   // (retained) ImGui internal helpers
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -478,46 +485,69 @@ static std::string instrGloss(const Instruction& in) {
     return std::string();   // call / jmp handled by the target name; nop/etc. omitted
 }
 
-// One-line purpose for common imported APIs (matched on the function name with
-// any A/W/Ex suffix or Nt/Zw prefix ignored). "" when unknown.
-static std::string apiPurpose(const std::string& dllDotFunc) {
-    std::string fn = dllDotFunc;
-    size_t dot = fn.find('.');
-    if (dot != std::string::npos) fn = fn.substr(dot + 1);
-    for (char& c : fn) c = (char)std::tolower((unsigned char)c);
-    auto has = [&](const char* k) { return fn.find(k) != std::string::npos; };
-    if (has("createfile"))        return "open / create a file or device";
-    if (has("readfile"))          return "read from a file/handle";
-    if (has("writefile"))         return "write to a file/handle";
-    if (has("createprocess") || has("winexec") || has("shellexecute")) return "spawn a process";
-    if (has("virtualalloc"))      return "allocate memory (often RWX)";
-    if (has("virtualprotect"))    return "change memory protection";
-    if (has("writeprocessmemory"))return "write another process's memory";
-    if (has("readprocessmemory")) return "read another process's memory";
-    if (has("createremotethread") || has("ntcreatethreadex")) return "start a thread in another process";
-    if (has("queueuserapc"))      return "queue an APC (injection)";
-    if (has("loadlibrary"))       return "load a DLL at runtime";
-    if (has("getprocaddress"))    return "resolve an export by name";
-    if (has("getmodulehandle"))   return "get a loaded module base";
-    if (has("isdebuggerpresent") || has("checkremotedebugger")) return "anti-debug check";
-    if (has("ntqueryinformationprocess")) return "query process info (often anti-debug)";
-    if (has("setwindowshookex"))  return "install a hook (injection)";
-    if (has("regsetvalue") || has("regcreatekey")) return "write the registry (persistence?)";
-    if (has("regopenkey") || has("regqueryvalue")) return "read the registry";
-    if (has("createservice"))     return "install a service (persistence)";
-    if (has("wsastartup") || has("socket") || has("connect") || has("send") || has("recv")) return "network socket I/O";
-    if (has("internetopen") || has("internetconnect") || has("httpsendrequest") || has("winhttp") || has("urldownload")) return "HTTP / internet I/O";
-    if (has("crypt") || has("bcrypt"))   return "cryptography";
-    if (has("messagebox"))        return "show a message box";
-    if (has("exitprocess") || has("terminateprocess")) return "terminate the process";
-    if (has("getprocessheap") || has("heapalloc")) return "heap allocation";
-    if (has("sleep"))             return "delay execution";
-    if (has("getticktount") || has("gettickcount") || has("queryperformancecounter")) return "read a timer (timing/anti-debug)";
-    if (has("createmutex"))       return "create a mutex (single-instance?)";
-    return std::string();
-}
+// apiPurpose() moved to Core/ApiInfo.h (ds::ApiPurpose) so the FuncAnnotate
+// engine shares the same API-behavior knowledge; included at the top of this file.
 
 static float slowPulse() { return 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.0f); }
+
+// Layered "glow" for a focused row: a soft outer halo (stacked translucent rects
+// growing outward), a crisp rounded outline, and a bright left accent bar. The
+// flat color FILL stays in the table's RowBg (under the text); this paints the
+// bloom over the row, so keep the halo alphas low enough that text stays legible.
+static void drawGlowRect(ImDrawList* dl, float x0, float x1, float yTop, float yBot,
+                         unsigned int colPacked, float intensity) {
+    const float  k = theme::UiScale();
+    const ImVec4 c = ImGui::ColorConvertU32ToFloat4(colPacked);
+    for (int i = 3; i >= 1; --i) {                                 // soft halo, widest first
+        float grow = (float)i * 2.5f * k;
+        float a    = intensity * 0.05f * (float)(4 - i);
+        dl->AddRectFilled(ImVec2(x0 - grow, yTop - grow), ImVec2(x1 + grow, yBot + grow),
+                          ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, a)), 4.0f * k + grow);
+    }
+    dl->AddRect(ImVec2(x0, yTop), ImVec2(x1, yBot),
+                ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 0.30f + 0.45f * intensity)), 3.0f * k, 0, 1.0f);
+    dl->AddRectFilled(ImVec2(x0, yTop), ImVec2(x0 + 3.0f * k, yBot),                  // left accent bar
+                      ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 0.55f + 0.45f * intensity)), 2.0f * k);
+}
+
+// Word-token classification for operand syntax coloring. Register names cover
+// x86/x64 (incl. r8-r15 sub-regs, xmm/ymm/zmm, segments) plus the common
+// ARM64/RISC-V/MIPS/PPC names the Capstone backends print.
+static bool isRegisterToken(const std::string& tok) {
+    if (tok.empty() || tok.size() > 6) return false;
+    std::string t; t.reserve(tok.size());
+    for (char c : tok) t += (char)std::tolower((unsigned char)c);
+    static const std::unordered_set<std::string> kNames = {
+        // x86/x64 GP + ip
+        "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","rip",
+        "eax","ebx","ecx","edx","esi","edi","ebp","esp","eip",
+        "ax","bx","cx","dx","si","di","bp","sp",
+        "al","bl","cl","dl","ah","bh","ch","dh","sil","dil","bpl","spl",
+        // segments / flags
+        "cs","ds","es","fs","gs","ss","rflags","eflags",
+        // ARM64 / RISC-V / MIPS / PPC common names
+        "lr","fp","xzr","wzr","pc","ra","gp","tp","zero",
+    };
+    if (kNames.count(t)) return true;
+    // rN[d|w|b] (x64), xN/wN/vN/qN/dN/sN (ARM64), aN/tN/sN (RISC-V), xmm/ymm/zmm/stN/mmN
+    auto digits = [](const std::string& s, size_t from, size_t to) {
+        if (from >= to) return false;
+        for (size_t i = from; i < to; ++i) if (!std::isdigit((unsigned char)s[i])) return false;
+        return true;
+    };
+    if (t.size() >= 4 && (t.rfind("xmm", 0) == 0 || t.rfind("ymm", 0) == 0 || t.rfind("zmm", 0) == 0))
+        return digits(t, 3, t.size());
+    if (t.size() >= 3 && (t[0] == 's' && t[1] == 't')) return digits(t, 2, t.size());
+    if (t.size() >= 3 && (t[0] == 'm' && t[1] == 'm')) return digits(t, 2, t.size());
+    if (t[0] == 'r') {   // r8..r15 + d/w/b suffix
+        size_t e = t.size();
+        if (e >= 2 && (t.back() == 'd' || t.back() == 'w' || t.back() == 'b')) --e;
+        return digits(t, 1, e);
+    }
+    if (t.size() >= 2 && (t[0]=='x' || t[0]=='w' || t[0]=='v' || t[0]=='q' || t[0]=='a' || t[0]=='t'))
+        return digits(t, 1, t.size());
+    return false;
+}
 
 // Short module name for symbols ("C:\\...\\kernel32.dll" -> "kernel32").
 static std::string modShortName(const std::string& name) {
@@ -649,13 +679,20 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
     // Launch-and-debug the loaded binary straight from the static view (breaks at
     // the entry point). Only shown when there's nothing attached yet.
     if (!ctx.debug.snapshot().attached()) {
+        const bool canLaunch = ctx.binaryLaunchable();
+        ImGui::BeginDisabled(!canLaunch);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.42f, 0.24f, 1.0f));
         bool run = ImGui::SmallButton("> Run");
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Launch this binary under the debugger and break at its entry point");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(canLaunch
+                ? "Launch this binary under the debugger and break at its entry point"
+                : "This image can't be started directly (only a PE .exe opened from disk can);\n"
+                  "attach to a running process in the Communications tab instead");
         if (run) {
             std::string err;
-            if (ctx.debug.launchAndAttach(ctx.binary.path(), err)) { runErr_.clear(); ctx.openLiveAssemblyView(); }
+            if (ctx.launchAndDebug(err)) runErr_.clear();
             else runErr_ = "Launch failed: " + err;
         }
         if (!runErr_.empty()) { ImGui::SameLine(); ImGui::TextColored(theme::col::bad(), "%s", runErr_.c_str()); }
@@ -673,12 +710,26 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
     uint64_t sig = listingSig(ctx);
     if (!listBuilt_ || sig != listSig_) { buildFullListing(ctx); listSig_ = sig; lastAsmScroll_ = 0; }
 
+    // Keep the cursor's function annotated (FuncAnnotate / JvmAnnotate, tiny LRU):
+    // the per-row inline path only renders cache hits, so this is the one eager
+    // build site. JVM routes to the bytecode engine; x86/x64 to FuncAnnotate.
+    if (showFnNotes_ || (ctx.arch == Arch::JVM && showHints_)) {
+        if (ctx.arch == Arch::JVM) jvmAnnotationsFor(ctx, cursorVA_, true);
+        else                       annotationsFor(ctx, cursorVA_, true);
+    }
+
     ImGui::SameLine();
     ImGui::TextDisabled("%d instruction(s), %d function(s)%s", listInsnCount_, (int)functions_.size(),
                         listInsnCount_ >= 800000 ? "  (capped)" : "");
     ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
     ImGui::Checkbox("Explain", &showHints_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Inline plain-language note of what each instruction does");
+    ImGui::SameLine();
+    ImGui::Checkbox("Notes", &showFnNotes_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Inline per-function analysis notes (calling convention, branch meaning,\n"
+                          "loops, call args, suspicious patterns). Heuristic - hover a note for its\n"
+                          "evidence and confidence; the Annotations tab shows the full report.");
     ImGui::SameLine();
     ImGui::Checkbox("Str", &showStringComments_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Inline string / imported-API comments");
@@ -778,6 +829,671 @@ void BinaryViewTab::renderAsmFuncHeader(AppContext& ctx, uint64_t addr) {
     if (nm.empty() || nm.find("+0x") != std::string::npos) { char b[28]; std::snprintf(b, sizeof(b), "sub_%llX", (unsigned long long)addr); nm = b; }
     ImGui::TableSetColumnIndex(2); ImGui::TextColored(theme::col::muted(), "0x%llX", (unsigned long long)addr);
     ImGui::TableSetColumnIndex(4); ImGui::TextColored(theme::col::accent(), "%s:", nm.c_str());
+    // FuncAnnotate one-liner (convention / args / frame / loops / patterns) when
+    // this function is warm in the annotation LRU. Hover for the evidence.
+    if (showFnNotes_ && ctx.arch != Arch::JVM) {
+        if (const AnnEntry* ae = annotationsFor(ctx, addr, false); ae && ae->fn == addr && !ae->ann.summary.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("  ; %s", ae->ann.summary.c_str());
+            if (ImGui::IsItemHovered() && !ae->ann.convEvidence.empty())
+                ImGui::SetTooltip("heuristic (confidence %.2f): %s", ae->ann.convConfidence, ae->ann.convEvidence.c_str());
+        }
+    }
+    // JvmAnnotate one-liner (stack depth / calls / categories / check?) for JVM methods.
+    if (showFnNotes_ && ctx.arch == Arch::JVM) {
+        if (const JvmAnnEntry* je = jvmAnnotationsFor(ctx, addr, false); je && je->fn == addr && !je->ann.summary.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("  ; %s", je->ann.summary.c_str());
+            if (ImGui::IsItemHovered() && je->ann.likelyCheck && !je->ann.checkEvidence.empty())
+                ImGui::SetTooltip("likely check method (conf %.2f): %s", je->ann.checkConfidence, je->ann.checkEvidence.c_str());
+        }
+    }
+}
+
+// Cached per-function annotations (Core/FuncAnnotate). The LRU is keyed by
+// function start and invalidated when the listing signature (image / functions /
+// arch / engine) changes. buildIfMissing=false is the per-row render path: it
+// returns only functions still warm in the cache, so scrolling never triggers
+// CFG builds; the cursor's function (renderAssembly) and the Annotations tab
+// build eagerly. Returned pointer stays valid until the next eviction.
+const BinaryViewTab::AnnEntry* BinaryViewTab::annotationsFor(AppContext& ctx, uint64_t va, bool buildIfMissing) {
+    if (!ctx.binary.loaded() || !ctx.disasm) return nullptr;
+    if (!ArchIsX86(ctx.arch)) return nullptr;          // x86/x64 heuristics only
+    uint64_t sig = listingSig(ctx);
+    if (sig != annSig_) { annLru_.clear(); annSig_ = sig; }
+    const Func* f = funcContaining(va);
+    if (!f) return nullptr;
+    for (auto it = annLru_.begin(); it != annLru_.end(); ++it)
+        if (it->fn == f->address) { annLru_.splice(annLru_.begin(), annLru_, it); return &annLru_.front(); }
+    if (!buildIfMissing) return nullptr;
+
+    size_t avail = 0;
+    const uint8_t* p = ctx.binary.ptrFromVA(f->address, avail);
+    if (!p) return nullptr;
+    size_t len = f->size ? std::min<size_t>(avail, f->size) : std::min<size_t>(avail, 0x4000);
+    ControlFlowGraph g = BuildCFG(p, len, f->address, *ctx.disasm, 3000,
+                                  [&](const Instruction& in) { return resolveJumpTable(ctx, in); });
+    AnnotateOptions opt;
+    opt.x64 = (ctx.arch == Arch::X64);
+    opt.nameFor = [this, &ctx](uint64_t a) -> std::string {
+        if (auto it = importMap_.find(a); it != importMap_.end()) return it->second;
+        return symbolFor(ctx, a);
+    };
+    opt.stringFor = [&ctx](uint64_t a) -> std::string {
+        size_t av = 0; const uint8_t* sp = ctx.binary.ptrFromVA(a, av);
+        return sp ? resolveString(sp, std::min<size_t>(av, 80)) : std::string();
+    };
+    opt.looksLikeVtable = [&ctx](uint64_t a) -> bool {
+        // Vtable shape: >= 2 consecutive pointers landing in executable sections.
+        const bool w = (ctx.arch == Arch::X64);
+        size_t av = 0; const uint8_t* dp = ctx.binary.ptrFromVA(a, av);
+        if (!dp || av < (w ? 16u : 8u)) return false;
+        auto isCode = [&](uint64_t t) {
+            for (const auto& s : ctx.binary.sections()) {
+                if (!s.executable) continue;
+                uint64_t lo = ctx.binary.imageBase() + s.virtualAddress;
+                uint64_t hi = lo + std::max<uint64_t>(s.virtualSize, s.rawSize);
+                if (t >= lo && t < hi) return true;
+            }
+            return false;
+        };
+        for (int i = 0; i < 2; ++i) {
+            uint64_t v = 0;
+            std::memcpy(&v, dp + i * (w ? 8 : 4), w ? 8 : 4);
+            if (!isCode(v)) return false;
+        }
+        return true;
+    };
+    AnnEntry e;
+    e.fn  = f->address;
+    e.ann = AnnotateFunction(g, opt);
+    for (const FnNote& n : e.ann.notes) {
+        if (!n.va) continue;                       // function-level: Annotations tab only
+        std::string& t = e.inlineText[n.va];
+        if (!t.empty()) t += "  |  ";
+        t += n.text;
+        std::string& tip = e.inlineTip[n.va];
+        if (!tip.empty()) tip += "\n\n";
+        char hdr[96];
+        std::snprintf(hdr, sizeof(hdr), "[%s] confidence %.2f  (%s, heuristic)",
+                      NoteKindName(n.kind), n.confidence, e.ann.analyzer);
+        tip += std::string(hdr) + "\n" + n.evidence;
+    }
+    annLru_.push_front(std::move(e));
+    while (annLru_.size() > kAnnLruCap) annLru_.pop_back();
+    return &annLru_.front();
+}
+
+// "Annotations" lower sub-tab: the full FuncAnnotate report for the cursor's
+// function — convention/args/frame with evidence, register lifetimes, and every
+// note (clickable). Spells out confidence so guesses never read as facts.
+void BinaryViewTab::renderAnnotationsTab(AppContext& ctx) {
+    if (!ImGui::BeginTabItem("Annotations")) return;
+    if (!ctx.binary.loaded() || !ctx.disasm) {
+        ImGui::TextDisabled("Load a binary to analyze.");
+        ImGui::EndTabItem(); return;
+    }
+    if (!ArchIsX86(ctx.arch)) {
+        ImGui::TextDisabled("Function annotations are implemented for x86/x64 only.");
+        ImGui::EndTabItem(); return;
+    }
+    const AnnEntry* ae = annotationsFor(ctx, cursorVA_, true);
+    if (!ae) {
+        ImGui::TextDisabled("Place the cursor inside an analyzed function (run analysis / click a function).");
+        ImGui::EndTabItem(); return;
+    }
+    const FuncAnnotations& a = ae->ann;
+
+    std::string fname = symbolFor(ctx, ae->fn);
+    if (fname.empty()) { char b[28]; std::snprintf(b, sizeof(b), "sub_%llX", (unsigned long long)ae->fn); fname = b; }
+    ImGui::TextColored(theme::col::accent(), "%s", fname.c_str());
+    ImGui::SameLine(); ImGui::TextDisabled("0x%llX", (unsigned long long)ae->fn);
+    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Everything below is heuristic (analyzer: %s). Each item lists its evidence;\n"
+                          "confidence is a 0..1 score of how distinctive that evidence is - not proof.", a.analyzer);
+
+    // ---- Function-level summary ----
+    if (!a.convention.empty()) {
+        ImGui::Text("Convention: %s", a.convention.c_str());
+        ImGui::SameLine(); ImGui::TextDisabled("conf %.2f", a.convConfidence);
+        if (ImGui::IsItemHovered() && !a.convEvidence.empty()) ImGui::SetTooltip("%s", a.convEvidence.c_str());
+    }
+    if (a.hasFramePointer || a.frameBytes) {
+        ImGui::Text("Frame: %s%s", a.hasFramePointer ? "frame pointer" : "no frame pointer",
+                    a.frameBytes ? "" : " (no fixed reservation seen)");
+        if (a.frameBytes) { ImGui::SameLine(); ImGui::Text("- 0x%X bytes reserved", a.frameBytes); }
+    }
+    for (const std::string& arg : a.args) ImGui::BulletText("%s", arg.c_str());
+
+    if (!a.stack.empty() && ImGui::TreeNode("Stack frame layout", "Stack frame layout (%d slot(s))", (int)a.stack.size())) {
+        if (ImGui::BeginTable("annstack", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Slot");
+            ImGui::TableSetupColumn("Location");
+            ImGui::TableSetupColumn("Kind");
+            ImGui::TableSetupColumn("Reads");
+            ImGui::TableSetupColumn("Writes");
+            ImGui::TableHeadersRow();
+            for (const StackSlot& s : a.stack) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::Text("%s", s.name.c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("[%s%s0x%llX]", s.base.c_str(), s.offset >= 0 ? "+" : "-",
+                            (unsigned long long)(s.offset >= 0 ? s.offset : -s.offset));
+                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", s.isArg ? "arg" : "local");
+                ImGui::TableNextColumn(); ImGui::Text("%d", s.reads);
+                ImGui::TableNextColumn(); ImGui::Text("%d", s.writes);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+    if (!a.regs.empty() && ImGui::TreeNode("Register lifetimes", "Register lifetimes (%d, approximate)", (int)a.regs.size())) {
+        ImGui::TextDisabled("Linear address-order scan - control flow joins are not modelled.");
+        if (ImGui::BeginTable("annregs", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Reg");
+            ImGui::TableSetupColumn("First");
+            ImGui::TableSetupColumn("Last");
+            ImGui::TableSetupColumn("Reads");
+            ImGui::TableSetupColumn("Writes");
+            ImGui::TableHeadersRow();
+            for (const RegLifetime& r : a.regs) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::Text("%s", r.reg.c_str());
+                ImGui::TableNextColumn(); ImGui::TextDisabled("0x%llX", (unsigned long long)r.firstVA);
+                ImGui::TableNextColumn(); ImGui::TextDisabled("0x%llX", (unsigned long long)r.lastVA);
+                ImGui::TableNextColumn(); ImGui::Text("%d", r.reads);
+                ImGui::TableNextColumn(); ImGui::Text("%d", r.writes);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+    ImGui::Separator();
+
+    // ---- Notes: list (left) + evidence detail (right) ----
+    ImGui::TextDisabled("%d note(s) - click to navigate, select for evidence", (int)a.notes.size());
+    ImGui::BeginChild("annlist", ImVec2(ImGui::GetContentRegionAvail().x * 0.52f, 0), ImGuiChildFlags_Borders);
+    ui::PushMono();
+    if (ImGui::BeginTable("annnotes", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f * theme::UiScale());
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 92.0f * theme::UiScale());
+        ImGui::TableSetupColumn("Note");
+        ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 44.0f * theme::UiScale());
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)a.notes.size(); ++i) {
+            const FnNote& n = a.notes[i];
+            ImGui::TableNextRow(); ImGui::PushID(i);
+            ImGui::TableSetColumnIndex(0);
+            char lbl[28];
+            if (n.va) std::snprintf(lbl, sizeof(lbl), "0x%llX", (unsigned long long)n.va);
+            else      std::snprintf(lbl, sizeof(lbl), "(function)");
+            if (ImGui::Selectable(lbl, annSel_ == i, ImGuiSelectableFlags_SpanAllColumns)) {
+                annSel_ = i;
+                if (n.va) gotoStatic(ctx, n.va);
+            }
+            ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", NoteKindName(n.kind));
+            ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(n.text.c_str());
+            ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%.2f", n.confidence);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ui::PopMono();
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    ImGui::BeginChild("anndetail", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    if (annSel_ >= 0 && annSel_ < (int)a.notes.size()) {
+        const FnNote& n = a.notes[annSel_];
+        ImGui::TextColored(theme::col::accent(), "%s", NoteKindName(n.kind));
+        ImGui::SameLine(); ImGui::TextDisabled("confidence %.2f - %s", n.confidence, a.analyzer);
+        ImGui::TextWrapped("%s", n.text.c_str());
+        ImGui::SeparatorText("Evidence");
+        ImGui::TextWrapped("%s", n.evidence.c_str());
+        ImGui::Separator();
+        if (n.va) {
+            if (ImGui::SmallButton("Go to instruction")) gotoStatic(ctx, n.va);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Override (set comment)...")) {
+                // User override: a persistent comment at the address wins visually
+                // over the heuristic note in the listing.
+                annPopupVA_ = n.va;
+                auto cit = comments_.find(n.va);
+                std::snprintf(commentBuf_, sizeof(commentBuf_), "%s",
+                              cit != comments_.end() ? cit->second.c_str() : "");
+                openCommentPopup_ = true;
+            }
+        }
+        if (ImGui::SmallButton("Copy note")) {
+            std::string s = n.text + "\n[" + NoteKindName(n.kind) + "] " + n.evidence;
+            ImGui::SetClipboardText(s.c_str());
+        }
+    } else {
+        ImGui::TextDisabled("Select a note to see why the analyzer thinks that.");
+    }
+    ImGui::EndChild();
+    ImGui::EndTabItem();
+}
+
+// Cached per-method Java bytecode annotations (Core/JvmAnnotate). Mirrors
+// annotationsFor: LRU keyed by method code offset, invalidated on listing-sig
+// change; buildIfMissing=false is the cache-hit-only per-row path.
+const BinaryViewTab::JvmAnnEntry* BinaryViewTab::jvmAnnotationsFor(AppContext& ctx, uint64_t va, bool buildIfMissing) {
+    if (ctx.arch != Arch::JVM || !ctx.binary.loaded() || !ctx.disasm) return nullptr;
+    auto cf = ctx.binary.javaClass();
+    if (!cf || !cf->ok) return nullptr;
+    uint64_t sig = listingSig(ctx);
+    if (sig != jvmAnnSig_) { jvmAnnLru_.clear(); jvmAnnSig_ = sig; }
+    const JvmMethod* m = cf->methodAtOffset(va);
+    if (!m) return nullptr;
+    for (auto it = jvmAnnLru_.begin(); it != jvmAnnLru_.end(); ++it)
+        if (it->fn == m->codeOffset) { jvmAnnLru_.splice(jvmAnnLru_.begin(), jvmAnnLru_, it); return &jvmAnnLru_.front(); }
+    if (!buildIfMissing) return nullptr;
+
+    size_t avail = 0;
+    const uint8_t* p = ctx.binary.ptrFromVA(m->codeOffset, avail);
+    if (!p) return nullptr;
+    size_t len = std::min<size_t>(avail, m->codeLength);
+    std::vector<Instruction> insns = ctx.disasm->disassemble(p, len, m->codeOffset, 0);
+    JvmAnnEntry e;
+    e.fn  = m->codeOffset;
+    e.ann = AnalyzeJvmMethod(*cf, *m, insns);
+    for (const JvmInsnNote& n : e.ann.notes) {
+        if (!n.effect.empty()) e.inlineEffect[n.bci] = n.effect;
+        if (!n.branch.empty()) e.inlineBranch[n.bci] = n.branch;
+        e.depthBefore[n.bci] = n.stackBefore;
+    }
+    jvmAnnLru_.push_front(std::move(e));
+    while (jvmAnnLru_.size() > kAnnLruCap) jvmAnnLru_.pop_back();
+    return &jvmAnnLru_.front();
+}
+
+// "Java" lower sub-tab: static .class / JVM analysis — the relationship chain,
+// constant-pool viewer, and the cursor method's stack-machine + findings. Only
+// shown for Arch::JVM targets. Mirrors the Annotations tab's honesty framing.
+void BinaryViewTab::renderJavaTab(AppContext& ctx) {
+    if (ctx.arch != Arch::JVM) return;        // not a Java target: hide the tab entirely
+    if (!ImGui::BeginTabItem("Java")) return;
+    auto cf = ctx.binary.javaClass();
+    if (!cf || !cf->ok) {
+        ImGui::TextDisabled("No parsed Java class. Load a .class file (or extract one from a JAR via the archive banner).");
+        ImGui::EndTabItem(); return;
+    }
+
+    // ---- relationship chain: native EXE -> runtime -> JAR -> Main-Class -> main -> check ----
+    {
+        ImGui::SeparatorText("Analysis chain");
+        const std::string cls = JvmShortClassName(cf->thisClass);
+        // A loaded .class is the leaf; if a wrapper EXE was detected this session
+        // the runtime scan recorded the launcher + embedded JAR + Main-Class.
+        if (ctx.runtimeInfo.wrapperLikely || ctx.javaInfo.isJar) {
+            ImGui::TextWrapped("Native EXE  ->  %s launcher  ->  %s  ->  Main-Class %s  ->  main()  ->  validation/check methods",
+                               ctx.runtimeInfo.wrapperRuntime.empty() ? "runtime" : ctx.runtimeInfo.wrapperRuntime.c_str(),
+                               ctx.javaInfo.isJar ? "embedded JAR" : "embedded class",
+                               ctx.javaInfo.mainClass.empty() ? cls.c_str() : ctx.javaInfo.mainClass.c_str());
+        } else {
+            ImGui::TextWrapped("Class %s  ->  %s  ->  validation/check methods",
+                               cf->thisClass.c_str(),
+                               cf->superClass.empty() ? "(no super)" : ("extends " + cf->superClass).c_str());
+        }
+        // List likely check methods across the whole class (best-effort: analyze each).
+        int checks = 0;
+        for (const JvmMethod& mm : cf->methods) {
+            if (!mm.codeLength) continue;
+            const JvmAnnEntry* ae = jvmAnnotationsFor(ctx, mm.codeOffset, true);
+            if (ae && ae->ann.likelyCheck) {
+                ++checks;
+                ImGui::Bullet();
+                ImGui::SameLine();
+                char lbl[160];
+                std::snprintf(lbl, sizeof(lbl), "%s  (conf %.2f) -> go", ae->ann.pretty.c_str(), ae->ann.checkConfidence);
+                ImGui::PushID((int)mm.codeOffset);
+                if (ImGui::SmallButton(lbl)) gotoStatic(ctx, mm.codeOffset);
+                if (ImGui::IsItemHovered() && !ae->ann.checkEvidence.empty())
+                    ImGui::SetTooltip("heuristic: %s", ae->ann.checkEvidence.c_str());
+                ImGui::PopID();
+            }
+        }
+        if (!checks) ImGui::TextDisabled("No method scored as a likely check/validation routine.");
+    }
+
+    // ---- the cursor method's analysis ----
+    const JvmAnnEntry* cur = jvmAnnotationsFor(ctx, cursorVA_, true);
+    if (ImGui::BeginTabBar("javasub")) {
+        if (ImGui::BeginTabItem("Method")) {
+            if (!cur) {
+                ImGui::TextDisabled("Place the cursor inside a method body.");
+            } else {
+                const JvmMethodAnalysis& a = cur->ann;
+                ImGui::TextColored(theme::col::accent(), "%s", a.pretty.c_str());
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stack effects + findings are computed from the bytecode (analyzer: %s).\n"
+                                      "Findings are heuristic and list their evidence + confidence.", a.analyzer);
+                ImGui::Text("max stack %d (declared %d) · max locals %d%s",
+                            a.computedMaxStack, a.declaredMaxStack, a.maxLocals,
+                            a.stackConsistent ? "" : " · IRREGULAR stack (obfuscation?)");
+                if (a.likelyCheck) {
+                    ImGui::TextColored(theme::col::warn(), "Likely validation/check method (conf %.2f)", a.checkConfidence);
+                    if (ImGui::IsItemHovered() && !a.checkEvidence.empty()) ImGui::SetTooltip("%s", a.checkEvidence.c_str());
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Operand-stack trace (click a row to navigate):");
+                ImGui::BeginChild("jvmstk", ImVec2(0, 0), ImGuiChildFlags_Borders);
+                ui::PushMono();
+                if (ImGui::BeginTable("jvmnotes", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+                    ImGui::TableSetupColumn("bci",   ImGuiTableColumnFlags_WidthFixed, 56.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("stack", ImGuiTableColumnFlags_WidthFixed, 64.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("op",    ImGuiTableColumnFlags_WidthFixed, 120.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("effect");
+                    ImGui::TableSetupColumn("branch");
+                    ImGui::TableSetupScrollFreeze(0, 1);
+                    ImGui::TableHeadersRow();
+                    // Re-decode for mnemonic display (cheap; method bodies are small).
+                    size_t avail = 0; const uint8_t* p = ctx.binary.ptrFromVA(cur->fn, avail);
+                    std::vector<Instruction> insns;
+                    if (p) { const JvmMethod* mm = cf->methodAtOffset(cur->fn);
+                             if (mm) insns = ctx.disasm->disassemble(p, std::min<size_t>(avail, mm->codeLength), cur->fn, 0); }
+                    for (size_t i = 0; i < a.notes.size(); ++i) {
+                        const JvmInsnNote& n = a.notes[i];
+                        ImGui::TableNextRow(); ImGui::PushID((int)i);
+                        ImGui::TableSetColumnIndex(0);
+                        char b[16]; std::snprintf(b, sizeof(b), "%llu", (unsigned long long)(n.bci - cur->fn));
+                        if (ImGui::Selectable(b, false, ImGuiSelectableFlags_SpanAllColumns)) gotoStatic(ctx, n.bci);
+                        ImGui::TableSetColumnIndex(1);
+                        if (n.stackBefore < 0) ImGui::TextColored(theme::col::muted(), "--");
+                        else ImGui::Text("%d->%d", n.stackBefore, n.stackAfter < 0 ? n.stackBefore : n.stackAfter);
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(i < insns.size() ? insns[i].mnemonic.c_str() : "");
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(n.effect.c_str());
+                        ImGui::TableSetColumnIndex(4);
+                        if (!n.branch.empty()) ImGui::TextColored(theme::col::branch(), "%s", n.branch.c_str());
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+                ui::PopMono();
+                ImGui::EndChild();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Findings")) {
+            if (cur && !cur->ann.findings.empty()) {
+                if (ImGui::BeginTable("jvmfind", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                    ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 90.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("bci", ImGuiTableColumnFlags_WidthFixed, 48.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("Finding");
+                    ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 44.0f * theme::UiScale());
+                    ImGui::TableHeadersRow();
+                    for (const JvmFinding& f : cur->ann.findings) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn(); ImGui::TextDisabled("%s", JvmCatName(f.cat));
+                        ImGui::TableNextColumn();
+                        ImGui::PushID((void*)(uintptr_t)f.bci);
+                        char b[16]; std::snprintf(b, sizeof(b), "%llu", (unsigned long long)(f.bci - cur->fn));
+                        if (ImGui::Selectable(b)) gotoStatic(ctx, f.bci);
+                        ImGui::PopID();
+                        ImGui::TableNextColumn(); ImGui::TextUnformatted(f.text.c_str());
+                        if (ImGui::IsItemHovered() && !f.evidence.empty()) ImGui::SetTooltip("%s", f.evidence.c_str());
+                        ImGui::TableNextColumn(); ImGui::TextDisabled("%.2f", f.confidence);
+                    }
+                    ImGui::EndTable();
+                }
+            } else ImGui::TextDisabled(cur ? "No notable API categories in this method." : "Place the cursor inside a method body.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Calls / Fields / Strings")) {
+            if (cur) {
+                const JvmMethodAnalysis& a = cur->ann;
+                if (ImGui::TreeNodeEx("Calls", ImGuiTreeNodeFlags_DefaultOpen, "Calls (%d)", (int)a.calls.size())) {
+                    for (const JvmCall& c : a.calls) {
+                        ImGui::PushID((void*)(uintptr_t)c.bci);
+                        char lbl[200];
+                        std::snprintf(lbl, sizeof(lbl), "%s  %s%s%s%s", c.kind.c_str(),
+                                      c.owner.empty() ? "" : (JvmShortClassName(c.owner) + ".").c_str(),
+                                      c.name.c_str(), c.descriptor.c_str(), c.local ? "  [local]" : "");
+                        if (ImGui::Selectable(lbl)) gotoStatic(ctx, c.bci);
+                        ImGui::PopID();
+                    }
+                    ImGui::TreePop();
+                }
+                if (ImGui::TreeNodeEx("Fields", ImGuiTreeNodeFlags_DefaultOpen, "Field accesses (%d)", (int)a.fields.size())) {
+                    for (const JvmFieldAccess& f : a.fields) {
+                        ImGui::PushID((void*)(uintptr_t)f.bci);
+                        char lbl[200];
+                        std::snprintf(lbl, sizeof(lbl), "%s%s  %s.%s : %s",
+                                      f.put ? "put" : "get", f.isStatic ? "static" : "field",
+                                      JvmShortClassName(f.owner).c_str(), f.name.c_str(), f.type.c_str());
+                        if (ImGui::Selectable(lbl)) gotoStatic(ctx, f.bci);
+                        ImGui::PopID();
+                    }
+                    ImGui::TreePop();
+                }
+                if (ImGui::TreeNodeEx("Strings", ImGuiTreeNodeFlags_DefaultOpen, "String constants (%d)", (int)a.strings.size())) {
+                    for (const JvmStringRef& s : a.strings) {
+                        ImGui::PushID((void*)(uintptr_t)s.bci);
+                        char lbl[220];
+                        std::snprintf(lbl, sizeof(lbl), "\"%.180s\"", s.text.c_str());
+                        if (ImGui::Selectable(lbl)) gotoStatic(ctx, s.bci);
+                        ImGui::PopID();
+                    }
+                    ImGui::TreePop();
+                }
+            } else ImGui::TextDisabled("Place the cursor inside a method body.");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Constant pool")) {
+            ImGui::SetNextItemWidth(220.0f * theme::UiScale());
+            ImGui::InputTextWithHint("##cpf", "filter...", jvmCpFilter_, sizeof(jvmCpFilter_));
+            ImGui::SameLine(); ImGui::TextDisabled("%d entries", (int)(cf->cp.size() ? cf->cp.size() - 1 : 0));
+            ImGui::BeginChild("jvmcp", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            ui::PushMono();
+            if (ImGui::BeginTable("cp", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+                ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 56.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Tag", ImGuiTableColumnFlags_WidthFixed, 110.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Value");
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                static const char* kTag[] = { "", "Utf8", "", "Integer", "Float", "Long", "Double", "Class",
+                                              "String", "Fieldref", "Methodref", "InterfaceMethodref",
+                                              "NameAndType", "", "", "MethodHandle", "MethodType", "Dynamic",
+                                              "InvokeDynamic", "Module", "Package" };
+                for (uint16_t i = 1; i < cf->cp.size(); ++i) {
+                    const JvmCpEntry& e = cf->cp[i];
+                    if (e.tag == 0) continue;   // second half of a Long/Double
+                    std::string val = cf->describeCp(i);
+                    const char* tn = (e.tag < (int)(sizeof(kTag) / sizeof(kTag[0]))) ? kTag[e.tag] : "?";
+                    if (jvmCpFilter_[0] && val.find(jvmCpFilter_) == std::string::npos &&
+                        std::string(tn).find(jvmCpFilter_) == std::string::npos) continue;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("#%u", i);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(tn);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(val.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ui::PopMono();
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndTabItem();
+}
+
+uint64_t BinaryViewTab::gameContextSig(AppContext& ctx) const {
+    uint64_t h = ctx.binary.loaded() ? ctx.binary.contentHash() : 0;
+    h ^= (uint64_t)strings_.size() << 1;
+    h ^= (uint64_t)functions_.size() << 17;
+    h ^= (uint64_t)algos_.size() << 33;
+    h ^= (uint64_t)namesGen_ << 49;
+    h ^= stringsLive_ ? 0xA51D0001ull : 0;
+    if (!strings_.empty()) h ^= strings_.front().address ^ (strings_.back().address << 7);
+    if (!functions_.empty()) h ^= functions_.front().address ^ (functions_.back().address << 11);
+    if (!algos_.empty()) h ^= algos_.front().address ^ (algos_.back().address << 13);
+    if (ctx.runtimeInfo.wrapperLikely) {
+        h ^= 0xC0FFEEull;
+        h ^= (uint64_t)(ctx.runtimeInfo.wrapperConfidence * 1000.0f) << 24;
+    }
+    return h;
+}
+
+const GameContextReport& BinaryViewTab::gameContextFor(AppContext& ctx) {
+    uint64_t sig = gameContextSig(ctx);
+    if (sig == gameCtxSig_) return gameCtx_;
+
+    GameContextInput in;
+    in.runtime = ctx.runtimeInfo;
+    in.strings.reserve(strings_.size());
+    for (const Strng& s : strings_) in.strings.push_back({ s.address, s.text, s.wide });
+    in.functions.reserve(functions_.size());
+    for (const Func& f : functions_) {
+        std::string nm = annName(ctx, f.address);
+        if (nm.empty()) nm = f.name;
+        std::string reason;
+        if (auto it = guessReason_.find(f.address); it != guessReason_.end()) reason = it->second;
+        in.functions.push_back({ f.address, f.size, nm, f.guessed, reason });
+    }
+    in.algorithms = algos_;
+    gameCtx_ = BuildGameContext(in);
+    gameCtxSig_ = sig;
+    return gameCtx_;
+}
+
+void BinaryViewTab::renderGameContextTab(AppContext& ctx) {
+    if (!ImGui::BeginTabItem("Game")) return;
+    const GameContextReport& r = gameContextFor(ctx);
+    ImGui::TextDisabled("Heuristic context for game reversing and crackme triage; every row carries confidence and evidence.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(220.0f * theme::UiScale());
+    ImGui::InputTextWithHint("##gamefilter", "filter...", gameCtxFilter_, sizeof(gameCtxFilter_));
+
+    std::string needle = gameCtxFilter_;
+    for (char& c : needle) c = (char)std::tolower((unsigned char)c);
+    auto match = [&](const std::string& s) {
+        if (needle.empty()) return true;
+        std::string h = s;
+        for (char& c : h) c = (char)std::tolower((unsigned char)c);
+        return h.find(needle) != std::string::npos;
+    };
+
+    if (r.empty()) {
+        ImGui::TextDisabled("No game/crackme context yet. Run function and string analysis first.");
+        ImGui::EndTabItem();
+        return;
+    }
+
+    if (ImGui::BeginTabBar("gamesub")) {
+        if (ImGui::BeginTabItem("Hints")) {
+            if (r.crackmeHints.empty()) {
+                ImGui::TextDisabled("No crackme-style starting points found.");
+            } else if (ImGui::BeginTable("gamehints", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+                ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 130.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Hint");
+                ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 44.0f * theme::UiScale());
+                ImGui::TableHeadersRow();
+                for (const Finding& f : r.crackmeHints) {
+                    if (!match(f.title + " " + f.detail)) continue;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", f.title.c_str());
+                    ImGui::TableNextColumn();
+                    if (f.address) {
+                        char a[24]; std::snprintf(a, sizeof(a), "0x%llX", (unsigned long long)f.address);
+                        if (ImGui::Selectable(a, false, ImGuiSelectableFlags_SpanAllColumns)) gotoStatic(ctx, f.address);
+                    } else ImGui::TextDisabled("-");
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", f.detail.c_str());
+                    if (ImGui::IsItemHovered() && !f.evidence.empty()) ImGui::SetTooltip("%s", f.evidence[0].what.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%.2f", f.confidence);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Strings")) {
+            if (r.strings.empty()) {
+                ImGui::TextDisabled("No categorized game strings found.");
+            } else if (ImGui::BeginTable("gamestrings", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Group", ImGuiTableColumnFlags_WidthFixed, 105.0f * theme::UiScale());
+                ImGui::TableSetupColumn("String");
+                ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 44.0f * theme::UiScale());
+                ImGui::TableHeadersRow();
+                for (const GameStringFinding& s : r.strings) {
+                    std::string cat = GameStringCategoryName(s.category);
+                    if (!match(cat + " " + s.text)) continue;
+                    ImGui::TableNextRow(); ImGui::PushID((void*)(uintptr_t)s.address);
+                    ImGui::TableNextColumn();
+                    char a[24]; std::snprintf(a, sizeof(a), "0x%llX", (unsigned long long)s.address);
+                    if (ImGui::Selectable(a, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (stringsLive_) { mainView_ = 4; liveNavigate(s.address); }
+                        else gotoStatic(ctx, s.address);
+                    }
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", cat.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(s.text.c_str());
+                    if (ImGui::IsItemHovered() && !s.evidence.empty()) ImGui::SetTooltip("%s", s.evidence.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%.2f", s.confidence);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Functions")) {
+            if (r.functions.empty()) {
+                ImGui::TextDisabled("No gameplay/workflow function candidates found.");
+            } else if (ImGui::BeginTable("gamefuncs", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 135.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Function");
+                ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 44.0f * theme::UiScale());
+                ImGui::TableHeadersRow();
+                for (const GameFunctionFinding& f : r.functions) {
+                    std::string kind = GameFunctionKindName(f.kind);
+                    if (!match(kind + " " + f.name + " " + f.evidence)) continue;
+                    ImGui::TableNextRow(); ImGui::PushID((void*)(uintptr_t)(f.address ^ (uint64_t)f.kind));
+                    ImGui::TableNextColumn();
+                    char a[24]; std::snprintf(a, sizeof(a), "0x%llX", (unsigned long long)f.address);
+                    if (ImGui::Selectable(a, false, ImGuiSelectableFlags_SpanAllColumns)) gotoStatic(ctx, f.address);
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", kind.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(f.name.c_str());
+                    if (ImGui::IsItemHovered() && !f.evidence.empty()) ImGui::SetTooltip("%s", f.evidence.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%.2f", f.confidence);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Runtime")) {
+            if (r.runtimeBoundaries.empty()) {
+                ImGui::TextDisabled("No runtime/container boundary findings.");
+            } else if (ImGui::BeginTable("gameruntime", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                ImGui::TableSetupColumn("Finding");
+                ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 90.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Evidence");
+                ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 44.0f * theme::UiScale());
+                ImGui::TableHeadersRow();
+                for (const Finding& f : r.runtimeBoundaries) {
+                    if (!match(f.title + " " + f.detail)) continue;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(f.title.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", f.category.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextWrapped("%s", f.detail.c_str());
+                    if (ImGui::IsItemHovered() && !f.evidence.empty()) ImGui::SetTooltip("%s", f.evidence[0].what.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%.2f", f.confidence);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndTabItem();
 }
 
 // Select every instruction address in [a, b] (inclusive) using the cached listing
@@ -957,35 +1673,51 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
 
     bool rowAtRip = snap.attached() && snap.regs.rip == in.address;
     bool rowSel   = in.address == cursorVA_ && !rowAtRip;
+    bool rowJump  = !rowAtRip && !rowSel && hlJumpVA_ && in.address == hlJumpVA_;
     bool rowMulti = selVAs_.size() > 1 && !rowAtRip && !rowSel && selVAs_.count(in.address);
-    if (rowAtRip) { float p = slowPulse(); ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.16f, 0.42f, 0.21f, 0.40f + 0.38f * p))); }
-    else if (rowSel) { float p = slowPulse(); ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.20f, 0.32f, 0.54f, 0.30f + 0.34f * p))); }
-    else if (rowMulti) { ImVec4 sc = theme::col::selection(); ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(sc.x, sc.y, sc.z, 0.26f))); }
+    float flash   = navFlashAt(in.address);
+    // Flat fill (under the text) — the glow halo/outline is painted post-table by
+    // drawRowGlows. Theme-routed so all palettes (incl. Light) stay correct:
+    // RIP = good, cursor = accent, the cursor's branch target = jump (violet).
+    {
+        float p = slowPulse();
+        ImVec4 fc(0, 0, 0, 0);
+        if (rowAtRip)      { ImVec4 c = theme::col::good();      fc = ImVec4(c.x, c.y, c.z, 0.26f + 0.14f * p); }
+        else if (rowSel)   { ImVec4 c = theme::col::accent();    fc = ImVec4(c.x, c.y, c.z, 0.22f + 0.12f * p); }
+        else if (rowJump)  { ImVec4 c = theme::col::jump();      fc = ImVec4(c.x, c.y, c.z, 0.16f + 0.10f * p); }
+        else if (rowMulti) { ImVec4 c = theme::col::selection(); fc = ImVec4(c.x, c.y, c.z, 0.26f); }
+        if (flash > 0.0f) fc.w = std::min(1.0f, fc.w + 0.25f * flash);
+        if (fc.w > 0.0f) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(fc));
+    }
 
     ImGui::TableSetColumnIndex(0);
     bool bp = hasBreakpoint(breakpoints_, in.address);
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::bad());   // red marker, matching the live gutter
     if (ImGui::Selectable(bp ? "*" : " ", false, ImGuiSelectableFlags_None, ImVec2(0, 0))) {
         if (bp) { breakpoints_.erase(in.address); if (snap.attached()) ctx.debug.removeBreakpoint(in.address); }
         else    { breakpoints_.insert(in.address); if (snap.attached()) ctx.debug.addBreakpoint(in.address); }
     }
+    ImGui::PopStyleColor();
 
     // col 1: flow gutter — record this row's center Y (+ lane/address X once) so
     // drawAsmArrows() can paint branch arrows over the listing after EndTable.
     ImGui::TableSetColumnIndex(1);
     if (!asmGotLaneX_) { asmLaneX_ = ImGui::GetCursorScreenPos().x; asmGotLaneX_ = true; }
     ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
+    const float rowYMid = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
     asmFlow_.push_back({ in.address, in.branchTarget,
-                         in.isBranch && !in.isCall && in.branchTarget != 0,
-                         (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f });
+                         in.isBranch && !in.isCall && in.branchTarget != 0, rowYMid });
+    pushRowGlow(rowYMid, rowAtRip, rowSel, rowJump, flash);
 
     ImGui::TableSetColumnIndex(2);
     if (!asmGotAddrX_) { asmAddrX_ = ImGui::GetCursorScreenPos().x; asmGotAddrX_ = true; }
     bool hwbp = std::any_of(snap.hwBreakpoints.begin(), snap.hwBreakpoints.end(),
                             [&](const HwBreakpointInfo& h) { return h.address == in.address; });
     char addrLbl[40]; std::snprintf(addrLbl, sizeof(addrLbl), "%s0x%llX", rowAtRip ? "> " : "  ", (unsigned long long)in.address);
-    if (rowAtRip)  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.9f, 0.4f, 1));
-    else if (hwbp) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.6f, 0.95f, 1));
-    else           ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_Text));
+    if (rowAtRip)      ImGui::PushStyleColor(ImGuiCol_Text, theme::col::good());
+    else if (hwbp)     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.6f, 0.95f, 1));
+    else if (rowJump)  ImGui::PushStyleColor(ImGuiCol_Text, theme::col::jump());
+    else               ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_Text));
     if (ImGui::Selectable(addrLbl, false)) {
         ImGuiIO& io = ImGui::GetIO();
         if (io.KeyShift && selAnchorVA_) {
@@ -1052,6 +1784,22 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
         if (ImGui::MenuItem("Copy address")) { char c[24]; std::snprintf(c, sizeof(c), "0x%llX", (unsigned long long)in.address); ImGui::SetClipboardText(c); }
         if (!inSel) emitInstrCopyMenu(in);   // selection menu already offers these when multi-selecting
         if (in.branchTarget && ImGui::MenuItem("Follow target")) navigateTo(in.branchTarget);
+        // In-encoding switch cases (JVM tableswitch/lookupswitch): jump to any case.
+        if (!in.extraTargets.empty() && ImGui::BeginMenu("Follow switch case")) {
+            for (size_t k = 0; k < in.extraTargets.size() && k < 64; ++k) {
+                char lbl[48];
+                std::snprintf(lbl, sizeof(lbl), "case %zu -> 0x%llX", k,
+                              (unsigned long long)in.extraTargets[k]);
+                if (ImGui::MenuItem(lbl)) navigateTo(in.extraTargets[k]);
+            }
+            if (in.extraTargets.size() > 64) ImGui::TextDisabled("(%zu more)", in.extraTargets.size() - 64);
+            if (in.branchTarget) {
+                char lbl[48];
+                std::snprintf(lbl, sizeof(lbl), "default -> 0x%llX", (unsigned long long)in.branchTarget);
+                if (ImGui::MenuItem(lbl)) navigateTo(in.branchTarget);
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Find references to this address")) startXrefSearch(ctx, in.address);
         if (uint64_t ref = instrDataRef(in)) if (ImGui::MenuItem("Find references to operand target")) startXrefSearch(ctx, ref);
         if (in.mnemonic == "jmp" && in.operands.find('[') != std::string::npos) {
@@ -1108,23 +1856,31 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
     ImGui::TextDisabled("%s", in.bytes.c_str());
 
     ImGui::TableSetColumnIndex(4);
-    ImVec4 mcol = in.isCall ? ImVec4(0.55f, 0.8f, 1.0f, 1) : in.isBranch ? ImVec4(0.95f, 0.75f, 0.4f, 1) : ImVec4(0.9f, 0.9f, 0.9f, 1);
+    ImVec4 mcol = in.isRet    ? theme::col::bad()
+                : in.isCall   ? theme::col::call()
+                : in.isBranch ? theme::col::branch()
+                              : ImGui::GetStyleColorVec4(ImGuiCol_Text);
     {
         ImVec2 cp = ImGui::GetCursorScreenPos();
-        if (!hoverTok.empty() && in.mnemonic == hoverTok)
-            ImGui::GetWindowDrawList()->AddRectFilled(cp, ImVec2(cp.x + ImGui::CalcTextSize(in.mnemonic.c_str()).x, cp.y + ImGui::GetTextLineHeight()), IM_COL32(95, 120, 175, 150), 2.0f);
+        if (!hoverTok.empty() && in.mnemonic == hoverTok) {
+            ImVec4 hc = theme::col::accent();
+            ImGui::GetWindowDrawList()->AddRectFilled(cp, ImVec2(cp.x + ImGui::CalcTextSize(in.mnemonic.c_str()).x, cp.y + ImGui::GetTextLineHeight()),
+                                                      ImGui::GetColorU32(ImVec4(hc.x, hc.y, hc.z, 0.40f)), 2.0f);
+        }
         ImGui::TextColored(mcol, "%-7s", in.mnemonic.c_str());
         if (ImGui::IsItemHovered()) nextHoverTok = in.mnemonic;
     }
     ImGui::SameLine(0, 0);
-    renderHoverTokens(in.operands.c_str(), ImGui::GetColorU32(ImVec4(0.9f, 0.9f, 0.9f, 1.0f)), hoverTok, nextHoverTok);
+    renderHoverTokens(in.operands.c_str(), ImGui::GetColorU32(ImGuiCol_Text), hoverTok, nextHoverTok);
     if (in.branchTarget) {
         ImGui::SameLine(); ImGui::TextDisabled("  ; 0x%llX", (unsigned long long)in.branchTarget);
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);   // it's a link
         if (ImGui::IsItemClicked()) navigateTo(in.branchTarget);       // click the target to follow
         if (showNames_) {
             std::string nm = symbolFor(ctx, in.branchTarget);
             if (!nm.empty()) {
                 ImGui::SameLine(0, 6); ImGui::TextColored(theme::col::call(), "%s", nm.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 if (ImGui::IsItemClicked()) navigateTo(in.branchTarget);
             }
         }
@@ -1136,7 +1892,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
         if (ref) {
             if (auto it = importMap_.find(ref); it != importMap_.end()) {       // call/jmp through the IAT
                 std::string txt = it->second;
-                std::string purpose = apiPurpose(it->second);
+                std::string purpose = ApiPurpose(it->second);
                 if (!purpose.empty()) txt += "  (" + purpose + ")";
                 ImGui::SameLine(); ImGui::TextColored(theme::col::call(), "  ; %s", txt.c_str());
                 dataComment = true;
@@ -1147,10 +1903,49 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
             }
         }
     }
-    // Inline "what it does" gloss, unless a string/API comment already explains it.
-    if (showHints_ && !dataComment) {
+    // Decoder-supplied annotation (JVM: resolved constant-pool refs, string
+    // literals, switch case targets). Same visual channel as string comments.
+    if (!in.comment.empty()) {
+        ImGui::SameLine(); ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), "  ; %s", in.comment.c_str());
+        dataComment = true;
+    }
+    // Per-function analysis note (FuncAnnotate): branch meaning, call args,
+    // loop/pattern hints for functions warm in the annotation LRU (the cursor's
+    // function is built eagerly in renderAssembly). These are heuristic guesses:
+    // the hover tooltip shows each note's kind, confidence, and evidence.
+    bool annShown = false;
+    if (showFnNotes_) {
+        if (const AnnEntry* ae = annotationsFor(ctx, in.address, false)) {
+            auto nit = ae->inlineText.find(in.address);
+            if (nit != ae->inlineText.end()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.82f, 1.0f), "  ; %s", nit->second.c_str());
+                if (ImGui::IsItemHovered()) {
+                    auto tit = ae->inlineTip.find(in.address);
+                    if (tit != ae->inlineTip.end()) ImGui::SetTooltip("%s", tit->second.c_str());
+                }
+                annShown = true;
+            }
+        }
+    }
+    // Inline "what it does" gloss, unless a string/API comment or an analysis
+    // note already explains the line.
+    if (showHints_ && !dataComment && !annShown) {
         std::string g = instrGloss(in);
         if (!g.empty()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.52f, 0.58f, 0.68f, 1.0f), "  ; %s", g.c_str()); }
+    }
+    // JVM bytecode: plain-language stack effect / branch meaning (JvmAnnotate).
+    // The CP-resolved comment already occupies the dataComment channel, so this
+    // adds the stack semantics after it. Cache-hit-only while scrolling.
+    if (ctx.arch == Arch::JVM && (showHints_ || showFnNotes_) && !annShown) {
+        if (const JvmAnnEntry* je = jvmAnnotationsFor(ctx, in.address, false)) {
+            auto bit = je->inlineBranch.find(in.address);
+            if (bit != je->inlineBranch.end()) {
+                ImGui::SameLine(); ImGui::TextColored(theme::col::branch(), "  ; %s", bit->second.c_str());
+            } else if (auto eit = je->inlineEffect.find(in.address); eit != je->inlineEffect.end()) {
+                ImGui::SameLine(); ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.82f, 1.0f), "  ; %s", eit->second.c_str());
+            }
+        }
     }
     if (auto cit = comments_.find(in.address); cit != comments_.end() && !cit->second.empty()) {
         ImGui::SameLine(); ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.55f, 1.0f), "  ; %s", cit->second.c_str());
@@ -1213,10 +2008,24 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
         return;
     }
 
-    // Reset the per-frame branch-arrow geometry sink (filled inside renderAsmRow).
-    asmFlow_.clear(); asmGotLaneX_ = asmGotAddrX_ = false;
+    // Reset the per-frame branch-arrow + row-glow geometry sinks (filled inside renderAsmRow).
+    asmFlow_.clear(); rowGlow_.clear(); asmGotLaneX_ = asmGotAddrX_ = false;
     ImVec2 tableMin = ImGui::GetCursorScreenPos();
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
+
+    // Branch target of the instruction under the cursor: its row (if visible)
+    // gets the violet jump-target glow, so clicking a jcc/call lights up where
+    // it goes. One decode per frame at most (usually a decode-cache hit).
+    hlJumpVA_ = 0;
+    if (cursorVA_) {
+        if (auto jit = decodeCache_.find(cursorVA_); jit != decodeCache_.end()) {
+            hlJumpVA_ = jit->second.branchTarget;
+        } else if (ctx.disasm) {
+            size_t javail = 0; Instruction jin;
+            const uint8_t* jp = ctx.binary.ptrFromVA(cursorVA_, javail);
+            if (jp && ctx.disasm->decodeOne(jp, javail, cursorVA_, jin)) hlJumpVA_ = jin.branchTarget;
+        }
+    }
 
     // Decoded visible-row cache validity: drop it when the image (load bumps the
     // content hash, a patch bumps liveGen_), the arch, or the engine changes, so a
@@ -1225,7 +2034,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                    ^ (liveGen_ * 0x9E3779B97F4A7C15ull)
                    ^ ((uint64_t)ctx.arch << 40)
                    ^ ((uint64_t)(ctx.disasm ? ctx.disasm->engine() : Engine::Zydis) << 44);
-    if (dcKey != decodeCacheKey_) { decodeCache_.clear(); decodeCacheKey_ = dcKey; }
+    if (dcKey != decodeCacheKey_) { decodeCache_.clear(); decodeOrder_.clear(); decodeCacheKey_ = dcKey; }
 
     ui::PushMono();
     if (ImGui::BeginTable("asm_full", 5,
@@ -1309,7 +2118,13 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                             in.mnemonic = "db";
                             char ob[8]; std::snprintf(ob, sizeof(ob), "0x%02X", b); in.operands = ob;
                         }
-                        if (decodeCache_.size() >= 4096) decodeCache_.clear();   // bounded; re-warms
+                        // FIFO eviction: drop the oldest entries (not the whole cache)
+                        // when over the cap, so a fast scroll keeps recently seen rows.
+                        while (decodeCache_.size() >= kDecodeCacheCap && !decodeOrder_.empty()) {
+                            decodeCache_.erase(decodeOrder_.front());
+                            decodeOrder_.pop_front();
+                        }
+                        decodeOrder_.push_back(row.addr);
                         dit = decodeCache_.emplace(row.addr, std::move(in)).first;
                     }
                     renderAsmRow(ctx, dit->second, snap, hoverTok, nextHoverTok, /*autoScrollHere=*/false);
@@ -1324,6 +2139,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
         ImGui::EndTable();
     }
     ui::PopMono();
+    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
     if (showJumpArrows_) drawAsmArrows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
 }
 
@@ -1357,10 +2173,15 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
     for (const auto& in : insns) if (in.isCall && in.branchTarget) funcSet.insert(in.branchTarget);
     for (const auto& f : functions_) funcSet.insert(f.address);
 
-    // Reset the per-frame branch-arrow geometry sink (filled inside renderAsmRow).
-    asmFlow_.clear(); asmGotLaneX_ = asmGotAddrX_ = false;
+    // Reset the per-frame branch-arrow + row-glow geometry sinks (filled inside renderAsmRow).
+    asmFlow_.clear(); rowGlow_.clear(); asmGotLaneX_ = asmGotAddrX_ = false;
     ImVec2 tableMin = ImGui::GetCursorScreenPos();
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
+
+    // Jump-target highlight: the branch target of the cursor's instruction.
+    hlJumpVA_ = 0;
+    for (const auto& jin : insns)
+        if (jin.address == cursorVA_) { hlJumpVA_ = jin.branchTarget; break; }
 
     ui::PushMono();
     if (ImGui::BeginTable("asm", 5,
@@ -1388,6 +2209,7 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
         ImGui::EndTable();
     }
     ui::PopMono();
+    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
     if (showJumpArrows_) drawAsmArrows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
 }
 
@@ -1452,6 +2274,53 @@ void BinaryViewTab::drawAsmArrows(float x0, float y0, float x1, float y1) {
     dl->PopClipRect();
 }
 
+// 1..0 decaying navigation-arrival flash for `addr` (0 when none / expired).
+// Set by navigateTo/navBack/navForward; expires by time so the clipper never
+// has to render the row for it to clear.
+float BinaryViewTab::navFlashAt(uint64_t addr) {
+    if (!navFlashVA_ || addr != navFlashVA_) return 0.0f;
+    float dt = (float)(ImGui::GetTime() - navFlashT0_);
+    if (dt >= 1.1f) { navFlashVA_ = 0; return 0.0f; }
+    return 1.0f - dt / 1.1f;
+}
+
+// Record one row's glow (color + intensity by cause) for the post-table pass.
+// Theme-routed: RIP = good (green), cursor = accent (what the user clicked),
+// jump target of the cursor's instruction = jump (violet). The nav flash mixes
+// the color toward white and boosts intensity, then decays over ~1s.
+void BinaryViewTab::pushRowGlow(float yCenter, bool rowAtRip, bool rowSel, bool rowJump, float flash) {
+    if (!(rowAtRip || rowSel || rowJump || flash > 0.0f)) return;
+    const float p = slowPulse();
+    ImVec4 c; float inten;
+    if (rowAtRip)      { c = theme::col::good();   inten = 0.55f + 0.45f * p; }
+    else if (rowSel)   { c = theme::col::accent(); inten = 0.40f + 0.30f * p; }
+    else if (rowJump)  { c = theme::col::jump();   inten = 0.30f + 0.25f * p; }
+    else               { c = theme::col::accent(); inten = 0.0f; }
+    if (flash > 0.0f) {   // white-hot arrival flash on top of the base glow
+        c = ImVec4(c.x + (1.0f - c.x) * flash * 0.6f,
+                   c.y + (1.0f - c.y) * flash * 0.6f,
+                   c.z + (1.0f - c.z) * flash * 0.6f, 1.0f);
+        inten = std::min(1.5f, inten + flash * 1.0f);
+    }
+    rowGlow_.push_back({ yCenter, ImGui::GetTextLineHeightWithSpacing(),
+                         ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 1.0f)), inten });
+}
+
+// Paint (then clear) the collected row glows over the table body. Same
+// foreground-drawlist + clip-rect approach as the arrows (the rows live inside
+// the table's scrolling child, so a window-drawlist rect would render behind
+// it); called after EndTable, BEFORE drawAsmArrows so arrows stay on top.
+void BinaryViewTab::drawRowGlows(float x0, float y0, float x1, float y1) {
+    if (rowGlow_.empty()) return;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->PushClipRect(ImVec2(x0, y0 + ImGui::GetFrameHeight()), ImVec2(x1, y1), true);
+    for (const RowGlow& g : rowGlow_)
+        drawGlowRect(dl, x0 + 1.0f, x1 - 1.0f, g.y - g.h * 0.5f, g.y + g.h * 0.5f,
+                     g.colorPacked, g.intensity);
+    dl->PopClipRect();
+    rowGlow_.clear();
+}
+
 // Move the cursor +/- N instructions through the cached full listing, skipping
 // the function-divider marker rows (which share an address with the first
 // instruction of the function). Backs J/K and the Prev/Next buttons.
@@ -1503,17 +2372,32 @@ void BinaryViewTab::revertPatchAt(AppContext& ctx, uint64_t va) {
     auto& V = ctx.project.patches;
     auto it = std::find_if(V.begin(), V.end(), [&](const PjPatch& x) { return x.address == fileVA; });
     if (it == V.end()) return;
+    const bool attached = ctx.debug.snapshot().attached();
+    const uint64_t revLo = fileVA, revHi = fileVA + it->orig.size();
     if (!it->orig.empty()) {
         // Live write needs the runtime VA; the image write + record use the file VA.
-        if (ctx.debug.snapshot().attached())
+        if (attached)
             ctx.debug.writeMemory(fileVAtoLive(ctx, fileVA), it->orig.data(), it->orig.size());
         ctx.binary.writeImage(fileVA, it->orig.data(), it->orig.size());
     }
     V.erase(it);
+    // The pristine restore just clobbered any SURVIVING patch overlapping the span:
+    // re-apply each one in full (idempotent; V order = application order, so the
+    // layering the user created is preserved — see buildPatchedImage in App.cpp).
+    for (const auto& p : V) {
+        if (p.address >= revHi || p.address + p.bytes.size() <= revLo) continue;
+        ctx.binary.writeImage(p.address, p.bytes.data(), p.bytes.size());
+        if (attached)
+            ctx.debug.writeMemory(fileVAtoLive(ctx, p.address), p.bytes.data(), p.bytes.size());
+    }
     // As in applyPatchBytes: no synchronous UI listing sweep — the worker rebuilds
     // off-thread via functionsDirty_, and visible rows re-decode the restored bytes.
     pseudoVA_ = 0; decompVA_ = 0; functionsDirty_ = true;
+    decompPending_ = false; decompLru_.clear();   // reverted bytes: cached pseudo-C is stale
     ++liveGen_;   // a live byte changed: invalidate the cached live decode
+    char tm[64];
+    std::snprintf(tm, sizeof(tm), "Reverted patch at 0x%llX.", (unsigned long long)fileVA);
+    ui::Toast(ui::ToastKind::Info, tm);
 }
 
 // Run the static function analysis (entry point + exports + prologue scan +
@@ -1661,6 +2545,7 @@ void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     }
     cursorVA_      = entry;
     lastAsmScroll_ = 0;          // force the Assembly view to re-center on the new cursor
+    runtimeBannerDismissed_ = false;   // new binary: re-show the runtime-wrapper/archive banner if detected
     navHist_.clear(); navPos_ = -1;
     strings_.clear(); stringsScanned_ = false; stringsLive_ = false;   // strings/symbols belonged to the old image
     stringsScanning_ = false; xrefScanning_ = false;                   // drop in-flight live scans for the old image
@@ -1668,7 +2553,7 @@ void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     functions_.clear(); funcIndexDirty_ = true; guessReason_.clear(); fnSummary_.clear();
     algos_.clear(); algosScanned_ = false; algoSel_ = -1;   // algorithm matches belonged to the old image
     symCache_.clear();
-    decompVA_ = 0; decompText_.clear();
+    decompVA_ = 0; setDecompContent(std::string(), {}); decompPending_ = false; decompLru_.clear();   // pseudocode belonged to the old image
     listBuilt_ = false;          // full-program listing belongs to the old image
     // IAT->"dll.func" map (cheap, read on the UI thread by symbolFor/dataRefToken).
     importMap_.clear();
@@ -1729,12 +2614,23 @@ void BinaryViewTab::restoreFromModuleCache(AppContext& ctx, LoadedModule& m) {
     ++liveGen_;
 }
 
+// Re-parse every watch expression into its compiled operand form. Called when
+// watches_ changes (load / add / remove) so the per-frame Watch-tab eval uses
+// EvalCompiled instead of re-parsing the string each frame.
+void BinaryViewTab::recompileWatches() {
+    watchProgs_.assign(watches_.size(), CondOperand{});
+    watchOk_.assign(watches_.size(), false);
+    for (size_t i = 0; i < watches_.size(); ++i)
+        watchOk_[i] = CompileExpression(watches_[i], watchProgs_[i]);
+}
+
 // Pull persisted analysis (ctx.project, populated on load) into the tab's live
 // editing state. Runs once per freshly-opened binary.
 void BinaryViewTab::loadProjectState(AppContext& ctx) {
     const ProjectState& p = ctx.project;
     comments_ = p.comments;
     names_    = p.names;
+    ++namesGen_;   // renames loaded from the sidecar change the function list's display
     algoLabels_ = p.algorithmLabels;   // user-confirmed algorithm labels (evidence overlay)
     bookmarks_.clear();
     for (const auto& b : p.bookmarks) bookmarks_.push_back({ b.address, b.label });
@@ -1742,8 +2638,11 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
     breakpoints_.insert(p.breakpoints.begin(), p.breakpoints.end());
     condBuf_.clear();
     for (const auto& kv : p.bpConditions) condBuf_[kv.first] = kv.second;
+    everyNBuf_.clear();
+    for (const auto& kv : p.bpEveryN) if (kv.second > 1) everyNBuf_[kv.first] = kv.second;
     std::snprintf(notes_, sizeof(notes_), "%s", p.notes.c_str());
     watches_ = p.watches;
+    recompileWatches();   // parse once; per-frame eval uses the compiled form
     if (p.lastCursor) cursorVA_ = p.lastCursor;
 
     // If we're already attached, arm any saved breakpoints now.
@@ -1752,6 +2651,8 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
             if (!ctx.debug.hasBreakpoint(a)) {
                 auto it = condBuf_.find(a);
                 ctx.debug.addBreakpoint(a, it != condBuf_.end() ? it->second : std::string());
+                if (auto en = everyNBuf_.find(a); en != everyNBuf_.end() && en->second > 1)
+                    ctx.debug.setBreakpointEveryN(a, en->second);
             }
     symCache_.clear();
     decompVA_ = 0;
@@ -1773,6 +2674,8 @@ void BinaryViewTab::saveProjectState(AppContext& ctx) {
     p.breakpoints.assign(breakpoints_.begin(), breakpoints_.end());
     p.bpConditions.clear();
     for (const auto& kv : condBuf_) if (!kv.second.empty()) p.bpConditions[kv.first] = kv.second;
+    p.bpEveryN.clear();
+    for (const auto& kv : everyNBuf_) if (kv.second > 1) p.bpEveryN[kv.first] = kv.second;
     p.notes = notes_;
     p.watches = watches_;
     if (cursorVA_) p.lastCursor = cursorVA_;
@@ -1806,6 +2709,7 @@ void BinaryViewTab::navigateTo(uint64_t va) {
     cursorVA_      = va;
     lastAsmScroll_ = 0;       // re-center the static full-program listing
     followLiveRip_ = false;
+    navFlashVA_ = va; navFlashT0_ = ImGui::GetTime();   // arrival flash on the landing row
 }
 // Restore the history entry at navPos_, switching the view to the space (live vs
 // static) that entry belongs to so a runtime VA never lands in a file-VA view.
@@ -1816,6 +2720,7 @@ void BinaryViewTab::navBack() {
     if (e.live) mainView_ = 4;                 // runtime entry -> live view
     else if (mainView_ == 4) mainView_ = 0;    // leaving live for a file entry -> static Assembly
     cursorVA_ = e.va; lastAsmScroll_ = 0; lastScrolledRip_ = 0; followLiveRip_ = false;
+    navFlashVA_ = e.va; navFlashT0_ = ImGui::GetTime();
 }
 void BinaryViewTab::navForward() {
     if (navPos_ < 0 || navPos_ + 1 >= (int)navHist_.size()) return;
@@ -1824,6 +2729,7 @@ void BinaryViewTab::navForward() {
     if (e.live) mainView_ = 4;
     else if (mainView_ == 4) mainView_ = 0;
     cursorVA_ = e.va; lastAsmScroll_ = 0; lastScrolledRip_ = 0; followLiveRip_ = false;
+    navFlashVA_ = e.va; navFlashT0_ = ImGui::GetTime();
 }
 void BinaryViewTab::gotoStatic(AppContext& ctx, uint64_t fileVA) {
     if (mainView_ == 4) liveNavigate(fileVAtoLive(ctx, fileVA));   // live view: shift to the runtime VA
@@ -1845,7 +2751,14 @@ void BinaryViewTab::toggleBreakpoint(AppContext& ctx, uint64_t va) {
 void BinaryViewTab::renderHoverTokens(const char* s, unsigned int col, const std::string& hl, std::string& nextHover) {
     if (!s || !s[0]) return;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 hlCol = IM_COL32(95, 120, 175, 150);
+    // Hover-match background + per-kind syntax colors, all theme-routed so the
+    // listing recolors with the palette: registers = call (cyan/blue family),
+    // numeric immediates = warn (amber), punctuation = muted, rest = caller's col.
+    const ImVec4 ha = theme::col::accent();
+    const ImU32 hlCol    = ImGui::GetColorU32(ImVec4(ha.x, ha.y, ha.z, 0.40f));
+    const ImU32 colReg   = ImGui::GetColorU32(theme::col::call());
+    const ImU32 colNum   = ImGui::GetColorU32(theme::col::warn());
+    const ImU32 colPunct = ImGui::GetColorU32(theme::col::muted());
     bool first = true;
     for (size_t i = 0; s[i];) {
         bool word = std::isalnum((unsigned char)s[i]) || s[i] == '_';
@@ -1860,7 +2773,11 @@ void BinaryViewTab::renderHoverTokens(const char* s, unsigned int col, const std
             ImVec2 ts = ImGui::CalcTextSize(tok.c_str());
             dl->AddRectFilled(cp, ImVec2(cp.x + ts.x, cp.y + ts.y), hlCol, 2.0f);
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImU32 tcol = col;
+        if (!word)                                        tcol = colPunct;
+        else if (std::isdigit((unsigned char)tok[0]))     tcol = colNum;   // 0x.., decimals
+        else if (isRegisterToken(tok))                    tcol = colReg;
+        ImGui::PushStyleColor(ImGuiCol_Text, tcol);
         ImGui::TextUnformatted(tok.c_str());
         ImGui::PopStyleColor();
         if (word && ImGui::IsItemHovered()) nextHover = tok;
@@ -1976,16 +2893,21 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
         return;
     }
 
-    const float boxW = 252.0f;
+    if (liveBoxW_ <= 0.0f) liveBoxW_ = 252.0f * theme::UiScale();   // scale default once for HiDPI
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::BeginChild("livemain", ImVec2(showRegBox_ ? avail.x - boxW - 8.0f : 0.0f, 0), ImGuiChildFlags_None);
+    // The register box is the RIGHT child here, so drive the split off the left
+    // (listing) width and derive the box width from it.
+    float leftW = showRegBox_ ? avail.x - liveBoxW_ - 8.0f : 0.0f;
+    ImGui::BeginChild("livemain", ImVec2(leftW, 0), ImGuiChildFlags_None);
     if (liveMode_ == 1) renderLivePseudocode(ctx, snap, base);
     else                renderLiveListing(ctx, snap, base);
     ImGui::EndChild();
 
     if (showRegBox_) {
-        ImGui::SameLine();
-        ImGui::BeginChild("liveregbox", ImVec2(boxW, 0), ImGuiChildFlags_Borders);
+        ds::ui::VSplitter("##livesplit", &leftW, 200.0f * theme::UiScale(),
+                          160.0f * theme::UiScale(), 6.0f * theme::UiScale());
+        liveBoxW_ = avail.x - leftW - 8.0f;   // keep the box width in sync with the drag
+        ImGui::BeginChild("liveregbox", ImVec2(0, 0), ImGuiChildFlags_Borders);
         renderRegisterBox(ctx, snap);
         ImGui::EndChild();
     }
@@ -2015,7 +2937,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
     // set, or the target process changes.
     uint64_t liveSig = start ^ (rip * 0x9E3779B97F4A7C15ull)
                      ^ ((uint64_t)liveGen_ << 1) ^ ((uint64_t)functions_.size() << 17)
-                     ^ ((uint64_t)symPid_ << 33);
+                     ^ ((uint64_t)symPid_ << 33) ^ ((uint64_t)ctx.engine << 56);   // engine switch -> re-decode
     if (liveSig != liveCacheSig_ || liveCacheStart_ != start || liveInsns_.empty()) {
         if (liveBuf_.size() < 4096) liveBuf_.resize(4096);   // reused scratch; never realloc'd per frame
         size_t got = ctx.debug.readMemoryMasked(start, liveBuf_.data(), 4096);   // mask our 0xCC bps -> real instructions
@@ -2067,6 +2989,13 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
     float laneX0 = 0.0f, addrX = 0.0f;
     bool  gotLaneX = false, gotAddrX = false;
 
+    // Jump-target highlight: the branch target of the cursor's instruction
+    // (violet glow on its row when visible). Index lookup — no decode.
+    rowGlow_.clear();
+    hlJumpVA_ = 0;
+    if (auto jit = idxOf.find(cursorVA_); jit != idxOf.end())
+        hlJumpVA_ = insns[jit->second].branchTarget;
+
     ui::PushMono();
     ImVec2 tableMin   = ImGui::GetCursorScreenPos();
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
@@ -2080,36 +3009,33 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
-        // Divider row printed before a function's first instruction.
-        auto emitFuncHeader = [&](uint64_t addr) {
-            ImGui::TableNextRow();
-            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(theme::col::accent().x, theme::col::accent().y, theme::col::accent().z, 0.18f)));
-            std::string nm = symbolFor(ctx, addr);
-            if (nm.empty() || nm.find("+0x") != std::string::npos) { char b[28]; std::snprintf(b, sizeof(b), "sub_%llX", (unsigned long long)addr); nm = b; }
-            ImGui::TableSetColumnIndex(2); ImGui::TextColored(theme::col::muted(), "0x%llX", (unsigned long long)addr);
-            ImGui::TableSetColumnIndex(4); ImGui::TextColored(theme::col::accent(), "%s:", nm.c_str());
-        };
-
         const std::string hoverTok = hoverToken_;   // highlight matches of last frame's hovered token
         std::string nextHoverTok;
         float lh = ImGui::GetTextLineHeight();
         for (int i = 0; i < (int)insns.size(); ++i) {
             const auto& in = insns[i];
-            if (i > 0 && funcSet.count(in.address)) emitFuncHeader(in.address);
+            // Divider row before a function's first instruction (same renderer as
+            // the static listing, so names/colors can't drift between the views).
+            if (i > 0 && funcSet.count(in.address)) renderAsmFuncHeader(ctx, in.address);
             ImGui::TableNextRow();
             ImGui::PushID((void*)(uintptr_t)in.address);
 
             bool rowAtRip = rip == in.address;
             bool rowSel   = in.address == cursorVA_ && !rowAtRip;
+            bool rowJump  = !rowAtRip && !rowSel && hlJumpVA_ && in.address == hlJumpVA_;
             bool rowMulti = selVAs_.size() > 1 && !rowAtRip && !rowSel && selVAs_.count(in.address);
-            if (rowAtRip) {
-                float p = slowPulse();   // slow green flash on the current instruction
-                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.16f, 0.42f, 0.21f, 0.40f + 0.38f * p)));
-            } else if (rowSel) {
-                float p = slowPulse();   // slow blue flash on the focused line
-                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.20f, 0.32f, 0.54f, 0.30f + 0.34f * p)));
-            } else if (rowMulti) {       // muted highlight for a multi-line selection
-                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(0.20f, 0.28f, 0.42f, 0.45f)));
+            float flash   = navFlashAt(in.address);
+            {   // Flat fill under the text; the glow halo is painted post-table
+                // (drawRowGlows). Theme-routed: RIP = good (green pulse), cursor =
+                // accent, the cursor instruction's branch target = jump (violet).
+                float p = slowPulse();
+                ImVec4 fc(0, 0, 0, 0);
+                if (rowAtRip)      { ImVec4 c = theme::col::good();      fc = ImVec4(c.x, c.y, c.z, 0.26f + 0.14f * p); }
+                else if (rowSel)   { ImVec4 c = theme::col::accent();    fc = ImVec4(c.x, c.y, c.z, 0.22f + 0.12f * p); }
+                else if (rowJump)  { ImVec4 c = theme::col::jump();      fc = ImVec4(c.x, c.y, c.z, 0.16f + 0.10f * p); }
+                else if (rowMulti) { ImVec4 c = theme::col::selection(); fc = ImVec4(c.x, c.y, c.z, 0.26f); }
+                if (flash > 0.0f) fc.w = std::min(1.0f, fc.w + 0.25f * flash);
+                if (fc.w > 0.0f) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(fc));
             }
 
             // col 0: breakpoint gutter (merged: snapshot OR pending/local list, so it updates instantly)
@@ -2132,6 +3058,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
             if (!gotLaneX) { laneX0 = ImGui::GetCursorScreenPos().x; gotLaneX = true; }
             ImGui::Dummy(ImVec2(1.0f, lh));
             rowY[i] = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
+            pushRowGlow(rowY[i], rowAtRip, rowSel, rowJump, flash);
 
             // col 2: address
             ImGui::TableSetColumnIndex(2);
@@ -2143,6 +3070,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
                           rowAtRip ? "> " : "  ", (unsigned long long)in.address);
             ImVec4 acol = rowAtRip ? theme::col::good()
                         : hwbp     ? ImVec4(0.95f, 0.6f, 0.95f, 1.0f)
+                        : rowJump  ? theme::col::jump()
                                    : ImGui::GetStyleColorVec4(ImGuiCol_Text);
             ImGui::PushStyleColor(ImGuiCol_Text, acol);
             if (ImGui::Selectable(addrLbl, false)) {
@@ -2265,20 +3193,23 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
 
             // col 4: mnemonic + operands (+ clickable target, + reg hints on the RIP row)
             ImGui::TableSetColumnIndex(4);
-            ImVec4 mcol = in.isCall   ? theme::col::call()
+            ImVec4 mcol = in.isRet    ? theme::col::bad()
+                        : in.isCall   ? theme::col::call()
                         : in.isBranch ? theme::col::branch()
-                                      : ImVec4(0.90f, 0.90f, 0.90f, 1.0f);
+                                      : ImGui::GetStyleColorVec4(ImGuiCol_Text);
             {   // mnemonic (one hover-highlightable token)
                 ImVec2 cp = ImGui::GetCursorScreenPos();
-                if (!hoverTok.empty() && in.mnemonic == hoverTok)
+                if (!hoverTok.empty() && in.mnemonic == hoverTok) {
+                    ImVec4 hc = theme::col::accent();
                     ImGui::GetWindowDrawList()->AddRectFilled(cp,
                         ImVec2(cp.x + ImGui::CalcTextSize(in.mnemonic.c_str()).x, cp.y + ImGui::GetTextLineHeight()),
-                        IM_COL32(95, 120, 175, 150), 2.0f);
+                        ImGui::GetColorU32(ImVec4(hc.x, hc.y, hc.z, 0.40f)), 2.0f);
+                }
                 ImGui::TextColored(mcol, "%-7s", in.mnemonic.c_str());
                 if (ImGui::IsItemHovered()) nextHoverTok = in.mnemonic;
             }
             ImGui::SameLine(0, 0);
-            renderHoverTokens(in.operands.c_str(), ImGui::GetColorU32(ImVec4(0.90f, 0.90f, 0.90f, 1.0f)), hoverTok, nextHoverTok);
+            renderHoverTokens(in.operands.c_str(), ImGui::GetColorU32(ImGuiCol_Text), hoverTok, nextHoverTok);
             if (in.branchTarget) {
                 ImGui::SameLine();
                 ImGui::TextColored(theme::col::muted(), "; 0x%llX", (unsigned long long)in.branchTarget);
@@ -2288,7 +3219,13 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
                 }
                 if (showNames_) {
                     std::string nm = symbolFor(ctx, in.branchTarget);
-                    if (!nm.empty()) { ImGui::SameLine(0, 6); ImGui::TextColored(theme::col::call(), "%s", nm.c_str()); }
+                    if (!nm.empty()) {
+                        ImGui::SameLine(0, 6); ImGui::TextColored(theme::col::call(), "%s", nm.c_str());
+                        if (ImGui::IsItemHovered()) {   // the name is a link too, like the static listing's
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) liveNavigate(in.branchTarget);
+                        }
+                    }
                 }
             }
             if (showRegHints_ && rowAtRip) {
@@ -2346,6 +3283,11 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
                     }
                 }
             }
+            // Decoder-supplied annotation (same channel as the static listing).
+            if (!in.comment.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), "  ; %s", in.comment.c_str());
+            }
             // User comment (persisted in the project), mirroring the static listing
             // so annotations carry over between the static and live views. Keyed by
             // the file VA, so translate from the runtime address under ASLR.
@@ -2360,9 +3302,14 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
     }
     ui::PopMono();
 
+    // Row glows (RIP / cursor / jump-target / nav flash) — under the arrows.
+    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
+
     // ---- Branch arrows in the flow gutter (drawn over the listing) ----
     if (showJumpArrows_ && gotLaneX && gotAddrX) {
-        ImVec2 clipMin = tableMin;
+        // Clip below the frozen header row (same as drawAsmArrows): the off-window
+        // up-stubs end at firstY - 8, which would otherwise paint over the header.
+        ImVec2 clipMin = ImVec2(tableMin.x, tableMin.y + ImGui::GetFrameHeight());
         ImVec2 clipMax = ImVec2(tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
         float firstY = clipMax.y, lastY = clipMin.y;
         for (float y : rowY) if (y >= 0) { firstY = std::min(firstY, y); lastY = std::max(lastY, y); }
@@ -2466,9 +3413,17 @@ std::string BinaryViewTab::describePointer(AppContext& ctx, const DbgSnapshot& s
         std::string s = resolveString(buf, g);
         if (!s.empty()) { if (s.size() > 40) s.resize(40); result = "\"" + s + "\""; }
     }
-    // 2) Does it point at a known function/import/export?
+    // 2) Does it point at a known function/import/export? symbolFor's live path
+    //    matches against the RUNTIME module list, so it needs the runtime address:
+    //    under ASLR the file-VA translation lands outside every live module (and
+    //    shifts other-module pointers by the main module's unrelated delta).
+    //    User renames are keyed by file VA, so check those via the translation first.
     if (result.empty()) {
-        std::string sym = symbolFor(ctx, liveVAtoFile(ctx, v));
+        std::string sym;
+        if (auto nit = names_.find(liveVAtoFile(ctx, v)); nit != names_.end() && !nit->second.empty())
+            sym = nit->second;
+        else
+            sym = symbolFor(ctx, v);
         if (!sym.empty()) result = sym;
     }
     // 3) One pointer-hop (a char**): follow and show the pointed-to string if any.
@@ -2816,6 +3771,10 @@ void BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
             size_t oavail = 0; const uint8_t* op = ctx.binary.ptrFromVA(fileVA, oavail);
             if (op) { size_t n = std::min(oavail, bytes.size()); cur.assign(op, op + n); }
         }
+        // `cur` was read from the PATCHED image / live memory: substitute the saved
+        // orig of every overlapping recorded patch so the capture is pristine (an
+        // overlapping patch must never record another patch's bytes as "original").
+        SubstitutePristine(fileVA, cur, V);
         for (size_t i = orig.size(); i < cur.size(); ++i) orig.push_back(cur[i]);   // append only the new tail
     }
 
@@ -2824,7 +3783,9 @@ void BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
                            [&](const PjPatch& x) { return x.address == fileVA; }), V.end());
     V.push_back(std::move(pp));
 
-    // Also write straight into the debuggee when attached.
+    // Also write straight into the debuggee when attached. (No toast here: the
+    // hex editor and batch NOP route every byte/instruction through this
+    // function - one-shot call sites raise their own toast.)
     if (attached) {
         size_t w = ctx.debug.writeMemory(liveVA, bytes.data(), bytes.size());
         patchStatus_ = (w == bytes.size()) ? "Live-patched + recorded for Save Binary As."
@@ -2839,6 +3800,7 @@ void BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
     // re-decode the patched image bytes immediately, and functionsDirty_ kicks the
     // worker to rebuild the row index off-thread (so a patch never freezes the UI).
     pseudoVA_ = 0; decompVA_ = 0;   // invalidate pseudocode / decompiler caches
+    decompPending_ = false; decompLru_.clear();   // patched bytes: cached pseudo-C is stale
     functionsDirty_ = true;         // boundaries may have changed: re-analyze + rebuild listing on the worker
     ++liveGen_;                     // a live byte changed: invalidate the cached live decode
 }
@@ -2925,7 +3887,12 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
     ImGui::Separator();
     ImGui::Checkbox("Pad short encodings with NOP", &patchPadNop_);
     ImGui::BeginDisabled(bytes.empty());
-    if (ImGui::Button("Apply")) applyPatchBytes(ctx, patchVA_, bytes, patchLen_, patchPadNop_);
+    if (ImGui::Button("Apply")) {
+        applyPatchBytes(ctx, patchVA_, bytes, patchLen_, patchPadNop_);
+        char tm[80];
+        std::snprintf(tm, sizeof(tm), "Patched %zu byte(s) at 0x%llX.", bytes.size(), (unsigned long long)patchVA_);
+        ui::Toast(ui::ToastKind::Success, tm);   // patchStatus_ carries the live-write detail
+    }
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::BeginDisabled(!patchLen_);
@@ -2983,12 +3950,13 @@ void BinaryViewTab::renderRenamePopup(AppContext& ctx) {
         else               names_.erase(annPopupVA_);
         projectDirty_ = true;
         symCache_.clear();         // resolved names changed
+        ++namesGen_;               // function-list display changed -> refilter
         decompVA_ = 0;             // pseudocode references names
         ImGui::CloseCurrentPopup();
     };
     if (ImGui::Button("Save", ImVec2(110, 0)) || enter) commit();
     ImGui::SameLine();
-    if (ImGui::Button("Clear", ImVec2(110, 0))) { names_.erase(annPopupVA_); projectDirty_ = true; symCache_.clear(); decompVA_ = 0; ImGui::CloseCurrentPopup(); }
+    if (ImGui::Button("Clear", ImVec2(110, 0))) { names_.erase(annPopupVA_); projectDirty_ = true; symCache_.clear(); ++namesGen_; decompVA_ = 0; ImGui::CloseCurrentPopup(); }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(110, 0))) ImGui::CloseCurrentPopup();
     (void)ctx;
@@ -3002,7 +3970,7 @@ void BinaryViewTab::renderCondPopup(AppContext& ctx) {
     ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("Breakpoint Condition", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
     ImGui::Text("Stop at 0x%llX only when:", (unsigned long long)annPopupVA_);
-    ImGui::TextDisabled("e.g.  rax == 0   |   [rsp+8] > 0x10   |   rcx != rdx     (empty = unconditional)");
+    ImGui::TextDisabled("e.g.  rax == 0   |   [rsp+8] > 0x10   |   rax s< 0  (signed)   (empty = unconditional)");
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(440);
     bool enter = ImGui::InputText("##cond", condPopupBuf_, sizeof(condPopupBuf_), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -3058,9 +4026,12 @@ uint64_t BinaryViewTab::liveMainBase(AppContext& ctx) {
 // any other case it falls back to the static engine.
 IDisassembler* BinaryViewTab::liveDecoder(AppContext& ctx, bool is32) {
     Arch want = is32 ? Arch::X86 : Arch::X64;
-    if (!liveDisasm_ || liveDisasmArch_ != (int)want) {
-        liveDisasm_     = MakeDisassembler(ctx.engine, want);
-        liveDisasmArch_ = (int)want;
+    // Key on BOTH bitness and engine: a Disassembler-menu engine switch must not
+    // keep decoding live memory with the previously built backend.
+    if (!liveDisasm_ || liveDisasmArch_ != (int)want || liveDisasmEngine_ != (int)ctx.engine) {
+        liveDisasm_       = MakeDisassembler(ctx.engine, want);
+        liveDisasmArch_   = (int)want;
+        liveDisasmEngine_ = (int)ctx.engine;
     }
     return liveDisasm_ ? liveDisasm_.get() : ctx.disasm.get();
 }
@@ -3373,6 +4344,13 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
     symbolIndex_.clear();
     gotoFilterLast_.clear(); gotoMatches_.clear();
 
+    // Build each entry's lowercased name once here (not per keystroke in the picker).
+    auto lower = [](const std::string& s) {
+        std::string r = s;
+        for (char& c : r) c = (char)std::tolower((unsigned char)c);
+        return r;
+    };
+
     if (symAttached_) {
         if (liveModulesPid_ != symPid_ || liveModules_.empty()) {
             ProcessManager pm; liveModules_ = pm.modules(symPid_); liveModulesPid_ = symPid_;
@@ -3386,11 +4364,14 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
                 it = modExports_.emplace(m.base, std::move(ex)).first;
             }
             std::string mn = modShortName(m.name);
-            for (const auto& e : it->second) symbolIndex_.push_back({ e.first, mn + "." + e.second });
+            for (const auto& e : it->second) {
+                std::string nm = mn + "." + e.second;
+                symbolIndex_.push_back({ e.first, nm, lower(nm) });
+            }
             if (symbolIndex_.size() > 120000) break;
         }
     } else if (ctx.binary.loaded()) {
-        for (const auto& f : functions_) symbolIndex_.push_back({ f.address, f.name });
+        for (const auto& f : functions_) symbolIndex_.push_back({ f.address, f.name, lower(f.name) });
     }
 }
 
@@ -3401,12 +4382,11 @@ uint64_t BinaryViewTab::lookupSymbol(AppContext& ctx, const char* name) {
     for (char& c : q) c = (char)std::tolower((unsigned char)c);
     uint64_t sub = 0;
     for (const auto& s : symbolIndex_) {
-        std::string n = s.second;
-        for (char& c : n) c = (char)std::tolower((unsigned char)c);
-        if (n == q) return s.first;                            // exact "module.name"
+        const std::string& n = s.lower;                        // pre-lowercased at build time
+        if (n == q) return s.addr;                             // exact "module.name"
         size_t dot = n.find('.');
-        if (dot != std::string::npos && n.compare(dot + 1, std::string::npos, q) == 0) return s.first;  // bare name
-        if (!sub && n.find(q) != std::string::npos) sub = s.first;  // first substring match
+        if (dot != std::string::npos && n.compare(dot + 1, std::string::npos, q) == 0) return s.addr;  // bare name
+        if (!sub && n.find(q) != std::string::npos) sub = s.addr;  // first substring match
     }
     if (sub) return sub;
     // Fallback: ask DbgHelp to resolve the name against the PDB / export table
@@ -3447,9 +4427,7 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
         for (char& c : q) c = (char)std::tolower((unsigned char)c);
         for (int i = 0; i < (int)symbolIndex_.size() && (int)gotoMatches_.size() < 500; ++i) {
             if (q.empty()) { gotoMatches_.push_back(i); continue; }
-            std::string n = symbolIndex_[i].second;
-            for (char& c : n) c = (char)std::tolower((unsigned char)c);
-            if (n.find(q) != std::string::npos) gotoMatches_.push_back(i);
+            if (symbolIndex_[i].lower.find(q) != std::string::npos) gotoMatches_.push_back(i);  // pre-lowercased
         }
     }
 
@@ -3458,7 +4436,7 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
         unsigned long long a = 0;
         bool hexPref = gotoNameBuf_[0] == '0' && (gotoNameBuf_[1] == 'x' || gotoNameBuf_[1] == 'X');
         if (hexPref && std::sscanf(gotoNameBuf_ + 2, "%llx", &a) == 1)  go((uint64_t)a);
-        else if (!gotoMatches_.empty())                                 go(symbolIndex_[gotoMatches_[0]].first);
+        else if (!gotoMatches_.empty())                                 go(symbolIndex_[gotoMatches_[0]].addr);
         else if (std::sscanf(gotoNameBuf_, "%llx", &a) == 1)            go((uint64_t)a);
         else if (uint64_t s = lookupSymbol(ctx, gotoNameBuf_))          go(s);  // DbgHelp PDB/export fallback
     }
@@ -3468,8 +4446,8 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
     for (int idx : gotoMatches_) {
         const auto& s = symbolIndex_[idx];
         ImGui::PushID(idx);
-        char lbl[320]; std::snprintf(lbl, sizeof(lbl), "0x%llX  %s", (unsigned long long)s.first, s.second.c_str());
-        if (ImGui::Selectable(lbl)) go(s.first);
+        char lbl[320]; std::snprintf(lbl, sizeof(lbl), "0x%llX  %s", (unsigned long long)s.addr, s.name.c_str());
+        if (ImGui::Selectable(lbl)) go(s.addr);
         ImGui::PopID();
     }
     if (gotoMatches_.empty())
@@ -3836,10 +4814,40 @@ void BinaryViewTab::renderXrefsTab(AppContext& ctx) {
         if (!src || src->empty()) { ImGui::TextDisabled("   no references found"); return; }
         ImGui::TextDisabled("   %zu reference(s):", src->size());
         ui::PushMono();
-        ImGuiListClipper clip;
-        clip.Begin((int)src->size());
-        while (clip.Step())
-            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) sourceRow((*src)[i]);
+        // Group data references by access kind so "who modifies this global?" is
+        // answered at a glance: Writers first, then Readers, address-taken, and
+        // the (kind-less) branch/call references. A group renders only when
+        // non-empty; the common all-code-ref case collapses to a flat list.
+        std::vector<uint64_t> writers, readers, takers, branches;
+        for (uint64_t a : *src) {
+            auto it = xrefIndex_.accessOf.find(a);
+            if (it == xrefIndex_.accessOf.end()) { branches.push_back(a); continue; }
+            switch (it->second) {
+                case 1:  writers.push_back(a); break;          // XrefAccess::Write
+                case 2:  takers.push_back(a);  break;          // XrefAccess::Ref
+                default: readers.push_back(a); break;          // XrefAccess::Read
+            }
+        }
+        auto group = [&](const char* name, const std::vector<uint64_t>& v, bool warnTint) {
+            if (v.empty()) return;
+            if (warnTint) ImGui::TextColored(theme::col::warn(), "   %s (%zu):", name, v.size());
+            else          ImGui::TextDisabled("   %s (%zu):", name, v.size());
+            ImGuiListClipper clip;
+            clip.Begin((int)v.size());
+            while (clip.Step())
+                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) sourceRow(v[(size_t)i]);
+        };
+        if (writers.empty() && readers.empty() && takers.empty()) {
+            ImGuiListClipper clip;                            // pure code refs: flat list
+            clip.Begin((int)src->size());
+            while (clip.Step())
+                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) sourceRow((*src)[i]);
+        } else {
+            group("Writers", writers, true);
+            group("Readers", readers, false);
+            group("Address taken", takers, false);
+            group("Branches/calls", branches, false);
+        }
         ui::PopMono();
     };
 
@@ -3928,11 +4936,22 @@ void BinaryViewTab::exportAnalysis(AppContext& ctx) {
 
 void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     panelPopToggle(&pseudoPoppedOut_, "pseudo"); ImGui::SameLine();
-    ImGui::TextDisabled("Decompiler view (structured pseudo-C).");
+    ImGui::TextDisabled("Decompiler view");
     ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) decompVA_ = 0;
+    {   // Output language. The LRU holds pseudo-C; Python is translated on display.
+        ImGui::SetNextItemWidth(110.0f * theme::UiScale());
+        const char* kLangs[] = { "Pseudo-C", "Python" };
+        if (ImGui::Combo("##pseudolang", &pseudoLang_, kLangs, 2)) {
+            if (const DecompResult* hit = decompLruGet(decompVA_)) applyDecompLang(*hit);
+            else decompVA_ = 0;   // not cached: force a re-decompile in the new language
+        }
+    }
     ImGui::SameLine();
-    ImGui::TextDisabled("if/else + while recovery via dominator analysis; goto fallback for irreducible flow.");
+    if (ImGui::SmallButton("Refresh")) { decompVA_ = 0; decompLru_.clear(); }   // force a re-decompile
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy") && !decompText_.empty()) ImGui::SetClipboardText(decompText_.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("if/else + while recovery via dominator analysis; goto fallback for irreducible flow. Click a line to show it in the listing.");
     ImGui::Separator();
     if (!ctx.binary.loaded() || !ctx.disasm) { ImGui::TextDisabled("No binary loaded."); return; }
 
@@ -3943,63 +4962,594 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     const Func* best = funcContaining(cursorVA_);
     if (best && cursorVA_ - best->address < 0x4000) { fnStart = best->address; fnSize = best->size; }
 
-    if (fnStart != decompVA_ || decompText_.empty()) {
+    if (fnStart != decompVA_) {
         decompVA_ = fnStart;
         size_t avail = 0;
         const uint8_t* p = ctx.binary.ptrFromVA(fnStart, avail);
         if (!p) {
-            decompText_ = "// cursor address is not mapped to file data\n";
+            setDecompContent("// cursor address is not mapped to file data\n", {});
+            decompPending_ = false;
+        } else if (const DecompResult* hit = decompLruGet(fnStart)) {
+            applyDecompLang(*hit);   // already decompiled recently — instant
+            decompPending_ = false;
         } else {
-            size_t win = fnSize ? std::min<size_t>(avail, std::min<uint32_t>(fnSize + 16u, 16384u))
-                                : std::min<size_t>(avail, 4096);
-            auto jt = [this, &ctx](const Instruction& in) { return resolveJumpTable(ctx, in); };
-            ControlFlowGraph g = BuildCFG(p, win, fnStart, *ctx.disasm, 2000, jt);
-            DecompileOptions opt;
-            opt.nameFor    = [this, &ctx](uint64_t a) -> std::string { return symbolFor(ctx, a); };
-            opt.dataRefFor = [this, &ctx](uint64_t a) -> std::string { return dataRefToken(ctx, a, /*live=*/false); };
-            // Feed the inferred signature into the emitted header (name spliced in).
-            opt.x86       = ArchIsX86(ctx.arch);   // gate the arg-header to x86/x64
-            opt.signature = guessSignature(ctx, fnStart, fnSize);
-            decompText_ = Decompile(g, opt);
-            if (!opt.signature.empty())
-                decompText_ = "// signature is heuristic (no full type recovery)\n" + decompText_;
+            // Decompile off the render thread (K_Decompile); the result lands in the
+            // bulk-drain loop. Show a placeholder until then so the UI never freezes.
+            setDecompContent(std::string(), {});
+            decompPending_ = true;
+            uint64_t end = fnStart + (fnSize ? std::min<uint32_t>(fnSize + 16u, 16384u)
+                                             : (uint32_t)std::min<size_t>(avail, 4096));
+            ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_Decompile,
+                                     guessNames_, ctx.analysis.epoch(), 0, fnStart, end);
         }
     }
 
+    if (decompPending_ && decompText_.empty()) {
+        ImGui::TextDisabled("Decompiling\xE2\x80\xA6 (running on the analysis worker)");
+        return;
+    }
+
+    // Per-line list (clipper) with click-to-navigate: lines carrying a source VA
+    // (DecompResult::lineVA) jump the cursor/listing there; synthetic lines (header,
+    // braces, decls) don't react. The old InputTextMultiline free selection is
+    // replaced by the Copy button + per-line context menu.
     ui::PushMono();
-    // Read-only multiline so the user can select / copy the output.
-    ImGui::InputTextMultiline("##decomp", decompText_.data(), decompText_.size() + 1,
-                              ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+    ImGui::BeginChild("decomp", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    ImGuiListClipper clip;
+    clip.Begin((int)decompLines_.size(), ImGui::GetTextLineHeightWithSpacing());
+    while (clip.Step()) {
+        for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+            const uint64_t va = (size_t)i < decompLineVA_.size() ? decompLineVA_[i] : 0;
+            ImGui::PushID(i);
+            const bool current = va && va == cursorVA_;
+            const std::string& ln = decompLines_[i];
+            // Whole-line syntax tint (cheap, theme-routed): comments muted,
+            // the function header in call color, goto labels in amber.
+            size_t fc = ln.find_first_not_of(' ');
+            ImVec4 lcol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            if (fc != std::string::npos) {
+                if (ln.compare(fc, 2, "//") == 0 || ln[fc] == '#')          lcol = theme::col::muted();
+                else if (i == 0 || ln.compare(fc, 4, "def ") == 0)          lcol = theme::col::call();
+                else if (ln.compare(fc, 4, "loc_") == 0)                    lcol = theme::col::warn();
+            }
+            if (current) {   // soft accent glow behind the statement synced to the listing
+                ImVec2 cp = ImGui::GetCursorScreenPos();
+                ImVec4 gc = theme::col::accent();
+                drawGlowRect(ImGui::GetWindowDrawList(), cp.x, cp.x + ImGui::GetContentRegionAvail().x,
+                             cp.y, cp.y + ImGui::GetTextLineHeight(),
+                             ImGui::GetColorU32(ImVec4(gc.x, gc.y, gc.z, 1.0f)), 0.35f + 0.25f * slowPulse());
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, lcol);
+            if (ImGui::Selectable(ln.empty() ? " " : ln.c_str(), current,
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (va) navigateTo(va);   // sync the assembly listing to this statement
+            }
+            ImGui::PopStyleColor();
+            if (va && ImGui::IsItemHovered())
+                ImGui::SetTooltip("0x%llX  (click to show in listing)", (unsigned long long)va);
+            if (ImGui::BeginPopupContextItem("##declinectx")) {
+                if (ImGui::MenuItem("Copy line")) ImGui::SetClipboardText(decompLines_[i].c_str());
+                if (va && ImGui::MenuItem("Show in listing")) navigateTo(va);
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+    }
+    clip.End();
+    ImGui::EndChild();
     ui::PopMono();
+}
+
+// Decompiler view (main view 6): the SAME structured-decompile output as the
+// Pseudocode view, shown side-by-side with a compact synced disassembly pane for
+// the same function. Both panes share decompVA_/decompLines_/decompLineVA_ and the
+// LRU+worker request flow (identical to renderPseudocode) — they render the function
+// enclosing the cursor, so the request is keyed on the same decompVA_. Hovering a
+// pseudo line (carrying a source VA) cross-highlights the matching asm row and vice
+// versa via decompHoverVA_; clicking either navigates the main listing.
+void BinaryViewTab::renderDecompiler(AppContext& ctx) {
+    panelPopToggle(&pseudoPoppedOut_, "pseudo"); ImGui::SameLine();
+    ImGui::TextDisabled("Decompiler");
+    ImGui::SameLine();
+    {   // Output language. The LRU holds pseudo-C; Python is translated on display.
+        ImGui::SetNextItemWidth(110.0f * theme::UiScale());
+        const char* kLangs[] = { "Pseudo-C", "Python" };
+        if (ImGui::Combo("##declang", &pseudoLang_, kLangs, 2)) {
+            if (const DecompResult* hit = decompLruGet(decompVA_)) applyDecompLang(*hit);
+            else decompVA_ = 0;   // not cached: force a re-decompile in the new language
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) { decompVA_ = 0; decompLru_.clear(); }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy") && !decompText_.empty()) ImGui::SetClipboardText(decompText_.c_str());
+    ImGui::Separator();
+    if (!ctx.binary.loaded() || !ctx.disasm) { ImGui::TextDisabled("No binary loaded."); return; }
+
+    // Decompile the function enclosing the cursor — IDENTICAL request flow to the
+    // Pseudocode view (decompVA_ keyed; off-thread K_Decompile; LRU-cached). Kept in
+    // sync here so switching between the two views never re-decompiles.
+    uint64_t fnStart = cursorVA_;
+    uint32_t fnSize  = 0;
+    const Func* best = funcContaining(cursorVA_);
+    if (best && cursorVA_ - best->address < 0x4000) { fnStart = best->address; fnSize = best->size; }
+
+    if (fnStart != decompVA_) {
+        decompVA_ = fnStart;
+        size_t avail = 0;
+        const uint8_t* p = ctx.binary.ptrFromVA(fnStart, avail);
+        if (!p) {
+            setDecompContent("// cursor address is not mapped to file data\n", {});
+            decompPending_ = false;
+        } else if (const DecompResult* hit = decompLruGet(fnStart)) {
+            applyDecompLang(*hit);
+            decompPending_ = false;
+        } else {
+            setDecompContent(std::string(), {});
+            decompPending_ = true;
+            uint64_t end = fnStart + (fnSize ? std::min<uint32_t>(fnSize + 16u, 16384u)
+                                             : (uint32_t)std::min<size_t>(avail, 4096));
+            ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_Decompile,
+                                     guessNames_, ctx.analysis.epoch(), 0, fnStart, end);
+        }
+    }
+
+    if (decompPending_ && decompText_.empty()) {
+        ImGui::TextDisabled("Decompiling\xE2\x80\xA6 (running on the analysis worker)");
+        return;
+    }
+
+    const float kS = theme::UiScale();
+    uint64_t hoverThisFrame = 0;   // VA hovered in either pane this frame (drives next-frame cross-highlight)
+
+    // ----- LEFT pane: the decompiled pseudo lines (clipper, click to navigate) -----
+    ui::PushMono();
+    ImGui::BeginChild("##decleft", ImVec2(decompSplitW_, 0), ImGuiChildFlags_Borders);
+    {
+        ImGuiListClipper clip;
+        clip.Begin((int)decompLines_.size(), ImGui::GetTextLineHeightWithSpacing());
+        while (clip.Step()) {
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                const uint64_t va = (size_t)i < decompLineVA_.size() ? decompLineVA_[i] : 0;
+                ImGui::PushID(i);
+                const std::string& ln = decompLines_[i];
+                const bool current = va && va == cursorVA_;
+                const bool synced  = va && va == decompHoverVA_;   // matched from the asm pane
+                // Whole-line syntax tint (wf-pline): comments muted, header in call, labels amber.
+                size_t fc = ln.find_first_not_of(' ');
+                ImVec4 lcol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                if (fc != std::string::npos) {
+                    if (ln.compare(fc, 2, "//") == 0 || ln[fc] == '#')   lcol = theme::col::muted();
+                    else if (i == 0 || ln.compare(fc, 4, "def ") == 0)   lcol = theme::col::call();
+                    else if (ln.compare(fc, 4, "loc_") == 0)             lcol = theme::col::warn();
+                }
+                // wf-ln line-number gutter (muted), then the source line.
+                ImGui::TextColored(theme::col::muted(), "%4d", i + 1);
+                ImGui::SameLine(0, 10.0f * kS);
+                if (current || synced) {
+                    ImVec2 cp = ImGui::GetCursorScreenPos();
+                    ImVec4 gc = current ? theme::col::accent() : theme::col::jump();
+                    drawGlowRect(ImGui::GetWindowDrawList(), cp.x, cp.x + ImGui::GetContentRegionAvail().x,
+                                 cp.y, cp.y + ImGui::GetTextLineHeight(),
+                                 ImGui::GetColorU32(ImVec4(gc.x, gc.y, gc.z, 1.0f)),
+                                 current ? 0.35f + 0.25f * slowPulse() : 0.30f);
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, lcol);
+                if (ImGui::Selectable(ln.empty() ? " " : ln.c_str(), current,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (va) navigateTo(va);
+                }
+                ImGui::PopStyleColor();
+                if (va && ImGui::IsItemHovered()) {
+                    hoverThisFrame = va;
+                    ImGui::SetTooltip("0x%llX  (click to show in listing)", (unsigned long long)va);
+                }
+                if (ImGui::BeginPopupContextItem("##decline")) {
+                    if (ImGui::MenuItem("Copy line")) ImGui::SetClipboardText(decompLines_[i].c_str());
+                    if (va && ImGui::MenuItem("Show in listing")) navigateTo(va);
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+        }
+        clip.End();
+    }
+    ImGui::EndChild();
+    ui::PopMono();
+
+    ds::ui::VSplitter("##dec_split", &decompSplitW_, 200.0f * kS, 200.0f * kS, 6.0f * kS);
+
+    // ----- RIGHT pane: compact synced disassembly for the SAME function -----
+    // A self-contained listing (decoded fresh over the function range) — NOT the big
+    // glow/arrow listing, so the foreground-draw-list patterns there are untouched.
+    ImGui::BeginChild("##decright", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    {
+        uint64_t lo = decompVA_;
+        uint32_t sz = fnSize ? fnSize : 0;
+        size_t avail = 0;
+        const uint8_t* base = ctx.binary.ptrFromVA(lo, avail);
+        if (!base) {
+            ImGui::TextDisabled("Function bytes are not mapped.");
+        } else {
+            size_t win = sz ? std::min<size_t>(avail, std::min<uint32_t>(sz + 16u, 16384u))
+                            : std::min<size_t>(avail, 4096);
+            ImGui::TextColored(theme::col::muted(), "0x%llX \xE2\x80\x93 0x%llX",
+                               (unsigned long long)lo, (unsigned long long)(lo + win));
+            ImGui::Separator();
+            ui::PushMono();
+            ImGui::BeginChild("##decasm", ImVec2(0, 0), ImGuiChildFlags_None);
+            uint64_t va = lo;
+            size_t off = 0;
+            int guard = 0;
+            while (off < win && guard++ < 20000) {
+                Instruction in;
+                if (!ctx.disasm->decodeOne(base + off, win - off, va, in) || in.length == 0) {
+                    ImGui::TextColored(theme::col::muted(), "%llX  db ??", (unsigned long long)va);
+                    ++off; ++va; continue;
+                }
+                ImGui::PushID((int)off);
+                const bool current = va == cursorVA_;
+                const bool synced  = va == decompHoverVA_;   // matched from the pseudo pane
+                if (current || synced) {
+                    ImVec2 cp = ImGui::GetCursorScreenPos();
+                    ImVec4 gc = current ? theme::col::accent() : theme::col::jump();
+                    drawGlowRect(ImGui::GetWindowDrawList(), cp.x, cp.x + ImGui::GetContentRegionAvail().x,
+                                 cp.y, cp.y + ImGui::GetTextLineHeight(),
+                                 ImGui::GetColorU32(ImVec4(gc.x, gc.y, gc.z, 1.0f)),
+                                 current ? 0.35f + 0.25f * slowPulse() : 0.30f);
+                }
+                char label[256];
+                std::snprintf(label, sizeof(label), "%llX  %-7s %s##r%zu",
+                              (unsigned long long)va, in.mnemonic.c_str(), in.operands.c_str(), off);
+                if (ImGui::Selectable(label, current)) navigateTo(va);
+                if (ImGui::IsItemHovered()) hoverThisFrame = va;
+                ImGui::PopID();
+                off += in.length;
+                va  += in.length;
+            }
+            ImGui::EndChild();
+            ui::PopMono();
+        }
+    }
+    ImGui::EndChild();
+
+    decompHoverVA_ = hoverThisFrame;   // cross-highlight on the next frame
+}
+
+// Show a pseudo-C decompile result in the selected output language. The worker
+// and the LRU always hold pseudo-C; Python is a pure display-side translation
+// (DecompileToPython preserves the per-line VA map), so switching languages is
+// instant and never re-decompiles.
+void BinaryViewTab::applyDecompLang(const DecompResult& c) {
+    if (pseudoLang_ == 1) {
+        DecompResult py = DecompileToPython(c);
+        setDecompContent(std::move(py.text), std::move(py.lineVA));
+    } else {
+        setDecompContent(c.text, c.lineVA);
+    }
+}
+
+// Set the Pseudocode view's content: the raw text plus its per-line source-VA
+// map, splitting the text into render lines once (the final empty segment after
+// the trailing '\n' is dropped, matching DecompResult::lineVA's convention).
+void BinaryViewTab::setDecompContent(std::string text, std::vector<uint64_t> lineVA) {
+    decompText_ = std::move(text);
+    decompLineVA_ = std::move(lineVA);
+    decompLines_.clear();
+    for (size_t s = 0, i = 0; i <= decompText_.size(); ++i)
+        if (i == decompText_.size() || decompText_[i] == '\n') {
+            if (i == decompText_.size() && s == i) break;   // drop the trailing empty segment
+            decompLines_.push_back(decompText_.substr(s, i - s));
+            s = i + 1;
+        }
+    decompLineVA_.resize(decompLines_.size(), 0);   // defensive: keep the vectors parallel
+}
+
+// Small LRU over recently decompiled functions (front = most recent). Returns the
+// cached result for `va`, moving it to the front, or nullptr on a miss.
+const DecompResult* BinaryViewTab::decompLruGet(uint64_t va) {
+    for (auto it = decompLru_.begin(); it != decompLru_.end(); ++it)
+        if (it->first == va) {
+            decompLru_.splice(decompLru_.begin(), decompLru_, it);   // move to front
+            return &decompLru_.front().second;
+        }
+    return nullptr;
+}
+
+// Insert/refresh the result for `va` at the front, evicting the oldest beyond the cap.
+void BinaryViewTab::decompLruPut(uint64_t va, const DecompResult& r) {
+    for (auto it = decompLru_.begin(); it != decompLru_.end(); ++it)
+        if (it->first == va) { it->second = r; decompLru_.splice(decompLru_.begin(), decompLru_, it); return; }
+    decompLru_.emplace_front(va, r);
+    while (decompLru_.size() > kDecompLruCap) decompLru_.pop_back();
+}
+
+// Route one edited byte (at file offset `off`) into the regular patch pipeline:
+// applyPatchBytes records the PjPatch (pristine orig), updates the in-memory
+// image, live-writes when attached, and invalidates the decode/pseudo caches.
+void BinaryViewTab::hexCommitByte(AppContext& ctx, uint64_t off, uint8_t value) {
+    uint64_t va = 0;
+    if (!ctx.binary.offsetToVA(off, va)) return;   // unmapped file bytes are read-only (v1)
+    if (off < ctx.binary.bytes().size() && ctx.binary.bytes()[(size_t)off] == value) return; // no-op edit
+    applyPatchBytes(ctx, va, { value }, 1, /*padNop=*/false);
 }
 
 void BinaryViewTab::renderHex(AppContext& ctx) {
     if (!ctx.binary.loaded()) { ImGui::TextDisabled("No binary loaded."); return; }
-    uint64_t va = cursorVA_;
-    size_t avail = 0;
-    const uint8_t* p = ctx.binary.ptrFromVA(va, avail);
-    if (!p) { p = ctx.binary.bytes().data(); avail = ctx.binary.bytes().size(); va = ctx.binary.imageBase(); }
-    size_t rows = std::min<size_t>(avail / 16 + 1, 64);
-    ImGui::BeginChild("hex", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    ui::PushMono();
-    for (size_t r = 0; r < rows; ++r) {
-        char line[160]; int o = 0;
-        o += std::snprintf(line + o, sizeof(line) - o, "%012llX  ", (unsigned long long)(va + r * 16));
-        for (size_t c = 0; c < 16; ++c) {
-            size_t idx = r * 16 + c;
-            if (idx < avail) o += std::snprintf(line + o, sizeof(line) - o, "%02X ", p[idx]);
-            else             o += std::snprintf(line + o, sizeof(line) - o, "   ");
+    const std::vector<uint8_t>& bytes = ctx.binary.bytes();
+    const uint64_t total = bytes.size();
+    if (!total) { ImGui::TextDisabled("Empty image."); return; }
+    if (hexCursorOff_ >= total) hexCursorOff_ = total - 1;
+
+    // ---- toolbar: cursor status, goto-offset, copy selection ----------------
+    {
+        uint64_t cva = 0;
+        bool mapped = ctx.binary.offsetToVA(hexCursorOff_, cva);
+        if (mapped) ImGui::Text("VA 0x%llX", (unsigned long long)cva);
+        else        ImGui::TextDisabled("no VA (unmapped file bytes: header/padding)");
+        ImGui::SameLine();
+        ImGui::TextDisabled("| file offset 0x%llX", (unsigned long long)hexCursorOff_);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f * theme::UiScale());
+        if (ImGui::InputTextWithHint("##hexoff", "goto offset", hexGotoOff_, sizeof(hexGotoOff_),
+                                     ImGuiInputTextFlags_EnterReturnsTrue)) {
+            unsigned long long o = 0;
+            if (std::sscanf(hexGotoOff_, "%llx", &o) == 1 && o < total) {
+                hexCursorOff_ = o; hexPendScroll_ = o; hexEditNibble_ = -1;
+                uint64_t va = 0;
+                if (ctx.binary.offsetToVA(o, va)) { navigateTo(va); hexLastScroll_ = cursorVA_; }
+            }
+            hexGotoOff_[0] = 0;
         }
-        o += std::snprintf(line + o, sizeof(line) - o, " ");
-        for (size_t c = 0; c < 16; ++c) {
-            size_t idx = r * 16 + c;
-            char ch = (idx < avail && std::isprint(p[idx])) ? (char)p[idx] : '.';
-            if (idx < avail) o += std::snprintf(line + o, sizeof(line) - o, "%c", ch);
+        const bool haveSel = hexSelA_ != ~0ull && hexSelB_ != ~0ull;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!haveSel);
+        if (ImGui::SmallButton("Copy") && haveSel) {
+            uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::min<uint64_t>(std::max(hexSelA_, hexSelB_), total - 1);
+            hi = std::min(hi, lo + (1ull << 20));            // cap the clipboard at ~1 MiB of bytes
+            std::string s; s.reserve((size_t)(hi - lo + 1) * 3);
+            char b[4];
+            for (uint64_t a = lo; a <= hi; ++a) { std::snprintf(b, sizeof(b), "%02X", bytes[(size_t)a]); if (!s.empty()) s += ' '; s += b; }
+            ImGui::SetClipboardText(s.c_str());
         }
-        ImGui::TextUnformatted(line);
+        ImGui::EndDisabled();
+        if (haveSel) {
+            ImGui::SameLine();
+            uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::max(hexSelA_, hexSelB_);
+            ImGui::TextDisabled("(%llu byte(s) selected)", (unsigned long long)(hi - lo + 1));
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("| type hex digits to edit; Tab = hex/ascii; click+drag to select");
     }
-    ui::PopMono();
+
+    // ---- rebuild the patched-span index when the patch set changes ----------
+    {
+        uint64_t sig = ((uint64_t)ctx.project.patches.size() << 32) ^ (uint64_t)liveGen_;
+        if (sig != hexPatchedSig_) {
+            hexPatchedSig_ = sig;
+            hexPatchedIv_.clear();
+            for (const auto& p : ctx.project.patches) {
+                uint64_t off = 0;
+                if (!p.bytes.empty() && ctx.binary.vaToOffset(p.address, off))
+                    hexPatchedIv_.push_back({ off, off + p.bytes.size() });
+            }
+            std::sort(hexPatchedIv_.begin(), hexPatchedIv_.end());
+        }
+    }
+    auto isPatched = [&](uint64_t off) -> bool {
+        auto it = std::upper_bound(hexPatchedIv_.begin(), hexPatchedIv_.end(),
+                                   std::make_pair(off, ~0ull));
+        if (it == hexPatchedIv_.begin()) return false;
+        --it;
+        return off >= it->first && off < it->second;
+    };
+
+    // ---- metrics (font-derived; HiDPI-safe) ----------------------------------
+    ui::PushMono();
+    const float charW    = ImGui::CalcTextSize("0").x;
+    const float byteW    = charW * 3.0f;                  // "XX "
+    const float groupGap = charW;                          // extra gap after 8 bytes
+    const float vaX      = charW;                          // VA column start
+    const float hexX     = vaX + charW * 14.0f;            // 12 digits + 2 spaces
+    const float asciiX   = hexX + 16.0f * byteW + groupGap + charW * 2.0f;
+    const float rowW     = asciiX + 16.0f * charW + charW;
+    const float lineH    = ImGui::GetTextLineHeightWithSpacing();   // clipper row stride
+    const float textH    = ImGui::GetTextLineHeight();              // item height (ItemSpacing.y completes the stride)
+    const int   totalRows = (int)((total + 15) / 16);
+
+    // NoNav: arrows/Tab drive the hex cursor below, not ImGui widget navigation.
+    ImGui::BeginChild("hex", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_HorizontalScrollbar);
+    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+
+    // External navigation (goto box, xref, data-address bounce) moved cursorVA_:
+    // follow it once, mapping the VA to its file offset.
+    if (cursorVA_ && cursorVA_ != hexLastScroll_) {
+        uint64_t off = 0;
+        if (ctx.binary.vaToOffset(cursorVA_, off) && off < total) {
+            hexCursorOff_ = off; hexPendScroll_ = off; hexEditNibble_ = -1;
+        }
+        hexLastScroll_ = cursorVA_;
+    }
+
+    // ---- keyboard: cursor movement + nibble/ascii editing -------------------
+    if (focused) {
+        const uint64_t prevOff = hexCursorOff_;
+        const int pageRows = std::max(1, (int)(ImGui::GetWindowHeight() / lineH) - 1);
+        auto move = [&](int64_t d) {
+            int64_t n = (int64_t)hexCursorOff_ + d;
+            hexCursorOff_ = (uint64_t)std::clamp<int64_t>(n, 0, (int64_t)total - 1);
+        };
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))  move(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) move(+1);
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))    move(-16);
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  move(+16);
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp))     move(-(int64_t)pageRows * 16);
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown))   move(+(int64_t)pageRows * 16);
+        if (ImGui::IsKeyPressed(ImGuiKey_Tab))        { hexAsciiCol_ = !hexAsciiCol_; hexEditNibble_ = -1; }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape))     hexEditNibble_ = -1;
+        if (hexCursorOff_ != prevOff) { hexPendScroll_ = hexCursorOff_; hexEditNibble_ = -1; }
+
+        // Ctrl+C copies the selection (same format as the toolbar button).
+        // Typed characters: hex nibbles (hex column) or raw bytes (ascii column).
+        ImGuiIO& io = ImGui::GetIO();
+        if (!io.KeyCtrl) {
+            for (int n = 0; n < io.InputQueueCharacters.Size; ++n) {
+                unsigned int ch = (unsigned int)io.InputQueueCharacters[n];
+                if (hexAsciiCol_) {
+                    if (ch >= 0x20 && ch < 0x7F) {
+                        hexCommitByte(ctx, hexCursorOff_, (uint8_t)ch);
+                        move(+1); hexPendScroll_ = hexCursorOff_;
+                    }
+                } else {
+                    int nib = -1;
+                    if (ch >= '0' && ch <= '9') nib = (int)(ch - '0');
+                    else if (ch >= 'a' && ch <= 'f') nib = (int)(ch - 'a' + 10);
+                    else if (ch >= 'A' && ch <= 'F') nib = (int)(ch - 'A' + 10);
+                    if (nib < 0) continue;
+                    if (hexEditNibble_ < 0) { hexEditByte_ = (uint8_t)(nib << 4); hexEditNibble_ = 0; }
+                    else {
+                        hexCommitByte(ctx, hexCursorOff_, (uint8_t)(hexEditByte_ | nib));
+                        hexEditNibble_ = -1;
+                        move(+1); hexPendScroll_ = hexCursorOff_;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pending scroll (goto / keyboard move / external nav): center-ish the row.
+    if (hexPendScroll_ != ~0ull) {
+        float y = (float)(hexPendScroll_ / 16) * lineH;
+        float view = ImGui::GetWindowHeight();
+        float cur = ImGui::GetScrollY();
+        if (y < cur || y > cur + view - lineH * 2.0f)     // only jump when off-screen
+            ImGui::SetScrollY(std::max(0.0f, y - view * 0.4f));
+        hexPendScroll_ = ~0ull;
+    }
+
+    // ---- rows (clipper) ------------------------------------------------------
+    const ImU32 colMuted = ImGui::ColorConvertFloat4ToU32(theme::col::muted());
+    const ImU32 colText  = ImGui::GetColorU32(ImGuiCol_Text);
+    const ImU32 colWarn  = ImGui::ColorConvertFloat4ToU32(theme::col::warn());
+    const ImU32 colAcc   = ImGui::ColorConvertFloat4ToU32(theme::col::accent());
+    ImVec4 selBg4 = theme::col::selection(); selBg4.w *= 0.45f;
+    const ImU32 colSelBg = ImGui::ColorConvertFloat4ToU32(selBg4);
+
+    const uint64_t selLo = (hexSelA_ == ~0ull) ? ~0ull : std::min(hexSelA_, hexSelB_);
+    const uint64_t selHi = (hexSelA_ == ~0ull) ? 0     : std::max(hexSelA_, hexSelB_);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGuiListClipper clip;
+    clip.Begin(totalRows, lineH);
+    while (clip.Step()) {
+        for (int r = clip.DisplayStart; r < clip.DisplayEnd; ++r) {
+            const uint64_t rowOff = (uint64_t)r * 16;
+            ImVec2 pos = ImGui::GetCursorScreenPos();
+            ImGui::PushID(r);
+            // textH-tall item: ItemSize adds ItemSpacing.y, so each row advances by
+            // exactly lineH — keeping the layout in lock-step with the clipper.
+            ImGui::InvisibleButton("row", ImVec2(std::max(rowW, ImGui::GetContentRegionAvail().x), textH));
+            ImGui::PopID();
+
+            // Mouse: click selects + moves the cursor; drag extends the selection.
+            const bool hovered = ImGui::IsItemHovered();
+            auto byteFromMouse = [&](bool& ascii) -> int64_t {
+                float mx = ImGui::GetIO().MousePos.x - pos.x;
+                ascii = mx >= asciiX - charW * 0.5f;
+                int c;
+                if (ascii) c = (int)((mx - asciiX) / charW);
+                else {
+                    float hx = mx - hexX;
+                    if (hx >= 8.0f * byteW) hx -= groupGap;   // undo the mid-row group gap
+                    c = (int)(hx / byteW);
+                }
+                if (c < 0) c = 0; if (c > 15) c = 15;
+                int64_t off = (int64_t)rowOff + c;
+                return off < (int64_t)total ? off : (int64_t)total - 1;
+            };
+            if (hovered && ImGui::IsItemClicked(0)) {
+                bool ascii = false;
+                int64_t off = byteFromMouse(ascii);
+                hexAsciiCol_ = ascii; hexEditNibble_ = -1;
+                hexCursorOff_ = (uint64_t)off;
+                if (ImGui::GetIO().KeyShift && hexSelA_ != ~0ull) hexSelB_ = (uint64_t)off;
+                else { hexSelA_ = hexSelB_ = (uint64_t)off; hexDragging_ = true; }
+                uint64_t va = 0;
+                if (ctx.binary.offsetToVA((uint64_t)off, va)) { cursorVA_ = va; hexLastScroll_ = va; }
+            }
+            if (hexDragging_ && hovered && ImGui::IsMouseDown(0)) {
+                bool ascii = false;
+                hexSelB_ = (uint64_t)byteFromMouse(ascii);
+            }
+            if (hovered && ImGui::IsMouseReleased(0)) hexDragging_ = false;
+            if (hovered) {
+                bool ascii = false;
+                uint64_t off = (uint64_t)byteFromMouse(ascii);
+                uint64_t va = 0;
+                if (ctx.binary.offsetToVA(off, va))
+                    ImGui::SetTooltip("offset 0x%llX   VA 0x%llX", (unsigned long long)off, (unsigned long long)va);
+                else
+                    ImGui::SetTooltip("offset 0x%llX   (no VA)", (unsigned long long)off);
+            }
+
+            // VA column (muted; dashes for unmapped rows).
+            char vabuf[20];
+            uint64_t rowVA = 0;
+            if (ctx.binary.offsetToVA(rowOff, rowVA)) std::snprintf(vabuf, sizeof(vabuf), "%012llX", (unsigned long long)rowVA);
+            else                                      std::snprintf(vabuf, sizeof(vabuf), "------------");
+            dl->AddText(ImVec2(pos.x + vaX, pos.y), colMuted, vabuf);
+
+            // Byte + ascii cells.
+            for (int c = 0; c < 16; ++c) {
+                const uint64_t off = rowOff + (uint64_t)c;
+                if (off >= total) break;
+                const uint8_t v = bytes[(size_t)off];
+                const float bx = pos.x + hexX + c * byteW + (c >= 8 ? groupGap : 0.0f);
+                const float ax = pos.x + asciiX + c * charW;
+                const bool sel = selLo != ~0ull && off >= selLo && off <= selHi;
+                const bool cur = off == hexCursorOff_;
+                const bool pat = isPatched(off);
+                if (sel) {
+                    dl->AddRectFilled(ImVec2(bx - charW * 0.25f, pos.y), ImVec2(bx + charW * 2.25f, pos.y + textH), colSelBg);
+                    dl->AddRectFilled(ImVec2(ax, pos.y), ImVec2(ax + charW, pos.y + textH), colSelBg);
+                }
+                char hb[4];
+                if (cur && hexEditNibble_ == 0 && !hexAsciiCol_)
+                    std::snprintf(hb, sizeof(hb), "%X_", hexEditByte_ >> 4);   // pending high nibble
+                else
+                    std::snprintf(hb, sizeof(hb), "%02X", v);
+                dl->AddText(ImVec2(bx, pos.y), pat ? colWarn : colText, hb);
+                char ac[2] = { (v >= 0x20 && v < 0x7F) ? (char)v : '.', 0 };
+                dl->AddText(ImVec2(ax, pos.y), pat ? colWarn : (ac[0] == '.' ? colMuted : colText), ac);
+                if (cur) {   // cursor frame on the active column, underline on the other
+                    if (!hexAsciiCol_) {
+                        dl->AddRect(ImVec2(bx - charW * 0.25f, pos.y), ImVec2(bx + charW * 2.25f, pos.y + textH), colAcc);
+                        dl->AddLine(ImVec2(ax, pos.y + textH - 1), ImVec2(ax + charW, pos.y + textH - 1), colAcc);
+                    } else {
+                        dl->AddRect(ImVec2(ax - 1, pos.y), ImVec2(ax + charW + 1, pos.y + textH), colAcc);
+                        dl->AddLine(ImVec2(bx, pos.y + textH - 1), ImVec2(bx + charW * 2.0f, pos.y + textH - 1), colAcc);
+                    }
+                }
+            }
+        }
+    }
+    clip.End();
+    if (!ImGui::IsMouseDown(0)) hexDragging_ = false;   // release outside any row
+
+    // Ctrl+C anywhere in the focused child copies the selection.
+    if (focused && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) &&
+        hexSelA_ != ~0ull && hexSelB_ != ~0ull) {
+        uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::min<uint64_t>(std::max(hexSelA_, hexSelB_), total - 1);
+        hi = std::min(hi, lo + (1ull << 20));
+        std::string s; s.reserve((size_t)(hi - lo + 1) * 3);
+        char b[4];
+        for (uint64_t a = lo; a <= hi; ++a) { std::snprintf(b, sizeof(b), "%02X", bytes[(size_t)a]); if (!s.empty()) s += ' '; s += b; }
+        ImGui::SetClipboardText(s.c_str());
+    }
+
     ImGui::EndChild();
+    ui::PopMono();
 }
 
 // Build call edges between discovered functions (cached). Each function is
@@ -4105,6 +5655,7 @@ std::string BinaryViewTab::guessSignature(AppContext& ctx, uint64_t fnStart, uin
     const char* win64[4] = { "rcx", "rdx", "r8", "r9" };
     const char* sysv[6]  = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
     int win64Args = 0, sysvArgs = 0;
+    int stackArgs = 0, retImmArgs = 0;   // x86: [ebp+8+4k] reads / `ret imm` (stdcall) byte count
     std::unordered_set<std::string> written;
     bool setsRax = false;
     size_t off = 0; int n = 0;
@@ -4116,6 +5667,30 @@ std::string BinaryViewTab::guessSignature(AppContext& ctx, uint64_t fnStart, uin
         std::string src = comma == std::string::npos ? std::string() : in.operands.substr(comma + 1);
         for (int i = 0; i < 4; ++i) if (!written.count(win64[i]) && src.find(win64[i]) != std::string::npos) win64Args = std::max(win64Args, i + 1);
         for (int i = 0; i < 6; ++i) if (!written.count(sysv[i])  && src.find(sysv[i])  != std::string::npos) sysvArgs  = std::max(sysvArgs,  i + 1);
+        if (ctx.arch == Arch::X86) {
+            // 32-bit cdecl/stdcall pass args on the stack: a read of [ebp + 8+4k]
+            // is the (k+1)-th incoming argument (8 = saved ebp + return address).
+            size_t bp = in.operands.find("ebp");
+            if (bp != std::string::npos && in.operands.find('[') != std::string::npos) {
+                size_t i2 = bp + 3;
+                while (i2 < in.operands.size() && in.operands[i2] == ' ') ++i2;
+                if (i2 < in.operands.size() && in.operands[i2] == '+') {
+                    ++i2; while (i2 < in.operands.size() && in.operands[i2] == ' ') ++i2;
+                    unsigned long long d = 0;
+                    if (std::sscanf(in.operands.c_str() + i2, "0x%llx", &d) == 1 ||
+                        std::sscanf(in.operands.c_str() + i2, "%llu", &d) == 1)
+                        if (d >= 8 && d < 8 + 4 * 32)         // sane arg window (32 slots)
+                            stackArgs = std::max(stackArgs, (int)((d - 8) / 4 + 1));
+                }
+            }
+            // `ret imm16` (stdcall) pops the arguments: imm/4 is the exact count.
+            if (in.isRet && !in.operands.empty()) {
+                unsigned long long imm = 0;
+                if (std::sscanf(in.operands.c_str(), "0x%llx", &imm) == 1 ||
+                    std::sscanf(in.operands.c_str(), "%llu", &imm) == 1)
+                    if (imm && imm % 4 == 0 && imm <= 4 * 32) retImmArgs = (int)(imm / 4);
+            }
+        }
         auto markIf = [&](const char* full, const char* alias) { if (dst.find(full) != std::string::npos || dst.find(alias) != std::string::npos) written.insert(full); };
         markIf("rcx","ecx"); markIf("rdx","edx"); markIf("r8","r8d"); markIf("r9","r9d"); markIf("rdi","edi"); markIf("rsi","esi");
         if ((in.mnemonic == "mov" || in.mnemonic == "lea" || in.mnemonic == "add" || in.mnemonic == "or" ||
@@ -4124,7 +5699,9 @@ std::string BinaryViewTab::guessSignature(AppContext& ctx, uint64_t fnStart, uin
         off += in.length; ++n;
         if (in.isRet) break;
     }
+    // `ret imm` is the callee's own answer (stdcall) — it wins over the slot scan.
     int args = std::max(win64Args, sysvArgs);
+    if (ctx.arch == Arch::X86) args = retImmArgs ? retImmArgs : std::max(args, stackArgs);
     std::string sig = setsRax ? "__int64 " : "void ";
     sig += "(";
     for (int i = 0; i < args; ++i) { if (i) sig += ", "; sig += "a" + std::to_string(i + 1); }
@@ -4274,6 +5851,7 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
                 }
             }
         }
+        if (!in.comment.empty()) { r += "  ; "; r += in.comment.substr(0, 48); }   // decoder annotation (JVM)
         return r;
     };
 
@@ -4435,7 +6013,7 @@ void BinaryViewTab::runByteSearch(AppContext& ctx) {
 }
 
 void BinaryViewTab::renderSidePanel(AppContext& ctx) {
-    panelPopToggle(&sidePoppedOut_, "side");
+    // (Drag the panel's tab to float/re-dock it — docking replaced the manual pop-out.)
     ImGui::SeparatorText("Byte Pattern Search");
     ImGui::SetNextItemWidth(-60);
     ImGui::InputTextWithHint("##bsearch", "DE AD BE EF", byteSearch_, sizeof(byteSearch_));
@@ -4506,15 +6084,24 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                 ImGui::BeginChild("fnlist", ImVec2(0, 0), ImGuiChildFlags_Borders);
                 ui::PushMono();   // monospace so the 0x... address column lines up
                 // Filter into an index list, then clipper-render only visible rows.
-                fnVisible_.clear();
-                for (int i = 0; i < (int)functions_.size(); ++i) {
-                    if (fnFilter_[0]) {
-                        const Func& f = functions_[i];
-                        std::string dn = annName(ctx, f.address);
-                        const std::string& nm = dn.empty() ? f.name : dn;
-                        if (nm.find(fnFilter_) == std::string::npos && f.name.find(fnFilter_) == std::string::npos) continue;
+                // Rebuild only when the filter text or the function set / rename state
+                // changes — otherwise the per-function annName() copy+probe ran every
+                // idle frame on large binaries.
+                uint64_t fnSig = (uint64_t)functions_.size() ^ ((uint64_t)namesGen_ << 40);
+                if (!functions_.empty()) fnSig ^= functions_.front().address ^ (functions_.back().address << 1);
+                if (std::strcmp(fnFilter_, fnFilterLast_) != 0 || fnSig != fnVisSig_) {
+                    std::snprintf(fnFilterLast_, sizeof(fnFilterLast_), "%s", fnFilter_);
+                    fnVisSig_ = fnSig;
+                    fnVisible_.clear();
+                    for (int i = 0; i < (int)functions_.size(); ++i) {
+                        if (fnFilter_[0]) {
+                            const Func& f = functions_[i];
+                            std::string dn = annName(ctx, f.address);
+                            const std::string& nm = dn.empty() ? f.name : dn;
+                            if (nm.find(fnFilter_) == std::string::npos && f.name.find(fnFilter_) == std::string::npos) continue;
+                        }
+                        fnVisible_.push_back(i);
                     }
-                    fnVisible_.push_back(i);
                 }
                 ImGuiListClipper fnClip;
                 fnClip.Begin((int)fnVisible_.size());
@@ -4574,16 +6161,28 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             // single-label render was ragged because hex addresses vary in width).
             ImGui::BeginChild("strs", ImVec2(0, 0), ImGuiChildFlags_Borders);
             ui::PushMono();
-            if (ImGui::BeginTable("strtbl", 3,
+            // The "Used by" column resolves through the background whole-program
+            // xref index: first referencing instruction -> its enclosing function.
+            // Static-file mode only (the live scan has no file-VA xref index).
+            const bool showUsedBy = !stringsLive_ && !xrefIndex_.empty();
+            if (ImGui::BeginTable("strtbl", showUsedBy ? 4 : 3,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV)) {
                 ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150);
                 ImGui::TableSetupColumn("T",       ImGuiTableColumnFlags_WidthFixed, 22);
                 ImGui::TableSetupColumn("String");
+                if (showUsedBy)
+                    ImGui::TableSetupColumn("Used by", ImGuiTableColumnFlags_WidthFixed, 170.0f * theme::UiScale());
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
-                strVisible_.clear();
-                for (int i = 0; i < (int)strings_.size(); ++i)
-                    if (!strFilter_[0] || strings_[i].text.find(strFilter_) != std::string::npos) strVisible_.push_back(i);
+                uint64_t strSig = (uint64_t)strings_.size();
+                if (!strings_.empty()) strSig ^= strings_.front().address ^ (strings_.back().address << 1);
+                if (std::strcmp(strFilter_, strFilterLast_) != 0 || strSig != strVisSig_) {
+                    std::snprintf(strFilterLast_, sizeof(strFilterLast_), "%s", strFilter_);
+                    strVisSig_ = strSig;
+                    strVisible_.clear();
+                    for (int i = 0; i < (int)strings_.size(); ++i)
+                        if (!strFilter_[0] || strings_[i].text.find(strFilter_) != std::string::npos) strVisible_.push_back(i);
+                }
                 ImGuiListClipper strClip;
                 strClip.Begin((int)strVisible_.size());
                 while (strClip.Step())
@@ -4605,6 +6204,24 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                     }
                     ImGui::TableSetColumnIndex(1); ImGui::TextDisabled(s.wide ? "L" : "A");
                     ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(s.text.c_str());
+                    if (showUsedBy) {
+                        ImGui::TableSetColumnIndex(3);
+                        // Owning function of the first referencing instruction.
+                        if (const std::vector<uint64_t>* refs = xrefIndex_.sources(s.address);
+                            refs && !refs->empty()) {
+                            if (const Func* fn = funcContaining(refs->front())) {
+                                std::string dn = annName(ctx, fn->address);
+                                const std::string& nm = dn.empty() ? fn->name : dn;
+                                if (ImGui::Selectable(nm.c_str())) gotoStatic(ctx, fn->address);
+                                if (ImGui::IsItemHovered() && refs->size() > 1)
+                                    ImGui::SetTooltip("%zu referencing site(s); click for the function", refs->size());
+                            } else {
+                                ImGui::TextDisabled("0x%llX", (unsigned long long)refs->front());
+                            }
+                        } else {
+                            ImGui::TextDisabled("-");
+                        }
+                    }
                     ImGui::PopID();
                 }
                 ImGui::EndTable();
@@ -4707,11 +6324,20 @@ void BinaryViewTab::applyHotPatch(AppContext& ctx) {
         size_t avail = 0; const uint8_t* p = ctx.binary.ptrFromVA(va, avail);
         if (p) regions.push_back({ va, p, (size_t)std::min<uint64_t>(avail, s.virtualSize) });
     }
+    // Avoid caves already claimed by previously recorded patches (their cave bodies
+    // aren't reflected in the static image we re-scan, so without this a second
+    // detour would re-select the same first-fitting cave and corrupt the first).
+    std::vector<uint64_t> avoidCaves;
+    avoidCaves.reserve(ctx.project.patches.size() * 2);
+    for (const auto& pp : ctx.project.patches) {
+        avoidCaves.push_back(pp.address);
+        if (!pp.bytes.empty()) avoidCaves.push_back(pp.address + pp.bytes.size() - 1);
+    }
     PlaceInput pin;
     pin.siteVA  = hotSiteVA_;
     pin.origLen = hotOrigLen_;
     pin.newBody = cr.bytes;
-    pin.caves   = FindCodeCaves(regions, cr.bytes.size() + kDetourJmpLen);
+    pin.caves   = FindCodeCaves(regions, cr.bytes.size() + kDetourJmpLen, avoidCaves);
     PlaceResult pr = PlacePatch(pin);
     if (pr.status == PlaceStatus::Refused || pr.status == PlaceStatus::NeedsAlloc) {
         hotStatus_ = std::string("place: ") + pr.reason; return;
@@ -4801,38 +6427,74 @@ void BinaryViewTab::renderPathExplorerTab(AppContext& ctx) {
 }
 
 void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
-    panelPopToggle(&lowerPoppedOut_, "lower");
+    // (Drag the panel's tab to float/re-dock it — docking replaced the manual pop-out.)
     if (ImGui::BeginTabBar("lower")) {
         renderSynthesisTab(ctx);
         renderHotPatchTab(ctx);
         renderPathExplorerTab(ctx);
+        renderAnnotationsTab(ctx);
+        renderJavaTab(ctx);
+        renderGameContextTab(ctx);
         if (ImGui::BeginTabItem("Breakpoints")) {
             DbgSnapshot snap = ctx.debug.snapshot();
             ImGui::SeparatorText("Software (0xCC)");
             if (snap.attached()) {
                 if (snap.breakpoints.empty()) ImGui::TextDisabled("None. Click the gutter or right-click an address.");
-                ImGui::TextDisabled("Condition examples:  rax == 0x10   |   rcx > 100   |   [rsp+8] != 0");
-                for (size_t i = 0; i < snap.breakpoints.size(); ++i) {
-                    const auto& bp = snap.breakpoints[i];
-                    ImGui::PushID((int)i);
-                    ImGui::Text("0x%llX", (unsigned long long)bp.address);
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("remove")) {
-                        ctx.debug.removeBreakpoint(bp.address);
-                        breakpoints_.erase(bp.address);
-                        condBuf_.erase(bp.address);
+                ImGui::TextDisabled("Condition examples:  rax == 0x10   |   rcx > 100   |   [rsp+8] != 0   |   rax s< 0  (signed)");
+                if (!snap.breakpoints.empty() &&
+                    ImGui::BeginTable("swbps", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Address");
+                    ImGui::TableSetupColumn("Hits");
+                    ImGui::TableSetupColumn("Every", ImGuiTableColumnFlags_WidthFixed, 56.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("Condition", ImGuiTableColumnFlags_WidthFixed, 280.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("##rm");
+                    ImGui::TableHeadersRow();
+                    for (size_t i = 0; i < snap.breakpoints.size(); ++i) {
+                        const auto& bp = snap.breakpoints[i];
+                        ImGui::PushID((int)i);
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("0x%llX", (unsigned long long)bp.address);
+                        ImGui::TableNextColumn();
+                        if (bp.hits == 0)               ImGui::TextColored(theme::col::muted(), "0");
+                        else if (bp.hits == bp.stops)   ImGui::Text("%u", bp.hits);
+                        else                            ImGui::Text("%u hits / %u stops", bp.hits, bp.stops);
+                        ImGui::TableNextColumn();
+                        {   // Break only on every Nth hit (0/1 = every; composes with the condition).
+                            int n = (int)(everyNBuf_.count(bp.address) ? everyNBuf_[bp.address] : bp.everyN);
+                            char nb[12]; std::snprintf(nb, sizeof(nb), n > 1 ? "%d" : "", n);
+                            ImGui::SetNextItemWidth(-FLT_MIN);
+                            if (ImGui::InputTextWithHint("##everyn", "1", nb, sizeof(nb),
+                                                         ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal)) {
+                                int nv = std::atoi(nb);
+                                if (nv < 0) nv = 0;
+                                if (nv > 1) everyNBuf_[bp.address] = (uint32_t)nv;
+                                else        everyNBuf_.erase(bp.address);
+                                ctx.debug.setBreakpointEveryN(bp.address, nv > 1 ? (uint32_t)nv : 0);
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Stop only on every Nth hit (blank/1 = every hit).\nCounted over raw hits; a condition still has to hold.");
+                        }
+                        ImGui::TableNextColumn();
+                        auto& buf = condBuf_[bp.address];
+                        if (buf.empty() && !bp.condition.empty()) buf = bp.condition;
+                        char tmp[160]; std::snprintf(tmp, sizeof(tmp), "%s", buf.c_str());
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        if (ImGui::InputTextWithHint("##cond", "condition (optional)", tmp, sizeof(tmp),
+                                                     ImGuiInputTextFlags_EnterReturnsTrue)) {
+                            buf = tmp;
+                            ctx.debug.setBreakpointCondition(bp.address, buf);
+                        }
+                        ImGui::TableNextColumn();
+                        if (ImGui::SmallButton("remove")) {
+                            ctx.debug.removeBreakpoint(bp.address);
+                            breakpoints_.erase(bp.address);
+                            condBuf_.erase(bp.address);
+                            everyNBuf_.erase(bp.address);
+                        }
+                        ImGui::PopID();
                     }
-                    ImGui::SameLine();
-                    auto& buf = condBuf_[bp.address];
-                    if (buf.empty() && !bp.condition.empty()) buf = bp.condition;
-                    char tmp[160]; std::snprintf(tmp, sizeof(tmp), "%s", buf.c_str());
-                    ImGui::SetNextItemWidth(260);
-                    if (ImGui::InputTextWithHint("##cond", "condition (optional)", tmp, sizeof(tmp),
-                                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
-                        buf = tmp;
-                        ctx.debug.setBreakpointCondition(bp.address, buf);
-                    }
-                    ImGui::PopID();
+                    ImGui::EndTable();
                 }
                 // Locally-added breakpoints the debug thread hasn't armed yet (they
                 // arm on the next debug event) - surface them immediately as pending.
@@ -4873,6 +6535,36 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 if (ImGui::SmallButton("remove")) ctx.debug.removeHardwareBreakpoint(hb.address);
                 ImGui::PopID();
             }
+            ImGui::SeparatorText("First-chance exceptions");
+            {
+                // Exceptions are always passed back to the debuggee; this only controls
+                // whether the debugger PAUSES when one is first raised (before any
+                // handler runs). Session-only config, lives on the Debugger.
+                bool fc = ctx.debug.breakOnFirstChanceEnabled();
+                if (ImGui::Checkbox("Break on any first-chance exception", &fc))
+                    ctx.debug.setBreakOnFirstChance(fc);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Pause when the debuggee raises an exception, before its own handlers run.\nJVM-internal faults stay silent unless their code is whitelisted below.");
+                ImGui::SetNextItemWidth(120.0f * theme::UiScale());
+                bool addCode = ImGui::InputTextWithHint("##fccode", "code, e.g. C0000005", fcCodeBuf_, sizeof(fcCodeBuf_),
+                                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsHexadecimal);
+                ImGui::SameLine();
+                if ((ImGui::SmallButton("Whitelist code") || addCode) && fcCodeBuf_[0]) {
+                    unsigned long long code = 0;
+                    if (std::sscanf(fcCodeBuf_, "%llx", &code) == 1 && code)
+                        ctx.debug.addFirstChanceCode((uint32_t)code);
+                    fcCodeBuf_[0] = 0;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Always break on this exception code's first chance, even with the global toggle off.");
+                for (uint32_t code : ctx.debug.firstChanceCodes()) {
+                    ImGui::PushID((int)code);
+                    ImGui::TextUnformatted(ExceptionCodeLabel(code).c_str());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("remove")) ctx.debug.removeFirstChanceCode(code);
+                    ImGui::PopID();
+                }
+            }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Registers")) {
@@ -4894,7 +6586,8 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                     {"R12","r12",&Registers::r12}, {"R13","r13",&Registers::r13}, {"R14","r14",&Registers::r14}, {"R15","r15",&Registers::r15},
                 };
                 ui::PushMono();
-                ImGui::BeginChild("regs", ImVec2(360, 0), ImGuiChildFlags_Borders);
+                if (regsSplitW_ <= 0.0f) regsSplitW_ = 360.0f * theme::UiScale();   // scale default once for HiDPI
+                ImGui::BeginChild("regs", ImVec2(regsSplitW_, 0), ImGuiChildFlags_Borders);
                 if (paused) ImGui::TextDisabled("double-click a value to edit");
                 else        ImGui::TextDisabled("(read-only while running)");
                 const int nRows = is32 ? 10 : (int)(sizeof(kRows) / sizeof(kRows[0]));   // hide r8-r15 for 32-bit
@@ -4943,7 +6636,8 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 }
                 ImGui::EndChild();
 
-                ImGui::SameLine();
+                ds::ui::VSplitter("##regsplit", &regsSplitW_, 220.0f * theme::UiScale(),
+                                  200.0f * theme::UiScale(), 6.0f * theme::UiScale());
                 ImGui::BeginChild("stack", ImVec2(0, 0), ImGuiChildFlags_Borders);
                 ImGui::TextDisabled(is32 ? "Stack (ESP):" : "Stack (RSP):");
                 for (int i = 0; i < 24; ++i) {
@@ -4990,20 +6684,28 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             bool add = ImGui::InputTextWithHint("##watchadd", "expression  e.g.  rax   [rsp+8]   0x140001000",
                                                 watchEntry_, sizeof(watchEntry_), ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::SameLine();
-            if ((ImGui::Button("Add") || add) && watchEntry_[0]) { watches_.push_back(watchEntry_); watchEntry_[0] = 0; }
+            if ((ImGui::Button("Add") || add) && watchEntry_[0]) {
+                watches_.push_back(watchEntry_); watchEntry_[0] = 0;
+                recompileWatches();
+            }
 
             const bool paused = snap.attached() && snap.state == DbgState::Paused;
             if (!paused) ImGui::TextDisabled("Values evaluate while the debuggee is paused.");
 
             // Resolve registers off the current snapshot + memory off the debuggee,
             // reusing the conditional-breakpoint expression evaluator (Cond.h).
+            // Accept the 32-bit aliases (eax/eip/...) like evalConditionFor does, so
+            // watches written against a WOW64 target resolve (32-bit values sit in
+            // the low halves of the snapshot registers).
             Registers regs = snap.regs;
             CondContext cc;
             cc.reg = [&regs](const std::string& n, uint64_t& o) -> bool {
-                if      (n=="rax") o=regs.rax; else if (n=="rbx") o=regs.rbx; else if (n=="rcx") o=regs.rcx;
-                else if (n=="rdx") o=regs.rdx; else if (n=="rsi") o=regs.rsi; else if (n=="rdi") o=regs.rdi;
-                else if (n=="rbp") o=regs.rbp; else if (n=="rsp") o=regs.rsp; else if (n=="rip") o=regs.rip;
-                else if (n=="rflags") o=regs.rflags;
+                if      (n=="rax"||n=="eax") o=regs.rax; else if (n=="rbx"||n=="ebx") o=regs.rbx;
+                else if (n=="rcx"||n=="ecx") o=regs.rcx; else if (n=="rdx"||n=="edx") o=regs.rdx;
+                else if (n=="rsi"||n=="esi") o=regs.rsi; else if (n=="rdi"||n=="edi") o=regs.rdi;
+                else if (n=="rbp"||n=="ebp") o=regs.rbp; else if (n=="rsp"||n=="esp") o=regs.rsp;
+                else if (n=="rip"||n=="eip") o=regs.rip;
+                else if (n=="rflags"||n=="eflags") o=regs.rflags;
                 else if (n=="r8")  o=regs.r8;  else if (n=="r9")  o=regs.r9;  else if (n=="r10") o=regs.r10;
                 else if (n=="r11") o=regs.r11; else if (n=="r12") o=regs.r12; else if (n=="r13") o=regs.r13;
                 else if (n=="r14") o=regs.r14; else if (n=="r15") o=regs.r15;
@@ -5023,8 +6725,17 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 ImGui::TableHeadersRow();
                 for (int i = 0; i < (int)watches_.size(); ++i) {
                     ImGui::TableNextRow(); ImGui::PushID(i);
-                    ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(watches_[i].c_str());
-                    uint64_t v = 0; bool ok = paused && EvalExpression(watches_[i], cc, v);
+                    const bool parsed = i < (int)watchOk_.size() && watchOk_[i];
+                    ImGui::TableSetColumnIndex(0);
+                    if (parsed) ImGui::TextUnformatted(watches_[i].c_str());
+                    else {
+                        ImGui::TextColored(theme::col::bad(), "%s", watches_[i].c_str());
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Parse error: expected a register, number, or [base +/- disp].");
+                    }
+                    // Compiled once on add/load; per-frame eval never re-parses the string.
+                    uint64_t v = 0;
+                    bool ok = paused && parsed && EvalCompiled(watchProgs_[i], cc, v);
                     ImGui::TableSetColumnIndex(1);
                     if (ok) ImGui::Text("0x%016llX", (unsigned long long)v); else ImGui::TextDisabled(paused ? "?" : "-");
                     ImGui::TableSetColumnIndex(2);
@@ -5036,7 +6747,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 ImGui::EndTable();
             }
             ui::PopMono();
-            if (removeAt >= 0) watches_.erase(watches_.begin() + removeAt);
+            if (removeAt >= 0) { watches_.erase(watches_.begin() + removeAt); recompileWatches(); }
             if (watches_.empty()) ImGui::TextDisabled("Add expressions (registers, [mem], constants) to watch them each stop.");
             ImGui::EndTabItem();
         }
@@ -5075,6 +6786,82 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 }
                 ImGui::TextDisabled("Select a thread to point the register/stack views at it; freeze to hold it across continues.");
             }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Modules")) {
+            // Live module list from LOAD_DLL/UNLOAD_DLL events (follows dynamic
+            // loads during the session; the Communications tab's static pane stays).
+            DbgSnapshot snap = ctx.debug.snapshot();
+            if (!snap.attached()) {
+                ImGui::TextDisabled("Attach a process to track its loaded modules live.");
+            } else if (snap.modules.empty()) {
+                ImGui::TextDisabled("No LOAD_DLL events yet (modules loaded before attach aren't listed here).");
+            } else {
+                ImGui::Text("%d module(s)", (int)snap.modules.size());
+                ImGui::SameLine();
+                ImGui::TextDisabled("- click a row to copy its base address");
+                if (ImGui::BeginTable("dbgmods", 4,
+                        ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
+                        ImGuiTableFlags_SizingFixedFit)) {
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 180.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, 150.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90.0f * theme::UiScale());
+                    ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableHeadersRow();
+                    for (size_t i = 0; i < snap.modules.size(); ++i) {
+                        const DbgModule& m = snap.modules[i];
+                        ImGui::PushID((int)i);
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        if (ImGui::Selectable(m.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                            char b[24]; std::snprintf(b, sizeof(b), "0x%llX", (unsigned long long)m.base);
+                            ImGui::SetClipboardText(b);
+                            ui::Toast(ui::ToastKind::Success, std::string("Copied base of ") + m.name);
+                        }
+                        ImGui::TableNextColumn();
+                        ImGui::Text("0x%llX", (unsigned long long)m.base);
+                        ImGui::TableNextColumn();
+                        if (m.size >= 1024 * 1024) ImGui::Text("%.1f MB", (double)m.size / (1024.0 * 1024.0));
+                        else if (m.size)           ImGui::Text("%.0f KB", (double)m.size / 1024.0);
+                        else                       ImGui::TextColored(theme::col::muted(), "?");
+                        ImGui::TableNextColumn();
+                        ImGui::TextColored(theme::col::muted(), "%s", m.path.c_str());
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Debug Output")) {
+            // OutputDebugString capture (bounded ring on the Debugger).
+            DbgSnapshot snap = ctx.debug.snapshot();
+            if (ImGui::SmallButton("Clear")) { ctx.debug.clearDebugOutput(); dbgOutSeen_ = 0; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy all") && !snap.debugOutput.empty()) {
+                std::string all;
+                for (const auto& l : snap.debugOutput) { all += l; all += '\n'; }
+                ImGui::SetClipboardText(all.c_str());
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d line(s)%s", (int)snap.debugOutput.size(),
+                                snap.attached() ? "" : "  (attach a process to capture OutputDebugString)");
+            ImGui::BeginChild("##dbgout", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            ui::PushMono();
+            ImGuiListClipper clip;
+            clip.Begin((int)snap.debugOutput.size());
+            while (clip.Step())
+                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i)
+                    ImGui::TextUnformatted(snap.debugOutput[(size_t)i].c_str());
+            clip.End();
+            ui::PopMono();
+            // Auto-scroll on new output unless the user scrolled back up.
+            if (snap.debugOutput.size() != dbgOutSeen_) {
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f || dbgOutSeen_ == 0)
+                    ImGui::SetScrollHereY(1.0f);
+                dbgOutSeen_ = snap.debugOutput.size();
+            }
+            ImGui::EndChild();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Call Stack")) {
@@ -5500,6 +7287,10 @@ void BinaryViewTab::render(AppContext& ctx) {
         ctx.analysis.cancelAndWaitIdle();
         stringsScanning_ = false; xrefScanning_ = false;
         ctx.modules.clear();
+        // The live view can only render an attached process; fall back to the
+        // static assembly so the user lands somewhere useful (the welcome screen
+        // when nothing is loaded) instead of a dead "attach a process" pane.
+        if (mainView_ == 4) mainView_ = 0;
     }
     // Attach edge: pull in the whole app. Seed the module registry from the live module
     // list and, when no file is already loaded, auto-open the process's main module so
@@ -5646,6 +7437,14 @@ void BinaryViewTab::render(AppContext& ctx) {
                 pathPending_ = false; pathFocus_ = true;
                 if (!pathHave_) pathStatus_ = "No reachable paths (region did not decode to a CFG).";
             }
+            if (ar.decompValid) {           // K_Decompile (static Pseudocode) result
+                DecompResult dr{ std::move(ar.decompText), std::move(ar.decompLineVA) };
+                decompLruPut(ar.decompVA, dr);              // cache for nav back/forward (pseudo-C)
+                if (ar.decompVA == decompVA_) {             // still the function on screen
+                    applyDecompLang(dr);                    // render in the selected language
+                    decompPending_ = false;
+                }
+            }
         }
     }
 
@@ -5710,114 +7509,316 @@ void BinaryViewTab::render(AppContext& ctx) {
     if (!ctx.binary.loaded() && mainView_ != 4)
         mainView_ = 4;
 
-    // Top control row: goto + view switch.
-    ImGui::SetNextItemWidth(170);
-    if (ImGui::InputTextWithHint("##goto", "0x... or name", gotoBuf_, sizeof(gotoBuf_),
-                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
-        unsigned long long a = 0;
-        bool looksHex = gotoBuf_[0] != 0;
-        for (const char* s = gotoBuf_ + ((gotoBuf_[0] == '0' && (gotoBuf_[1] == 'x' || gotoBuf_[1] == 'X')) ? 2 : 0); *s; ++s)
-            if (!std::isxdigit((unsigned char)*s)) { looksHex = false; break; }
-        if (looksHex && std::sscanf(gotoBuf_, "%llx", &a) == 1)        navigateTo((uint64_t)a);
-        else if (uint64_t sym = lookupSymbol(ctx, gotoBuf_))           navigateTo(sym);
-    }
-    ImGui::SameLine();
-    {   // Back / Forward history.
+    // Top chrome (wireframe): nav row (back/forward + mono goto + pickers) above
+    // the view tab strip. Same actions and mainView_ values as the old radio row.
+    {
+        const float k = theme::UiScale();
+        const bool icons = ui::IconsLoaded();
         bool canBack = navPos_ > 0;
         bool canFwd  = navPos_ >= 0 && navPos_ + 1 < (int)navHist_.size();
         ImGui::BeginDisabled(!canBack);
-        if (ImGui::Button("<")) navBack();
+        if (ImGui::Button(icons ? DS_ICON_BACK "###navback" : "<###navback")) navBack();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Back (Alt+Left / mouse back)");
         ImGui::SameLine(0, 2);
         ImGui::BeginDisabled(!canFwd);
-        if (ImGui::Button(">")) navForward();
+        if (ImGui::Button(icons ? DS_ICON_FORWARD "###navfwd" : ">###navfwd")) navForward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Forward (Alt+Right / mouse forward)");
+        ImGui::SameLine(0, 6.0f * k);
+        ImGui::SetNextItemWidth(190.0f * k);
+        ui::PushMono();
+        bool gotoHit = ImGui::InputTextWithHint("##goto", "0x... or name", gotoBuf_, sizeof(gotoBuf_),
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+        ui::PopMono();
+        if (gotoHit) {
+            unsigned long long a = 0;
+            bool looksHex = gotoBuf_[0] != 0;
+            for (const char* s = gotoBuf_ + ((gotoBuf_[0] == '0' && (gotoBuf_[1] == 'x' || gotoBuf_[1] == 'X')) ? 2 : 0); *s; ++s)
+                if (!std::isxdigit((unsigned char)*s)) { looksHex = false; break; }
+            if (looksHex && std::sscanf(gotoBuf_, "%llx", &a) == 1)        navigateTo((uint64_t)a);
+            else if (uint64_t sym = lookupSymbol(ctx, gotoBuf_))           navigateTo(sym);
+        }
+        ImGui::SameLine(0, 6.0f * k);
+        if (ui::ToolbarIconButton(DS_ICON_CODE, "Goto sym", "Fuzzy symbol picker (Ctrl+G)"))
+            openGotoPopup_ = true;
+        ImGui::SameLine(0, 4.0f * k);
+        if (ui::ToolbarIconButton(DS_ICON_SEARCH, "Find text", "Search the disassembly text (Ctrl+Shift+F)"))
+            openTextPopup_ = true;
+        if (ctx.analysis.bulkPending()) {
+            ImGui::SameLine(0, 12.0f * k);
+            drawAnalysisProgress(ctx, true);
+        }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Goto sym")) openGotoPopup_ = true;
-    ImGui::SameLine();
-    if (ImGui::Button("Find text")) openTextPopup_ = true;
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!ctx.binary.loaded());
-    ImGui::RadioButton("Assembly", &mainView_, 0); ImGui::SameLine();
-    ImGui::RadioButton("Pseudocode", &mainView_, 1); ImGui::SameLine();
-    ImGui::RadioButton("Hex", &mainView_, 2); ImGui::SameLine();
-    ImGui::RadioButton("Graph (CFG)", &mainView_, 3); ImGui::SameLine();
-    ImGui::RadioButton("Call Graph", &mainView_, 5);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!snap.attached());
-    ImGui::RadioButton("Live Assembly", &mainView_, 4);
-    ImGui::EndDisabled();
-    if (ctx.analysis.bulkPending()) {
-        ImGui::SameLine(); ImGui::TextDisabled("  ");
+    // The code-view switcher now lives in the CENTER panel's tab strip (below). The
+    // Graph (CFG=3) and Call Graph (5) views moved into the GRAPH column, so fold any
+    // such persisted main-view value back to a center code view (graphView_ records
+    // which graph tab to show). This also normalizes ctx.requestedLiveAssembly etc.
+    if (mainView_ == 3) { graphView_ = 0; mainView_ = 0; }
+    else if (mainView_ == 5) { graphView_ = 1; mainView_ = 0; }
+
+    // Runtime/container banner. Two cases: the file IS a ZIP/JAR archive (facts
+    // from the central directory -> accent), or the RuntimeScan verdict says the
+    // EXE likely hands off to another runtime (heuristic -> warn, like other
+    // guessed results). The [x] hides it until the next load.
+    if (ctx.binary.loaded() && !runtimeBannerDismissed_ &&
+        (ctx.runtimeInfo.isStandaloneArchive || ctx.runtimeInfo.wrapperLikely)) {
+        const JavaScanResult&    ji = ctx.javaInfo;
+        const RuntimeScanResult& ri = ctx.runtimeInfo;
+        const float s = theme::UiScale();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f * s, 3.0f * s));
+        if (ri.isStandaloneArchive) {
+            ImGui::TextColored(theme::col::accent(), "%sZIP/JAR archive \xE2\x80\x94 %zu entr%s.",
+                               ui::IconsLoaded() ? DS_ICON_FOLDER " " : "",
+                               ji.entries.size(), ji.entries.size() == 1 ? "y" : "ies");
+            if (!ji.mainClass.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(theme::col::muted(), "Main-Class %s", ji.mainClass.c_str());
+            }
+            if (!ji.entries.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Browse archive..."))
+                    ctx.requestedBrowseArchive = true;   // consumed by App::render (owns the popup)
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##runtimebanner")) runtimeBannerDismissed_ = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide this banner (until the next load)");
+        } else {
+            ImGui::TextColored(theme::col::warn(), "Runtime wrapper detected: %s (%.0f%% confidence)",
+                               ri.wrapperRuntime.c_str(), ri.wrapperConfidence * 100.0f);
+            if (ImGui::IsItemHovered()) {
+                std::string tip = ri.wrapperDetail;
+                for (const auto& f : ri.findings) {
+                    char line[512];
+                    std::snprintf(line, sizeof(line), "%s%s \xE2\x80\x94 %.0f%% \xE2\x80\x94 %s",
+                                  tip.empty() ? "" : "\n",
+                                  f.title.c_str(), f.confidence * 100.0f, f.detail.c_str());
+                    tip += line;
+                }
+                ImGui::SetTooltip("%s", tip.c_str());
+            }
+            if (ji.jarSize > 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton(ji.isJar ? "Extract JAR..." : "Extract ZIP..."))
+                    ctx.requestedExtractJava = true;   // consumed by App::render (owns the Save dialog)
+            }
+            if (!ji.entries.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Browse archive..."))
+                    ctx.requestedBrowseArchive = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x##runtimebanner")) runtimeBannerDismissed_ = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide this banner (until the next load)");
+            ImGui::TextColored(theme::col::muted(),
+                               "This executable appears to hand off execution to another runtime. Native disassembly may only show launcher code.");
+        }
+        ImGui::PopStyleVar();
+        ImGui::Separator();
+    }
+
+    // Java class banner: the loaded image IS a .class file. Facts from the
+    // parsed header (not heuristic), so it renders in accent, not warn.
+    if (ctx.binary.loaded() && ctx.binary.format() == BinFormat::JavaClass &&
+        ctx.binary.javaClass() && !runtimeBannerDismissed_) {
+        const JvmClassFile& jc = *ctx.binary.javaClass();
+        ImGui::TextColored(theme::col::accent(), "Java class: %s", jc.thisClass.c_str());
         ImGui::SameLine();
-        drawAnalysisProgress(ctx, true);
+        ImGui::TextColored(theme::col::muted(),
+                           "- %zu method(s)%s%s \xC2\xB7 live-debug a running JVM via Communications > Java debug (JDWP)",
+                           jc.methods.size(),
+                           jc.sourceFile.empty() ? "" : ", source ",
+                           jc.sourceFile.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x##jvmbanner")) runtimeBannerDismissed_ = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hide this banner (until the next load)");
+        ImGui::Separator();
     }
-    ImGui::Separator();
 
-    // Layout: main view (left) | side panel (right), lower tabs underneath. A panel
-    // that has been popped out (its own window, rendered after this block) is skipped
-    // here so the remaining panels reflow to fill the freed space.
-    const float sideW  = 320.0f;
-    const float lowerH = 200.0f;
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float mainW = sidePoppedOut_  ? avail.x : (avail.x - sideW - 8);
-    float mainH = lowerPoppedOut_ ? avail.y : (avail.y - lowerH - 8);
+    // Layout: a FIXED, near-1:1 wireframe body (disassembler-wireframes.html
+    // .wf-body.va) replacing the old per-page DockSpace. Five bordered .wf-panel
+    // regions: LEFT side panel (218) | CENTER code views (flex) | GRAPH column (400) |
+    // RIGHT register rail (250), over a BOTTOM debug dock (~200 tall). Column widths +
+    // dock height are drag-resizable (VSplitter / the local HSplitter) and persist
+    // across frames; 7px gaps between columns. No imgui.ini docking state involved.
+    const float kS  = theme::UiScale();
+    const float gap = 7.0f * kS;
 
-    ImGui::BeginChild("mainview", ImVec2(mainW, mainH), ImGuiChildFlags_Borders);
-    // selVAs_ is shared by the static and live listings (file-base vs runtime VAs),
-    // so drop the selection when crossing between them to avoid ghost highlights.
-    if ((mainView_ == 0 || mainView_ == 4) && mainView_ != selView_) {
-        if (selView_ == 0 || selView_ == 4) { selVAs_.clear(); selAnchorVA_ = 0; }
-        selView_ = mainView_;
+    // Scale the pixel-size defaults once (HiDPI). Survives live theme/DPI switches
+    // because we only multiply on first use; later width drags are already in pixels.
+    if (!layoutScaled_) {
+        // Scale only the NEW fixed-layout fields. regsSplitW_/liveBoxW_ keep their own
+        // first-use scaling guards in the lower Registers tab / live view (untouched).
+        leftColW_    *= kS; graphColW_   *= kS; rightRailW_  *= kS;
+        bottomDockH_ *= kS; decompSplitW_ *= kS;
+        layoutScaled_ = true;
     }
-    switch (mainView_) {
-        case 0: renderAssembly(ctx);   break;
-        case 1: if (pseudoPoppedOut_) { ImGui::TextDisabled("Pseudocode is open in a separate window.");
-                                        if (ImGui::SmallButton("Dock back")) pseudoPoppedOut_ = false; }
-                else renderPseudocode(ctx); break;
-        case 2: renderHex(ctx);        break;
-        case 3: if (graphPoppedOut_)  { ImGui::TextDisabled("Graph is open in a separate window.");
-                                        if (ImGui::SmallButton("Dock back")) graphPoppedOut_ = false; }
-                else renderGraph(ctx); break;
-        case 4: renderLiveAssembly(ctx); break;
-        case 5: renderCallGraph(ctx);  break;
+
+    // View > Reset Layout: restore the column widths / dock height to their defaults
+    // (the fixed layout has no dock node to rebuild).
+    if (ctx.requestResetDockLayout) {
+        leftColW_    = 218.0f * kS; graphColW_   = 400.0f * kS;
+        rightRailW_  = 250.0f * kS; bottomDockH_ = 200.0f * kS;
+        decompSplitW_ = 360.0f * kS;   // decompiler pseudo|asm split (same default as init)
+        ctx.requestResetDockLayout = false;
+    }
+
+    // A wireframe .wf-panel: a bordered child whose top is a wf-tabstrip header (via
+    // ui::TabStrip) ending in three decorative 9px "window dots" (.wf-win-btns). Draw
+    // the dots inline on the window draw list — purely cosmetic, no behavior.
+    auto winDots = [&](float panelRight, float headerTop) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float sz = 9.0f * kS, dg = 5.0f * kS;
+        const ImU32 c = ImGui::GetColorU32(theme::col::muted());
+        float y = headerTop + (27.0f * kS - sz) * 0.5f;   // match ui::TabStrip strip height
+        float x = panelRight - 9.0f * kS - sz;
+        for (int d = 0; d < 3; ++d) {
+            dl->AddRect(ImVec2(x, y), ImVec2(x + sz, y + sz), c, 2.0f * kS, 0, 1.5f * kS);
+            x -= sz + dg;
+        }
+    };
+
+    // Available body height = everything above the bottom dock + its splitter.
+    const float bodyAvailH = ImGui::GetContentRegionAvail().y;
+    const float splitH     = 6.0f * kS;
+    float bodyH = bodyAvailH - bottomDockH_ - splitH;
+    if (bodyH < 120.0f * kS) bodyH = 120.0f * kS;   // keep the body usable
+
+    // A vertical drag handle that resizes the column to its RIGHT (drag right shrinks
+    // it). VSplitter resizes the LEFT side, but CENTER is the flex column, so the
+    // center|graph and graph|right dividers must adjust the right column's width.
+    auto vsplitRight = [&](const char* id, float* rightW, float minW, float maxW) {
+        ImGui::SameLine(0.0f, 0.0f);
+        const float h = ImGui::GetContentRegionAvail().y;
+        ImGui::InvisibleButton(id, ImVec2(gap, h > 1.0f ? h : 1.0f));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive()) *rightW -= ImGui::GetIO().MouseDelta.x;
+        if (*rightW < minW) *rightW = minW;
+        if (*rightW > maxW) *rightW = maxW;
+        ImGui::SameLine(0.0f, 0.0f);
+    };
+
+    // ===== Upper body: LEFT | CENTER | GRAPH | RIGHT (horizontal VSplitters) =====
+    ImGui::BeginChild("##binbody", ImVec2(0, bodyH), ImGuiChildFlags_None);
+    {
+        const ImU32 border = ImGui::GetColorU32(theme::col::line());
+        const float rowH = ImGui::GetContentRegionAvail().y;
+
+        // selVAs_ is shared by the static and live listings (file-base vs runtime VAs),
+        // so drop the selection when crossing between them to avoid ghost highlights.
+        if ((mainView_ == 0 || mainView_ == 4) && mainView_ != selView_) {
+            if (selView_ == 0 || selView_ == 4) { selVAs_.clear(); selAnchorVA_ = 0; }
+            selView_ = mainView_;
+        }
+
+        // -- LEFT: side panel (Bookmarks/Functions/Strings/Imports — its own tabbar) --
+        ImGui::BeginChild("##leftpanel", ImVec2(leftColW_, rowH), ImGuiChildFlags_Borders);
+        renderSidePanel(ctx);
+        ImGui::EndChild();
+        // left|center divider resizes the LEFT side panel. minRight keeps room for the
+        // center (>=220), graph and right columns plus the two inter-column gaps.
+        ds::ui::VSplitter("##sp_left", &leftColW_, 140.0f * kS,
+                          graphColW_ + rightRailW_ + 220.0f * kS + 2.0f * gap, gap);
+
+        // Remaining width must hold CENTER (flex) + GRAPH + RIGHT (+ 2 gaps between them).
+        // Lay GRAPH and RIGHT from fixed widths; CENTER takes the rest.
+        const float remain = ImGui::GetContentRegionAvail().x;
+        float centerW = remain - graphColW_ - rightRailW_ - 2.0f * gap;
+        if (centerW < 220.0f * kS) centerW = 220.0f * kS;
+
+        // -- CENTER: code views (Assembly / Pseudocode / Decompiler / Hex / Live) --
+        ImGui::BeginChild("##centerpanel", ImVec2(centerW, rowH), ImGuiChildFlags_Borders);
+        {
+            static const char* kCodeViews[] = { "Assembly", "Pseudocode", "Decompiler", "Hex", "Live Assembly" };
+            static const int   kCodeId[]    = { 0, 1, 6, 2, 4 };
+            const bool loadedB = ctx.binary.loaded();
+            const bool cen[5]  = { loadedB, loadedB, loadedB, loadedB, snap.attached() };
+            int cactive = 0;
+            for (int i = 0; i < 5; ++i) if (kCodeId[i] == mainView_) { cactive = i; break; }
+            ImVec2 hdr = ImGui::GetCursorScreenPos();
+            int csel = ui::TabStrip("##codeviews", kCodeViews, 5, cactive, cen);
+            if (csel != cactive && cen[csel]) mainView_ = kCodeId[csel];
+            winDots(hdr.x + ImGui::GetContentRegionAvail().x, hdr.y);
+            switch (mainView_) {
+                case 0: renderAssembly(ctx);   break;
+                case 1: if (pseudoPoppedOut_) { ImGui::TextDisabled("Pseudocode is open in a separate window.");
+                                                if (ImGui::SmallButton("Dock back")) pseudoPoppedOut_ = false; }
+                        else renderPseudocode(ctx); break;
+                case 2: renderHex(ctx);        break;
+                case 4: renderLiveAssembly(ctx); break;
+                case 6: renderDecompiler(ctx); break;
+                default: renderAssembly(ctx);  break;   // 3/5 no longer live in the center
+            }
+        }
+        ImGui::EndChild();
+        // center|graph divider resizes the GRAPH column (right of the handle). Cap it
+        // so the center never collapses below its minimum given the current rail width.
+        vsplitRight("##sp_center", &graphColW_, 200.0f * kS,
+                    remain - rightRailW_ - 220.0f * kS - 2.0f * gap);
+
+        // -- GRAPH column: CFG / Call Graph (own tab strip) --
+        ImGui::BeginChild("##graphpanel", ImVec2(graphColW_, rowH), ImGuiChildFlags_Borders);
+        {
+            static const char* kGViews[] = { "CFG", "Call Graph" };
+            ImVec2 hdr = ImGui::GetCursorScreenPos();
+            graphView_ = ui::TabStrip("##graphviews", kGViews, 2, graphView_);
+            winDots(hdr.x + ImGui::GetContentRegionAvail().x, hdr.y);
+            if (graphPoppedOut_) {
+                ImGui::TextDisabled("Graph is open in a separate window.");
+                if (ImGui::SmallButton("Dock back")) graphPoppedOut_ = false;
+            } else if (graphView_ == 0) {
+                renderGraph(ctx);
+            } else {
+                renderCallGraph(ctx);
+            }
+        }
+        ImGui::EndChild();
+        // graph|right divider resizes the RIGHT rail (right of the handle).
+        vsplitRight("##sp_graph", &rightRailW_, 160.0f * kS,
+                    remain - graphColW_ - 220.0f * kS - 2.0f * gap);
+
+        // -- RIGHT rail: Registers / Stack --
+        ImGui::BeginChild("##rightrail", ImVec2(0, rowH), ImGuiChildFlags_Borders);
+        {
+            static const char* kRViews[] = { "Registers", "Stack" };
+            static int rView = 0;
+            ImVec2 hdr = ImGui::GetCursorScreenPos();
+            rView = ui::TabStrip("##railviews", kRViews, 2, rView);
+            winDots(hdr.x + ImGui::GetContentRegionAvail().x, hdr.y);
+            if (!snap.attached()) {
+                ImGui::TextColored(theme::col::muted(), "Attach a process to see live %s.",
+                                   rView == 0 ? "registers" : "stack");
+            } else if (rView == 0) {
+                renderRegisterBox(ctx, snap);
+            } else {
+                renderStackTab(ctx);
+            }
+        }
+        ImGui::EndChild();
+        (void)border;
     }
     ImGui::EndChild();
 
-    if (!sidePoppedOut_) {
-        ImGui::SameLine();
-        ImGui::BeginChild("sidepanel", ImVec2(sideW, mainH), ImGuiChildFlags_Borders);
-        renderSidePanel(ctx);
-        ImGui::EndChild();
+    // ===== Horizontal splitter between the body and the bottom debug dock =====
+    {
+        ImGui::InvisibleButton("##sp_bottom", ImVec2(-FLT_MIN, splitH));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (ImGui::IsItemActive()) bottomDockH_ -= ImGui::GetIO().MouseDelta.y;
+        const float maxDock = bodyAvailH - 160.0f * kS;
+        if (bottomDockH_ > maxDock)        bottomDockH_ = maxDock;
+        if (bottomDockH_ < 100.0f * kS)    bottomDockH_ = 100.0f * kS;
     }
 
-    if (!lowerPoppedOut_) {
-        ImGui::BeginChild("lowertabs", ImVec2(0, 0), ImGuiChildFlags_Borders);
-        renderLowerTabs(ctx);
-        ImGui::EndChild();
-    }
+    // ===== BOTTOM debug dock: the lower tabs (Breakpoints/Registers/Threads/...) =====
+    ImGui::BeginChild("##bottomdock", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    renderLowerTabs(ctx);
+    ImGui::EndChild();
 
-    // Popped-out panels render as standalone windows (their own OS window when
-    // viewports are enabled). Closing the window (the title-bar X) docks it back.
+    // The Graph / Pseudocode "pop out a sub-view" buttons stay (orthogonal to docking:
+    // they pop a specific main-view rendering into its own window).
     const float ds = theme::UiScale();
-    if (sidePoppedOut_) {
-        ImGui::SetNextWindowSize(ImVec2(360 * ds, 640 * ds), ImGuiCond_FirstUseEver);
-        bool open = true;
-        if (ImGui::Begin("Side Panel - DisasmStudio", &open)) renderSidePanel(ctx);
-        ImGui::End();
-        if (!open) sidePoppedOut_ = false;
-    }
-    if (lowerPoppedOut_) {
-        ImGui::SetNextWindowSize(ImVec2(900 * ds, 320 * ds), ImGuiCond_FirstUseEver);
-        bool open = true;
-        if (ImGui::Begin("Debug Panels - DisasmStudio", &open)) renderLowerTabs(ctx);
-        ImGui::End();
-        if (!open) lowerPoppedOut_ = false;
-    }
     if (graphPoppedOut_) {
         ImGui::SetNextWindowSize(ImVec2(900 * ds, 720 * ds), ImGuiCond_FirstUseEver);
         bool open = true;

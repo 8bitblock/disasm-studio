@@ -72,6 +72,16 @@ int main() {
         "r9 == 1",               // unknown register -> error
         "[r9] == 1",             // unknown register in a deref base -> error
         "rax == bogus",          // unknown register on the rhs -> error
+        // Signed operators (and the s-tokenizer boundary cases).
+        "rax s< 0",
+        "rax s> 0",
+        "rax s<= 0x1000",
+        "rax s>= 0x1000",
+        "rbx s> -5",
+        "rbx s< -5",
+        "rax s<0x1001",          // no space before the rhs
+        "[rsp+8] s>= 0",
+        "s< 5",                  // operator without lhs -> error
     };
 
     for (const char* e : exprs) {
@@ -106,6 +116,23 @@ int main() {
     CHECK(CompileCondition("").empty && CompileCondition("").valid);
     CHECK(!CompileCondition("garbage").valid);
     CHECK(CompileCondition("rax == 1").valid && !CompileCondition("rax == 1").empty);
+
+    // ---- 2b) Signed operators: concrete truth values. ----
+    CHECK(EvalCompiled(CompileCondition("rbx s> -5"), cc, false));    // 5 > -5 signed
+    CHECK(!EvalCompiled(CompileCondition("rbx > -5"), cc, true));     // unsigned: 5 not > 0xFF..FB
+    CHECK(!EvalCompiled(CompileCondition("rbx s< -5"), cc, true));
+    CHECK(EvalCompiled(CompileCondition("rax s<= 0x1000"), cc, false));
+    CHECK(EvalCompiled(CompileCondition("rax s>= 0x1000"), cc, false));
+    CHECK(!EvalCompiled(CompileCondition("rax s< 0"), cc, true));     // 0x1000 not negative
+    CHECK(CompileCondition("rax s< 0").valid && CompileCondition("rax s< 0").op == CondOp::SLt);
+    CHECK(CompileCondition("rax s<= 0").op == CondOp::SLe);           // longest-match at same position
+    CHECK(CompileCondition("rax s>= 0").op == CondOp::SGe);
+    CHECK(!CompileCondition("s< 5").valid);                           // no lhs operand
+    // Boundary guard: an identifier's trailing 's' never becomes the operator.
+    CHECK(CompileCondition("flags<1").valid && CompileCondition("flags<1").op == CondOp::Lt &&
+          CompileCondition("flags<1").lhs.reg == "flags");
+    CHECK(CompileCondition("flags<=1").op == CondOp::Le &&
+          CompileCondition("flags<=1").lhs.reg == "flags");
 
     // ---- 3) Compiled single-operand eval matches EvalExpression (watch path). ----
     const char* ops[] = {

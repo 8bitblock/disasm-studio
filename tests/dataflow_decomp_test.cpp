@@ -260,6 +260,118 @@ int main() {
         if (g_fail) std::printf("--- test5 ---\n%s\n", out.c_str());
     }
 
+    // 15) Folded-constant comment: const-prop reduces the return expression to
+    //     pure arithmetic on constants -> the value is spelled out as a comment.
+    //     mov ecx, 0x1000 ; lea eax, [ecx + 0x234] ; ret
+    {
+        std::string out = decompile({
+            mk(0x1000, 5, "mov", "ecx, 0x1000"),
+            mk(0x1005, 4, "lea", "eax, [ecx + 0x234]"),
+            mk(0x1009, 1, "ret", "", true, true),
+        });
+        CHECK(has(out, "0x1000 + 0x234"));      // the folded expression is shown
+        CHECK(has(out, "/* = 0x1234 */"));      // ...with its computed value
+        if (g_fail) std::printf("--- test15 ---\n%s\n", out.c_str());
+    }
+    //     A bare constant gets no redundant "/* = */" comment.
+    {
+        std::string out = decompile({
+            mk(0x1000, 5, "mov", "eax, 7"),
+            mk(0x1005, 1, "ret", "", true, true),
+        });
+        CHECK(has(out, "return 7;"));
+        CHECK(!has(out, "/* ="));
+        if (g_fail) std::printf("--- test15b ---\n%s\n", out.c_str());
+    }
+
+    // 16) Win64 call-argument recovery: a string marshalled into rcx must appear
+    //     AT the call site (and not be dead-code-eliminated).
+    //     lea rcx, [str] ; call printf   ->   printf("hello")
+    {
+        DecompileOptions opt;
+        opt.nameFor    = [](uint64_t a) -> std::string { return a == 0x2000ull ? "printf" : std::string(); };
+        opt.dataRefFor = [](uint64_t a) -> std::string { return a == 0x140005000ull ? "\"hello\"" : std::string(); };
+        std::string out = decompile({
+            mk(0x1000, 7, "lea",  "rcx, [0x140005000]"),
+            mk(0x1007, 5, "call", "", true, false, 0x2000),
+            mk(0x100C, 1, "ret",  "", true, true),
+        }, opt);
+        CHECK(has(out, "printf(\"hello\")"));   // the string is shown where it is passed
+        if (g_fail) std::printf("--- test16 ---\n%s\n", out.c_str());
+    }
+
+    // 17) Win64 multiple contiguous args (rcx, rdx), one an immediate, one a string.
+    //     mov rcx, 1 ; lea rdx, [str] ; call foo   ->   foo(1, "hi")
+    {
+        DecompileOptions opt;
+        opt.nameFor    = [](uint64_t a) -> std::string { return a == 0x2000ull ? "foo" : std::string(); };
+        opt.dataRefFor = [](uint64_t a) -> std::string { return a == 0x140005000ull ? "\"hi\"" : std::string(); };
+        std::string out = decompile({
+            mk(0x1000, 7, "mov",  "rcx, 1"),
+            mk(0x1007, 7, "lea",  "rdx, [0x140005000]"),
+            mk(0x100E, 5, "call", "", true, false, 0x2000),
+            mk(0x1013, 1, "ret",  "", true, true),
+        }, opt);
+        CHECK(has(out, "foo(1, \"hi\")"));
+        if (g_fail) std::printf("--- test17 ---\n%s\n", out.c_str());
+    }
+
+    // 18) Contiguity guard: a value in r8 with NO value in rcx/rdx must NOT
+    //     fabricate a gap argument — the call stays nullary.
+    //     mov r8, 5 ; call foo   ->   foo()
+    {
+        DecompileOptions opt;
+        opt.nameFor = [](uint64_t a) -> std::string { return a == 0x2000ull ? "foo" : std::string(); };
+        std::string out = decompile({
+            mk(0x1000, 7, "mov",  "r8, 5"),
+            mk(0x1007, 5, "call", "", true, false, 0x2000),
+            mk(0x100C, 1, "ret",  "", true, true),
+        }, opt);
+        CHECK(has(out, "foo()"));
+        CHECK(!has(out, "foo(5"));   // r8 alone is not arg1
+        if (g_fail) std::printf("--- test18 ---\n%s\n", out.c_str());
+    }
+
+    // 19) x86 cdecl push-chain recovery: args are the pushes since frame setup,
+    //     in call order (cdecl pushes right-to-left, so the LAST push is arg1).
+    //     push ebp ; mov ebp,esp ; push "world" ; push "hello" ; call foo
+    //       ->  foo("hello", "world")
+    {
+        DecompileOptions opt;
+        opt.nameFor    = [](uint64_t a) -> std::string { return a == 0x2000ull ? "foo" : std::string(); };
+        opt.dataRefFor = [](uint64_t a) -> std::string {
+            if (a == 0x404000ull) return "\"world\"";
+            if (a == 0x404010ull) return "\"hello\"";
+            return std::string();
+        };
+        std::string out = decompile({
+            mk(0x1000, 1, "push", "ebp"),
+            mk(0x1001, 2, "mov",  "ebp, esp"),         // frame setup -> clears the saved-ebp push
+            mk(0x1003, 5, "push", "0x404000"),         // "world" (pushed first)
+            mk(0x1008, 5, "push", "0x404010"),         // "hello" (pushed last -> first arg)
+            mk(0x100D, 5, "call", "", true, false, 0x2000),
+            mk(0x1012, 1, "ret",  "", true, true),
+        }, opt);
+        CHECK(has(out, "foo(\"hello\", \"world\")"));
+        if (g_fail) std::printf("--- test19 ---\n%s\n", out.c_str());
+    }
+
+    // 20) Kill switch: callArgs=false restores the bare `callee()` form (and the
+    //     unread marshalling def is then dead — string disappears, legacy behavior).
+    {
+        DecompileOptions opt; opt.callArgs = false;
+        opt.nameFor    = [](uint64_t a) -> std::string { return a == 0x2000ull ? "printf" : std::string(); };
+        opt.dataRefFor = [](uint64_t a) -> std::string { return a == 0x140005000ull ? "\"hello\"" : std::string(); };
+        std::string out = decompile({
+            mk(0x1000, 7, "lea",  "rcx, [0x140005000]"),
+            mk(0x1007, 5, "call", "", true, false, 0x2000),
+            mk(0x100C, 1, "ret",  "", true, true),
+        }, opt);
+        CHECK(has(out, "printf()"));
+        CHECK(!has(out, "printf(\"hello\")"));
+        if (g_fail) std::printf("--- test20 ---\n%s\n", out.c_str());
+    }
+
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     std::printf("dataflow_decomp_test: all checks passed\n");
     return 0;

@@ -27,7 +27,6 @@ struct PatchCtx {
 struct CompileResult {
     bool                 ok = false;
     std::vector<uint8_t> bytes;        // the compiled, position-independent body
-    uint32_t             entryOffset = 0;
     std::string          diagnostics;  // assembler/compiler messages (esp. when !ok)
 };
 

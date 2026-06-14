@@ -19,8 +19,10 @@ void BuildXrefInto(XrefIndex& idx, const uint8_t* data, size_t size,
         // data address it references (RIP-relative or absolute). Both map back to
         // this instruction as the referencing source.
         if (in.branchTarget) idx.toTarget[in.branchTarget].push_back(a);
-        if (uint64_t ref = instrDataRef(in); ref && ref != in.branchTarget)
+        if (uint64_t ref = instrDataRef(in); ref && ref != in.branchTarget) {
             idx.toTarget[ref].push_back(a);
+            idx.accessOf[a] = (uint8_t)instrDataAccess(in);   // Read / Write / Ref
+        }
         off += in.length;
         since += in.length;
         if (progress && since >= 0x10000) { progress->fetch_add((uint32_t)since, std::memory_order_relaxed); since = 0; }

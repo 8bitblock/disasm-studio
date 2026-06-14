@@ -12,7 +12,7 @@ namespace ds::theme {
 
 // Built-in palettes. Keep `Count` last so the menu can iterate the set.
 enum class ThemeId {
-    Midnight,       // deep blue dark (default)
+    Midnight,       // deep blue dark
     Slate,          // neutral gray dark, teal accent
     Light,          // bright/paper light theme
     Monokai,        // warm dark, green/pink
@@ -20,6 +20,7 @@ enum class ThemeId {
     Dracula,        // purple/pink dark
     Nord,           // cold blue-gray
     Matrix,         // black + phosphor green
+    Paper,          // warm paper + ink, amber accent (the wireframe look; default)
     Count
 };
 
@@ -39,6 +40,14 @@ const char* ThemeName(ThemeId id);   // human label for menus
 void  SetUiScale(float scale);
 float UiScale();
 
+// UI density. Only the spacing/padding metrics are scaled by this (on top of the
+// HiDPI UiScale); rounding/borders are unaffected. Comfortable is the roomier
+// default. SetDensity takes effect on the next ApplyTheme().
+enum class Density { Compact, Comfortable, Spacious };
+void        SetDensity(Density d);
+Density     CurrentDensity();
+const char* DensityName(Density d);   // human label for menus
+
 // Shared accent colors (resolved against the *current* theme), so tabs don't
 // each invent their own and recolor automatically when the theme changes.
 namespace col {
@@ -49,9 +58,17 @@ namespace col {
     ImVec4 muted();      // dim text
     ImVec4 call();       // call instructions
     ImVec4 branch();     // branch instructions
+    ImVec4 jump();       // jump-TARGET highlight (violet/magenta family, distinct from good/accent)
     ImVec4 selection();  // multi-line selection highlight (RGBA, pre-alpha)
     ImVec4 menubar();    // menu-bar / status-bar background (palette, not hardcoded)
     ImVec4 windowBg();   // primary window background (e.g. the D3D clear color)
+
+    // Wireframe panel-chrome tokens (used by the ui:: panel/toolbar widgets so
+    // the bordered-panel look stays on-palette in every theme).
+    ImVec4 panel();        // panel body background (child bg)
+    ImVec4 panelHeader();  // panel tab-strip / toolbar-chip background
+    ImVec4 line();         // strong panel/widget border ("ink" line)
+    ImVec4 lineSoft();     // soft inner divider line
 }
 
 } // namespace ds::theme

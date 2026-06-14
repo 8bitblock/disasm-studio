@@ -111,7 +111,8 @@ enum class TempKind : uint8_t {
     RunTo,        // user "run to cursor" target
     StepOver,     // return point of a stepped-over call/rep -> pause
     StepOutSkip,  // return point of a call/rep skipped during step-out -> keep going
-    EntryPoint    // launch break-at-entry: one-shot bp at the program entry -> pause
+    EntryPoint,   // launch break-at-entry: one-shot bp at the program entry -> pause
+    JvmInit       // one-shot bp at jvm.dll!JNI_CreateJavaVM (break-on-JVM-init) -> pause
 };
 
 } // namespace ds

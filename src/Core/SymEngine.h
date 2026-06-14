@@ -66,7 +66,6 @@ enum class SymStatus { Ok, Unavailable, DecodeError, StepLimit, Unsupported, Esc
 
 struct SymOptions {
     uint32_t maxSteps = 4096;      // instruction budget
-    uint32_t maxDepth = 64;        // branch depth budget (F3)
     uint32_t timeoutMs = 5000;
     bool     useZ3 = false;        // allow solver-backed simplify/equivalence
 };
@@ -78,15 +77,11 @@ struct SymOutputs {
     SymStatus                   status = SymStatus::Unavailable;
     std::vector<SymValue>       outputs;          // output regs/slots as ExprAst
     std::vector<PathConstraint> pathConstraints;  // F3
-    uint64_t                    exitVA = 0;
-    bool                        offCfg = false;    // reached a non-CFG target (best-effort)
 };
 
 struct ConcreteState {
     SymStatus status = SymStatus::Unavailable;
     RegFile   regs;
-    uint64_t  exitVA = 0;
-    bool      fault = false;
 };
 
 // Symbolically execute [startVA,endVA): returns output expressions + path constraints.

@@ -1,6 +1,8 @@
 #include "MemoryToolsTab.h"
 #include "../Core/MemCompare.h"
 #include "../Ui/Fonts.h"
+#include "../Ui/Icons.h"
+#include "../Ui/Widgets.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cstdio>
@@ -81,20 +83,20 @@ void MemoryToolsTab::firstScan(AppContext& ctx) {
     }
     sz = typeSize(valueType_);
 
-    // Interpret raw bits per value type for ordered (bigger/smaller) comparisons,
-    // honouring the signed/unsigned mode (shared with next-scan via MemCompare).
-    auto asNum = [&](uint64_t bits) -> double { return MemAsNumber(valueType_, bits, unsignedMode_); };
-
     auto regions = ctx.debug.regions();
     std::vector<uint8_t> buf;
     const size_t kChunk = 1 << 20;        // 1 MB read window
     const size_t kCap   = 2'000'000;      // cap stored results
     size_t scannedBytes = 0;
     const size_t kByteBudget = 512ull << 20; // don't scan more than 512 MB
+    // Overlap consecutive chunks by sz-1 bytes so a value straddling a chunk
+    // boundary is still compared (chunk N's last start is off+got-sz, chunk N+1's
+    // first start is off+step = off+kChunk-sz+1 — contiguous, no double-report).
+    const size_t step = (sz > 1) ? (kChunk - (sz - 1)) : kChunk;
 
     for (auto& rg : regions) {
         if (!rg.read) continue;
-        for (uint64_t off = 0; off < rg.size && scannedBytes < kByteBudget; off += kChunk) {
+        for (uint64_t off = 0; off < rg.size && scannedBytes < kByteBudget; off += step) {
             size_t want = (size_t)std::min<uint64_t>(kChunk, rg.size - off);
             buf.resize(want);
             size_t got = ctx.debug.readMemory(rg.base + off, buf.data(), want);
@@ -105,8 +107,8 @@ void MemoryToolsTab::firstScan(AppContext& ctx) {
                 // First "bigger/smaller than X" scan compares the current value to the
                 // entered value X (the needle), Cheat-Engine style — there is no prev yet.
                 bool keep = wantValue ? (scanType_ == ST_Exact   ? cur == needle
-                                        : scanType_ == ST_Bigger  ? asNum(cur) > asNum(needle)
-                                        : asNum(cur) < asNum(needle))
+                                        : scanType_ == ST_Bigger  ? MemGreater(valueType_, unsignedMode_, cur, needle)
+                                        : MemLess(valueType_, unsignedMode_, cur, needle))
                                       : true; // Changed/Unchanged/Unknown -> capture all on first scan
                 if (keep) {
                     results_.push_back({ rg.base + off + i, cur });
@@ -157,8 +159,9 @@ void MemoryToolsTab::nextScan(AppContext& ctx) {
 
 void MemoryToolsTab::renderScanner(AppContext& ctx) {
     ImGui::SeparatorText("Memory Scanner");
+    // render() shows a hero card when detached, so `attached` is normally true
+    // here - the gating below stays as a cheap safety net.
     bool attached = ctx.debug.snapshot().attached();
-    if (!attached) ImGui::TextDisabled("Attach a process (Communications tab) to scan live memory.");
 
     ImGui::SetNextItemWidth(160);
     ImGui::Combo("Value type", &valueType_, kValueTypes, IM_ARRAYSIZE(kValueTypes));
@@ -181,12 +184,13 @@ void MemoryToolsTab::renderScanner(AppContext& ctx) {
                           "(e.g. 0xFFFFFFFF > 0). Default is signed (-1 < 0).");
 
     ImGui::BeginDisabled(!attached);
-    if (ImGui::Button("First Scan")) firstScan(ctx);
+    if (ui::ToolbarIconButton(DS_ICON_SEARCH, "First Scan", "Scan all committed memory for the value")) firstScan(ctx);
     ImGui::SameLine();
     ImGui::BeginDisabled(!firstScanDone_);
-    if (ImGui::Button("Next Scan")) nextScan(ctx);
+    if (ui::ToolbarIconButton(DS_ICON_PLAY, "Next Scan", "Filter the previous results by the comparison")) nextScan(ctx);
     ImGui::SameLine();
-    if (ImGui::Button("New Scan")) { firstScanDone_ = false; results_.clear(); totalFound_ = 0; scanStatus_.clear(); }
+    if (ui::ToolbarIconButton(DS_ICON_ADD, "New Scan", "Discard results and start over"))
+        { firstScanDone_ = false; results_.clear(); totalFound_ = 0; scanStatus_.clear(); }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
 
@@ -347,6 +351,16 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx) {
 }
 
 void MemoryToolsTab::render(AppContext& ctx) {
+    // All four panes operate on an attached process - a hero card with a path
+    // to Communications beats four disabled forms.
+    if (!ctx.debug.snapshot().attached()) {
+        if (ui::EmptyState(DS_ICON_MEMORY, "Not attached",
+                           "Attach to a process in Communications to scan, view, and edit its memory.",
+                           "Go to Communications"))
+            ctx.requestedTab = "Communications";
+        return;
+    }
+
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float colW = avail.x * 0.5f;
 

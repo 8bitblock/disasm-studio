@@ -2,7 +2,9 @@
 #include "../Core/BinaryFile.h"
 #include "../Core/AlgoScan.h"
 #include "../Ui/Fonts.h"
+#include "../Ui/Icons.h"
 #include "../Ui/Theme.h"
+#include "../Ui/Widgets.h"
 #include "imgui.h"
 #include <algorithm>
 
@@ -18,6 +20,7 @@ void BinaryTechTab::runTechScan(AppContext& ctx) {
         c.name = a.name; c.category = a.category; c.confidence = a.confidence;
         c.address = a.address; c.addresses = a.dataVAs; c.hitCount = a.dataVAs.size();
         c.detail = a.detail + (a.section.empty() ? std::string() : "  [" + a.section + "]");
+        c.analyzer = "AlgoScan";
         caps_.push_back(std::move(c));
     }
     std::sort(caps_.begin(), caps_.end(),
@@ -35,24 +38,35 @@ static bool vaIsExecutable(const BinaryFile& bin, uint64_t va) {
 }
 
 void BinaryTechTab::render(AppContext& ctx) {
-    ImGui::BeginDisabled(!ctx.binary.loaded());
-    if (ImGui::Button("Run Tech Scan")) runTechScan(ctx);
-    ImGui::EndDisabled();
+    // No binary: a hero card with the open action instead of a disabled form.
+    if (!ctx.binary.loaded()) {
+        if (ui::EmptyState(DS_ICON_SHIELD, "No binary loaded",
+                           "Open a binary to detect capabilities from imports, section names, and byte patterns.",
+                           "Open Binary..."))
+            ctx.openBinaryDialog();
+        return;
+    }
+
+    if (ui::ToolbarIconButton(DS_ICON_SHIELD, "Run Tech Scan",
+                              "Detect capabilities and techniques from imports, section names, and byte patterns"))
+        runTechScan(ctx);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(200);
-    ImGui::InputTextWithHint("##techfilter", "filter category...", filter_, sizeof(filter_));
+    ui::SearchBox("##techfilter", "filter category...", filter_, sizeof(filter_), 200.0f * theme::UiScale());
     ImGui::SameLine();
-    if (!ctx.binary.loaded())  ImGui::TextDisabled("load a binary first");
-    else if (scanned_)         ImGui::TextDisabled("%d capabilit%s", (int)caps_.size(), caps_.size() == 1 ? "y" : "ies");
-    else                       ImGui::TextDisabled("not scanned");
+    if (scanned_) ImGui::TextDisabled("%d capabilit%s", (int)caps_.size(), caps_.size() == 1 ? "y" : "ies");
+    else          ImGui::TextDisabled("not scanned");
     ImGui::Separator();
 
     if (!scanned_) {
-        ImGui::TextDisabled("Press Run Tech Scan to detect capabilities and techniques from imports, section names, and byte patterns.");
+        if (ui::EmptyState(DS_ICON_SHIELD, "Not scanned yet",
+                           "Run the tech scan to map this binary's capabilities (network, crypto, injection, anti-debug, ...).",
+                           "Run Tech Scan"))
+            runTechScan(ctx);
         return;
     }
     if (caps_.empty()) {
-        ImGui::TextDisabled("No notable capabilities detected (no flagged imports, packer sections, or known byte patterns).");
+        ui::EmptyState(DS_ICON_CHECK, "No notable capabilities detected",
+                       "No flagged imports, packer sections, or known byte patterns in this binary.");
         return;
     }
 
@@ -74,9 +88,9 @@ void BinaryTechTab::render(AppContext& ctx) {
                 ctx.gotoAddress(c.address);
             ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.category.c_str());
             ImGui::TableSetColumnIndex(2);
-            ImVec4 col = c.confidence > 0.85f ? ImVec4(0.4f, 0.9f, 0.4f, 1)
-                       : c.confidence > 0.65f ? ImVec4(0.95f, 0.8f, 0.4f, 1)
-                                              : ImVec4(0.9f, 0.6f, 0.5f, 1);
+            ImVec4 col = c.confidence > 0.85f ? theme::col::good()
+                       : c.confidence > 0.65f ? theme::col::warn()
+                                              : theme::col::bad();
             ImGui::TextColored(col, "%.0f%%", c.confidence * 100.0f);
         }
         ImGui::EndTable();
@@ -94,6 +108,8 @@ void BinaryTechTab::render(AppContext& ctx) {
             ImGui::SameLine();
             if (ImGui::SmallButton("View in disassembly")) ctx.gotoAddress(c.address);
         }
+        if (!c.analyzer.empty())
+            ImGui::TextColored(theme::col::muted(), "Source: %s", c.analyzer.c_str());
         ImGui::Separator();
         ImGui::TextWrapped("%s", c.detail.c_str());
         ImGui::Separator();

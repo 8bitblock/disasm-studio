@@ -5,9 +5,14 @@
 // Grammar (whitespace optional):
 //
 //   condition := operand OP operand
-//   OP        := == | != | <= | >= | < | >
+//   OP        := == | != | <= | >= | < | > | s< | s<= | s> | s>=
 //   operand   := number | register | '[' addr ']'
 //   addr      := (register | number) ['+' number | '-' number]
+//
+// The s-prefixed operators compare as SIGNED 64-bit values (rax s< 0 is true
+// when rax holds a negative two's-complement value); the plain forms stay
+// unsigned. `-1` literals parse via strtoull wrap-around to 0xFFFF... — exactly
+// the bit pattern a signed compare expects.
 //
 // Registers and memory are resolved through caller-supplied callbacks, so the
 // evaluator stays decoupled from Win32 CONTEXT / process memory and is unit
@@ -43,7 +48,7 @@ bool EvalExpression(const std::string& expr, const CondContext& ctx, uint64_t& o
 // operands and the comparison operator are baked in; an empty / unconditional
 // expression compiles to {empty=true}, and an unparseable one to {valid=false}.
 
-enum class CondOp  : uint8_t { Eq, Ne, Lt, Gt, Le, Ge };
+enum class CondOp  : uint8_t { Eq, Ne, Lt, Gt, Le, Ge, SLt, SGt, SLe, SGe };  // S* = signed compares (appended; values stable)
 enum class CondTerm: uint8_t { Number, Register, Memory }; // a single operand's kind
 
 // A compiled operand: a literal number, a named register, or a memory deref

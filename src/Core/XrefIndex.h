@@ -22,9 +22,21 @@ class IDisassembler;
 struct XrefIndex {
     // target address -> instruction addresses that reference it (sorted, de-duped).
     std::unordered_map<uint64_t, std::vector<uint64_t>> toTarget;
+    // source instruction -> how it accesses its DATA reference (XrefAccess from
+    // Tabs/DataRef.h, stored as its uint8_t value to keep this header light):
+    // 0 = Read, 1 = Write, 2 = Ref (address taken / lea). Only data refs are
+    // recorded; branch/call edges aren't (their kind is implicit). Lets the
+    // Xrefs panel group "Writers" vs "Readers" for a data address.
+    std::unordered_map<uint64_t, uint8_t> accessOf;
 
-    void clear() { toTarget.clear(); }
+    void clear() { toTarget.clear(); accessOf.clear(); }
     bool empty() const { return toTarget.empty(); }
+
+    // Access kind for a source instruction's data ref (defaults to Read).
+    uint8_t access(uint64_t src) const {
+        auto it = accessOf.find(src);
+        return it == accessOf.end() ? 0 : it->second;
+    }
 
     // Sources referencing `target`, or nullptr if none.
     const std::vector<uint64_t>* sources(uint64_t target) const {

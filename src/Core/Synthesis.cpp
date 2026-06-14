@@ -10,10 +10,24 @@
 
 namespace ds {
 
-// ---- small register-file name access (full 64-bit names only) ----
+// ---- small register-file name access (sub-registers map to their 64-bit parent) ----
 static uint64_t* RegPtr(RegFile& r, const std::string& nameRaw) {
     std::string n; n.reserve(nameRaw.size());
     for (char c : nameRaw) n.push_back((char)std::tolower((unsigned char)c));
+    // Normalize common sub-register names to their 64-bit parent (the call site
+    // masks the returned storage to the output width, so the parent value is correct).
+    static const struct { const char* sub; const char* parent; } aliases[] = {
+        {"eax","rax"},{"ax","rax"},{"al","rax"},   {"ebx","rbx"},{"bx","rbx"},{"bl","rbx"},
+        {"ecx","rcx"},{"cx","rcx"},{"cl","rcx"},   {"edx","rdx"},{"dx","rdx"},{"dl","rdx"},
+        {"esi","rsi"},{"si","rsi"},{"sil","rsi"},  {"edi","rdi"},{"di","rdi"},{"dil","rdi"},
+        {"ebp","rbp"},{"bp","rbp"},{"bpl","rbp"},  {"esp","rsp"},{"sp","rsp"},{"spl","rsp"},
+        {"r8d","r8"},{"r8w","r8"},{"r8b","r8"},     {"r9d","r9"},{"r9w","r9"},{"r9b","r9"},
+        {"r10d","r10"},{"r10w","r10"},{"r10b","r10"},{"r11d","r11"},{"r11w","r11"},{"r11b","r11"},
+        {"r12d","r12"},{"r12w","r12"},{"r12b","r12"},{"r13d","r13"},{"r13w","r13"},{"r13b","r13"},
+        {"r14d","r14"},{"r14w","r14"},{"r14b","r14"},{"r15d","r15"},{"r15w","r15"},{"r15b","r15"},
+        {"eip","rip"},{"eflags","rflags"},
+    };
+    for (auto& a : aliases) if (n == a.sub) { n = a.parent; break; }
     static const struct { const char* nm; size_t off; } tbl[] = {
         {"rax", offsetof(RegFile,rax)},{"rbx", offsetof(RegFile,rbx)},{"rcx", offsetof(RegFile,rcx)},
         {"rdx", offsetof(RegFile,rdx)},{"rsi", offsetof(RegFile,rsi)},{"rdi", offsetof(RegFile,rdi)},
@@ -128,7 +142,7 @@ SynthResult Synthesize(const std::vector<Instruction>& insns, uint64_t lo, uint6
     for (uint32_t s = 0; s < total; ++s) {
         std::unordered_map<uint64_t, uint64_t> assign;
         for (const auto& in : inputs) {
-            const uint32_t bits = in.bytes * 8;
+            const uint32_t bits = (in.bytes == 0 || in.bytes >= 8) ? 64u : in.bytes * 8u;
             assign[in.varId] = MaskToBits(rng(), bits);
         }
         SeedSource sd = seed;

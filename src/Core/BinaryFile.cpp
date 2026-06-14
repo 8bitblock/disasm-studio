@@ -1,4 +1,5 @@
 #include "BinaryFile.h"
+#include "JvmClass.h"
 
 #include <algorithm>
 #include <cstring>
@@ -24,8 +25,17 @@ void BinaryFile::clear() {
     importSize_= 0;
     relocRVA_  = 0;
     relocSize_ = 0;
+    exceptRVA_ = 0;
+    exceptSize_= 0;
+    overlayOffset_ = 0;
+    overlaySize_   = 0;
+    securityOff_   = 0;
+    securitySize_  = 0;
+    clrRva_        = 0;
+    clrSize_       = 0;
     imports_.clear();
     relocs_.clear();
+    javaClass_.reset();
 }
 
 const char* BinaryFile::formatName() const {
@@ -34,6 +44,7 @@ const char* BinaryFile::formatName() const {
         case BinFormat::PE32Plus: return "PE32+ (x64)";
         case BinFormat::ELF:      return "ELF";
         case BinFormat::MachO:    return "Mach-O";
+        case BinFormat::JavaClass: return "Java class";
         case BinFormat::Raw:      return "Raw";
         default:                  return "Unknown";
     }
@@ -59,6 +70,8 @@ bool BinaryFile::load(const std::string& path) {
         if (!parseELF()) format_ = BinFormat::Raw;
     } else if (magic == 0xFEEDFACEu || magic == 0xFEEDFACFu) {   // Mach-O thin (LE)
         if (!parseMachO()) format_ = BinFormat::Raw;
+    } else if (IsJavaClassImage(data_.data(), data_.size())) {   // 0xCAFEBABE
+        if (!parseJavaClass()) format_ = BinFormat::Raw;
     } else {
         format_ = BinFormat::Raw;
     }
@@ -191,7 +204,10 @@ bool BinaryFile::parsePE() {
     };
     exportRVA_  = dir(0, 0);  exportSize_ = dir(0, 4);
     importRVA_  = dir(1, 8);  importSize_ = dir(1, 12);
+    exceptRVA_  = dir(3, 24); exceptSize_ = dir(3, 28);  // [3] exception (.pdata RUNTIME_FUNCTIONs)
+    securityOff_= dir(4, 32); securitySize_ = dir(4, 36); // [4] security: FILE OFFSET, not RVA
     relocRVA_   = dir(5, 40); relocSize_  = dir(5, 44);
+    clrRva_     = dir(14, 112); clrSize_ = dir(14, 116);  // [14] CLR/COM descriptor (.NET)
 
     size_t sec = opt + optSize;
     for (uint16_t i = 0; i < numSections; ++i, sec += 40) {
@@ -215,6 +231,28 @@ bool BinaryFile::parsePE() {
         s.executable      = (s.characteristics & 0x20000000u) != 0; // IMAGE_SCN_MEM_EXECUTE
         sections_.push_back(s);
     }
+
+    // PE overlay: anything in the file past the end of all section raw data (and
+    // past the headers, so a sectionless PE doesn't claim the whole file). Only
+    // meaningful for an on-disk load — a live mapping repurposes rawOffset as the
+    // RVA above, so end-of-raw-data math would be nonsense there. Each section's
+    // end is clamped to the file size so a hostile rawOffset/rawSize can't wrap
+    // 64-bit math or push `end` past EOF and invent a negative-sized overlay.
+    if (!mappedImage_) {
+        uint64_t end = static_cast<uint64_t>(sec);   // end of the section table
+        if (end > data_.size()) end = data_.size();
+        for (const Section& s : sections_) {
+            uint64_t e = (s.rawOffset <= data_.size() && s.rawSize <= data_.size() - s.rawOffset)
+                             ? s.rawOffset + s.rawSize
+                             : static_cast<uint64_t>(data_.size());
+            if (e > end) end = e;
+        }
+        if (data_.size() > end) {
+            overlayOffset_ = end;
+            overlaySize_   = data_.size() - end;
+        }
+    }
+
     parseImports();   // needs sections_ for RVA translation
     parseRelocs();
     return true;
@@ -278,6 +316,83 @@ void BinaryFile::parseRelocs() {
         }
         off += blockSize;
     }
+}
+
+// x64 .pdata: an array of 12-byte RUNTIME_FUNCTION { BeginAddress, EndAddress,
+// UnwindData } RVAs. Two kinds of entry describe a CONTINUATION of an earlier
+// function rather than a new one and are skipped:
+//   - UnwindData with bit 0 set points at a parent RUNTIME_FUNCTION directly;
+//   - an UNWIND_INFO whose flags carry UNW_FLAG_CHAININFO (0x4).
+// Bounded + clamped like every other table walk (a hostile size/RVA must not
+// spin or read wild).
+std::vector<std::pair<uint64_t, uint64_t>> BinaryFile::pdataRanges() const {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    if (!exceptRVA_ || exceptSize_ < 12) return out;
+    if (format_ != BinFormat::PE32Plus || machine_ != MachineArch::X64) return out;
+    const uint32_t count = std::min<uint32_t>(exceptSize_ / 12, 200000);
+    out.reserve(std::min<uint32_t>(count, 4096));
+    for (uint32_t i = 0; i < count; ++i) {
+        size_t av = 0;
+        const uint8_t* p = ptrFromRVA((uint64_t)exceptRVA_ + (uint64_t)i * 12, av);
+        if (!p || av < 12) break;
+        uint32_t begin = 0, end = 0, unwind = 0;
+        std::memcpy(&begin, p, 4); std::memcpy(&end, p + 4, 4); std::memcpy(&unwind, p + 8, 4);
+        if (!begin || end <= begin) continue;             // hostile/empty range
+        if (unwind & 1) continue;                         // chained: parent RUNTIME_FUNCTION ref
+        size_t ua = 0;
+        if (const uint8_t* u = ptrFromRVA(unwind, ua); u && ua >= 1 && ((u[0] >> 3) & 0x4))
+            continue;                                     // UNW_FLAG_CHAININFO: continuation chunk
+        out.emplace_back(imageBase_ + begin, imageBase_ + end);
+    }
+    return out;
+}
+
+// ------------------------------------------------------------- Java class --
+// imageBase_ stays 0 and every section maps identity (virtualAddress ==
+// rawOffset == file offset), so VA == file offset throughout: ptrFromVA /
+// vaToOffset / offsetToVA line up, and JvmDisassembler's bci math
+// (va - method code start) is exact. Each method body becomes its own
+// executable section (the listing walks executable sections, so dividers and
+// function discovery land on real method starts); one whole-file data section
+// at the end backs hex / string-scan / byte-search views for the rest.
+bool BinaryFile::parseJavaClass() {
+    auto cf = std::make_shared<JvmClassFile>(ParseJavaClass(data_.data(), data_.size()));
+    if (!cf->ok) return false;
+    format_    = BinFormat::JavaClass;
+    machine_   = MachineArch::JVM;
+    is64_      = false;
+    imageBase_ = 0;
+    javaClass_ = cf;
+
+    const std::string cls = JvmShortClassName(cf->thisClass);
+    uint64_t entryMain = 0, entryClinit = 0, entryFirst = 0;
+    for (const auto& m : cf->methods) {
+        if (!m.codeLength) continue;                      // abstract / native: no body
+        if ((uint64_t)m.codeOffset + m.codeLength > data_.size()) continue;
+        Section s;
+        s.name           = cls + "." + m.name;
+        s.virtualAddress = m.codeOffset;
+        s.virtualSize    = m.codeLength;
+        s.rawOffset      = m.codeOffset;
+        s.rawSize        = m.codeLength;
+        s.executable     = true;
+        sections_.push_back(std::move(s));
+        if (!entryFirst) entryFirst = m.codeOffset;
+        if (!entryMain && m.name == "main" && (m.accessFlags & JVM_ACC_STATIC))
+            entryMain = m.codeOffset;
+        if (!entryClinit && m.name == "<clinit>") entryClinit = m.codeOffset;
+    }
+    entryRVA_ = entryMain ? entryMain : entryClinit ? entryClinit : entryFirst;
+
+    Section all;
+    all.name           = "classfile";
+    all.virtualAddress = 0;
+    all.virtualSize    = data_.size();
+    all.rawOffset      = 0;
+    all.rawSize        = data_.size();
+    all.executable     = false;
+    sections_.push_back(std::move(all));                  // last: method sections win per-VA lookups
+    return true;
 }
 
 const Section* BinaryFile::firstCodeSection() const {

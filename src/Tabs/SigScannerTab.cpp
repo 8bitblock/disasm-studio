@@ -2,7 +2,9 @@
 #include "../Core/FunctionAnalyzer.h"
 #include "../Core/ProcessManager.h"
 #include "../Core/SigMatch.h"
+#include "../Ui/Icons.h"
 #include "../Ui/Theme.h"
+#include "../Ui/Widgets.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cctype>
@@ -61,6 +63,16 @@ void SigScannerTab::scan(AppContext& ctx) {
                     return m.name.empty() ? m.path : m.name;
             return std::string("live");
         };
+        // Region protection suffix (r/w/x) appended to the module column, so a hit
+        // in writable scratch memory is distinguishable from one in mapped code.
+        auto protOf = [](const MemRegion& rg) -> std::string {
+            std::string p = " [";
+            p += rg.read  ? 'r' : '-';
+            p += rg.write ? 'w' : '-';
+            p += rg.exec  ? 'x' : '-';
+            p += ']';
+            return p;
+        };
         const size_t kChunk      = 1u << 20;          // 1 MB read window
         const size_t kByteBudget = 512ull << 20;      // stay responsive on big targets
         const size_t overlap     = pat.size() - 1;
@@ -74,7 +86,9 @@ void SigScannerTab::scan(AppContext& ctx) {
             for (uint64_t off = 0; off < rg.size && scanned < kByteBudget && results_.size() <= 4096;) {
                 size_t want = (size_t)std::min<uint64_t>(kChunk, rg.size - off);
                 buf.resize(want);
-                size_t got = ctx.debug.readMemory(rg.base + off, buf.data(), want);
+                // Masked read: our own 0xCC software-breakpoint bytes are substituted
+                // back to the originals, so a pattern crossing a breakpoint still hits.
+                size_t got = ctx.debug.readMemoryMasked(rg.base + off, buf.data(), want);
                 scanned += got;
                 if (got >= pat.size()) {
                     // Collect up to the remaining result budget in this chunk; the
@@ -84,7 +98,7 @@ void SigScannerTab::scan(AppContext& ctx) {
                     if (room) {
                         for (size_t i : FindAllMasked(buf.data(), got, pat, room)) {
                             uint64_t va = rg.base + off + i;
-                            results_.push_back({ va, patternInput_, moduleAt(va) });
+                            results_.push_back({ va, patternInput_, moduleAt(va) + protOf(rg) });
                             if (results_.size() > 4096) { truncated_ = true; break; }
                         }
                     }
@@ -95,6 +109,10 @@ void SigScannerTab::scan(AppContext& ctx) {
         }
         if (truncated_) results_.pop_back();   // drop the one-over sentinel: display exactly the 4096 cap
         progress_ = 1.0f;
+        char tm[80];
+        std::snprintf(tm, sizeof(tm), "Live scan: %d match(es)%s.", (int)results_.size(),
+                      truncated_ ? " (capped)" : "");
+        ui::Toast(truncated_ ? ui::ToastKind::Warn : ui::ToastKind::Info, tm);
         return;
     }
 
@@ -116,6 +134,10 @@ void SigScannerTab::scan(AppContext& ctx) {
     }
     if (truncated_) results_.pop_back();   // drop the one-over sentinel: display exactly the 4096 cap
     progress_ = 1.0f;
+    char tm[80];
+    std::snprintf(tm, sizeof(tm), "Scan: %d match(es)%s.", (int)results_.size(),
+                  truncated_ ? " (capped)" : "");
+    ui::Toast(truncated_ ? ui::ToastKind::Warn : ui::ToastKind::Info, tm);
 }
 
 void SigScannerTab::render(AppContext& ctx) {
@@ -131,33 +153,48 @@ void SigScannerTab::render(AppContext& ctx) {
         ctx.pendingSignature.clear();
         scan(ctx);   // populate Results (the default sub-tab) right away
     }
-    ImGui::SetNextItemWidth(420);
+    DbgSnapshot snap = ctx.debug.snapshot();
+    // Nothing to scan against at all: a hero card instead of a dead form.
+    if (!ctx.binary.loaded() && !snap.attached()) {
+        if (ui::EmptyState(DS_ICON_SEARCH, "Nothing to scan",
+                           "Open a binary to scan for byte patterns, or attach a process for live scans.",
+                           "Open Binary..."))
+            ctx.openBinaryDialog();
+        return;
+    }
+
+    // ---- Toolbar: pattern + scan + live | name + save | progress / warnings ----
+    const float s = theme::UiScale();
+    ImGui::SetNextItemWidth(std::max(280.0f * s, ImGui::GetContentRegionAvail().x * 0.40f));
     if (ImGui::InputTextWithHint("##pattern", "AA BB ?? DD pattern...", patternInput_, sizeof(patternInput_)))
         patternClipped_ = false;   // the box no longer holds the clipped handoff pattern
     ImGui::SameLine();
-    DbgSnapshot snap = ctx.debug.snapshot();
     bool canScan = live_ ? snap.attached() : ctx.binary.loaded();
     ImGui::BeginDisabled(!canScan);
-    if (ImGui::Button("Scan")) scan(ctx);
+    if (ui::ToolbarIconButton(DS_ICON_SEARCH, "Scan",
+                              live_ ? "Scan the attached process's memory" : "Scan the loaded file"))
+        scan(ctx);
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Checkbox("Live", &live_)) { results_.clear(); progress_ = 0.0f; }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Scan the attached process's committed memory (works paused or running) instead of the file on disk.");
+    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f * s);
+    ImGui::InputTextWithHint("##signame", "signature name", sigName_, sizeof(sigName_));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(120);
-    ImGui::InputTextWithHint("##signame", "name", sigName_, sizeof(sigName_));
-    ImGui::SameLine();
-    if (ImGui::Button("Save Sig")) {
-        Sig s{ sigName_, patternInput_, "?", -1 };
-        if (ctx.binary.loaded()) { s.count = countMatches(ctx.binary, s.pattern); s.health = healthFromCount(s.count); }
-        sigs_.push_back(std::move(s));
+    if (ui::ToolbarIconButton(DS_ICON_SAVE, "Save Sig", "Store the pattern in the Sig Health list")) {
+        Sig s2{ sigName_, patternInput_, "?", -1 };
+        if (ctx.binary.loaded()) { s2.count = countMatches(ctx.binary, s2.pattern); s2.health = healthFromCount(s2.count); }
+        sigs_.push_back(std::move(s2));
+        ui::Toast(ui::ToastKind::Success,
+                  sigName_[0] ? std::string("Signature '") + sigName_ + "' saved." : "Signature saved.");
     }
     ImGui::SameLine();
-    ImGui::ProgressBar(progress_, ImVec2(140, 0));
+    ImGui::ProgressBar(progress_, ImVec2(140.0f * s, 0));
     if (patternClipped_) {
         ImGui::SameLine();
-        ImGui::TextColored(theme::col::warn(), "(signature too long \xE2\x80\x94 truncated)");
+        ui::Badge("signature truncated", theme::col::warn());
     }
 
     if (ImGui::BeginTabBar("sigsub")) {

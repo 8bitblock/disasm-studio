@@ -210,6 +210,36 @@ operands always count). Args are contiguous, so if a later register is an arg th
 earlier ones are named too. This mirrors the UI's `guessSignature` so the arg
 count matches the emitted header.
 
+#### Call-argument recovery
+
+`renderCallArgs` reconstructs the arguments passed to each `call` and renders them
+inline — `printf("hello", a1)` instead of a bare `printf()` — gated by
+`DecompileOptions::callArgs` (default on; off restores the legacy nullary form).
+There are no callee prototypes, so it is heuristic:
+
+- **Win64** integer arguments live in `rcx, rdx, r8, r9`. At the call site the pass
+  walks that sequence and takes the **contiguous run** of registers that still hold
+  a propagated value in the environment, stopping at the first one with no tracked
+  value. Because the volatile set is cleared after every `call`, a value present in
+  an arg register here was demonstrably set since the last call (or must-reach from
+  predecessors) — strong evidence it is being passed. Stopping at the first gap
+  prevents a stale higher register (e.g. a leftover `r8`) from fabricating a missing
+  `rcx`/`rdx`.
+- **x86 cdecl/stdcall** push their arguments right-to-left immediately before the
+  call. The pass records each `push` value (resolving string/global immediates via
+  `dataRefFor`) into a pending list that is reset by frame/stack manipulation
+  (`mov ebp,esp`, `sub esp`, `add esp` — so the prologue's saved-register pushes and
+  the previous call's cleanup don't leak in) and consumed reversed at the next call
+  (last push = first argument). `push`/`pop` still emit no statement; the stack
+  itself is not modeled.
+
+Crucially, each argument's reads are unioned into the call statement's reads. That
+is what makes **string literals appear at the point they're passed**: the `lea`/`mov`
+that marshalled a string into an argument register is now read by the call, so
+dead-assignment elimination no longer deletes it — and because the call inlines the
+propagated value (the literal), the marshalling line itself folds away, leaving just
+`f("...")`. Without this, an argument-only string was a dead store and vanished.
+
 #### Dead-assignment elimination (live-variable analysis)
 
 `eliminateDead` runs a standard **iterative backward live-variable analysis** over
