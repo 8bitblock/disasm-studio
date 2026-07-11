@@ -69,9 +69,10 @@ struct FuncEvidence {
 // name) when no confident guess can be made. Exposed for unit testing.
 GuessedName GuessFromEvidence(const FuncEvidence& e);
 
-// Convert an API/identifier (CamelCase or with A/W suffix) to snake_case, e.g.
-// "CreateFileW" -> "create_file", "GetTickCount" -> "get_tick_count". Exposed
-// for testing and reuse.
+// Convert an API/identifier (CamelCase or with A/W suffix) to a valid snake_case
+// identifier, e.g. "CreateFileW" -> "create_file", "GetTickCount" ->
+// "get_tick_count". Import/stdcall decoration is removed. Returns empty when
+// the input carries no usable name (for example an ordinal import).
 std::string ToSnakeIdentifier(const std::string& api);
 
 class FunctionNamer {

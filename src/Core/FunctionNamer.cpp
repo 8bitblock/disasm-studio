@@ -1,7 +1,7 @@
 #include "FunctionNamer.h"
 #include "BinaryFile.h"
 #include "../Disasm/IDisassembler.h"
-#include "../Tabs/DataRef.h"   // instrDataRef(): data address an instruction references
+#include "../Tabs/DataRef.h"   // instrDataRef/instrImmRef: referenced data addresses
 
 #include <algorithm>
 #include <cctype>
@@ -38,8 +38,56 @@ std::string bareApi(const std::string& full) {
     if (full.empty()) return "";
     size_t dot = full.rfind('.');
     std::string n = (dot == std::string::npos) ? full : full.substr(dot + 1);
-    if (norm(n).rfind("ordinal", 0) == 0) return "";   // "ordinal_123" carries no meaning
+    // BinaryFile spells ordinal-only PE imports as "#123".  Older producers may
+    // use "ordinal_123"; neither carries semantic naming evidence.
+    if (n.empty() || n[0] == '#' || norm(n).rfind("ordinal", 0) == 0) return "";
     return n;
+}
+
+bool isIdentifier(const std::string& s) {
+    if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    for (char c : s)
+        if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+    return true;
+}
+
+// FunctionAnalyzer's anonymous names have one exact shape.  Merely starting
+// with "sub_" is not enough: a real export such as sub_handler must survive.
+bool isAnonymousSubName(const std::string& s) {
+    if (s.size() <= 4 || s.rfind("sub_", 0) != 0) return false;
+    for (size_t i = 4; i < s.size(); ++i)
+        if (!std::isxdigit((unsigned char)s[i])) return false;
+    return true;
+}
+
+// Case-insensitive allocation avoids visually ambiguous guesses beside PE/PDB
+// names ("Read_File" and "read_file") while preserving the chosen spelling.
+std::string nameKey(const std::string& s) {
+    std::string k; k.reserve(s.size());
+    for (char c : s) k.push_back((char)std::tolower((unsigned char)c));
+    return k;
+}
+
+// Strip import-pointer and stdcall decoration without changing the API's useful
+// display case.  Used for j_<API> thunk names.
+std::string thunkIdentifier(const std::string& full) {
+    std::string n = bareApi(full);
+    if (n.empty() || n[0] == '?') return {};             // MSVC-mangled tail: no safe short name
+    size_t lead = 0; while (lead < n.size() && n[lead] == '_') ++lead;
+    n.erase(0, lead);
+    std::string low = nameKey(n);
+    if (low.rfind("imp_", 0) == 0) n.erase(0, 4);       // __imp_CreateFileW
+    if (size_t at = n.find('@'); at != std::string::npos) n.resize(at); // _foo@8
+
+    std::string out;
+    for (char c : n) {
+        if (std::isalnum((unsigned char)c) || c == '_') out.push_back(c);
+        else if (!out.empty() && out.back() != '_')     out.push_back('_');
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    if (out.empty()) return {};
+    if (std::isdigit((unsigned char)out[0])) out = "fn_" + out;
+    return isIdentifier(out) ? out : std::string();
 }
 
 std::string joinApis(const std::vector<std::string>& v) {
@@ -164,7 +212,9 @@ std::string semanticName(const std::vector<std::string>& apis) {
     if (has("memset") || has("zeromemory"))                                     return "fill_memory";
     if (has("malloc") || has("calloc") || has("heapalloc") || has("localalloc") ||
         has("globalalloc") || has("realloc"))                                   return "allocate_buffer";
-    if (has("free") || has("heapfree") || has("localfree") || has("globalfree"))return "free_buffer";
+    // Exact `free`: substring matching misclassified FreeLibrary/VirtualFree as
+    // CRT buffer releases (their thin-wrapper names are more truthful).
+    if (eq("free") || has("heapfree") || has("localfree") || has("globalfree")) return "free_buffer";
     return "";
 }
 
@@ -176,30 +226,98 @@ std::string identifierString(const std::vector<std::string>& strings) {
     for (const std::string& s : strings) {
         if (s.size() < 4 || s.size() > 40) continue;
         if (!(std::isalpha((unsigned char)s[0]) || s[0] == '_')) continue;
-        bool ok = true, hasUpper = false, hasLower = false, hasUnder = false;
+        bool ok = true, hasUpper = false, hasLower = false, hasUnder = false, hasDigit = false;
         for (char c : s) {
             if (!(std::isalnum((unsigned char)c) || c == '_')) { ok = false; break; }
             if (std::isupper((unsigned char)c)) hasUpper = true;
             if (std::islower((unsigned char)c)) hasLower = true;
             if (c == '_') hasUnder = true;
+            if (std::isdigit((unsigned char)c)) hasDigit = true;
         }
         if (!ok) continue;
+        // A short lowercase word ("error", "password", "success") is data, not
+        // credible embedded symbol evidence.  Require an identifier-shaped cue.
+        if (!((hasUpper && hasLower) || hasUnder || (hasUpper && hasDigit))) continue;
+        if (isAnonymousSubName(s)) continue;             // don't rename A to B's placeholder
+        std::string low = nameKey(s);
+        if (low == "__function__" || low == "__file__" || low == "__line__") continue;
         // Score: camelCase or snake_case identifiers look like real symbol names.
         int score = 0;
         if (hasUpper && hasLower) score += 3;
         if (hasUnder) score += 2;
+        if (hasDigit) score += 1;
         score += (int)(40 - s.size()) / 10;           // mild preference for shorter
         if (score > bestScore) { bestScore = score; best = s; }
     }
-    // Require a minimally name-like token (avoid grabbing a random word).
-    return bestScore >= 2 ? best : std::string();
+    return best;
+}
+
+std::string compactLower(const std::string& s) {
+    std::string out; out.reserve(s.size());
+    for (char c : s)
+        if (!std::isspace((unsigned char)c)) out.push_back((char)std::tolower((unsigned char)c));
+    return out;
+}
+
+bool isFrameNoise(const Instruction& in, bool sawRet) {
+    const std::string m = nameKey(in.mnemonic);
+    const std::string o = compactLower(in.operands);
+    if (m == "nop" || m == "endbr64" || m == "endbr32" || m == "leave") return true;
+    // INT3 is common alignment after a completed body, but before the first RET
+    // it is an observable trap and must not turn "int3; ret" into nullsub.
+    if (sawRet && m == "int3") return true;
+    if ((m == "push" || m == "pop") && (o == "rbp" || o == "ebp")) return true;
+    if (m == "mov" && (o == "rbp,rsp" || o == "ebp,esp")) return true;
+    return false;
+}
+
+bool zeroLiteral(std::string s) {
+    if (s.size() >= 2 && s[0] == '0' && s[1] == 'x') s.erase(0, 2);
+    if (!s.empty() && s.back() == 'h') s.pop_back();
+    if (s.empty()) return false;
+    for (char c : s) if (c != '0') return false;
+    return true;
+}
+
+bool zeroesAccumulator(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    const std::string o = compactLower(in.operands);
+    if ((m == "xor" || m == "sub") && (o == "eax,eax" || o == "rax,rax")) return true;
+    if (m != "mov") return false;
+    size_t comma = o.find(',');
+    if (comma == std::string::npos) return false;
+    const std::string dst = o.substr(0, comma);
+    return (dst == "eax" || dst == "rax") && zeroLiteral(o.substr(comma + 1));
+}
+
+// Conservative x86 accumulator-clobber tracking for ret_zero.  False negatives
+// are preferable to claiming "returns 0" after a later write made that untrue.
+bool writesAccumulator(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    const std::string o = compactLower(in.operands);
+    size_t comma = o.find(',');
+    const std::string dst = o.substr(0, comma);
+    const bool explicitAcc = dst == "rax" || dst == "eax" || dst == "ax" ||
+                             dst == "al"  || dst == "ah";
+    if (explicitAcc && m != "cmp" && m != "test" && m != "bt" && m != "push") return true;
+    return m == "mul" || (m == "imul" && comma == std::string::npos) ||
+           m == "div" || m == "idiv" ||
+           m == "cpuid" || m == "rdtsc" || m == "rdtscp" || m == "xgetbv" ||
+           m == "cmpxchg" || m == "cmpxchg8b" || m == "cmpxchg16b" ||
+           m == "syscall" || m == "sysenter" || m == "lahf" || m == "popad" ||
+           m.rfind("lods", 0) == 0;
 }
 
 } // namespace
 
 std::string ToSnakeIdentifier(const std::string& api) {
-    size_t i = 0; while (i < api.size() && api[i] == '_') ++i;
-    std::string a = api.substr(i);
+    std::string a = bareApi(api);
+    if (a.empty() || a[0] == '?') return {};
+    size_t i = 0; while (i < a.size() && a[i] == '_') ++i;
+    a.erase(0, i);
+    std::string low = nameKey(a);
+    if (low.rfind("imp_", 0) == 0) a.erase(0, 4);      // __imp_Foo -> Foo
+    if (size_t at = a.find('@'); at != std::string::npos) a.resize(at);
     // Drop a trailing ANSI/Wide variant suffix ("CreateFileW" -> "CreateFile").
     if (a.size() >= 2 && (a.back() == 'A' || a.back() == 'W') &&
         std::islower((unsigned char)a[a.size() - 2]))
@@ -216,12 +334,14 @@ std::string ToSnakeIdentifier(const std::string& api) {
         if (up && !out.empty() && out.back() != '_' && (prevAlnumLower || nextLower))
             out.push_back('_');
         if (std::isalnum((unsigned char)c)) out.push_back((char)std::tolower((unsigned char)c));
-        else if (c == '_' && !out.empty() && out.back() != '_') out.push_back('_');
+        else if (!out.empty() && out.back() != '_') out.push_back('_');
     }
     while (!out.empty() && out.back() == '_') out.pop_back();
     size_t b = 0; while (b < out.size() && out[b] == '_') ++b;
     out = out.substr(b);
-    return out.empty() ? std::string("fn") : out;
+    if (out.empty()) return {};
+    if (std::isdigit((unsigned char)out[0])) out = "fn_" + out;
+    return out;
 }
 
 GuessedName GuessFromEvidence(const FuncEvidence& e) {
@@ -235,8 +355,10 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
 
     // 2) Thunk / wrapper that tail-jumps straight to a known import.
     if (e.isThunk && !e.thunkApi.empty()) {
-        set("j_" + bareApi(e.thunkApi), "tail-jumps to " + e.thunkApi);
-        return g;
+        if (std::string api = thunkIdentifier(e.thunkApi); !api.empty()) {
+            set("j_" + api, "tail-jumps to " + e.thunkApi);
+            return g;
+        }
     }
 
     // 3) Trivial stubs.
@@ -254,8 +376,10 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
         }
         // 5) Thin wrapper around exactly one notable API.
         if (e.apis.size() == 1 && e.callCount <= 2 && e.instrCount <= 24) {
-            set(ToSnakeIdentifier(e.apis[0]), "wrapper around " + e.apis[0]);
-            return g;
+            if (std::string name = ToSnakeIdentifier(e.apis[0]); !name.empty()) {
+                set(std::move(name), "wrapper around " + e.apis[0]);
+                return g;
+            }
         }
     }
 
@@ -278,7 +402,9 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     guessed_ = 0;
     std::vector<GuessedName> out(funcs.size());
 
-    auto isGuessable = [](const NamerInput& f) { return f.name.rfind("sub_", 0) == 0; };
+    auto isGuessable = [](const NamerInput& f) {
+        return !f.isExport && isAnonymousSubName(f.name);
+    };
 
     // Resolve a call/jmp instruction's target to an import name (direct target or
     // an IAT slot referenced through memory). "" when it isn't an import.
@@ -323,9 +449,26 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         if (t.isThunk) thunks[funcs[i].address] = t;
     }
 
+    // Follow chains such as jmp sub_X -> jmp [IAT].  The previous one-level pass
+    // left the outer thunk anonymous even though its final import was known.
+    for (size_t pass = 0; pass < thunks.size(); ++pass) {
+        bool changed = false;
+        for (auto& [address, t] : thunks) {
+            (void)address;
+            if (!t.api.empty() || !t.target) continue;
+            auto next = thunks.find(t.target);
+            if (next != thunks.end() && !next->second.api.empty()) {
+                t.api = next->second.api;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+
     // ---- Pass 2: full evidence + synthesis. ----
-    std::unordered_set<std::string> used;     // for de-duplication of guessed names
-    for (const auto& f : funcs) if (!isGuessable(f)) used.insert(f.name);
+    // Keep synthesis separate from allocation so we know exactly which anonymous
+    // originals will remain occupied before assigning any guessed names.
+    std::vector<GuessedName> synthesized(funcs.size());
 
     for (size_t i = 0; i < funcs.size(); ++i) {
         const NamerInput& f = funcs[i];
@@ -341,18 +484,23 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
 
         const auto& insns = bodies[i];
         int meaningful = 0;     // instrs that aren't padding/frame noise
-        bool hadRet = false, zeroedAcc = false;
+        int retCount = 0;
+        bool accKnownZero = false, allReturnsZero = true, hasControlBranch = false;
         std::unordered_set<std::string> apiSeen, strSeen;
         for (const auto& in : insns) {
             ++e.instrCount;
-            const std::string& m = in.mnemonic;
-            bool noise = (m == "nop" || m == "endbr64" || m == "endbr32" ||
-                          m == "leave" || m == "int3" || m == "push" || m == "pop");
+            bool noise = isFrameNoise(in, retCount != 0);
             if (!noise) ++meaningful;
-            if (in.isRet) hadRet = true;
+            if (in.isRet) {
+                ++retCount;
+                allReturnsZero = allReturnsZero && accKnownZero;
+                continue;
+            }
+            if (in.isBranch && !in.isCall) hasControlBranch = true;
 
             if (in.isCall) {
                 ++e.callCount;
+                accKnownZero = false;                                // x86 calls return through eax/rax
                 std::string nm = resolveTargetApi(in);
                 if (nm.empty() && in.branchTarget) {                 // call to another local fn?
                     if (in.branchTarget == f.address) e.selfRecursive = true;
@@ -364,32 +512,54 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                     e.apis.push_back(bare);
             } else {
                 // String reference?
-                if (uint64_t d = instrDataRef(in); d && stringRefFor) {
+                uint64_t d = instrDataRef(in);
+                if (!d) d = instrImmRef(in);                         // x86-32 mov/push offset string
+                if (d && stringRefFor) {
                     std::string s = stringRefFor(d);
-                    if (!s.empty() && e.strings.size() < 8 && strSeen.insert(s).second)
+                    if (!s.empty() && e.strings.size() < 32 && strSeen.insert(s).second)
                         e.strings.push_back(s);
                 }
-                // Accumulator zeroing (for ret_zero): xor eax,eax / mov eax,0 / xor rax,rax.
-                if ((m == "xor" && (in.operands == "eax, eax" || in.operands == "rax, rax")) ||
-                    ((m == "mov") && (in.operands == "eax, 0" || in.operands == "rax, 0")))
-                    zeroedAcc = true;
+                if (zeroesAccumulator(in)) accKnownZero = true;
+                else if (writesAccumulator(in)) accKnownZero = false;
             }
         }
-        e.retOnly = (e.callCount == 0 && hadRet && meaningful <= 1);
-        e.retZero = (e.callCount == 0 && hadRet && zeroedAcc && meaningful <= 4);
+        e.retOnly = (e.callCount == 0 && retCount == 1 && !hasControlBranch && meaningful <= 1);
+        e.retZero = (e.callCount == 0 && retCount == 1 && !hasControlBranch &&
+                     allReturnsZero && meaningful <= 4);
 
         GuessedName g = GuessFromEvidence(e);
         if (!g.guessed) continue;
+        synthesized[i] = std::move(g);
+    }
 
-        // De-duplicate: first taker keeps the bare name, later ones get _1, _2, ...
+    // Reserve every current name, including anonymous names that will remain
+    // unguessed.  Release all originals known to be replaced, then allocate in
+    // stable function order.  This avoids both duplicate unresolved sub_ names
+    // and needless suffixes for placeholders that another guess will vacate.
+    std::unordered_map<std::string, size_t> used;
+    for (const auto& f : funcs) if (!f.name.empty()) ++used[nameKey(f.name)];
+    for (size_t i = 0; i < funcs.size(); ++i) {
+        if (!synthesized[i].guessed) continue;
+        const std::string oldKey = nameKey(funcs[i].name);
+        if (auto it = used.find(oldKey); it != used.end()) {
+            if (it->second > 1) --it->second;
+            else used.erase(it);
+        }
+    }
+
+    for (size_t i = 0; i < funcs.size(); ++i) {
+        GuessedName& g = synthesized[i];
+        if (!g.guessed) continue;
         std::string base = g.name, cand = base;
-        for (int k = 1; used.count(cand); ++k) {
+        for (int k = 1; used.count(nameKey(cand)); ++k) {
             char suf[16]; std::snprintf(suf, sizeof(suf), "_%d", k);
             cand = base + suf;
         }
-        used.insert(cand);
-        out[i].name    = cand;
-        out[i].reason  = g.reason;
+        ++used[nameKey(cand)];
+        if (cand != base)
+            g.reason += "; name \"" + base + "\" already existed, shown as \"" + cand + "\"";
+        out[i].name    = std::move(cand);
+        out[i].reason  = std::move(g.reason);
         out[i].guessed = true;
         ++guessed_;
     }

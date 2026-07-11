@@ -8,6 +8,7 @@
 namespace ds {
 
 void BinaryFile::clear() {
+    ++imageRevision_;
     path_.clear();
     data_.clear();
     sections_.clear();
@@ -135,6 +136,7 @@ size_t BinaryFile::writeImage(uint64_t va, const uint8_t* in, size_t n) {
     if (!in || !n || !vaToOffset(va, off)) return 0;
     size_t w = 0;
     for (; w < n && (size_t)off + w < data_.size(); ++w) data_[(size_t)off + w] = in[w];
+    if (w) ++imageRevision_;
     return w;
 }
 

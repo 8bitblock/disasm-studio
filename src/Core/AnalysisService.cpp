@@ -8,6 +8,7 @@
 #include "../Disasm/JvmDisassembler.h"   // AttachJvmClass (JavaClass symbolication)
 
 #include <algorithm>
+#include <limits>
 
 namespace ds {
 
@@ -32,24 +33,55 @@ AnalysisService::~AnalysisService() {
 
 void AnalysisService::requestBulk(const BinaryFile* bin, Engine engine, Arch arch,
                                   uint32_t kinds, bool guessNames, uint64_t epoch,
-                                  uint64_t moduleBase, uint64_t regionLo, uint64_t regionHi) {
+                                  uint64_t moduleBase, uint64_t regionLo, uint64_t regionHi,
+                                  std::shared_ptr<const DecompileNameMap> decompNames,
+                                  std::string decompSignature, uint64_t decompContext) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        bool merged = false;
+        constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile;
+        const uint32_t incomingTargeted = kinds & kTargeted;
+        BulkJob* mergeInto = nullptr;
         for (auto& j : queue_) {                 // coalesce with an unstarted request
-            if (j.modBase == moduleBase) {       // for the same module
-                j.kinds |= kinds;
-                j.bin    = bin;
-                j.engine = engine;
-                j.arch   = arch;
-                j.guess  = guessNames;
-                j.epoch  = epoch;
-                if (kinds & (K_Synthesis | K_PathExplore | K_Decompile)) { j.regionLo = regionLo; j.regionHi = regionHi; }
-                merged = true;
+            if (j.modBase != moduleBase) continue;
+            const uint32_t queuedTargeted = j.kinds & kTargeted;
+            // Targeted passes share regionLo/regionHi storage. Different target
+            // kinds must remain separate jobs or the newer request silently moves
+            // the older pass to its own region. Untargeted bulk work may still
+            // merge into either job; the same target kind takes the newest region.
+            if (queuedTargeted && incomingTargeted
+                && queuedTargeted != incomingTargeted) continue;
+            if (!mergeInto) mergeInto = &j; // untargeted fallback
+            // Prefer an already-pending request for this exact targeted pass over
+            // an earlier untargeted job, avoiding duplicate decompiles.
+            if (!incomingTargeted || queuedTargeted == incomingTargeted) {
+                mergeInto = &j;
                 break;
             }
         }
-        if (!merged) queue_.push_back(BulkJob{ bin, engine, arch, kinds, guessNames, epoch, moduleBase, regionLo, regionHi });
+        if (mergeInto) {
+            BulkJob& j = *mergeInto;
+            j.kinds |= kinds;
+            j.bin    = bin;
+            j.engine = engine;
+            j.arch   = arch;
+            j.guess  = guessNames;
+            j.epoch  = epoch;
+            if (incomingTargeted) { j.regionLo = regionLo; j.regionHi = regionHi; }
+            if (kinds & K_Decompile) {
+                j.decompNames = std::move(decompNames);
+                j.decompSignature = std::move(decompSignature);
+                j.decompContext = decompContext;
+            }
+        } else {
+            BulkJob job;
+            job.bin = bin; job.engine = engine; job.arch = arch; job.kinds = kinds;
+            job.guess = guessNames; job.epoch = epoch; job.modBase = moduleBase;
+            job.regionLo = regionLo; job.regionHi = regionHi;
+            job.decompNames = std::move(decompNames);
+            job.decompSignature = std::move(decompSignature);
+            job.decompContext = decompContext;
+            queue_.push_back(std::move(job));
+        }
         pending_.store(true);
         pendingKinds_.store(pendingKinds_.load(std::memory_order_relaxed) | kinds);
     }
@@ -177,10 +209,15 @@ void AnalysisService::runJob(const BulkJob& job) {
     std::shared_ptr<XrefIndex> xrefIdx;   // built by K_Xref; reused by K_Intent for extent mapping
 
     if ((job.kinds & K_Strings) && !superseded()) {
-        setPhase(AnalysisPhase::Strings, (uint32_t)job.bin->bytes().size(), job.modBase);
-        strings = ScanStringsImage(*job.bin, 20000, &progCur_);
+        const size_t imageBytes = job.bin->bytes().size();
+        setPhase(AnalysisPhase::Strings,
+                 (uint32_t)std::min(imageBytes, (size_t)std::numeric_limits<uint32_t>::max()),
+                 job.modBase);
+        bool stringsTruncated = false;
+        strings = ScanStringsImage(*job.bin, kDefaultStringScanCap, &progCur_, &stringsTruncated);
         haveStrings = true;
         AnalysisResult r; r.strings = strings; r.stringsValid = true;
+        r.stringsTruncated = stringsTruncated;
         emit(std::move(r));
     }
 
@@ -195,12 +232,20 @@ void AnalysisService::runJob(const BulkJob& job) {
 
     if ((job.kinds & K_Listing) && !superseded()) {
         setPhase(AnalysisPhase::Listing, 800000, job.modBase);
+        // A strings-only rescan also asks the worker to refresh data-string rows.
+        // Discover divider starts locally when K_Funcs was not part of that job;
+        // do not emit/churn the UI's existing function list.
+        if (funcs.empty()) {
+            if (!haveStrings) { strings = ScanStringsImage(*job.bin); haveStrings = true; }
+            funcs = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess).functions;
+        }
         std::vector<uint64_t> starts;
         starts.reserve(funcs.size());
         for (const auto& f : funcs) starts.push_back(f.address);   // dividers from this job's funcs
         std::vector<ListRowR> rows = BuildListingRows(*job.bin, *dis, starts, strings, 800000, superseded, &progCur_);
         if (!superseded()) {
-            int cnt = 0; for (const auto& r : rows) if (!r.divider) ++cnt;
+            int cnt = 0;
+            for (const auto& r : rows) if (!r.divider && !r.strData) ++cnt;
             AnalysisResult r; r.listRows = std::move(rows); r.listInsnCount = cnt; r.listingValid = true;
             emit(std::move(r));
         }
@@ -284,15 +329,18 @@ void AnalysisService::runJob(const BulkJob& job) {
         }
     }
 
-    // Structured pseudo-C for the function in [regionLo, regionHi) (off the render
-    // thread). Base name resolution only (imports + string literals); the UI re-applies
-    // nothing — user renames still show in the listing, not here (documented default).
+    // Structured pseudo-C for [regionLo, regionHi), off the render thread. The job
+    // owns an immutable name/signature snapshot, including analyst renames and the
+    // current discovered/guessed function names.
     if ((job.kinds & K_Decompile) && !superseded() && job.regionHi > job.regionLo) {
-        DecompResult t = DecompileRegion(*job.bin, *dis, ArchIsX86(job.arch), job.regionLo, job.regionHi);
+        DecompResult t = DecompileRegion(*job.bin, *dis, ArchIsX86(job.arch),
+                                         job.regionLo, job.regionHi,
+                                         job.decompNames.get(), job.decompSignature);
         if (!superseded()) {
             AnalysisResult r; r.decompText = std::move(t.text); r.decompLineVA = std::move(t.lineVA);
             r.decompValid = true;
             r.decompVA = job.regionLo;
+            r.decompContext = job.decompContext;
             r.regionLo = job.regionLo; r.regionHi = job.regionHi;
             emit(std::move(r));
         }

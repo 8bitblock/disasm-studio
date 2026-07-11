@@ -35,7 +35,12 @@ public:
     // Symbol entries exposed to the command palette: address + display name +
     // a pre-lowercased copy for fuzzy matching. Backed by the signature-cached
     // goto-symbol index (rebuilt only when the target/process changes).
-    struct SymEntry { uint64_t addr; std::string name; std::string lower; };
+    struct SymEntry {
+        uint64_t addr;
+        std::string name;
+        std::string lower;
+        bool live = false; // runtime address (live module export) vs file/project VA
+    };
     const std::vector<SymEntry>& paletteSymbols(AppContext& ctx) {
         buildSymbolIndex(ctx);
         return symbolIndex_;
@@ -59,9 +64,9 @@ private:
     void drawAsmArrows(float x0, float y0, float x1, float y1);            // branch arrows in the static flow gutter (table body rect)
     void revertPatchAt(AppContext& ctx, uint64_t va);                      // restore a recorded patch's original bytes
     void renderLiveAssembly(AppContext& ctx);
-    void renderLiveListing(AppContext& ctx, struct DbgSnapshot& snap, uint64_t start);
-    void renderLivePseudocode(AppContext& ctx, struct DbgSnapshot& snap, uint64_t start);
-    void renderRegisterBox(AppContext& ctx, struct DbgSnapshot& snap);
+    void renderLiveListing(AppContext& ctx, const struct DbgSnapshot& snap, uint64_t start);
+    void renderLivePseudocode(AppContext& ctx, const struct DbgSnapshot& snap, uint64_t start);
+    void renderRegisterBox(AppContext& ctx, const struct DbgSnapshot& snap);
     void renderLiveSearchPopup(AppContext& ctx);
     void renderPatchPopup(AppContext& ctx);
     void applyPatchBytes(AppContext& ctx, uint64_t va, std::vector<uint8_t> bytes,
@@ -81,6 +86,8 @@ private:
     void renderXrefsTab(AppContext& ctx);      // "Xrefs" lower sub-tab: who references the cursor / its function
     void exportAnalysis(AppContext& ctx);      // File > Export Analysis: write Markdown/HTML report
     std::string decompileFunctionText(AppContext& ctx, uint64_t fnStart, uint32_t fnSize); // structured pseudo-C for one fn
+    void requestFunctionDecompile(AppContext& ctx, uint64_t fnStart, uint32_t fnSize,
+                                  size_t availableBytes); // queue named/signature-aware worker decompile
     const DecompResult* decompLruGet(uint64_t va);                // recently-decompiled cache lookup (nav back/fwd)
     void                decompLruPut(uint64_t va, const DecompResult& r);
     std::string symbolFor(AppContext& ctx, uint64_t addr);   // address -> function/export name
@@ -134,6 +141,7 @@ private:
     void renderPathExplorerTab(AppContext& ctx);                     // F3: path tree lower tab
     void renderCommentPopup(AppContext& ctx);   // edit address -> comment
     void renderRenamePopup(AppContext& ctx);    // edit address -> name
+    void invalidateNameDependentCaches();       // user/discovered names changed: refresh picker/pseudocode/etc.
     void renderCondPopup(AppContext& ctx);      // edit address -> breakpoint condition
     void loadProjectState(AppContext& ctx);     // ctx.project -> tab members (on open)
     void saveProjectState(AppContext& ctx);     // tab members -> ctx.project (each frame)
@@ -153,8 +161,19 @@ private:
     void toggleBreakpoint(AppContext& ctx, uint64_t va);   // SW breakpoint at va (+ live debugger)
 
     struct Bookmark  { uint64_t address; std::string label; };
-    struct Strng     { uint64_t address; std::string text; bool wide = false; };
-    struct Func      { uint64_t address; std::string name; uint32_t size; bool guessed = false; };
+    struct Strng {
+        uint64_t address;
+        std::string text;
+        bool wide = false;
+        bool textTruncated = false;
+    };
+    struct Func      {
+        uint64_t address;
+        std::string name;
+        uint32_t size;
+        bool guessed = false;
+        bool isExport = false; // authoritative discovery name; FunctionNamer must preserve it
+    };
     struct CallFrame { uint64_t pc; uint64_t frameSp; std::string name; };
 
     uint64_t cursorVA_  = 0;     // current focus address
@@ -216,6 +235,13 @@ private:
     std::unordered_map<uint64_t, Instruction> decodeCache_;
     std::deque<uint64_t>                      decodeOrder_;   // insertion order for FIFO eviction
     uint64_t                                  decodeCacheKey_ = ~0ull;
+    // Windowed assembly decodes up to 256 instructions. Cache that whole window
+    // while the cursor/image/function bounds are unchanged instead of repeating
+    // alignment, allocation, decode, and function-set construction every frame.
+    uint64_t                                  asmWindowKey_ = ~0ull;
+    uint64_t                                  asmWindowCursor_ = ~0ull;
+    std::vector<Instruction>                  asmWindowInsns_;
+    std::unordered_set<uint64_t>              asmWindowFuncSet_;
     bool                 functionsDirty_ = false;   // a patch changed code: re-run analyzeFunctions before the next decompile/CFG
 
     // Static-listing branch arrows: per-frame geometry collected inside renderAsmRow
@@ -332,6 +358,9 @@ private:
     uint64_t                liveMainBase_    = 0;   // cached runtime base of the main module
     uint32_t                liveMainBasePid_ = 0;   // pid the cache was computed for
     char                    funcTabFilter_[64] = "";
+    std::vector<int>        funcTabVisible_;          // cached lower Functions-tab filter result
+    char                    funcTabFilterLast_[64] = "\x01";
+    uint64_t                funcTabVisSig_ = ~0ull;
 
     // Pseudocode cache (regenerated when the function or RIP context changes).
     uint64_t              pseudoVA_ = 0;
@@ -339,18 +368,23 @@ private:
 
     // Decompiler (structured pseudo-C) for the static Pseudocode view. The decompile
     // runs off the render thread (K_Decompile); decompVA_ is the function currently
-    // shown, decompText_ its result, decompPending_ true while the worker is running.
+    // shown when decompValid_ is true (VA 0 is valid), decompText_ its result, and
+    // decompPending_ true while the worker is running.
     // decompLines_/decompLineVA_ are decompText_ split per line + the per-line source
     // VAs (DecompResult::lineVA; 0 = synthetic) backing click-to-navigate.
     // decompLru_ keeps the few most-recently decompiled functions so nav back/forward
     // is instant (no re-decompile); a small linear list (front = most recent), capped.
     uint64_t              decompVA_ = 0;
+    bool                  decompValid_ = false;
     std::string           decompText_;
     std::vector<std::string> decompLines_;
     std::vector<uint64_t>    decompLineVA_;
     bool                  decompPending_ = false;
     static constexpr size_t kDecompLruCap = 16;
     std::list<std::pair<uint64_t, DecompResult>> decompLru_;
+    std::shared_ptr<const DecompileNameMap> decompNamesSnapshot_; // reused across function navigation
+    uint64_t              decompNamesFunctionsGen_ = ~0ull;
+    uint32_t              decompNamesNamesGen_ = ~0u;
     void setDecompContent(std::string text, std::vector<uint64_t> lineVA);
     // Pseudocode output language (0 = pseudo-C, 1 = Python). The worker/LRU always
     // hold pseudo-C; applyDecompLang translates on display (DecompileToPython is a
@@ -421,6 +455,8 @@ private:
     bool                  showNames_ = true;   // resolve call/jmp targets to names
     bool                  symAttached_ = false;// cached once per frame (avoid re-locking debug snapshot)
     uint32_t              symPid_ = 0;
+    const DbgSnapshot*    frameSnap_ = nullptr; // borrowed App render snapshot (or fallback below)
+    DbgSnapshot           fallbackFrameSnap_;  // standalone/test render fallback
     // Parsed export tables for live modules: base -> sorted (va, name).
     std::unordered_map<uint64_t, std::vector<std::pair<uint64_t, std::string>>> modExports_;
     SymbolResolver                              symbols_;     // DbgHelp / PDB names
@@ -440,6 +476,7 @@ private:
     // public section so the command palette can consume the index.)
     std::vector<SymEntry>                         symbolIndex_;
     uint64_t                                      symbolIndexSig_ = ~0ull;
+    uint64_t                                      symbolLiveModulesSig_ = ~0ull;
     bool                                          openGotoPopup_ = false;
     char                                          gotoNameBuf_[96] = "";
     std::vector<int>                              gotoMatches_;   // indices into symbolIndex_
@@ -503,11 +540,15 @@ private:
     char                  fnFilterLast_[64] = "\x01";   // sentinel != "" forces a first build
     char                  strFilterLast_[64] = "\x01";
     uint64_t              fnVisSig_  = ~0ull;   // data signature of fnVisible_'s last build
-    uint64_t              strVisSig_ = ~0ull;   // data signature of strVisible_'s last build
-    uint32_t              namesGen_  = 0;       // bumped when names_ (renames) change
+    uint64_t              strVisSig_ = ~0ull;   // stringsGen_ of strVisible_'s last build
+    uint32_t              namesGen_  = 0;       // bumped when user/guessed/discovered names change
+    uint64_t              functionsGen_ = 0;    // bumped whenever functions_ membership/bounds change
+    uint64_t              stringsGen_ = 0;      // bumped whenever strings_ is cleared/replaced
     bool                  stringsLive_ = false;    // scan debuggee memory instead of the file
     bool                  stringsScanned_ = false;
-    bool                  stringsScanning_ = false; // a live (off-thread) string scan is in flight
+    bool                  stringsScanning_ = false; // an off-thread file/live scan is in flight
+    bool                  stringsScanLive_ = false; // chooses the matching progress source
+    bool                  stringsTruncated_ = false;// result cap omitted additional strings
     uint64_t              stringsToken_   = 0;      // matches the in-flight LiveScanService request
     uint32_t              stringsAutoPid_ = 0;     // pid we already auto-scanned live strings for
     char                  notes_[4096] = "";

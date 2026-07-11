@@ -32,9 +32,11 @@ struct ModuleAnalysisCache {
     int                        listInsnCount = 0;
     std::shared_ptr<XrefIndex> xref;
     std::string                summary;
+    bool stringsTruncated = false;
     bool funcsValid = false, stringsValid = false, listingValid = false;
     void clear() { functions.clear(); strings.clear(); listRows.clear(); listInsnCount = 0;
-                   xref.reset(); summary.clear(); funcsValid = stringsValid = listingValid = false; }
+                   xref.reset(); summary.clear(); stringsTruncated = false;
+                   funcsValid = stringsValid = listingValid = false; }
 };
 
 struct LoadedModule {

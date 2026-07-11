@@ -161,7 +161,10 @@ void LiveScanService::runJob(const Job& job) {
         size_t sz = (size_t)rg.size;
         if (job.kind != LiveKind::ReadImage) {          // honour the overall byte cap
             if (scanned >= job.byteCap) { res.truncated = true; break; }
-            if (scanned + sz > job.byteCap) sz = job.byteCap - scanned;
+            if (scanned + sz > job.byteCap) {
+                sz = job.byteCap - scanned;
+                res.truncated = true; // the tail of this range will not be scanned
+            }
         }
         buf.resize(sz);
         size_t got = job.reader(rg.base, buf.data(), sz);
@@ -170,9 +173,13 @@ void LiveScanService::runJob(const Job& job) {
         if (got) {
             switch (job.kind) {
                 case LiveKind::Strings:
-                    ScanStringsBuffer(buf.data(), got, rg.base, res.strings, job.strCap);
-                    if (res.strings.size() >= job.strCap) res.truncated = true;
+                {
+                    bool bufferTruncated = false;
+                    ScanStringsBuffer(buf.data(), got, rg.base, res.strings,
+                                      job.strCap, &bufferTruncated);
+                    if (bufferTruncated) res.truncated = true;
                     break;
+                }
                 case LiveKind::Xref:
                     if (dis && !FindRefsInBuffer(buf.data(), got, rg.base, job.target, *dis, res.hits, job.hitCap)) {
                         res.truncated = true;
@@ -188,7 +195,10 @@ void LiveScanService::runJob(const Job& job) {
             }
         }
         progCur_.store((uint32_t)(r + 1), std::memory_order_relaxed);
-        if (job.kind == LiveKind::Strings && res.strings.size() >= job.strCap) break;
+        // Exactly hitting the cap is not proof that data was omitted. Continue to
+        // the next range with zero room; its first candidate will set truncated.
+        if (job.kind == LiveKind::Strings && res.truncated
+            && res.strings.size() >= job.strCap) break;
     }
 
     if (job.kind == LiveKind::Strings) {

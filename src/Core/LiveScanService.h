@@ -83,7 +83,8 @@ public:
     // Queue a job; returns a token to match its result with. `reader` must stay valid
     // until the job runs (it captures the Debugger, which outlives this service).
     uint64_t requestStrings(std::vector<LiveRange> ranges, MemReader reader, uint64_t epoch,
-                            size_t strCap = 20000, size_t byteCap = 256ull * 1024 * 1024);
+                            size_t strCap = kDefaultStringScanCap,
+                            size_t byteCap = 256ull * 1024 * 1024);
     uint64_t requestXref(std::vector<LiveRange> ranges, uint64_t target, Engine engine, Arch arch,
                          MemReader reader, uint64_t epoch,
                          size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024);
@@ -114,7 +115,7 @@ private:
         uint64_t  moduleBase = 0;
         Engine    engine = Engine::Zydis;
         Arch      arch   = Arch::X64;
-        size_t    strCap = 20000;
+        size_t    strCap = kDefaultStringScanCap;
         size_t    hitCap = 3000;
         size_t    byteCap = 256ull * 1024 * 1024;
         uint64_t  epoch = 0;

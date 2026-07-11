@@ -11,6 +11,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ds {
@@ -1084,11 +1085,11 @@ struct Structurer {
 
 // Find the ')' matching the '(' at s[open] (quote-aware), or npos.
 static size_t pyMatchParen(const std::string& s, size_t open) {
-    int depth = 0; bool q = false;
+    int depth = 0; char quote = 0;
     for (size_t i = open; i < s.size(); ++i) {
         char c = s[i];
-        if (q) { if (c == '\\') ++i; else if (c == '"') q = false; continue; }
-        if (c == '"') q = true;
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') quote = c;
         else if (c == '(') ++depth;
         else if (c == ')') { if (--depth == 0) return i; }
     }
@@ -1096,18 +1097,122 @@ static size_t pyMatchParen(const std::string& s, size_t open) {
 }
 
 static bool pyIdentChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
+static bool pyKeyword(const std::string& s);
+static std::string pyIdentifier(const std::string& raw, const char* fallback);
+
+static bool pyDottedIdentifier(const std::string& s) {
+    if (s.empty()) return false;
+    size_t b = 0;
+    while (b < s.size()) {
+        size_t e = s.find('.', b);
+        if (e == std::string::npos) e = s.size();
+        std::string part = s.substr(b, e - b);
+        if (part.empty() || !(std::isalpha((unsigned char)part[0]) || part[0] == '_') || pyKeyword(part))
+            return false;
+        for (char c : part) if (!pyIdentChar(c)) return false;
+        b = e + 1;
+    }
+    return true;
+}
+
+// nameFor deliberately accepts analyst-authored labels. When one is used as a
+// call target, make only the callable token Python-safe; operands and qualified
+// import spellings (`kernel32.CreateFileW`) remain otherwise untouched.
+static std::string pyCallNames(std::string s) {
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c != '(') continue;
+
+        size_t e = i;
+        while (e > 0 && std::isspace((unsigned char)s[e - 1])) --e;
+        size_t b = e;
+        while (b > 0) {
+            char x = s[b - 1];
+            if (x == '=' || x == ',' || x == ';' || x == '[' || x == ']' ||
+                x == '(' || x == ')' || x == '{' || x == '}') break;
+            if (x == '!') {
+                size_t pos = b - 1;
+                bool left = pos > 0 && pyIdentChar(s[pos - 1]);
+                bool right = pos + 1 < s.size() && pyIdentChar(s[pos + 1]);
+                if (!left || !right) break;
+            }
+            if (std::string("+-*/%&|^<>").find(x) != std::string::npos) {
+                size_t pos = b - 1;
+                bool leftIdent = pos > 0 && pyIdentChar(s[pos - 1]);
+                bool rightIdent = pos + 1 < s.size() && pyIdentChar(s[pos + 1]);
+                bool arrow = (x == '-' && pos + 1 < s.size() && s[pos + 1] == '>') ||
+                             (x == '>' && pos > 0 && s[pos - 1] == '-');
+                if (!arrow && (!leftIdent || !rightIdent)) break; // unary/deref or a real operator boundary
+                bool spaced = (pos > 0 && std::isspace((unsigned char)s[pos - 1])) ||
+                              (pos + 1 < s.size() && std::isspace((unsigned char)s[pos + 1]));
+                bool paired = (pos > 0 && ((x == '&' && s[pos - 1] == '&') ||
+                                           (x == '|' && s[pos - 1] == '|') ||
+                                           (x == '<' && (s[pos - 1] == '<' || s[pos - 1] == '=')) ||
+                                           (x == '>' && (s[pos - 1] == '>' || s[pos - 1] == '=')))) ||
+                              (pos + 1 < s.size() && ((x == '&' && s[pos + 1] == '&') ||
+                                                     (x == '|' && s[pos + 1] == '|') ||
+                                                     (x == '<' && (s[pos + 1] == '<' || s[pos + 1] == '=')) ||
+                                                     (x == '>' && (s[pos + 1] == '>' || s[pos + 1] == '='))));
+                if (spaced || paired) break;
+            }
+            --b;
+        }
+        while (b < e && std::isspace((unsigned char)s[b])) ++b;
+        if (e <= b) continue;
+        if (s.compare(b, 7, "return ") == 0) b += 7;
+        while (b < e && std::isspace((unsigned char)s[b])) ++b;
+        if (e <= b) continue;
+
+        std::string raw = s.substr(b, e - b);
+        std::string normalized;
+        normalized.reserve(raw.size());
+        for (size_t k = 0; k < raw.size();) {
+            if (k + 1 < raw.size() && raw[k] == ':' && raw[k + 1] == ':') {
+                normalized += '.'; k += 2;
+            } else if (k + 1 < raw.size() && raw[k] == '-' && raw[k + 1] == '>') {
+                normalized += '.'; k += 2;
+            } else normalized += raw[k++];
+        }
+        std::string replacement = pyDottedIdentifier(normalized)
+            ? normalized : pyIdentifier(normalized, "func");
+        if (replacement == raw) continue;
+        const size_t gap = i - e;
+        s.replace(b, e - b, replacement);
+        i = b + replacement.size() + gap;
+    }
+    return s;
+}
 
 // Expression rewrite: *(X) -> mem[X], &(X) -> addr(X), strip C casts, ! -> not,
 // && / || -> and / or, " / " -> " // " (integer division), hi:lo -> (hi, lo).
 // Quote-aware so string literals inlined by dataRefFor pass through untouched.
 static std::string pyExpr(std::string s) {
+    s = pyCallNames(std::move(s));
+    // A C indirect call spells a callable value as `(*fp)(args)` (or
+    // `(**(addr))(args)` for a pointer loaded from memory). Python calls the
+    // value directly. Remove exactly the call-site dereference here; the normal
+    // memory pass below still turns any remaining `*(addr)` into `mem[addr]`.
+    char quote = 0;
+    for (size_t i = 0; i + 2 < s.size(); ++i) {
+        char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c != '(' || s[i + 1] != '*') continue;
+        size_t close = pyMatchParen(s, i);
+        if (close != std::string::npos && close + 1 < s.size() && s[close + 1] == '(')
+            s.erase(i + 1, 1);   // (*fp)(...) -> (fp)(...)
+    }
+
     // *(X) -> mem[X]. The C lift only ever emits the literal "*(" for a memory
     // dereference (multiplication always has spaces around '*').
-    bool q = false;
+    quote = 0;
     for (size_t i = 0; i + 1 < s.size(); ++i) {
         char c = s[i];
-        if (q) { if (c == '\\') ++i; else if (c == '"') q = false; continue; }
-        if (c == '"') { q = true; continue; }
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
         if (c == '*' && s[i + 1] == '(') {
             size_t close = pyMatchParen(s, i + 1);
             if (close == std::string::npos) break;
@@ -1116,20 +1221,30 @@ static std::string pyExpr(std::string s) {
         }
     }
     static const char* kCasts[] = {
+        // Microsoft-width spellings are emitted by the deep data-flow lift for
+        // movzx/movsx, so keep these in sync with DataFlow.cpp.
+        "(unsigned __int8)", "(unsigned __int16)", "(unsigned __int32)", "(unsigned __int64)",
+        "(signed __int8)",   "(signed __int16)",   "(signed __int32)",   "(signed __int64)",
+        "(__int8)", "(__int16)", "(__int32)", "(__int64)",
         "(int64_t)", "(uint64_t)", "(int32_t)", "(uint32_t)", "(int16_t)", "(uint16_t)",
-        "(int8_t)", "(uint8_t)", "(__int64)", "(int)", "(unsigned)", "(char)", "(short)", "(long)",
+        "(int8_t)", "(uint8_t)", "(unsigned long long)", "(signed long long)", "(long long)",
+        "(unsigned int)", "(signed int)", "(int)", "(unsigned)", "(signed)",
+        "(const void *)", "(const char *)", "(const wchar_t *)", "(unsigned char *)",
+        "(void *)", "(char *)", "(wchar_t *)",
+        "(size_t)", "(ssize_t)", "(intptr_t)", "(uintptr_t)",
+        "(float)", "(double)", "(bool)", "(char)", "(short)", "(long)",
     };
     std::string o; o.reserve(s.size());
-    q = false;
+    quote = 0;
     for (size_t i = 0; i < s.size();) {
         char c = s[i];
-        if (q) {
+        if (quote) {
             o += c;
             if (c == '\\' && i + 1 < s.size()) { o += s[i + 1]; i += 2; continue; }
-            if (c == '"') q = false;
+            if (c == quote) quote = 0;
             ++i; continue;
         }
-        if (c == '"') { q = true; o += c; ++i; continue; }
+        if (c == '"' || c == '\'') { quote = c; o += c; ++i; continue; }
         // C constants -> Python literals, word-boundary safe (so a variable like
         // `truth` or `null_ptr` is never partially rewritten). Only fires at the
         // start of an identifier run whose previous output char isn't an ident char.
@@ -1146,8 +1261,20 @@ static std::string pyExpr(std::string s) {
             }
             if (did) continue;
         }
-        if (c == '&' && i + 1 < s.size() && s[i + 1] == '&') { o += "and"; i += 2; continue; }
-        if (c == '|' && i + 1 < s.size() && s[i + 1] == '|') { o += "or";  i += 2; continue; }
+        if (c == '&' && i + 1 < s.size() && s[i + 1] == '&') {
+            while (!o.empty() && std::isspace((unsigned char)o.back())) o.pop_back();
+            o += " and "; i += 2;
+            while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+            continue;
+        }
+        if (c == '|' && i + 1 < s.size() && s[i + 1] == '|') {
+            while (!o.empty() && std::isspace((unsigned char)o.back())) o.pop_back();
+            o += " or "; i += 2;
+            while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+            continue;
+        }
+        if (c == '-' && i + 1 < s.size() && s[i + 1] == '>') { o += '.'; i += 2; continue; }
+        if (c == ':' && i + 1 < s.size() && s[i + 1] == ':') { o += '.'; i += 2; continue; }
         if (c == '&' && i + 1 < s.size() && s[i + 1] == '(') { o += "addr"; ++i; continue; }   // lea: &(X) -> addr(X)
         if (c == '!' && (i + 1 >= s.size() || s[i + 1] != '=')) { o += "not "; ++i; continue; }
         if (c == '/' && i > 0 && s[i - 1] == ' ' && i + 1 < s.size() && s[i + 1] == ' '
@@ -1179,13 +1306,23 @@ static std::string pyExpr(std::string s) {
 static std::string pyStmt(const std::string& tin) {
     std::string t = tin;
     if (t.empty()) return "pass";
+    // Keep inline assembly opaque. In particular, an instruction spelling can
+    // itself contain `; `, which must not be mistaken for the div-lift's pair of
+    // top-level C statements below.
+    if (t.rfind("__asm { ", 0) == 0 && t.size() > 10 && t.compare(t.size() - 2, 2, " }") == 0) {
+        std::string body = t.substr(8, t.size() - 10);
+        std::string lit = "'";
+        for (char c : body) { if (c == '\\' || c == '\'') lit += '\\'; lit += c; }
+        lit += '\'';
+        return "asm(" + lit + ")";
+    }
     // The 1-operand div lift packs two statements into one line; translate both.
     {   // split on top-level "; "
-        int depth = 0; bool q = false;
+        int depth = 0; char quote = 0;
         for (size_t i = 0; i + 1 < t.size(); ++i) {
             char c = t[i];
-            if (q) { if (c == '\\') ++i; else if (c == '"') q = false; continue; }
-            if (c == '"') q = true;
+            if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+            if (c == '"' || c == '\'') quote = c;
             else if (c == '(' || c == '[') ++depth;
             else if (c == ')' || c == ']') --depth;
             else if (c == ';' && depth == 0 && t[i + 1] == ' ')
@@ -1195,8 +1332,6 @@ static std::string pyStmt(const std::string& tin) {
     if (t == "return")               return "return";
     if (t.rfind("return ", 0) == 0)  return "return " + pyExpr(t.substr(7));
     if (t == "break" || t == "continue" || t.rfind("goto ", 0) == 0) return t;   // goto stays a pseudo-statement
-    if (t.rfind("__asm { ", 0) == 0 && t.size() > 10 && t.compare(t.size() - 2, 2, " }") == 0)
-        return "asm('" + t.substr(8, t.size() - 10) + "')";
     if (t.rfind("swap(", 0) == 0 && t.back() == ')') {
         std::string inner = t.substr(5, t.size() - 6), a, b;
         if (split2(inner, a, b)) {
@@ -1209,26 +1344,355 @@ static std::string pyStmt(const std::string& tin) {
     return pyExpr(t);
 }
 
-// Is this whole line a local-variable declaration ("__int64 v0;", "void *v1;")?
-static bool pyIsDecl(const std::string& t) {
-    if (t.empty() || t.back() != ';') return false;
-    if (t.find('=') != std::string::npos || t.find('(') != std::string::npos) return false;
-    size_t sp = t.find(' ');
-    if (sp == std::string::npos) return false;
-    static const char* kTypes[] = {
-        "void", "int", "char", "short", "long", "unsigned", "signed", "float", "double", "bool",
-        "__int64", "int8_t", "int16_t", "int32_t", "int64_t",
-        "uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t",
+static bool pyTypeWord(const std::string& s) {
+    static const char* kWords[] = {
+        "void", "bool", "char", "short", "int", "long", "float", "double",
+        "signed", "unsigned", "const", "volatile", "restrict", "struct", "class", "enum",
+        "size_t", "ssize_t", "intptr_t", "uintptr_t",
+        "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "__int8", "__int16", "__int32", "__int64",
+        "BYTE", "WORD", "DWORD", "QWORD", "BOOL", "WCHAR", "HANDLE", "HWND", "HRESULT",
+        "LPVOID", "LPCVOID", "LPSTR", "LPCSTR", "LPWSTR", "LPCWSTR",
     };
-    std::string w = t.substr(0, sp);
-    for (const char* k : kTypes) if (w == k) return true;
+    for (const char* w : kWords) if (s == w) return true;
     return false;
+}
+
+static bool pyKeyword(const std::string& s) {
+    static const char* kWords[] = {
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break",
+        "class", "continue", "def", "del", "elif", "else", "except", "finally", "for",
+        "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or",
+        "pass", "raise", "return", "try", "while", "with", "yield",
+    };
+    for (const char* w : kWords) if (s == w) return true;
+    return false;
+}
+
+// Symbols can contain module separators, C++ scopes, punctuation, or even spaces
+// from a user rename. Preserve the information in a stable Python identifier
+// instead of silently taking only the final identifier fragment.
+static std::string pyIdentifier(const std::string& raw, const char* fallback) {
+    std::string out; out.reserve(raw.size() + 1);
+    for (char c : raw) {
+        if (std::isalnum((unsigned char)c) || c == '_') out += c;
+        else if (out.empty() || out.back() != '_') out += '_';
+    }
+    if (out.empty()) out = fallback;
+    if (std::isdigit((unsigned char)out[0])) out.insert(out.begin(), '_');
+    if (pyKeyword(out)) out += '_';
+    return out;
+}
+
+static bool pyCallingConvention(const std::string& s) {
+    static const char* kWords[] = {
+        "__cdecl", "__fastcall", "__stdcall", "__thiscall", "__vectorcall",
+        "cdecl", "fastcall", "stdcall", "thiscall", "WINAPI", "CALLBACK", "NTAPI",
+    };
+    for (const char* w : kWords) if (s == w) return true;
+    return false;
+}
+
+// Return the name portion before a function's opening parenthesis. The emitter
+// always puts the return type/calling convention first, but the actual symbol can
+// be a user-authored phrase or a qualified C++/module name.
+static std::string pyFunctionName(const std::string& prefix) {
+    size_t p = 0;
+    bool sawType = false;
+    bool firstWord = true;
+    bool expectTag = false;
+    while (p < prefix.size() && std::isspace((unsigned char)prefix[p])) ++p;
+    while (p < prefix.size()) {
+        while (p < prefix.size() && (std::isspace((unsigned char)prefix[p]) ||
+                                     prefix[p] == '*' || prefix[p] == '&')) ++p;
+        size_t b = p;
+        while (p < prefix.size() && !std::isspace((unsigned char)prefix[p]) &&
+               prefix[p] != '*' && prefix[p] != '&') ++p;
+        if (b == p) break;
+        std::string word = prefix.substr(b, p - b);
+        bool suffixType = word.size() > 2 && word.compare(word.size() - 2, 2, "_t") == 0;
+        bool upperType = word.size() > 1;
+        for (char c : word) if (std::isalpha((unsigned char)c) && !std::isupper((unsigned char)c)) upperType = false;
+        bool convention = pyCallingConvention(word);
+        bool type = expectTag || pyTypeWord(word) || suffixType || (upperType && !sawType);
+        // A user-defined return type (`Widget foo`) is indistinguishable from a
+        // bare symbol until there is a following token. Function headers emitted
+        // by this decompiler always have a return type, so consume that first word.
+        if (firstWord && !type && !convention &&
+            prefix.find_first_not_of(" \t*&", p) != std::string::npos)
+            type = true;
+        if (!type && !convention)
+            return trim(prefix.substr(b));
+        expectTag = word == "struct" || word == "class" || word == "enum";
+        if (type) sawType = true;
+        firstWord = false;
+    }
+
+    // Unknown/malformed return type: the final token is still a better function
+    // name than emitting an empty or invalid `def` line.
+    size_t e = prefix.find_last_not_of(" \t*&");
+    if (e == std::string::npos) return std::string();
+    size_t b = e + 1;
+    while (b > 0 && !std::isspace((unsigned char)prefix[b - 1]) &&
+           prefix[b - 1] != '*' && prefix[b - 1] != '&') --b;
+    return prefix.substr(b, e - b + 1);
+}
+
+// Split a C parameter list without treating commas in function-pointer types as
+// parameter separators.
+static std::vector<std::string> pySplitParams(const std::string& s) {
+    std::vector<std::string> out;
+    int paren = 0, bracket = 0; char quote = 0; size_t begin = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') ++paren;
+        else if (c == ')') --paren;
+        else if (c == '[') ++bracket;
+        else if (c == ']') --bracket;
+        else if (c == ',' && paren == 0 && bracket == 0) {
+            out.push_back(trim(s.substr(begin, i - begin)));
+            begin = i + 1;
+        }
+    }
+    out.push_back(trim(s.substr(begin)));
+    return out;
+}
+
+// Extract a usable Python parameter name from a typed C declaration. Unnamed
+// parameters get stable a<N> placeholders; a sole `void` means no parameters.
+static std::string pyParamName(std::string a, size_t ordinal) {
+    a = trim(a);
+    if (a.empty() || a == "void") return std::string();
+    if (a == "...") return "*args";
+
+    // Function-pointer declarator: `void (*callback)(int, int)` (also accepts
+    // calling-convention words between '(' and '*').
+    for (size_t star = a.find('*'); star != std::string::npos; star = a.find('*', star + 1)) {
+        if (a.rfind('(', star) == std::string::npos) continue;
+        size_t b = star + 1; while (b < a.size() && std::isspace((unsigned char)a[b])) ++b;
+        if (b >= a.size() || !(std::isalpha((unsigned char)a[b]) || a[b] == '_')) continue;
+        size_t e = b + 1; while (e < a.size() && pyIdentChar(a[e])) ++e;
+        return a.substr(b, e - b);
+    }
+
+    // Drop trailing array extents so `const char *argv[]` ends at `argv`.
+    for (;;) {
+        size_t e = a.find_last_not_of(" \t");
+        if (e == std::string::npos || a[e] != ']') break;
+        int depth = 0; size_t b = e;
+        for (;;) {
+            char c = a[b];
+            if (c == ']') ++depth;
+            else if (c == '[' && --depth == 0) break;
+            if (b == 0) { depth = -1; break; }
+            --b;
+        }
+        if (depth != 0) break;
+        a.erase(b);
+    }
+
+    // Last identifier is the declarator name. If it is only a C type word, the
+    // signature omitted the name (`int`, `char **`) and needs a placeholder.
+    for (size_t e = a.size(); e > 0;) {
+        while (e > 0 && !pyIdentChar(a[e - 1])) --e;
+        size_t b = e; while (b > 0 && pyIdentChar(a[b - 1])) --b;
+        if (b == e) break;
+        std::string id = a.substr(b, e - b);
+        // An identifier before a later '*'/'&' is part of the type, not a name
+        // (`Widget *` is an unnamed parameter; `Widget *value` ends at value).
+        const bool beforePointer = a.find_first_of("*&", e) != std::string::npos;
+        if ((std::isalpha((unsigned char)id[0]) || id[0] == '_') &&
+            !pyTypeWord(id) && !beforePointer)
+            return id;
+        e = b;
+    }
+    return "a" + std::to_string(ordinal);
+}
+
+enum class PyDecl { NotDeclaration, Uninitialized, Initialized };
+
+// Translate a known C local declaration. Uninitialized locals disappear (as
+// before); initialized declarations retain their assignment instead of leaking
+// invalid `int x = ...` syntax into the Python view.
+static PyDecl pyDeclaration(const std::string& t, std::string& statement) {
+    if (t.empty() || t.back() != ';') return PyDecl::NotDeclaration;
+    size_t wb = 0;
+    while (wb < t.size() && std::isspace((unsigned char)t[wb])) ++wb;
+    size_t we = wb;
+    while (we < t.size() && pyIdentChar(t[we])) ++we;
+    if (wb == we) return PyDecl::NotDeclaration;
+    std::string first = t.substr(wb, we - wb);
+    bool suffixType = first.size() > 2 && first.compare(first.size() - 2, 2, "_t") == 0;
+    if (!pyTypeWord(first) && !suffixType) return PyDecl::NotDeclaration;
+
+    // Split comma-separated declarators at top level (`int x = 1, *p = f(a,b)`).
+    // The shared type stays on the first segment; pyParamName also accepts the
+    // later bare/pointer declarators.
+    std::string body = t.substr(0, t.size() - 1);
+    std::vector<std::string> decls;
+    int paren = 0, bracket = 0, brace = 0; char quote = 0; size_t begin = 0;
+    for (size_t i = 0; i <= body.size(); ++i) {
+        char c = i < body.size() ? body[i] : ',';
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') ++paren;
+        else if (c == ')') --paren;
+        else if (c == '[') ++bracket;
+        else if (c == ']') --bracket;
+        else if (c == '{') ++brace;
+        else if (c == '}') --brace;
+        else if (c == ',' && paren == 0 && bracket == 0 && brace == 0) {
+            decls.push_back(trim(body.substr(begin, i - begin)));
+            begin = i + 1;
+        }
+    }
+
+    bool initialized = false;
+    for (const std::string& decl : decls) {
+        size_t eq = std::string::npos;
+        paren = bracket = brace = 0; quote = 0;
+        for (size_t i = 0; i < decl.size(); ++i) {
+            char c = decl[i];
+            if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+            if (c == '"' || c == '\'') quote = c;
+            else if (c == '(') ++paren;
+            else if (c == ')') --paren;
+            else if (c == '[') ++bracket;
+            else if (c == ']') --bracket;
+            else if (c == '{') ++brace;
+            else if (c == '}') --brace;
+            else if (c == '=' && paren == 0 && bracket == 0 && brace == 0) {
+                char prev = i ? decl[i - 1] : 0;
+                char next = i + 1 < decl.size() ? decl[i + 1] : 0;
+                if (next != '=' && std::string("=!<>+-*/%&|^").find(prev) == std::string::npos) {
+                    eq = i; break;
+                }
+            }
+        }
+        if (eq == std::string::npos) continue; // Python has no declaration-only counterpart
+
+        std::string lhs = trim(decl.substr(0, eq));
+        std::string name = pyParamName(lhs, 0);
+        if (name.empty() || name == "a0" || name == "*args") continue;
+        name = pyIdentifier(name, "local");
+        std::string rhs = trim(decl.substr(eq + 1));
+        // A simple C aggregate initializer is most legible as a Python list.
+        if (rhs.size() >= 2 && rhs.front() == '{' && rhs.back() == '}')
+            rhs = "[" + rhs.substr(1, rhs.size() - 2) + "]";
+        if (!statement.empty()) statement += "; ";
+        statement += name + " = " + pyExpr(rhs);
+        initialized = true;
+    }
+    return initialized ? PyDecl::Initialized : PyDecl::Uninitialized;
 }
 
 static bool pyIsLabel(const std::string& t) {
     if (t.size() < 2 || t.back() != ':' || t.rfind("loc_", 0) != 0) return false;
     for (size_t i = 4; i + 1 < t.size(); ++i) if (!std::isxdigit((unsigned char)t[i])) return false;
     return true;
+}
+
+// Text before a Python # comment, respecting the quoted string used by asm().
+static std::string pyCodePart(const std::string& s) {
+    bool sq = false, dq = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if ((sq || dq) && c == '\\') { ++i; continue; }
+        if (!dq && c == '\'') { sq = !sq; continue; }
+        if (!sq && c == '"') { dq = !dq; continue; }
+        if (!sq && !dq && c == '#') return trim(s.substr(0, i));
+    }
+    return trim(s);
+}
+
+static size_t pyIndentOf(const std::string& s) {
+    size_t n = 0;
+    while (n < s.size() && (s[n] == ' ' || s[n] == '\t')) ++n;
+    return n;
+}
+
+// The C structurer represents an else-if as an `else` containing one nested
+// `if`. Collapse only when that if/else chain is the outer else's sole executable
+// child, so Python gets the natural `elif` spelling without changing semantics.
+static void pyFoldElif(std::vector<std::string>& lines, std::vector<uint64_t>& vas) {
+    for (size_t i = 0; i + 1 < lines.size(); ++i) {
+        if (trim(lines[i]) != "else:") continue; // keep a commented else untouched
+        const size_t outerIndent = pyIndentOf(lines[i]);
+        const size_t childIndent = outerIndent + 4;
+        const size_t nested = i + 1;
+        std::string nestedCode = pyCodePart(lines[nested]);
+        if (pyIndentOf(lines[nested]) != childIndent || nestedCode.rfind("if ", 0) != 0 ||
+            nestedCode.back() != ':') continue;
+
+        // Find the outer else's end. Blank lines do not carry indentation, while
+        // comments do and therefore correctly delimit an outdented suite.
+        size_t end = lines.size();
+        for (size_t k = nested + 1; k < lines.size(); ++k) {
+            if (trim(lines[k]).empty()) continue;
+            if (pyIndentOf(lines[k]) <= outerIndent) { end = k; break; }
+        }
+
+        bool soleChain = true;
+        for (size_t k = nested + 1; k < end; ++k) {
+            std::string code = pyCodePart(lines[k]);
+            if (code.empty() || pyIndentOf(lines[k]) != childIndent) continue;
+            if (code == "else:" || code.rfind("elif ", 0) == 0) continue;
+            soleChain = false; break; // a sequential statement also belongs to the outer else
+        }
+        if (!soleChain) continue;
+
+        // Retain any trailing comment from the nested if header.
+        std::string nestedText = trim(lines[nested]);
+        lines[i] = std::string(outerIndent, ' ') + "elif " + nestedText.substr(3);
+        if (i < vas.size() && nested < vas.size()) vas[i] = vas[nested];
+        lines.erase(lines.begin() + nested);
+        if (nested < vas.size()) vas.erase(vas.begin() + nested);
+        --end;
+        for (size_t k = i + 1; k < end; ++k) {
+            size_t ind = pyIndentOf(lines[k]);
+            if (ind >= childIndent) lines[k].erase(0, 4);
+        }
+    }
+}
+
+// Dropping C declarations/braces and match-ending breaks can expose genuinely
+// empty Python suites (an empty spin loop and a break-only switch case are common
+// binary shapes). Insert a mapped `pass`; an empty match needs a wildcard case
+// because Python's match grammar does not accept a plain statement as its suite.
+static void pyEnsureNonEmptySuites(std::vector<std::string>& lines, std::vector<uint64_t>& vas) {
+    const size_t n = lines.size();
+    std::vector<size_t> nextCode(n + 1, n);
+    for (size_t i = n; i-- > 0;)
+        nextCode[i] = pyCodePart(lines[i]).empty() ? nextCode[i + 1] : i;
+
+    std::vector<std::string> rebuilt;
+    std::vector<uint64_t> rebuiltVA;
+    rebuilt.reserve(n + n / 8 + 2);
+    rebuiltVA.reserve(rebuilt.capacity());
+    for (size_t i = 0; i < lines.size(); ++i) {
+        rebuilt.push_back(lines[i]);
+        rebuiltVA.push_back(i < vas.size() ? vas[i] : 0);
+        std::string code = pyCodePart(lines[i]);
+        if (code.empty() || code.back() != ':') continue;   // not a compound-statement header
+        size_t ind = pyIndentOf(lines[i]);
+        size_t j = nextCode[i + 1];
+        if (j < lines.size() && pyIndentOf(lines[j]) > ind) continue;
+
+        const uint64_t va = i < vas.size() ? vas[i] : 0;
+        if (code.rfind("match ", 0) == 0) {
+            rebuilt.push_back(std::string(ind + 4, ' ') + "case _:");
+            rebuiltVA.push_back(va);
+            rebuilt.push_back(std::string(ind + 8, ' ') + "pass");
+            rebuiltVA.push_back(va);
+        } else {
+            rebuilt.push_back(std::string(ind + 4, ' ') + "pass");
+            rebuiltVA.push_back(va);
+        }
+    }
+    lines.swap(rebuilt);
+    vas.swap(rebuiltVA);
 }
 
 } // namespace
@@ -1260,6 +1724,11 @@ DecompResult DecompileToPython(const DecompResult& c) {
     struct Blk { size_t indent; int kind; std::string step; uint64_t stepVA; };   // kind 0=other 1=loop 2=switch
     std::vector<Blk> stack;
     auto switchDepth = [&]() { size_t n = 0; for (const Blk& b : stack) if (b.kind == 2) ++n; return n; };
+    auto currentLoop = [&]() -> const Blk* {
+        for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+            if (it->kind == 1) return &*it;
+        return nullptr;
+    };
     auto emitAt = [&](size_t indent, const std::string& s, uint64_t va) {
         out.push_back(std::string(indent + 4 * switchDepth(), ' ') + s);
         outVA.push_back(va);
@@ -1294,27 +1763,31 @@ DecompResult DecompileToPython(const DecompResult& c) {
             size_t p = t.find('(');
             size_t close = (p == std::string::npos) ? std::string::npos : pyMatchParen(t, p);
             if (p != std::string::npos && close != std::string::npos) {
-                size_t ns = p; while (ns > 0 && pyIdentChar(t[ns - 1])) --ns;
-                std::string name = t.substr(ns, p - ns);
-                if (name.empty()) name = "func";
-                // Keep arg NAMES only (an inferred signature may carry C types).
+                std::string rawName = pyFunctionName(t.substr(0, p));
+                std::string name = pyIdentifier(rawName, "func");
+                // Keep argument names only. Typed signatures can contain arrays,
+                // unnamed parameters, or nested commas in a function-pointer type.
                 std::string args = t.substr(p + 1, close - p - 1), alist;
-                size_t s0 = 0;
-                while (s0 <= args.size()) {
-                    size_t comma = args.find(',', s0);
-                    std::string a1 = args.substr(s0, comma == std::string::npos ? std::string::npos : comma - s0);
-                    size_t ae = a1.find_last_not_of(" *");
-                    if (ae != std::string::npos) {
-                        size_t as = ae; while (as > 0 && pyIdentChar(a1[as - 1])) --as;
-                        if (pyIdentChar(a1[as]) || as < ae) {
-                            if (!alist.empty()) alist += ", ";
-                            alist += a1.substr(as, ae - as + 1);
-                        }
-                    }
-                    if (comma == std::string::npos) break;
-                    s0 = comma + 1;
+                std::vector<std::string> params = pySplitParams(args);
+                std::vector<std::string> usedNames;
+                for (size_t ai = 0; ai < params.size(); ++ai) {
+                    std::string paramName = pyParamName(params[ai], ai + 1);
+                    if (paramName.empty()) continue;   // empty list / sole C `void`
+                    const bool variadic = paramName == "*args";
+                    if (!variadic) paramName = pyIdentifier(paramName, "a");
+                    std::string bare = variadic ? paramName.substr(1) : paramName;
+                    std::string unique = bare;
+                    int suffix = 2;
+                    while (std::find(usedNames.begin(), usedNames.end(), unique) != usedNames.end())
+                        unique = bare + "_" + std::to_string(suffix++);
+                    usedNames.push_back(unique);
+                    paramName = variadic ? "*" + unique : unique;
+                    if (!alist.empty()) alist += ", ";
+                    alist += paramName;
                 }
-                emitAt(ind, "def " + name + "(" + alist + "):" + cmt, va);
+                std::string nameComment;
+                if (!rawName.empty() && rawName != name) nameComment = "  # symbol: " + rawName;
+                emitAt(ind, "def " + name + "(" + alist + "):" + cmt + nameComment, va);
                 continue;
             }
         }
@@ -1359,9 +1832,19 @@ DecompResult DecompileToPython(const DecompResult& c) {
 
         if (pyIsLabel(t)) { emitAt(ind, "# " + t, va); continue; }       // goto target marker
         if (t.rfind("case ", 0) == 0 && t.back() == ':') { emitAt(ind, t + cmt, va); continue; }
-        if (pyIsDecl(t)) continue;                                       // Python needs no declarations
+        if (t == "default:") { emitAt(ind, "case _:" + cmt, va); continue; }
 
         if (!t.empty() && t.back() == ';') {                             // plain statement
+            std::string declStatement;
+            PyDecl decl = pyDeclaration(t, declStatement);
+            if (decl == PyDecl::Uninitialized) {
+                if (!cmt.empty()) emitAt(ind, cmt.substr(2), va);
+                continue;
+            }
+            if (decl == PyDecl::Initialized) {
+                emitAt(ind, declStatement + cmt, va);
+                continue;
+            }
             std::string stmt = t.substr(0, t.size() - 1);
             while (!stmt.empty() && stmt.back() == ' ') stmt.pop_back();
             if (stmt.rfind("if (", 0) == 0) {                            // one-liner "if (C) S;"
@@ -1371,6 +1854,15 @@ DecompResult DecompileToPython(const DecompResult& c) {
                     std::string rest = close + 1 < stmt.size() ? stmt.substr(close + 1) : std::string();
                     size_t rs = rest.find_first_not_of(' ');
                     rest = rs == std::string::npos ? std::string() : rest.substr(rs);
+                    if (rest == "continue") {
+                        const Blk* loop = currentLoop();
+                        if (loop && !loop->step.empty()) {
+                            emitAt(ind, "if " + pyExpr(cond) + ":", va);
+                            emitAt(ind + 4, loop->step, loop->stepVA);
+                            emitAt(ind + 4, "continue" + cmt, va);
+                            continue;
+                        }
+                    }
                     emitAt(ind, "if " + pyExpr(cond) + ": " + pyStmt(rest) + cmt, va);
                     continue;
                 }
@@ -1381,6 +1873,10 @@ DecompResult DecompileToPython(const DecompResult& c) {
                     if (it->kind == 1) break; else if (it->kind == 2) { inSwitch = true; break; }
                 if (inSwitch) { if (!cmt.empty()) emitAt(ind, "pass" + cmt, va); continue; }
             }
+            if (stmt == "continue") {
+                const Blk* loop = currentLoop();
+                if (loop && !loop->step.empty()) emitAt(ind, loop->step, loop->stepVA);
+            }
             emitAt(ind, pyStmt(stmt) + cmt, va);
             continue;
         }
@@ -1388,6 +1884,8 @@ DecompResult DecompileToPython(const DecompResult& c) {
         emitAt(ind, pyExpr(t) + cmt, va);   // anything else: best-effort expression rewrite
     }
 
+    pyFoldElif(out, outVA);
+    pyEnsureNonEmptySuites(out, outVA);
     for (const std::string& l : out) { r.text += l; r.text += '\n'; }
     r.lineVA = std::move(outVA);
     return r;

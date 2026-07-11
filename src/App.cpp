@@ -9,6 +9,8 @@
 #include "Tabs/MemoryToolsTab.h"
 #include "Tabs/BinaryDiffTab.h"
 #include "Tabs/BinaryTechTab.h"
+#include "Tabs/CortexTab.h"
+#include "Tabs/PrismTab.h"
 
 #include "Ui/Theme.h"
 #include "Ui/Fonts.h"
@@ -18,6 +20,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -49,6 +52,8 @@ App::App() {
     tabs_.emplace_back(std::make_unique<MemoryToolsTab>());
     tabs_.emplace_back(std::make_unique<BinaryDiffTab>());
     tabs_.emplace_back(std::make_unique<BinaryTechTab>());
+    tabs_.emplace_back(std::make_unique<CortexTab>());   // RE brain (additions.md #3)
+    tabs_.emplace_back(std::make_unique<PrismTab>());    // explanatory profiler (additions.md #5)
 }
 
 App::~App() {
@@ -1038,6 +1043,8 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             { "Memory Tools",   DS_ICON_MEMORY  },
             { "Binary Diff",    DS_ICON_SWITCH  },
             { "Binary Tech",    DS_ICON_SHIELD  },
+            { "Cortex",         DS_ICON_INFO    },
+            { "Prism",          DS_ICON_LIGHTNING },
         };
         auto iconFor = [&](const char* nm) -> const char* {
             for (const auto& ki : kIcons) if (std::strcmp(ki.name, nm) == 0) return ki.icon;
@@ -1065,24 +1072,39 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             if (std::strcmp(nm, "Memory Tools") == 0)   return "scan";
             if (std::strcmp(nm, "Binary Diff") == 0)    return "a/b";
             if (std::strcmp(nm, "Binary Tech") == 0)    return "caps";
+            if (std::strcmp(nm, "Cortex") == 0)         return "insight";
+            if (std::strcmp(nm, "Prism") == 0)          return "profile";
             return "";
         };
 
         const ImVec4 acc      = theme::col::accent();
         const float  pad      = 6.0f * k;       // wf-vtab vertical padding (6px)
-        const float  hpad     = 14.0f * k;      // wf-vtab horizontal padding (14px)
-        const float  gap      = 8.0f * k;
+        const float  sidePad  = 10.0f * k;
+        const float  roomyGap = 8.0f * k;
+        const float  compactGap = 4.0f * k;
+        const float  roomyCard = 120.0f * k;
+        const bool   compact  = vp->WorkSize.x < sidePad * 2.0f +
+                                roomyCard * (float)tabs_.size() +
+                                roomyGap * (float)(tabs_.empty() ? 0 : tabs_.size() - 1);
+        const float  hpad     = (compact ? 8.0f : 14.0f) * k;
+        const float  gap      = compact ? compactGap : roomyGap;
         const float  rounding = 5.0f * k;
         const float  cardH    = stripH - 2.0f * pad;
         const float  cardTop  = win.y + pad;
         const float  iconSz   = 16.0f * k;      // sub-glyph drawn to the card's left
-        float        x        = win.x + 10.0f * k;
+        const float  usableW  = (std::max)(1.0f, vp->WorkSize.x - sidePad * 2.0f -
+                                          gap * (float)(tabs_.empty() ? 0 : tabs_.size() - 1));
+        const float  fitCardW = tabs_.empty() ? usableW : usableW / (float)tabs_.size();
+        // New sections must not disappear beyond the right edge. Cards share the
+        // available strip width on compact windows and stop growing on wide ones.
+        const float  cardW    = (std::max)(1.0f, (std::min)(190.0f * k, fitCardW));
+        float        x        = win.x + sidePad;
 
         for (int i = 0; i < (int)tabs_.size(); ++i) {
             const char* nm = tabs_[i]->name();
             const bool active = (i == activeTab_);
             const char* ic = ui::IconsLoaded() ? iconFor(nm) : nullptr;
-            const bool drawIcon = (ic && ui::gIconFontLarge);
+            const bool drawIcon = (ic && ui::gIconFontLarge && cardW >= 104.0f * k);
 
             // Measure: label (normal font) over mono sub-text. Card width fits both.
             ImVec2 labelSz = ImGui::CalcTextSize(nm);
@@ -1095,10 +1117,6 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             ui::PopMono();
 
             const float iconW    = drawIcon ? (iconSz + 8.0f * k) : 0.0f;
-            const float innerW   = iconW + (labelSz.x > subSz.x ? labelSz.x : subSz.x);
-            float       cardW    = innerW + 2.0f * hpad;
-            const float minW     = 120.0f * k;
-            if (cardW < minW) cardW = minW;
 
             const ImVec2 a(x, cardTop);
             const ImVec2 b(x + cardW, cardTop + cardH);
@@ -1150,21 +1168,36 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             }
 
             // Label (bold-ish: normal text color when active, muted otherwise).
+            // Ellipsize in compact mode so long labels never paint over neighbours.
             const ImVec4 labCol = active ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
                                          : theme::col::muted();
-            dl->AddText(ImVec2(contentX, blockY), ImGui::GetColorU32(labCol), nm);
+            const float labelAvail = (std::max)(1.0f, (b.x - hpad) - contentX);
+            std::string label = nm;
+            if (ImGui::CalcTextSize(label.c_str()).x > labelAvail) {
+                if (ImGui::CalcTextSize("...").x > labelAvail) label.clear();
+                else {
+                    while (label.size() > 1 &&
+                           ImGui::CalcTextSize((label + "...").c_str()).x > labelAvail)
+                        label.pop_back();
+                    label += "...";
+                }
+            }
+            dl->AddText(ImVec2(contentX, blockY), ImGui::GetColorU32(labCol), label.c_str());
 
             // Mono sub-text, ellipsized to the card width.
             {
-                const float subAvail = (b.x - hpad) - contentX;
+                const float subAvail = (std::max)(1.0f, (b.x - hpad) - contentX);
                 std::string st = sub;
                 ui::PushMono();
                 ImFont* mf = ImGui::GetFont();
                 if (monoFont->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, st.c_str()).x > subAvail) {
-                    while (st.size() > 1 &&
-                           mf->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, (st + "...").c_str()).x > subAvail)
-                        st.pop_back();
-                    st += "...";
+                    if (mf->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, "...").x > subAvail) st.clear();
+                    else {
+                        while (st.size() > 1 &&
+                               mf->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, (st + "...").c_str()).x > subAvail)
+                            st.pop_back();
+                        st += "...";
+                    }
                 }
                 dl->AddText(mf, subFontSz, ImVec2(contentX, blockY + labelSz.y + 2.0f * k),
                             ImGui::GetColorU32(theme::col::muted()), st.c_str());
@@ -1188,7 +1221,10 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
                                     4.0f * k, ImGui::GetColorU32(bc));
 
             if (clicked) activeTab_ = i;
-            if (hovered) ImGui::SetTooltip("%s  (Ctrl+%d)", nm, i + 1);
+            if (hovered) {
+                if (i < 9) ImGui::SetTooltip("%s  (Ctrl+%d)", nm, i + 1);
+                else       ImGui::SetTooltip("%s", nm);
+            }
             ImGui::PopID();
 
             x += cardW + gap;
@@ -1229,7 +1265,7 @@ void App::renderMainWindow(const DbgSnapshot& dbg) {
             if (ctx_.requestedTab == tabs_[i]->name()) { activeTab_ = i; break; }
         ctx_.requestedTab.clear();
     }
-    // Ctrl+1..7 jumps straight to a section (mirrors the tab-card tooltips).
+    // Ctrl+1..9 jumps straight to a section (mirrors the tab-card tooltips).
     if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl)
         for (int i = 0; i < (int)tabs_.size() && i < 9; ++i)
             if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_1 + i))) activeTab_ = i;
@@ -1463,7 +1499,8 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
     for (int i = 0; i < (int)tabs_.size(); ++i) {
         char lbl[64], det[16];
         std::snprintf(lbl, sizeof(lbl), "Go to: %s", tabs_[i]->name());
-        std::snprintf(det, sizeof(det), "Ctrl+%d", i + 1);
+        if (i < 9) std::snprintf(det, sizeof(det), "Ctrl+%d", i + 1);
+        else       std::snprintf(det, sizeof(det), "Section");
         std::string nm = tabs_[i]->name();
         add(nullptr, lbl, det, [this, nm] { ctx_.requestedTab = nm; });
     }
@@ -1496,7 +1533,7 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
     if (binaryView_) {
         const auto& src = binaryView_->paletteSymbols(ctx_);
         syms.reserve(src.size());
-        for (const auto& e : src) syms.push_back({ e.addr, e.name, e.lower });
+        for (const auto& e : src) syms.push_back({ e.addr, e.name, e.lower, e.live });
     }
     palette_.open(std::move(items), std::move(syms));
 }
@@ -1535,6 +1572,11 @@ void App::render() {
         ui::Toast(ui::ToastKind::Info, "Debuggee exited - debug session ended");
         dbg = ctx_.debug.snapshot();
     }
+    ctx_.frameDebugSnapshot = &dbg;
+    struct ResetFrameDebugSnapshot {
+        AppContext& ctx;
+        ~ResetFrameDebugSnapshot() { ctx.frameDebugSnapshot = nullptr; }
+    } resetFrameDebugSnapshot{ ctx_ };
     renderMenuBar();
     renderDebugToolbar(dbg);
     renderTabCardStrip(dbg);

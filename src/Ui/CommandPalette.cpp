@@ -51,20 +51,20 @@ void CommandPalette::rebuildResults() {
         if (hex) {
             unsigned long long va = 0;
             std::sscanf(h.c_str(), "%llx", &va);
-            results_.push_back({ 1 << 20, 2, 0, (uint64_t)va });
+            results_.push_back({ 1 << 20, 2, 0, (uint64_t)va, false });
         }
     }
 
     if (q.empty()) {
-        for (int i = 0; i < (int)actions_.size(); ++i) results_.push_back({ 0, 0, i, 0 });
+        for (int i = 0; i < (int)actions_.size(); ++i) results_.push_back({ 0, 0, i, 0, false });
     } else {
         for (int i = 0; i < (int)actions_.size(); ++i) {
             int s = FuzzyScore(q.c_str(), actionLower_[i].c_str());
-            if (s >= 0) results_.push_back({ s + 4, 0, i, 0 });   // small action bias over symbols
+            if (s >= 0) results_.push_back({ s + 4, 0, i, 0, false }); // small action bias over symbols
         }
         for (int i = 0; i < (int)symbols_.size(); ++i) {
             int s = FuzzyScore(q.c_str(), symbols_[i].lower.c_str());
-            if (s >= 0) results_.push_back({ s, 1, i, symbols_[i].addr });
+            if (s >= 0) results_.push_back({ s, 1, i, symbols_[i].addr, symbols_[i].live });
         }
         std::stable_sort(results_.begin(), results_.end(),
                          [](const Result& a, const Result& b) { return a.score > b.score; });
@@ -168,7 +168,10 @@ void CommandPalette::render(AppContext& ctx) {
         std::function<void()> action;
         if (r.kind == 0) action = actions_[(size_t)r.idx].run;
         close();
-        if (r.kind != 0) ctx.gotoAddress(r.va);   // symbol pick or typed address
+        if (r.kind != 0) {
+            if (r.live) ctx.gotoAddressLive(r.va);
+            else        ctx.gotoAddress(r.va);
+        }
         else if (action) action();
         return;
     }

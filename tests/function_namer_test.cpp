@@ -37,12 +37,21 @@ int main() {
     CHECK_EQ(ToSnakeIdentifier("RtlZeroMemory"), "rtl_zero_memory");
     CHECK_EQ(ToSnakeIdentifier("_malloc"),      "malloc");
     CHECK_EQ(ToSnakeIdentifier("VirtualAllocEx"), "virtual_alloc_ex");
+    CHECK_EQ(ToSnakeIdentifier("KERNEL32.CreateFileW"), "create_file");
+    CHECK_EQ(ToSnakeIdentifier("__imp_CreateFileW@16"), "create_file");
+    CHECK_EQ(ToSnakeIdentifier("operator new"), "operator_new");
+    CHECK_EQ(ToSnakeIdentifier("123Api"), "fn_123_api");
+    CHECK(ToSnakeIdentifier("#12").empty());
 
     // ---- entry / thunk / stubs (highest priority) -------------------------
     { FuncEvidence e; e.isEntry = true; e.apis = {"ExitProcess"};
       CHECK_EQ(GuessFromEvidence(e).name, "start"); }
     { FuncEvidence e; e.isThunk = true; e.thunkApi = "CreateFileW";
       auto g = GuessFromEvidence(e); CHECK_EQ(g.name, "j_CreateFileW"); CHECK(g.guessed); }
+    { FuncEvidence e; e.isThunk = true; e.thunkApi = "__imp_CreateFileW@16";
+      CHECK_EQ(GuessFromEvidence(e).name, "j_CreateFileW"); }
+    { FuncEvidence e; e.isThunk = true; e.thunkApi = "#12";
+      CHECK(!GuessFromEvidence(e).guessed); }
     { FuncEvidence e; e.isThunk = true; e.thunkApi = "";   // jmp to a local sub -> no guess
       CHECK(!GuessFromEvidence(e).guessed); }
     { FuncEvidence e; e.retOnly = true; e.callCount = 0; e.instrCount = 1;
@@ -72,6 +81,9 @@ int main() {
 
     // "SendMessageW" must NOT be mistaken for a network send.
     CHECK(GuessFromEvidence(apis({"SendMessageW"})).name != "net_send");
+    // Substring matching `free` used to mislabel both as free_buffer.
+    CHECK_EQ(GuessFromEvidence(apis({"FreeLibrary"}, 5, 1)).name, "free_library");
+    CHECK_EQ(GuessFromEvidence(apis({"VirtualFree"}, 5, 1)).name, "virtual_free");
 
     // ---- single-API thin wrapper ------------------------------------------
     { auto g = GuessFromEvidence(apis({"GetTickCount"}, /*instr*/5, /*calls*/1));
@@ -82,6 +94,12 @@ int main() {
     // ---- string-derived name (embedded identifier) ------------------------
     { FuncEvidence e; e.instrCount = 20; e.strings = {"OpenConfig"};
       auto g = GuessFromEvidence(e); CHECK_EQ(g.name, "OpenConfig"); CHECK(g.guessed); }
+    { FuncEvidence e; e.instrCount = 20; e.strings = {"access_denied"};
+      CHECK_EQ(GuessFromEvidence(e).name, "access_denied"); }
+    { FuncEvidence e; e.instrCount = 20; e.strings = {"password", "success", "error"};
+      CHECK(!GuessFromEvidence(e).guessed); }
+    { FuncEvidence e; e.instrCount = 20; e.strings = {"sub_DEADBEEF"};
+      CHECK(!GuessFromEvidence(e).guessed); }
     { FuncEvidence e; e.instrCount = 20; e.strings = {"%s: error %d\n", "ok"};  // not identifier-like
       CHECK(!GuessFromEvidence(e).guessed); }
 

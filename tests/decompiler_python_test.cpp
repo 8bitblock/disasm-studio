@@ -318,6 +318,279 @@ int main() {
         CHECK(py.text.find("/*") == std::string::npos);   // no C comment survives
     }
 
+    // ---- emitter-native casts + indirect calls become Python-style expressions --
+    {
+        DecompResult c;
+        c.text =
+            "__int64 calls(a1, a2)\n"
+            "{\n"
+            "    v0 = (unsigned __int8)*(a1);\n"
+            "    v1 = (__int16)*(a1 + 2);\n"
+            "    v2 = (*a2)(v0);\n"
+            "    v3 = (**(a1 + 8))(v1);\n"
+            "    return v3;\n"
+            "}\n";
+        c.lineVA = { 0, 0, 0x2000, 0x2004, 0x2008, 0x200C, 0x2010, 0 };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        CHECK(lineWith(L, "v0 = mem[a1]") >= 0);
+        CHECK(lineWith(L, "v1 = mem[a1 + 2]") >= 0);
+        CHECK(lineWith(L, "v2 = (a2)(v0)") >= 0);
+        CHECK(lineWith(L, "v3 = (mem[a1 + 8])(v1)") >= 0);
+        CHECK(py.text.find("__int8") == std::string::npos);
+        CHECK(py.text.find("__int16") == std::string::npos);
+        CHECK(py.text.find("(*") == std::string::npos);
+    }
+
+    // ---- typed headers and empty suites remain usable Python pseudocode --------
+    {
+        DecompResult c;
+        c.text =
+            "int typed(void (*callback)(int, int), const char *argv[], int, Widget *, ...)\n"
+            "{\n"
+            "    while (1) {\n"
+            "    }\n"
+            "    switch (argc) {\n"
+            "    case 0:\n"
+            "        break;\n"
+            "    default:\n"
+            "        // no work\n"
+            "        break;\n"
+            "    }\n"
+            "}\n";
+        c.lineVA = { 0, 0, 0x3000, 0x3000, 0x3010, 0x3010,
+                     0x3014, 0x3010, 0x3018, 0x301C, 0x3010, 0 };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        CHECK(!L.empty() && L[0] == "def typed(callback, argv, a3, a4, *args):");
+        CHECK(lineWith(L, "case _:") >= 0);
+
+        // Every suite header must have a real (non-comment) indented body. This
+        // catches empty spin loops and switch cases whose synthetic C break is
+        // intentionally removed for Python match semantics.
+        for (size_t i = 0; i < L.size(); ++i) {
+            std::string h = trimmed(L[i]);
+            size_t hash = h.find("  # ");
+            if (hash != std::string::npos) h.resize(hash);
+            if (h.empty() || h[0] == '#' || h.back() != ':') continue;
+            size_t hi = L[i].find_first_not_of(' ');
+            size_t j = i + 1;
+            while (j < L.size()) {
+                std::string b = trimmed(L[j]);
+                if (!b.empty() && b[0] != '#') break;
+                ++j;
+            }
+            CHECK(j < L.size());
+            if (j < L.size()) CHECK(L[j].find_first_not_of(' ') > hi);
+        }
+        int wp = lineWith(L, "while True:");
+        CHECK(wp >= 0 && (size_t)(wp + 1) < L.size() && trimmed(L[(size_t)wp + 1]) == "pass");
+        int c0 = lineWith(L, "case 0:");
+        CHECK(c0 >= 0 && (size_t)(c0 + 1) < L.size() && trimmed(L[(size_t)c0 + 1]) == "pass");
+        if (c0 >= 0) CHECK(py.lineVA[(size_t)c0 + 1] == 0x3010); // synthetic pass maps to case/header VA
+    }
+
+    // A void parameter list is empty, and dropping the only C declaration must
+    // not leave the function's Python suite empty.
+    {
+        DecompResult c{
+            "void empty(void)\n"
+            "{\n"
+            "    __int64 v0;\n"
+            "}\n",
+            { 0, 0, 0, 0 }
+        };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        CHECK(L.size() == 2);
+        if (L.size() == 2) {
+            CHECK(L[0] == "def empty():");
+            CHECK(L[1] == "    pass");
+        }
+    }
+
+    // The deep emitter really produces the Microsoft-width casts above for
+    // movzx/movsx. Exercise the full CFG -> data flow -> Python path so the two
+    // sides cannot silently drift apart.
+    {
+        std::vector<Instruction> ins;
+        ins.push_back(mk(0x4000, 3, "movzx", "eax, byte ptr [rcx]"));
+        ins.push_back(mk(0x4003, 1, "ret", "", true, true, 0));
+        ControlFlowGraph g = buildG(ins);
+        DecompileOptions opt;
+        DecompResult c = DecompileWithMap(g, opt);
+        CHECK(c.text.find("(unsigned __int8)") != std::string::npos);
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        CHECK(py.text.find("__int8") == std::string::npos);
+        CHECK(lineWith(L, "mem[a1]") >= 0);
+    }
+
+    // ---- analyst names, declarations, call targets, and compact operators ----
+    // User labels are intentionally free-form in the UI. The Python display must
+    // keep qualified imports readable while making invalid definitions/calls safe.
+    {
+        DecompResult c;
+        c.text =
+            "struct Result check password(int value, long value, DWORD, int lambda, ...)\n"
+            "{\n"
+            "    int local = 7;\n"
+            "    int first = 1, second = helper(1, 2);\n"
+            "    int unused, kept = 9;\n"
+            "    const char *ptr = (const char *)*(base);\n"
+            "    void (*callback)(int);\n"
+            "    DWORD scratch; /* reserved */\n"
+            "    r0 = check password(local);\n"
+            "    r1 = kernel32.CreateFileW(ptr);\n"
+            "    r2 = ns::worker(local);\n"
+            "    r3 = module!ordinal(local);\n"
+            "    r4 = 123-start(local);\n"
+            "    r5 = !predicate(local);\n"
+            "    r6 = left&&!right||other;\n"
+            "    r7 = obj->ready(local);\n"
+            "    r8 = read/file(local);\n"
+            "    r9 = left&&predicate(local);\n"
+            "    literal = 'x&&y->z';\n"
+            "    return r0;\n"
+            "}\n";
+        c.lineVA.resize(21);
+        for (size_t i = 0; i < c.lineVA.size(); ++i) c.lineVA[i] = 0x5000 + i;
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        CHECK(!L.empty() && L[0] ==
+              "def check_password(value, value_2, a3, lambda_, *args):  # symbol: check password");
+        CHECK(lineWith(L, "local = 7") >= 0);
+        CHECK(lineWith(L, "first = 1; second = helper(1, 2)") >= 0);
+        CHECK(lineWith(L, "kept = 9") >= 0);
+        CHECK(lineWith(L, "unused") < 0);
+        CHECK(lineWith(L, "ptr = mem[base]") >= 0);
+        CHECK(lineWith(L, "callback") < 0);                  // uninitialized function-pointer decl dropped
+        CHECK(lineWith(L, "# reserved") >= 0);               // useful comment on a dropped decl survives
+        CHECK(lineWith(L, "r0 = check_password(local)") >= 0);
+        CHECK(lineWith(L, "r1 = kernel32.CreateFileW(ptr)") >= 0); // dotted import spelling preserved
+        CHECK(lineWith(L, "r2 = ns.worker(local)") >= 0);     // C++ scope becomes a Python qualifier
+        CHECK(lineWith(L, "r3 = module_ordinal(local)") >= 0);
+        CHECK(lineWith(L, "r4 = _123_start(local)") >= 0);
+        CHECK(lineWith(L, "r5 = not predicate(local)") >= 0);
+        CHECK(lineWith(L, "r6 = left and not right or other") >= 0);
+        CHECK(lineWith(L, "r7 = obj.ready(local)") >= 0);
+        CHECK(lineWith(L, "r8 = read_file(local)") >= 0);
+        CHECK(lineWith(L, "r9 = left and predicate(local)") >= 0);
+        CHECK(lineWith(L, "literal = 'x&&y->z'") >= 0);       // operator text in a char literal is opaque
+        int local = lineWith(L, "local = 7");
+        if (local >= 0) CHECK(py.lineVA[(size_t)local] == 0x5002);
+    }
+
+    // Already-valid identifiers, including meaningful trailing underscores,
+    // remain byte-for-byte unchanged and do not gain an "original symbol" note.
+    {
+        DecompResult c{
+            "int valid_name_(int arg_)\n"
+            "{\n"
+            "    return arg_;\n"
+            "}\n",
+            { 0, 0, 0x5100, 0 }
+        };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(!L.empty() && L[0] == "def valid_name_(arg_):");
+        CHECK(py.text.find("# symbol:") == std::string::npos);
+        CHECK(py.lineVA.size() == L.size());
+    }
+
+    // ---- nested else-if becomes elif without swallowing trailing statements ---
+    {
+        DecompResult c;
+        c.text =
+            "int choose(a, b)\n"
+            "{\n"
+            "    if (a) {\n"
+            "        return 1;\n"
+            "    }\n"
+            "    else {\n"
+            "        if (b) {\n"
+            "            return 2;\n"
+            "        }\n"
+            "        else {\n"
+            "            return 3;\n"
+            "        }\n"
+            "    }\n"
+            "}\n";
+        c.lineVA = { 0, 0, 0x6000, 0x6004, 0x6000, 0x6000, 0x6010,
+                     0x6014, 0x6010, 0x6010, 0x6018, 0x6010, 0x6000, 0 };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        int ei = lineWith(L, "elif b:");
+        CHECK(ei >= 0);
+        if (ei >= 0) {
+            CHECK(L[(size_t)ei].find_first_not_of(' ') == 4);
+            CHECK(py.lineVA[(size_t)ei] == 0x6010);
+        }
+        CHECK(lineWith(L, "        if b:") < 0);
+        CHECK(lineWith(L, "    else:") >= 0); // nested conditional's final else is retained
+    }
+
+    // Do not fold an else whose nested if is followed by another outer-suite
+    // statement; doing so would incorrectly make that statement conditional.
+    {
+        DecompResult c{
+            "int keep_nested(a)\n"
+            "{\n"
+            "    if (a) {\n"
+            "        return 1;\n"
+            "    }\n"
+            "    else {\n"
+            "        if (b) {\n"
+            "            use();\n"
+            "        }\n"
+            "        cleanup();\n"
+            "    }\n"
+            "}\n",
+            std::vector<uint64_t>(12, 0)
+        };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(lineWith(L, "elif b:") < 0);
+        CHECK(lineWith(L, "        if b:") >= 0);
+        CHECK(lineWith(L, "        cleanup()") >= 0);
+        CHECK(py.lineVA.size() == L.size());
+    }
+
+    // A continue in the generic Python while form of a C for-loop must execute
+    // the hoisted step first, just as the original for-loop does.
+    {
+        DecompResult c{
+            "int loop()\n"
+            "{\n"
+            "    for (; i < 10; i++) {\n"
+            "        if (skip) continue;\n"
+            "        consume(i);\n"
+            "    }\n"
+            "}\n",
+            { 0, 0, 0x7000, 0x7004, 0x7008, 0x700C, 0 }
+        };
+        DecompResult py = DecompileToPython(c);
+        std::vector<std::string> L = splitLines(py.text);
+        CHECK(py.lineVA.size() == L.size());
+        int iff = lineWith(L, "if skip:");
+        CHECK(iff >= 0 && (size_t)(iff + 2) < L.size());
+        if (iff >= 0 && (size_t)(iff + 2) < L.size()) {
+            CHECK(trimmed(L[(size_t)iff + 1]) == "i += 1");
+            CHECK(trimmed(L[(size_t)iff + 2]) == "continue");
+            CHECK(py.lineVA[(size_t)iff + 1] == 0x7000);
+            CHECK(py.lineVA[(size_t)iff + 2] == 0x7004);
+        }
+        int steps = 0;
+        for (const std::string& l : L) if (trimmed(l) == "i += 1") ++steps;
+        CHECK(steps == 2); // continue path + normal bottom-of-loop path
+    }
+
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     std::printf("decompiler_python_test: all checks passed\n");
     return 0;

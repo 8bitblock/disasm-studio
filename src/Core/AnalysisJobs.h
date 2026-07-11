@@ -14,9 +14,12 @@
 #include "Decompiler.h"   // DecompResult (DecompileRegion's text + per-line VA map)
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ds {
@@ -26,8 +29,18 @@ class IDisassembler;
 struct XrefIndex;
 struct AlgoMatch;
 
-// One extracted printable string (parallels BinaryViewTab::Strng).
-struct StrResult { uint64_t address = 0; std::string text; bool wide = false; };
+// A corrupt/resource-heavy image can contain millions of tiny runs. Keep scans
+// bounded at a high, explicit limit which the clipper-rendered UI can handle.
+inline constexpr size_t kDefaultStringScanCap = 100000;
+
+// One extracted printable string (parallels BinaryViewTab::Strng). A pathological
+// individual run is retained as a bounded prefix; textTruncated makes that honest.
+struct StrResult {
+    uint64_t    address       = 0;
+    std::string text;
+    bool        wide          = false;
+    bool        textTruncated = false;
+};
 
 // One discovered + optionally heuristically-named function
 // (parallels BinaryViewTab::Func plus its guessReason_ entry).
@@ -37,6 +50,7 @@ struct FuncResult {
     std::string name;
     bool        guessed = false;
     std::string reason;   // basis for a guessed name (tooltip); "" when not guessed
+    bool        isExport = false; // authoritative loader/PDB-style name; never replace
 };
 
 // One row of the full-program listing index (parallels BinaryViewTab::ListRow).
@@ -51,21 +65,33 @@ struct AnalyzeOut {
     std::string             summary;
 };
 
-// Extract ASCII/UTF-8 + UTF-16LE printable runs (>= 4 chars) from the file image,
-// mapping offsets through offsetToVA. Returned sorted by address, capped at `cap`.
-// This is the FILE-mode scan only; the live/debuggee scan stays on the UI thread.
+// Immutable address->display-name snapshot supplied to an off-thread decompile.
+// The UI builds this from discovered/guessed functions plus analyst renames, so
+// the worker never reaches into mutable tab/project state.
+using DecompileNameMap = std::unordered_map<uint64_t, std::string>;
+
+// Extract ASCII/UTF-8 + UTF-16LE printable runs (>= 4 characters) from the file
+// image, mapping offsets through offsetToVA. Returned sorted by address and capped.
+// `truncated`, when non-null, reports that additional results existed past the cap.
+// This is the FILE-mode scan; live/debuggee buffers use ScanStringsBuffer on the
+// LiveScanService worker.
 // `progress`, when non-null, is set to the number of image bytes scanned so far
 // (a background worker publishes it for a progress bar; never read by this fn).
-std::vector<StrResult> ScanStringsImage(const BinaryFile& bin, size_t cap = 20000,
-                                        std::atomic<uint32_t>* progress = nullptr);
+std::vector<StrResult> ScanStringsImage(const BinaryFile& bin,
+                                        size_t cap = kDefaultStringScanCap,
+                                        std::atomic<uint32_t>* progress = nullptr,
+                                        bool* truncated = nullptr);
 
 // Append ASCII/UTF-8 + UTF-16LE printable runs (>= 4 chars) found in the raw buffer
 // [d, d+n) to `out`, mapping a buffer offset k to the virtual address (base + k).
-// Stops once `out` reaches `cap`. This is the buffer primitive behind the live
-// (debuggee-memory) string scan, run on the LiveScanService worker. The caller
+// Stops once `out` reaches `cap`. `truncated`, when non-null, reports that this
+// buffer contained an additional result which did not fit. This is the primitive
+// behind the live (debuggee-memory) scan on the LiveScanService worker. The caller
 // sorts/de-dups across buffers. Pure (no UI/Win32).
 void ScanStringsBuffer(const uint8_t* d, size_t n, uint64_t base,
-                       std::vector<StrResult>& out, size_t cap = 20000);
+                       std::vector<StrResult>& out,
+                       size_t cap = kDefaultStringScanCap,
+                       bool* truncated = nullptr);
 
 // Discover functions (FunctionAnalyzer) and, when `guessNames`, apply the heuristic
 // namer (FunctionNamer) using the binary's imports + the provided strings. `strings`
@@ -105,12 +131,14 @@ std::vector<AlgoMatch> ScanAlgorithmsJob(const BinaryFile& bin, const XrefIndex*
 
 // Decompile the function in [lo, hi) to structured pseudo-C off the UI thread (the
 // K_Decompile pass). Mirrors BinaryViewTab::decompileFunctionText's pipeline (BuildCFG
-// then Decompile), but resolves call/data names with BASE resolution only — imported
-// API names from bin.imports() and inline string literals — because the worker can't
-// see the UI's user renames or jump-table heuristics. `x86` gates the arg-header (set
-// false for non-x86 so no spurious params are listed). Returns {"",{}} if [lo,hi) is
-// unmapped. The per-line VA map (DecompResult::lineVA) backs pseudocode->asm clicks.
+// then Decompile). Base import/string resolution is always available; an optional
+// immutable name snapshot adds user, discovered, and guessed names without sharing
+// mutable UI state. `signature` supplies the inferred header and `x86` gates x86-only
+// argument analysis. [lo,hi) is an exact exclusive interval and is never read past.
+// Returns {"",{}} when it is empty/unmapped. lineVA backs pseudocode->assembly clicks.
 DecompResult DecompileRegion(const BinaryFile& bin, IDisassembler& dis,
-                             bool x86, uint64_t lo, uint64_t hi);
+                             bool x86, uint64_t lo, uint64_t hi,
+                             const DecompileNameMap* names = nullptr,
+                             std::string_view signature = {});
 
 } // namespace ds

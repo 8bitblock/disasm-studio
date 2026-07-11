@@ -63,6 +63,10 @@ public:
     // Cached on first use (at load, before any patch) so writeImage() patches do
     // not change the key and split a binary's saved analysis across two sidecars.
     uint64_t                    contentHash() const;
+    // Monotone in-memory image generation. Unlike contentHash(), this changes on
+    // load/clear and every successful writeImage(), so derived views can invalidate
+    // analysis after a patch without changing the persistence key.
+    uint64_t                    imageRevision() const { return imageRevision_; }
 
     // Translate a virtual address to a pointer into the loaded image, or null.
     const uint8_t* ptrFromVA(uint64_t va, size_t& availOut) const;
@@ -141,6 +145,7 @@ private:
     std::string          path_;
     std::vector<uint8_t> data_;
     std::vector<Section> sections_;
+    uint64_t             imageRevision_ = 1;
     mutable uint64_t     hash_      = 0;       // cached contentHash of the pristine file
     mutable bool         hashValid_ = false;   // false until first contentHash() / reset by clear()
     BinFormat            format_     = BinFormat::Unknown;

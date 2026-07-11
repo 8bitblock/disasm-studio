@@ -80,6 +80,7 @@ struct AnalysisResult {
     uint64_t moduleBase = 0;     // which module this result is for (0 = single binary)
 
     std::vector<StrResult>  strings;       bool stringsValid = false;
+    bool                    stringsTruncated = false; // hit kDefaultStringScanCap
     std::vector<FuncResult> functions;     bool funcsValid   = false;
     std::string             summary;
     std::vector<ListRowR>   listRows;      bool listingValid = false;
@@ -92,6 +93,7 @@ struct AnalysisResult {
     std::string             decompText;    bool decompValid  = false;  // K_Decompile (pseudocode) result
     std::vector<uint64_t>   decompLineVA;  // per-line source VAs (DecompResult::lineVA)
     uint64_t                decompVA      = 0;                          // function start the pseudocode is for
+    uint64_t                decompContext = 0; // caller name generation; rejects stale renamed output
     uint64_t                regionLo = 0, regionHi = 0;                // the region these targeted
 };
 
@@ -111,12 +113,15 @@ public:
     uint64_t bumpEpoch()   { return epoch_.fetch_add(1, std::memory_order_acq_rel) + 1; }
 
     // Queue (and coalesce) a bulk job for `moduleBase` (0 = the single loaded
-    // binary). A pending-but-unstarted request for the same module is merged: the
-    // kinds are OR'd and the newest binary/engine/arch/guess/epoch win. Different
-    // modules queue independently and fan out across the worker pool.
+    // binary). A compatible pending request for the same module is merged: kinds
+    // are OR'd and newest settings win. Different targeted kinds (Synthesis, Path
+    // Explore, Decompile) stay separate because each owns a distinct address range.
+    // Different modules queue independently and fan out across the worker pool.
     void requestBulk(const BinaryFile* bin, Engine engine, Arch arch,
                      uint32_t kinds, bool guessNames, uint64_t epoch,
-                     uint64_t moduleBase = 0, uint64_t regionLo = 0, uint64_t regionHi = 0);
+                     uint64_t moduleBase = 0, uint64_t regionLo = 0, uint64_t regionHi = 0,
+                     std::shared_ptr<const DecompileNameMap> decompNames = {},
+                     std::string decompSignature = {}, uint64_t decompContext = 0);
 
     // Non-blocking: move the next finished result out, if any. The pool delivers one
     // result PER PASS, so the caller should drain in a loop each frame and still
@@ -157,6 +162,9 @@ private:
         uint64_t          epoch  = 0;
         uint64_t          modBase = 0;
         uint64_t          regionLo = 0, regionHi = 0;   // K_Synthesis / K_PathExplore target
+        std::shared_ptr<const DecompileNameMap> decompNames; // immutable UI name snapshot
+        std::string       decompSignature;
+        uint64_t          decompContext = 0;
     };
 
     void threadMain();

@@ -30,6 +30,7 @@ struct PaletteSymbol {
     uint64_t    addr;
     std::string name;
     std::string lower;   // pre-lowercased for FuzzyScore
+    bool        live = false; // runtime symbol -> gotoAddressLive, else static/file VA
 };
 
 class CommandPalette {
@@ -40,7 +41,7 @@ public:
     void render(AppContext& ctx);   // call once per frame, after the main UI
 
 private:
-    struct Result { int score; int kind; int idx; uint64_t va; };  // kind: 0=action 1=symbol 2=goto-address
+    struct Result { int score; int kind; int idx; uint64_t va; bool live = false; }; // kind: 0=action 1=symbol 2=goto-address
 
     void rebuildResults();
 

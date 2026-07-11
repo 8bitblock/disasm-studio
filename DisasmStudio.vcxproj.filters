@@ -39,6 +39,9 @@
     <ClCompile Include="src\Core\JvmAnnotate.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\XrefIndex.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\Report.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Cortex.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\Prism.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\PrismSampler.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Disasm\ZydisDisassembler.cpp"><Filter>Source\Disasm</Filter></ClCompile>
     <ClCompile Include="src\Disasm\CapstoneDisassembler.cpp"><Filter>Source\Disasm</Filter></ClCompile>
     <ClCompile Include="src\Disasm\DisassemblerFactory.cpp"><Filter>Source\Disasm</Filter></ClCompile>
@@ -49,6 +52,8 @@
     <ClCompile Include="src\Tabs\MemoryToolsTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryDiffTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryTechTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\CortexTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\PrismTab.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Hv\HvDbgClient.cpp"><Filter>Source\Hv</Filter></ClCompile>
     <ClCompile Include="src\Hv\HvDbgLoader.cpp"><Filter>Source\Hv</Filter></ClCompile>
   </ItemGroup>
@@ -83,6 +88,9 @@
     <ClInclude Include="src\Core\JvmAnnotate.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\XrefIndex.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\Report.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Cortex.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\Prism.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\PrismSampler.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Tabs\DataRef.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Core\StepLogic.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\ProcessManager.h"><Filter>Headers\Core</Filter></ClInclude>
@@ -100,6 +108,8 @@
     <ClInclude Include="src\Tabs\MemoryToolsTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Tabs\BinaryDiffTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Tabs\BinaryTechTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\CortexTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\PrismTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Hv\HvDbgClient.h"><Filter>Headers\Hv</Filter></ClInclude>
     <ClInclude Include="src\Hv\HvDbgLoader.h"><Filter>Headers\Hv</Filter></ClInclude>
     <ClInclude Include="src\Hv\HvDbgProtocol.h"><Filter>Headers\Hv</Filter></ClInclude>

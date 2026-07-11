@@ -123,6 +123,25 @@ src/Core/
                         and a password/serial/license check-method verdict. Confidence + evidence per finding.
   Project.* / Json.*    Per-binary analysis persistence (JSON sidecar) + tiny JSON lib.
   TechScan.*            Capability detection from imports/sections/byte-patterns (multi-hit; testable).
+  Cortex.*              RE-brain (additions.md #3): PURE reasoning layer over the other analyzers' output
+                        (TechScan caps + AlgoScan matches + FunctionNamer guesses + FuncAnnotate per-function
+                        summaries/patterns via CortexInput::funcInfo + imports/strings) -> plain-English
+                        headline/verdict, merged per-category behaviours (confidence+evidence), per-function
+                        briefs (prefer the FuncAnnotate summary/patterns; carry calling convention) + a ranked
+                        highlights list, and a deterministic keyword-routed AskCortex() "chat with the binary"
+                        (incl. per-function lookup: "what does sub_401500 / 0x.. do?"). RenderCortexMarkdown for
+                        export. No model dependency — the LLM-backend seam is AskCortex()/the verdict text.
+                        Testable (cortex_test); CortexTab drives it (builds the FuncAnnotations, bounded to 200).
+  Prism.* / PrismSampler.*  Explanatory profiler (additions.md #5). Prism.* is the PURE aggregation+explanation
+                        layer: symbolized stack samples -> self/inclusive hot-function table, thread-state
+                        breakdown (running/waiting/lock-contention/allocation/io/gpu via top-frame keyword
+                        classification), PER-THREAD breakdown (each thread's dominant state + hottest leaf),
+                        PER-MODULE self-time, an over-time timeline (30 buckets by PrismSample::timeMs; empty
+                        when untimed), hot call paths, and a "where the time goes / what to fix" verdict
+                        (testable, prism_test). PrismSampler.* is the thin Win32 layer: a background thread that
+                        suspends each target-process thread, StackWalk64s it (DbgHelpMutex, like Debugger::
+                        unwindStack), symbolizes to "module!function", stamps GetTickCount64, and appends
+                        PrismSamples. x64 targets only. PrismTab shows the timeline strip + threads/modules columns.
   FunctionAnalyzer.* / SymbolResolver.* / Cond.* / ProcessManager.* / StepLogic.h
 src/Disasm/             IDisassembler + Zydis/Capstone/JVM backends, factory, Keystone assembler.
 src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 lines).

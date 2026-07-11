@@ -158,6 +158,9 @@
     <ClCompile Include="src\Core\PathExploreJob.cpp" />
     <ClCompile Include="src\Core\PatchCompiler.cpp" />
     <ClCompile Include="src\Core\Report.cpp" />
+    <ClCompile Include="src\Core\Cortex.cpp" />
+    <ClCompile Include="src\Core\Prism.cpp" />
+    <ClCompile Include="src\Core\PrismSampler.cpp" />
     <ClCompile Include="src\Disasm\ZydisDisassembler.cpp" />
     <ClCompile Include="src\Disasm\CapstoneDisassembler.cpp" />
     <ClCompile Include="src\Disasm\DisassemblerFactory.cpp" />
@@ -171,6 +174,8 @@
     <ClCompile Include="src\Tabs\MemoryToolsTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryDiffTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryTechTab.cpp" />
+    <ClCompile Include="src\Tabs\CortexTab.cpp" />
+    <ClCompile Include="src\Tabs\PrismTab.cpp" />
     <ClCompile Include="src\Hv\HvDbgClient.cpp" />
     <ClCompile Include="src\Hv\HvDbgLoader.cpp" />
   </ItemGroup>
@@ -254,6 +259,11 @@
     <ClInclude Include="src\Tabs\MemoryToolsTab.h" />
     <ClInclude Include="src\Tabs\BinaryDiffTab.h" />
     <ClInclude Include="src\Tabs\BinaryTechTab.h" />
+    <ClInclude Include="src\Tabs\CortexTab.h" />
+    <ClInclude Include="src\Tabs\PrismTab.h" />
+    <ClInclude Include="src\Core\Cortex.h" />
+    <ClInclude Include="src\Core\Prism.h" />
+    <ClInclude Include="src\Core\PrismSampler.h" />
     <ClInclude Include="src\Hv\HvDbgClient.h" />
     <ClInclude Include="src\Hv\HvDbgLoader.h" />
     <ClInclude Include="src\Hv\HvDbgProtocol.h" />

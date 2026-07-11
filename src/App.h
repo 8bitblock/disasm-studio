@@ -32,6 +32,10 @@ class BinaryViewTab;
 struct AppContext {
     BinaryFile                     binary;
     Debugger                       debug;
+    // Borrowed for the duration of App::render(): lets the active tab reuse the
+    // toolbar/status snapshot instead of deep-copying debugger vectors again.
+    // Null outside rendering (and in standalone tab tests).
+    const DbgSnapshot*             frameDebugSnapshot = nullptr;
     // Live-memory scan worker pool (process string scan / xref sweep / module-image
     // reads, off the render thread). Declared AFTER `debug` so its dtor joins the
     // workers before the Debugger — whose readMemoryMasked the workers call — is gone.

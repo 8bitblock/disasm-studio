@@ -27,6 +27,10 @@ call :one techscan_multi_test    "src\Core\TechScan.cpp src\Core\JavaScan.cpp sr
 call :one jvmaware_test          ""
 call :one excname_test           ""
 call :one functionanalyzer_test  "src\Core\FunctionAnalyzer.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp"
+call :one function_namer_test    "src\Core\FunctionNamer.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp"
+call :one function_namer_pipeline_test "src\Core\FunctionNamer.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp"
+call :one analysis_service_test  "src\Core\AnalysisService.cpp src\Core\AnalysisJobs.cpp src\Core\XrefIndex.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\FunctionAnalyzer.cpp src\Core\FunctionNamer.cpp src\Core\AlgoScan.cpp src\Core\SigMatch.cpp src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp src\Core\SynthesisJob.cpp src\Core\Synthesis.cpp src\Core\PathExploreJob.cpp src\Core\PathExplore.cpp src\Core\ExprAst.cpp src\Core\SymEngine.cpp src\Core\Simplify.cpp src\Disasm\JvmDisassembler.cpp"
+call :one livescan_service_test  "src\Core\LiveScanService.cpp src\Core\AnalysisJobs.cpp src\Core\XrefIndex.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\FunctionAnalyzer.cpp src\Core\FunctionNamer.cpp src\Core\AlgoScan.cpp src\Core\SigMatch.cpp src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp"
 call :one jvmclass_test          "src\Core\JvmClass.cpp"
 call :one jvmdisasm_test         "src\Core\JvmClass.cpp src\Disasm\JvmDisassembler.cpp src\Core\CFG.cpp"
 call :one jvmload_test           "src\Core\JvmClass.cpp src\Core\BinaryFile.cpp src\Core\FunctionAnalyzer.cpp src\Disasm\JvmDisassembler.cpp"
@@ -45,6 +49,8 @@ call :one dataflow_decomp_test    "src\Core\CFG.cpp src\Core\Decompiler.cpp src\
 call :one decompiler_tempname_test "src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp"
 call :one decompiler_folder_test  "src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp"
 call :one funcannotate_test       "src\Core\FuncAnnotate.cpp src\Core\CFG.cpp"
+call :one cortex_test             "src\Core\Cortex.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp"
+call :one prism_test              "src\Core\Prism.cpp"
 
 echo.
 if %FAILED%==0 ( echo ===== ALL TEST BINARIES PASSED ===== ) else ( echo ===== %FAILED% TEST BINARIES FAILED ===== )

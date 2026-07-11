@@ -7,6 +7,7 @@
 #include "../Core/AnalysisService.h"
 #include "../Core/Report.h"
 #include "../Core/ProcessManager.h"
+#include "../Core/SigMatch.h"
 #include "../Core/SynthesisJob.h"   // F1 synthesize a region
 #include "../Core/PatchCompiler.h"  // F2 compile editor source -> bytes
 #include "../Core/PatchPlacer.h"    // F2 cave-finder + detour placement
@@ -28,6 +29,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <unordered_set>
 
 namespace ds {
@@ -39,6 +41,33 @@ static bool hasBreakpoint(const std::unordered_set<uint64_t>& bps, uint64_t a) {
 static bool hasBreakpoint(const DbgSnapshot& snap, uint64_t a) {
     return std::find_if(snap.breakpoints.begin(), snap.breakpoints.end(),
                         [a](const SwBreakpointInfo& bp) { return bp.address == a; }) != snap.breakpoints.end();
+}
+
+static uint64_t debugModuleSignature(const DbgSnapshot& snap) {
+    uint64_t sig = (uint64_t)snap.modules.size() * 0x9E3779B97F4A7C15ull;
+    for (const DbgModule& module : snap.modules) {
+        uint64_t nameHash = 1469598103934665603ull;
+        const std::string& identity = module.path.empty() ? module.name : module.path;
+        for (unsigned char c : identity) nameHash = (nameHash ^ c) * 1099511628211ull;
+        sig ^= (module.base * 0xD6E8FEB86659FD93ull) ^
+               (module.size * 0xA0761D6478BD642Full) ^ nameHash;
+    }
+    return sig;
+}
+
+// Allocation-free ASCII case-insensitive substring search for large side-panel
+// filters. Non-ASCII UTF-8 bytes compare exactly, so valid UTF-8 text remains safe.
+static bool containsAsciiInsensitive(const std::string& haystack, const char* needle) {
+    if (!needle || !needle[0]) return true;
+    const char* first = haystack.data();
+    const char* last  = first + haystack.size();
+    const char* nlast = needle + std::strlen(needle);
+    return std::search(first, last, needle, nlast, [](char a, char b) {
+        const unsigned char ua = (unsigned char)a, ub = (unsigned char)b;
+        if (ua < 0x80 && ub < 0x80)
+            return std::tolower(ua) == std::tolower(ub);
+        return ua == ub;
+    }) != last;
 }
 
 // Turn a space-separated hex byte string ("48 89 5C") into a C initializer
@@ -678,7 +707,7 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
     }
     // Launch-and-debug the loaded binary straight from the static view (breaks at
     // the entry point). Only shown when there's nothing attached yet.
-    if (!ctx.debug.snapshot().attached()) {
+    if (!frameSnap_->attached()) {
         const bool canLaunch = ctx.binaryLaunchable();
         ImGui::BeginDisabled(!canLaunch);
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.42f, 0.24f, 1.0f));
@@ -752,8 +781,9 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
 // the background-worker adopt path so the two agree on when listRows_ is current.
 uint64_t BinaryViewTab::listingSig(AppContext& ctx) const {
     return (ctx.binary.loaded() ? ctx.binary.contentHash() : 0)
-         ^ ((uint64_t)functions_.size() << 1)
-         ^ ((uint64_t)strings_.size() << 20)
+         ^ (functionsGen_ * 0xD6E8FEB86659FD93ull)
+         ^ (stringsGen_ * 0x9E3779B97F4A7C15ull)
+         ^ (stringsLive_ ? 0x51A17E5ull : 0ull)
          ^ ((uint64_t)ctx.arch << 40)
          ^ ((uint64_t)(ctx.disasm ? ctx.disasm->engine() : Engine::Zydis) << 44);
 }
@@ -776,8 +806,9 @@ void BinaryViewTab::buildFullListing(AppContext& ctx) {
     for (const auto& f : functions_) funcStarts.insert(f.address);
 
     // Strings sorted by address, consumed per data section below (ascending).
-    std::vector<int> strOrder(strings_.size());
-    for (int i = 0; i < (int)strings_.size(); ++i) strOrder[i] = i;
+    const size_t staticStringCount = stringsLive_ ? 0 : strings_.size();
+    std::vector<int> strOrder(staticStringCount);
+    for (int i = 0; i < (int)staticStringCount; ++i) strOrder[i] = i;
     std::sort(strOrder.begin(), strOrder.end(),
               [&](int a, int b) { return strings_[a].address < strings_[b].address; });
 
@@ -806,7 +837,9 @@ void BinaryViewTab::buildFullListing(AppContext& ctx) {
                 ++listInsnCount_;
                 off += ok ? in.length : 1;
             }
-            if (listInsnCount_ >= kCap) break;
+            // The instruction cap must not hide strings in later data sections.
+            // Subsequent executable sections naturally contribute no rows once the
+            // budget is exhausted, but the outer section walk continues.
         } else {
             // Data section: emit a row per known string literal inside its VA span,
             // so navigating to a string lands on a real, visible row.
@@ -1326,12 +1359,11 @@ void BinaryViewTab::renderJavaTab(AppContext& ctx) {
 
 uint64_t BinaryViewTab::gameContextSig(AppContext& ctx) const {
     uint64_t h = ctx.binary.loaded() ? ctx.binary.contentHash() : 0;
-    h ^= (uint64_t)strings_.size() << 1;
-    h ^= (uint64_t)functions_.size() << 17;
+    h ^= stringsGen_ * 0x9E3779B97F4A7C15ull;
+    h ^= functionsGen_ * 0xD6E8FEB86659FD93ull;
     h ^= (uint64_t)algos_.size() << 33;
     h ^= (uint64_t)namesGen_ << 49;
     h ^= stringsLive_ ? 0xA51D0001ull : 0;
-    if (!strings_.empty()) h ^= strings_.front().address ^ (strings_.back().address << 7);
     if (!functions_.empty()) h ^= functions_.front().address ^ (functions_.back().address << 11);
     if (!algos_.empty()) h ^= algos_.front().address ^ (algos_.back().address << 13);
     if (ctx.runtimeInfo.wrapperLikely) {
@@ -1351,11 +1383,13 @@ const GameContextReport& BinaryViewTab::gameContextFor(AppContext& ctx) {
     for (const Strng& s : strings_) in.strings.push_back({ s.address, s.text, s.wide });
     in.functions.reserve(functions_.size());
     for (const Func& f : functions_) {
-        std::string nm = annName(ctx, f.address);
-        if (nm.empty()) nm = f.name;
+        std::string overrideName = annName(ctx, f.address);
+        const bool shownGuess = f.guessed && overrideName.empty();
+        std::string nm = overrideName.empty() ? f.name : overrideName;
         std::string reason;
-        if (auto it = guessReason_.find(f.address); it != guessReason_.end()) reason = it->second;
-        in.functions.push_back({ f.address, f.size, nm, f.guessed, reason });
+        if (shownGuess)
+            if (auto it = guessReason_.find(f.address); it != guessReason_.end()) reason = it->second;
+        in.functions.push_back({ f.address, f.size, nm, shownGuess, reason, f.isExport });
     }
     in.algorithms = algos_;
     gameCtx_ = BuildGameContext(in);
@@ -1844,8 +1878,10 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
             if (std::find_if(functions_.begin(), functions_.end(), [&](const Func& f){ return f.address == in.address; }) == functions_.end()) {
                 char nm[28]; std::snprintf(nm, sizeof(nm), "sub_%llX", (unsigned long long)in.address);
                 functions_.push_back({ in.address, nm, 0 });
+                ++functionsGen_;        // listing divider membership changed
                 listBuilt_ = false;       // refresh function dividers in the listing
                 funcIndexDirty_ = true;   // keep the sorted lookup index in sync
+                invalidateNameDependentCaches(); // refilter/reindex + refresh named pseudocode
                 ++liveGen_;               // invalidate the cached live decode (divider set)
             }
         }
@@ -2001,7 +2037,7 @@ static void drawAnalysisProgress(AppContext& ctx, bool withCancel) {
 }
 
 void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     if (listRows_.empty()) {
         if (ctx.analysis.bulkPending()) drawAnalysisProgress(ctx, true);
         else ImGui::TextDisabled("No executable code found (try Functions > Analyze, or a different arch).");
@@ -2101,7 +2137,8 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                     char addrLbl[40]; std::snprintf(addrLbl, sizeof(addrLbl), "  0x%llX", (unsigned long long)row.addr);
                     if (ImGui::Selectable(addrLbl, false, ImGuiSelectableFlags_SpanAllColumns)) navigateTo(row.addr);
                     ImGui::TableSetColumnIndex(4);
-                    ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), st.wide ? "L\"%s\"" : "\"%s\"", st.text.c_str());
+                    ImGui::TextColored(theme::col::warn(), st.wide ? "L\"%s%s\"" : "\"%s%s\"",
+                                       st.text.c_str(), st.textTruncated ? "..." : "");
                     ImGui::PopID();
                 } else {
                     // Decode once per address and memoize: a fast scroll otherwise
@@ -2148,30 +2185,63 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
         ImGui::TextDisabled("Load a binary to disassemble (File > Open Binary).");
         return;
     }
-    uint64_t va = cursorVA_;
-    size_t size = 0;
-    const uint8_t* p = codeWindow(ctx, va, size);
-    if (cursorVA_ == 0) cursorVA_ = va;
-    if (!p) { ImGui::TextDisabled("Cursor address is not mapped to file data."); return; }
+    const DbgSnapshot& snap = *frameSnap_;
+    const uint64_t windowKey = ctx.binary.contentHash()
+                             ^ (ctx.binary.imageRevision() * 0x9E3779B97F4A7C15ull)
+                             ^ (functionsGen_ * 0xD6E8FEB86659FD93ull)
+                             ^ ((uint64_t)ctx.arch << 40)
+                             ^ ((uint64_t)ctx.disasm->engine() << 44);
+    if (asmWindowKey_ != windowKey || asmWindowCursor_ != cursorVA_) {
+        uint64_t va = cursorVA_;
+        size_t size = 0;
+        const uint8_t* p = codeWindow(ctx, va, size);
+        if (cursorVA_ == 0) cursorVA_ = va;
+        if (!p) {
+            asmWindowInsns_.clear(); asmWindowFuncSet_.clear();
+            asmWindowKey_ = windowKey; asmWindowCursor_ = cursorVA_;
+        } else {
+            // Back up so the focused line isn't pinned to the top. The sorted
+            // function index turns the old full functions_ scan into a logarithmic
+            // lookup on each (now infrequent) cache rebuild.
+            uint64_t fanchor = 0;
+            if (const Func* f = funcContaining(cursorVA_);
+                f && f->address <= cursorVA_ && cursorVA_ - f->address <= 192)
+                fanchor = f->address;
+            uint64_t winStart = alignBinaryStart(ctx.binary, *ctx.disasm, cursorVA_, 192, fanchor);
+            size_t avail2 = 0;
+            const uint8_t* wp = ctx.binary.ptrFromVA(winStart, avail2);
+            if (!wp) { wp = p; winStart = va; avail2 = size; }
 
-    // Back up so the focused line isn't pinned to the top (show a screenful above it).
-    // Anchor the window to the nearest analyzed function start within the lookback
-    // so context rows above the cursor decode from a real boundary, not a guess.
-    uint64_t fanchor = 0;
-    for (const auto& f : functions_)
-        if (f.address <= cursorVA_ && cursorVA_ - f.address <= 192 && f.address > fanchor) fanchor = f.address;
-    uint64_t winStart = alignBinaryStart(ctx.binary, *ctx.disasm, cursorVA_, 192, fanchor);
-    size_t avail2 = 0;
-    const uint8_t* wp = ctx.binary.ptrFromVA(winStart, avail2);
-    if (!wp) { wp = p; winStart = va; avail2 = size; }
-
-    DbgSnapshot snap = ctx.debug.snapshot();
-    auto insns = ctx.disasm->disassemble(wp, std::min<size_t>(avail2, 4096), winStart, 256);
-
-    // Function starts (call targets + analyzed functions) -> "sub_X" dividers.
-    std::unordered_set<uint64_t> funcSet;
-    for (const auto& in : insns) if (in.isCall && in.branchTarget) funcSet.insert(in.branchTarget);
-    for (const auto& f : functions_) funcSet.insert(f.address);
+            asmWindowInsns_ = ctx.disasm->disassemble(
+                wp, std::min<size_t>(avail2, 4096), winStart, 256);
+            asmWindowFuncSet_.clear();
+            asmWindowFuncSet_.reserve(64);
+            for (const auto& in : asmWindowInsns_)
+                if (in.isCall && in.branchTarget) asmWindowFuncSet_.insert(in.branchTarget);
+            // Only starts inside this 256-row window can become dividers. The old
+            // cache rebuild inserted every discovered function, making each cursor
+            // move O(all functions) on large binaries despite rendering 256 rows.
+            if (!funcIndex_.empty() && !asmWindowInsns_.empty()) {
+                const uint64_t firstVA = asmWindowInsns_.front().address;
+                const Instruction& last = asmWindowInsns_.back();
+                const uint64_t lastLen = last.length ? (uint64_t)last.length : 1ull;
+                const uint64_t endVA = last.address > UINT64_MAX - lastLen
+                                     ? UINT64_MAX : last.address + lastLen;
+                auto fit = std::lower_bound(funcIndex_.begin(), funcIndex_.end(),
+                                             std::make_pair(firstVA, (std::numeric_limits<int>::min)()));
+                for (; fit != funcIndex_.end() && fit->first < endVA; ++fit)
+                    asmWindowFuncSet_.insert(fit->first);
+            }
+            asmWindowKey_ = windowKey;
+            asmWindowCursor_ = cursorVA_;
+        }
+    }
+    if (asmWindowInsns_.empty()) {
+        ImGui::TextDisabled("Cursor address is not mapped to file data.");
+        return;
+    }
+    const auto& insns = asmWindowInsns_;
+    const auto& funcSet = asmWindowFuncSet_;
 
     // Reset the per-frame branch-arrow + row-glow geometry sinks (filled inside renderAsmRow).
     asmFlow_.clear(); rowGlow_.clear(); asmGotLaneX_ = asmGotAddrX_ = false;
@@ -2200,7 +2270,7 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
         const std::string hoverTok = hoverToken_;
         std::string nextHoverTok;
         bool firstRow = true;
-        for (auto& in : insns) {
+        for (const auto& in : insns) {
             if (!firstRow && funcSet.count(in.address)) renderAsmFuncHeader(ctx, in.address);
             firstRow = false;
             renderAsmRow(ctx, in, snap, hoverTok, nextHoverTok, /*autoScrollHere=*/true);
@@ -2392,8 +2462,10 @@ void BinaryViewTab::revertPatchAt(AppContext& ctx, uint64_t va) {
     }
     // As in applyPatchBytes: no synchronous UI listing sweep — the worker rebuilds
     // off-thread via functionsDirty_, and visible rows re-decode the restored bytes.
-    pseudoVA_ = 0; decompVA_ = 0; functionsDirty_ = true;
+    pseudoVA_ = 0; decompVA_ = 0; decompValid_ = false; functionsDirty_ = true;
     decompPending_ = false; decompLru_.clear();   // reverted bytes: cached pseudo-C is stale
+    xrefIndex_.clear(); xrefIndexSig_ = ~0ull;
+    algos_.clear(); algosScanned_ = false; algoSel_ = -1;
     ++liveGen_;   // a live byte changed: invalidate the cached live decode
     char tm[64];
     std::snprintf(tm, sizeof(tm), "Reverted patch at 0x%llX.", (unsigned long long)fileVA);
@@ -2409,10 +2481,12 @@ void BinaryViewTab::analyzeFunctions(AppContext& ctx) {
     auto found = fa.analyze(ctx.binary, *ctx.disasm);
     functions_.clear();
     functions_.reserve(found.size());
-    for (auto& f : found) functions_.push_back({ f.address, f.name, f.size, false });
+    for (auto& f : found) functions_.push_back({ f.address, f.name, f.size, false, f.isExport });
+    ++functionsGen_;
     fnSummary_ = fa.lastSummary();
     funcIndexDirty_ = true;   // function set changed: rebuild the sorted lookup index
     guessFunctionNames(ctx);  // give anonymous sub_ functions meaningful guessed names
+    invalidateNameDependentCaches(); // also drops old guessed names from pseudocode/picker
     ++liveGen_;               // ...and invalidate the cached live decode (divider set)
 }
 
@@ -2430,7 +2504,7 @@ void BinaryViewTab::guessFunctionNames(AppContext& ctx) {
 
     std::vector<NamerInput> in;
     in.reserve(functions_.size());
-    for (auto& f : functions_) in.push_back({ f.address, f.size, false, f.name });
+    for (auto& f : functions_) in.push_back({ f.address, f.size, f.isExport, f.name });
 
     // Imports: an IAT-slot / import-target VA -> "dll.func". Restricted to the
     // import map so the guesser never recurses into the sub_ names we're replacing.
@@ -2496,13 +2570,28 @@ const BinaryViewTab::Func* BinaryViewTab::funcContaining(uint64_t addr) {
 // Live mode (stringsLive_) walks the attached process's committed memory and uses
 // the region base + offset directly. Usage is cross-referenced via "Find references".
 void BinaryViewTab::scanStrings(AppContext& ctx) {
+    strings_.clear();
+    ++stringsGen_;
+    stringsScanned_ = false;
+    stringsScanning_ = false;
+    stringsTruncated_ = false;
+    stringsToken_ = 0; // any older live result can no longer match
+
+    // Existing code/divider rows remain useful while the worker scans, but every
+    // string row indexes the old strings_ vector. Remove only those rows and stamp
+    // the new signature so the render thread never falls back to a decode sweep.
+    listRows_.erase(std::remove_if(listRows_.begin(), listRows_.end(),
+                    [](const ListRow& r) { return r.strData; }), listRows_.end());
+    listBuilt_ = true;
+    listSig_ = listingSig(ctx);
+
     if (stringsLive_) {
         // LIVE: scan the attached process's module images OFF the render thread (reading
         // hundreds of MB via ReadProcessMemory would otherwise freeze the UI). We pick
         // the module ranges here (main module first, so module strings keep a STABLE
         // address across rescans) and hand them + a memory-reader to LiveScanService.
-        DbgSnapshot snap = ctx.debug.snapshot();
-        strings_.clear(); stringsScanned_ = false; stringsScanning_ = false;
+        const DbgSnapshot& snap = *frameSnap_;
+        stringsScanLive_ = true;
         if (!snap.attached()) return;
         ProcessManager pm;
         std::vector<ModuleInfo> mods = pm.modules(snap.pid);
@@ -2519,15 +2608,15 @@ void BinaryViewTab::scanStrings(AppContext& ctx) {
         stringsToken_ = ctx.livescan.requestStrings(std::move(ranges), std::move(reader), ctx.livescan.epoch());
         return;
     }
-    // FILE: the image is already in memory, so scan synchronously via the shared pure
-    // scanner (the same one the background worker runs on load).
-    strings_.clear();
-    stringsScanned_ = true;
-    stringsScanning_ = false;
+
+    // FILE: scanning and rebuilding the data-string listing rows both run on the
+    // analysis pool. Raising the result cap must never turn the Scan button into a
+    // large render-thread stall.
+    stringsScanLive_ = false;
     if (!ctx.binary.loaded()) return;
-    std::vector<StrResult> r = ScanStringsImage(ctx.binary);
-    strings_.reserve(r.size());
-    for (auto& s : r) strings_.push_back({ s.address, s.text, s.wide });
+    stringsScanning_ = true;
+    ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch,
+                             K_Strings | K_Listing, guessNames_, ctx.analysis.epoch());
 }
 
 // Called once after a new binary is loaded. Lands the cursor on the entry point
@@ -2547,14 +2636,18 @@ void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     lastAsmScroll_ = 0;          // force the Assembly view to re-center on the new cursor
     runtimeBannerDismissed_ = false;   // new binary: re-show the runtime-wrapper/archive banner if detected
     navHist_.clear(); navPos_ = -1;
-    strings_.clear(); stringsScanned_ = false; stringsLive_ = false;   // strings/symbols belonged to the old image
-    stringsScanning_ = false; xrefScanning_ = false;                   // drop in-flight live scans for the old image
+    strings_.clear(); ++stringsGen_;
+    stringsScanned_ = false; stringsLive_ = false; stringsTruncated_ = false;
+    stringsScanning_ = false; stringsScanLive_ = false; xrefScanning_ = false;
     stringsToken_ = 0; xrefToken_ = 0;                                 // ignore any of their late results (tokens are >= 1)
-    functions_.clear(); funcIndexDirty_ = true; guessReason_.clear(); fnSummary_.clear();
+    functions_.clear(); ++functionsGen_;
+    funcIndexDirty_ = true; guessReason_.clear(); fnSummary_.clear();
     algos_.clear(); algosScanned_ = false; algoSel_ = -1;   // algorithm matches belonged to the old image
     symCache_.clear();
-    decompVA_ = 0; setDecompContent(std::string(), {}); decompPending_ = false; decompLru_.clear();   // pseudocode belonged to the old image
-    listBuilt_ = false;          // full-program listing belongs to the old image
+    decompVA_ = 0; decompValid_ = false;
+    setDecompContent(std::string(), {}); decompPending_ = false; decompLru_.clear();
+    listRows_.clear(); listInsnCount_ = 0; listBuilt_ = true;
+    listSig_ = listingSig(ctx);  // worker owns the rebuild; never sweep on the UI thread
     // IAT->"dll.func" map (cheap, read on the UI thread by symbolFor/dataRefToken).
     importMap_.clear();
     for (const auto& im : ctx.binary.imports()) importMap_[im.iatVA] = im.dll + "." + im.name;
@@ -2580,6 +2673,8 @@ void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     // delivery: strings/functions appear first, the heavier listing/xref follow). The
     // live string scan stays on the UI thread.
     uint64_t e = ctx.analysis.bumpEpoch();
+    stringsScanning_ = true;
+    stringsScanLive_ = false;
     ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch,
                              K_Funcs | K_Strings | K_Listing | K_Xref | K_Intent, guessNames_, e);
 }
@@ -2590,16 +2685,21 @@ void BinaryViewTab::restoreFromModuleCache(AppContext& ctx, LoadedModule& m) {
     functions_.clear(); guessReason_.clear();
     functions_.reserve(m.cache.functions.size());
     for (auto& f : m.cache.functions) {
-        functions_.push_back({ f.address, f.name, f.size, f.guessed });
+        functions_.push_back({ f.address, f.name, f.size, f.guessed, f.isExport });
         if (f.guessed && !f.reason.empty()) guessReason_[f.address] = f.reason;
     }
     fnSummary_      = m.cache.summary;
     funcIndexDirty_ = true;
-    symCache_.clear();
+    ++functionsGen_;
+    invalidateNameDependentCaches();
     strings_.clear();
     strings_.reserve(m.cache.strings.size());
-    for (auto& s : m.cache.strings) strings_.push_back({ s.address, s.text, s.wide });
+    for (auto& s : m.cache.strings)
+        strings_.push_back({ s.address, s.text, s.wide, s.textTruncated });
+    ++stringsGen_;
     stringsScanned_ = true;
+    stringsScanning_ = false;
+    stringsTruncated_ = m.cache.stringsTruncated;
     if (m.cache.listingValid) {
         listRows_.clear();
         listRows_.reserve(m.cache.listRows.size());
@@ -2630,7 +2730,7 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
     const ProjectState& p = ctx.project;
     comments_ = p.comments;
     names_    = p.names;
-    ++namesGen_;   // renames loaded from the sidecar change the function list's display
+    invalidateNameDependentCaches(); // sidecar renames affect picker, Cortex-facing state, and pseudocode
     algoLabels_ = p.algorithmLabels;   // user-confirmed algorithm labels (evidence overlay)
     bookmarks_.clear();
     for (const auto& b : p.bookmarks) bookmarks_.push_back({ b.address, b.label });
@@ -2646,7 +2746,7 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
     if (p.lastCursor) cursorVA_ = p.lastCursor;
 
     // If we're already attached, arm any saved breakpoints now.
-    if (ctx.debug.snapshot().attached())
+    if (frameSnap_->attached())
         for (uint64_t a : breakpoints_)
             if (!ctx.debug.hasBreakpoint(a)) {
                 auto it = condBuf_.find(a);
@@ -2654,8 +2754,7 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
                 if (auto en = everyNBuf_.find(a); en != everyNBuf_.end() && en->second > 1)
                     ctx.debug.setBreakpointEveryN(a, en->second);
             }
-    symCache_.clear();
-    decompVA_ = 0;
+    decompVA_ = 0; decompValid_ = false;
     projectLoaded_ = true;
     projectDirty_  = false;   // freshly loaded: tab state matches ctx.project
 }
@@ -2786,7 +2885,7 @@ void BinaryViewTab::renderHoverTokens(const char* s, unsigned int col, const std
 }
 
 void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     if (!snap.attached()) {
         ImGui::TextDisabled("Attach a process in the Communications tab to view live assembly.");
         return;
@@ -2915,7 +3014,7 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     renderLiveSearchPopup(ctx);
 }
 
-void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64_t base) {
+void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, uint64_t base) {
     const uint64_t rip = snap.regs.rip;
     // Back up the window so the focus (RIP when following, or the navigated cursor)
     // isn't pinned to the very top - you can see the code above it too. Anchor to
@@ -2936,7 +3035,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, DbgSnapshot& snap, uint64
     // self-modifying code), a live write/patch/re-analyze (liveGen_), the function
     // set, or the target process changes.
     uint64_t liveSig = start ^ (rip * 0x9E3779B97F4A7C15ull)
-                     ^ ((uint64_t)liveGen_ << 1) ^ ((uint64_t)functions_.size() << 17)
+                     ^ ((uint64_t)liveGen_ << 1) ^ (functionsGen_ * 0xD6E8FEB86659FD93ull)
                      ^ ((uint64_t)symPid_ << 33) ^ ((uint64_t)ctx.engine << 56);   // engine switch -> re-decode
     if (liveSig != liveCacheSig_ || liveCacheStart_ != start || liveInsns_.empty()) {
         if (liveBuf_.size() < 4096) liveBuf_.resize(4096);   // reused scratch; never realloc'd per frame
@@ -3442,7 +3541,7 @@ std::string BinaryViewTab::describePointer(AppContext& ctx, const DbgSnapshot& s
     return result;
 }
 
-void BinaryViewTab::renderRegisterBox(AppContext& ctx, DbgSnapshot& snap) {
+void BinaryViewTab::renderRegisterBox(AppContext& ctx, const DbgSnapshot& snap) {
     const Registers& r = snap.regs;
     const bool is32 = snap.is32;   // 32-bit (WOW64) target: e* names, 4-byte stack
     const bool paused = snap.state == DbgState::Paused;   // memory previews only meaningful while paused
@@ -3550,7 +3649,7 @@ void BinaryViewTab::renderRegisterBox(AppContext& ctx, DbgSnapshot& snap) {
     ui::PopMono();
 }
 
-void BinaryViewTab::renderLivePseudocode(AppContext& ctx, DbgSnapshot& snap, uint64_t start) {
+void BinaryViewTab::renderLivePseudocode(AppContext& ctx, const DbgSnapshot& snap, uint64_t start) {
     // Scope to the function enclosing `start`. Analyzed function bounds are file-base
     // VAs, so translate them to the runtime base (ASLR) to pick the right function and
     // decompile exactly it - not an open-ended window that runs into the next function.
@@ -3578,7 +3677,7 @@ void BinaryViewTab::renderLivePseudocode(AppContext& ctx, DbgSnapshot& snap, uin
     ImGui::Separator();
 
     if (pseudoVA_ != fnStartLive || pseudoText_.empty()) {
-        size_t win = fnSize ? (size_t)std::min<uint32_t>(fnSize + 16u, 16384u) : 4096u;
+        size_t win = fnSize ? (size_t)std::min<uint32_t>(fnSize, 16384u) : 4096u;
         std::vector<uint8_t> buf(win);
         size_t got = ctx.debug.readMemoryMasked(fnStartLive, buf.data(), buf.size());   // mask 0xCC bps -> real code
         if (!got) {
@@ -3799,9 +3898,11 @@ void BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
     // Don't force a synchronous UI-thread listing re-sweep here: the visible rows
     // re-decode the patched image bytes immediately, and functionsDirty_ kicks the
     // worker to rebuild the row index off-thread (so a patch never freezes the UI).
-    pseudoVA_ = 0; decompVA_ = 0;   // invalidate pseudocode / decompiler caches
+    pseudoVA_ = 0; decompVA_ = 0; decompValid_ = false; // invalidate pseudocode / decompiler caches
     decompPending_ = false; decompLru_.clear();   // patched bytes: cached pseudo-C is stale
     functionsDirty_ = true;         // boundaries may have changed: re-analyze + rebuild listing on the worker
+    xrefIndex_.clear(); xrefIndexSig_ = ~0ull;
+    algos_.clear(); algosScanned_ = false; algoSel_ = -1;
     ++liveGen_;                     // a live byte changed: invalidate the cached live decode
 }
 
@@ -3814,7 +3915,7 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
 
     // Patch a LIVE target at its own bitness (the file engine/arch would assemble/preview
     // x64 bytes into a 32-bit WOW64 process, or vice versa); the static path uses the file.
-    DbgSnapshot    snap     = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     const bool     live     = snap.attached();
     const bool     is32     = snap.is32;
     const Arch     liveArch = is32 ? Arch::X86 : Arch::X64;
@@ -3934,6 +4035,28 @@ void BinaryViewTab::renderCommentPopup(AppContext& /*ctx*/) {
     ImGui::EndPopup();
 }
 
+void BinaryViewTab::invalidateNameDependentCaches() {
+    // Name-bearing output is cached in several independent views. Keep the
+    // generation monotone so a running decompile can be rejected when it returns
+    // with the pre-rename snapshot.
+    ++namesGen_;
+    symCache_.clear();
+    symbolIndexSig_ = ~0ull;
+    decompValid_ = false;
+    decompPending_ = false;
+    decompLru_.clear();
+    decompNamesSnapshot_.reset();
+    decompNamesFunctionsGen_ = ~0ull;
+    decompNamesNamesGen_ = ~0u;
+    setDecompContent(std::string(), {});
+    pseudoVA_ = 0;
+    pseudoText_.clear();
+    annLru_.clear();
+    annSig_ = ~0ull;
+    callStack_.clear();
+    callStackSig_ = ~0ull;
+}
+
 void BinaryViewTab::renderRenamePopup(AppContext& ctx) {
     if (openRenamePopup_) { ImGui::OpenPopup("Rename Symbol"); openRenamePopup_ = false; }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
@@ -3941,22 +4064,33 @@ void BinaryViewTab::renderRenamePopup(AppContext& ctx) {
     ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("Rename Symbol", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
     ImGui::Text("Name for 0x%llX", (unsigned long long)annPopupVA_);
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+    ImGui::TextWrapped("Saved with this binary and used in assembly, pseudocode, search, and Cortex. Blank clears it.");
+    ImGui::PopStyleColor();
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(400);
     bool enter = ImGui::InputText("##rn", renameBuf_, sizeof(renameBuf_), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::Separator();
     auto commit = [&]() {
-        if (renameBuf_[0]) names_[annPopupVA_] = renameBuf_;
-        else               names_.erase(annPopupVA_);
+        const auto old = names_.find(annPopupVA_);
+        const std::string before = old == names_.end() ? std::string() : old->second;
+        const std::string after = renameBuf_[0] ? std::string(renameBuf_) : std::string();
+        if (after.empty()) names_.erase(annPopupVA_);
+        else               names_[annPopupVA_] = after;
+        if (before == after) { ImGui::CloseCurrentPopup(); return; }
         projectDirty_ = true;
-        symCache_.clear();         // resolved names changed
-        ++namesGen_;               // function-list display changed -> refilter
-        decompVA_ = 0;             // pseudocode references names
+        invalidateNameDependentCaches();
         ImGui::CloseCurrentPopup();
     };
     if (ImGui::Button("Save", ImVec2(110, 0)) || enter) commit();
     ImGui::SameLine();
-    if (ImGui::Button("Clear", ImVec2(110, 0))) { names_.erase(annPopupVA_); projectDirty_ = true; symCache_.clear(); ++namesGen_; decompVA_ = 0; ImGui::CloseCurrentPopup(); }
+    if (ImGui::Button("Clear", ImVec2(110, 0))) {
+        if (names_.erase(annPopupVA_)) {
+            projectDirty_ = true;
+            invalidateNameDependentCaches();
+        }
+        ImGui::CloseCurrentPopup();
+    }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(110, 0))) ImGui::CloseCurrentPopup();
     (void)ctx;
@@ -4051,11 +4185,23 @@ uint64_t BinaryViewTab::liveVAtoFile(AppContext& ctx, uint64_t liveVA) {
 std::string BinaryViewTab::symbolFor(AppContext& ctx, uint64_t addr) {
     if (!addr) return std::string();
 
-    // A user rename for this exact address wins over every other resolver.
-    if (auto it = names_.find(addr); it != names_.end() && !it->second.empty())
+    // Project annotations use file VAs. If this is a relocated live-main-module
+    // address, resolve its canonical file VA first; static listing addresses still
+    // map directly even while a debugger is attached.
+    uint64_t canonical = addr;
+    size_t mappedAvail = 0;
+    bool canonicalMapped = ctx.binary.loaded() && ctx.binary.ptrFromVA(addr, mappedAvail);
+    if (!canonicalMapped && symAttached_ && ctx.binary.loaded()) {
+        const uint64_t candidate = liveVAtoFile(ctx, addr);
+        canonicalMapped = ctx.binary.ptrFromVA(candidate, mappedAvail) != nullptr;
+        if (canonicalMapped) canonical = candidate;
+    }
+
+    // A user rename for this exact/canonical address wins over every resolver.
+    if (auto it = names_.find(canonical); it != names_.end() && !it->second.empty())
         return it->second;
     // An IAT slot resolves to its imported API name.
-    if (auto it = importMap_.find(addr); it != importMap_.end())
+    if (auto it = importMap_.find(canonical); it != importMap_.end())
         return it->second;
 
     // Drop the cache + DbgHelp session when the target changes (attach <-> static).
@@ -4114,7 +4260,24 @@ std::string BinaryViewTab::symbolFor(AppContext& ctx, uint64_t addr) {
                     }
                 }
             }
-            // 3) module + offset.
+            // 3) Analyzed main-module name (including a heuristic guess), after
+            // richer PDB/export names but before the generic module+offset fallback.
+            if (result.empty() && canonicalMapped && !functions_.empty()) {
+                const Func* best = funcContaining(canonical);
+                if (best && canonical >= best->address
+                    && (canonical == best->address
+                        || (best->size && canonical - best->address < best->size))) {
+                    const uint64_t off = canonical - best->address;
+                    if (!off) result = best->name;
+                    else {
+                        char buf[256];
+                        std::snprintf(buf, sizeof(buf), "%s+0x%llX", best->name.c_str(),
+                                      (unsigned long long)off);
+                        result = buf;
+                    }
+                }
+            }
+            // 4) module + offset.
             if (result.empty()) {
                 char buf[112]; std::snprintf(buf, sizeof(buf), "%s+0x%llX", mn.c_str(), (unsigned long long)(addr - mod->base));
                 result = buf;
@@ -4133,7 +4296,10 @@ std::string BinaryViewTab::symbolFor(AppContext& ctx, uint64_t addr) {
         // 2) Analyzed functions fallback (run Analyze to populate).
         if (result.empty() && !functions_.empty()) {
             const Func* best = funcContaining(addr);   // greatest start <= addr (exact match included)
-            if (best && addr - best->address < 0x1000) {
+            // Respect the discovered extent.  The old fixed 0x1000 window made a
+            // short guessed function label unrelated padding/data as name+offset.
+            if (best && addr >= best->address &&
+                (addr == best->address || (best->size && addr - best->address < best->size))) {
                 uint64_t off = addr - best->address;
                 if (off == 0) result = best->name;
                 else { char buf[256]; std::snprintf(buf, sizeof(buf), "%s+0x%llX", best->name.c_str(), (unsigned long long)off); result = buf; }
@@ -4211,7 +4377,7 @@ void BinaryViewTab::computeCallStack(AppContext& ctx, const DbgSnapshot& snap) {
 }
 
 void BinaryViewTab::renderCallStack(AppContext& ctx) {
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     if (!snap.attached())                  { ImGui::TextDisabled("Attach a process to view the call stack."); return; }
     if (snap.state != DbgState::Paused)    { ImGui::TextDisabled("Pause the process to walk the stack."); return; }
 
@@ -4261,7 +4427,7 @@ void BinaryViewTab::renderCallStack(AppContext& ctx) {
 // it points to, and a "follow" jump. Frame boundaries from the call-stack walk and
 // the RBP slot are highlighted. Pause-only (reads the debuggee's memory).
 void BinaryViewTab::renderStackTab(AppContext& ctx) {
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     if (!snap.attached())               { ImGui::TextDisabled("Attach a process to inspect the stack."); return; }
     if (snap.state != DbgState::Paused) { ImGui::TextDisabled("Pause the process to inspect the stack."); return; }
 
@@ -4337,9 +4503,22 @@ void BinaryViewTab::renderStackTab(AppContext& ctx) {
 }
 
 void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
-    uint64_t sig = symAttached_ ? ((uint64_t)symPid_ | 0x100000000ull)
-                                : (uint64_t)(ctx.binary.loaded() ? functions_.size() + 1 : 0);
-    if (sig == symbolIndexSig_ && !symbolIndex_.empty()) return;
+    DbgSnapshot standaloneSnap;
+    const DbgSnapshot* currentSnap = ctx.frameDebugSnapshot ? ctx.frameDebugSnapshot : frameSnap_;
+    if (!currentSnap) {
+        standaloneSnap = ctx.debug.snapshot();
+        currentSnap = &standaloneSnap;
+    }
+    symAttached_ = currentSnap->attached();
+    symPid_ = currentSnap->pid;
+    const uint64_t liveModuleSig = symAttached_ && currentSnap
+                                 ? debugModuleSignature(*currentSnap) : 0;
+    uint64_t sig = (symAttached_ ? ((uint64_t)symPid_ | 0x100000000ull) : 0ull)
+                 ^ (functionsGen_ * 0xD6E8FEB86659FD93ull)
+                 ^ ((uint64_t)namesGen_ << 32)
+                 ^ liveModuleSig
+                 ^ (ctx.binary.loaded() ? 0x9E3779B97F4A7C15ull : 0ull);
+    if (sig == symbolIndexSig_) return; // an empty index is a valid cached result too
     symbolIndexSig_ = sig;
     symbolIndex_.clear();
     gotoFilterLast_.clear(); gotoMatches_.clear();
@@ -4351,9 +4530,31 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
         return r;
     };
 
+    // Project/analyzed symbols are file-space and remain available while attached.
+    // Put analyst renames first and suppress the discovered-name duplicate at the
+    // same address. This also makes names on data/arbitrary instruction addresses
+    // navigable, not only names that happen to coincide with function discovery.
+    std::unordered_set<uint64_t> fileNamed;
+    if (ctx.binary.loaded()) {
+        fileNamed.reserve(names_.size() + functions_.size());
+        for (const auto& [va, name] : names_) {
+            if (name.empty()) continue;
+            symbolIndex_.push_back({ va, name, lower(name), false });
+            fileNamed.insert(va);
+        }
+        for (const auto& f : functions_) {
+            if (f.name.empty() || fileNamed.count(f.address)) continue;
+            symbolIndex_.push_back({ f.address, f.name, lower(f.name), false });
+            fileNamed.insert(f.address);
+        }
+    }
+
     if (symAttached_) {
-        if (liveModulesPid_ != symPid_ || liveModules_.empty()) {
+        if (liveModulesPid_ != symPid_ || liveModules_.empty() ||
+            symbolLiveModulesSig_ != liveModuleSig) {
             ProcessManager pm; liveModules_ = pm.modules(symPid_); liveModulesPid_ = symPid_;
+            modExports_.clear(); // an unloaded base may be reused by a different DLL
+            symbolLiveModulesSig_ = liveModuleSig;
         }
         for (const auto& m : liveModules_) {
             auto it = modExports_.find(m.base);
@@ -4366,12 +4567,10 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
             std::string mn = modShortName(m.name);
             for (const auto& e : it->second) {
                 std::string nm = mn + "." + e.second;
-                symbolIndex_.push_back({ e.first, nm, lower(nm) });
+                symbolIndex_.push_back({ e.first, nm, lower(nm), true });
             }
             if (symbolIndex_.size() > 120000) break;
         }
-    } else if (ctx.binary.loaded()) {
-        for (const auto& f : functions_) symbolIndex_.push_back({ f.address, f.name, lower(f.name) });
     }
 }
 
@@ -4432,13 +4631,21 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
     }
 
     auto go = [&](uint64_t a) { navigateTo(a); ImGui::CloseCurrentPopup(); };
+    auto goSymbol = [&](const SymEntry& s) {
+        if (s.live) { mainView_ = 4; liveNavigate(s.addr); }
+        else        { gotoStatic(ctx, s.addr); }
+        ImGui::CloseCurrentPopup();
+    };
     if (enter) {
         unsigned long long a = 0;
         bool hexPref = gotoNameBuf_[0] == '0' && (gotoNameBuf_[1] == 'x' || gotoNameBuf_[1] == 'X');
         if (hexPref && std::sscanf(gotoNameBuf_ + 2, "%llx", &a) == 1)  go((uint64_t)a);
-        else if (!gotoMatches_.empty())                                 go(symbolIndex_[gotoMatches_[0]].addr);
+        else if (!gotoMatches_.empty())                                 goSymbol(symbolIndex_[gotoMatches_[0]]);
         else if (std::sscanf(gotoNameBuf_, "%llx", &a) == 1)            go((uint64_t)a);
-        else if (uint64_t s = lookupSymbol(ctx, gotoNameBuf_))          go(s);  // DbgHelp PDB/export fallback
+        else if (uint64_t s = lookupSymbol(ctx, gotoNameBuf_)) { // DbgHelp PDB/export fallback
+            if (symAttached_) { mainView_ = 4; liveNavigate(s); ImGui::CloseCurrentPopup(); }
+            else              go(s);
+        }
     }
 
     ImGui::BeginChild("glist", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_Borders);
@@ -4447,7 +4654,7 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
         const auto& s = symbolIndex_[idx];
         ImGui::PushID(idx);
         char lbl[320]; std::snprintf(lbl, sizeof(lbl), "0x%llX  %s", (unsigned long long)s.addr, s.name.c_str());
-        if (ImGui::Selectable(lbl)) go(s.addr);
+        if (ImGui::Selectable(lbl)) goSymbol(s);
         ImGui::PopID();
     }
     if (gotoMatches_.empty())
@@ -4463,7 +4670,7 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
 
 void BinaryViewTab::startTextSearch(AppContext& ctx) {
     textHits_.clear(); textStatus_.clear(); openTextPopup_ = true;
-    textHitsLive_ = ctx.debug.snapshot().attached();   // attached -> hits are runtime VAs
+    textHitsLive_ = frameSnap_->attached();   // attached -> hits are runtime VAs
     if (!textSearch_[0]) { textStatus_ = "Enter text to search.";      return; }
 
     std::string q = textSearch_;
@@ -4472,7 +4679,7 @@ void BinaryViewTab::startTextSearch(AppContext& ctx) {
 
     const size_t kHitCap = 4000;
     char line[192];
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     // Debuggee-bitness engine when attached (the x64 engine on a 32-bit WOW64 target
     // decodes to garbage and matches nothing); works with no file loaded too.
     IDisassembler* dis = snap.attached() ? liveDecoder(ctx, snap.is32) : ctx.disasm.get();
@@ -4532,7 +4739,7 @@ void BinaryViewTab::renderTextSearchPopup(AppContext& ctx) {
     ImGui::SameLine(); if (ImGui::Button("Find") || go) startTextSearch(ctx);
     if (!textStatus_.empty()) ImGui::TextDisabled("%s", textStatus_.c_str());
 
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     ImGui::BeginChild("tlist", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_Borders);
     ui::PushMono();
     for (uint64_t a : textHits_) {
@@ -4576,7 +4783,7 @@ void BinaryViewTab::startXrefSearch(AppContext& ctx, uint64_t target) {
     xrefStatus_.clear();
     xrefScanning_ = false;
     openXrefPopup_ = true;
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     xrefHitsLive_ = snap.attached();                   // attached -> hits are runtime VAs
 
     const size_t kHitCap = 3000;
@@ -4623,7 +4830,7 @@ void BinaryViewTab::startXrefSearch(AppContext& ctx, uint64_t target) {
 // then — as each image arrives (see the ReadImage drain in render) — hand it to the
 // analysis pool. Results land in each module's registry cache for instant switching.
 void BinaryViewTab::analyzeAllModules(AppContext& ctx) {
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     if (!snap.attached()) return;
     if (liveModulesPid_ != snap.pid || liveModules_.empty()) {
         ProcessManager pm; liveModules_ = pm.modules(snap.pid); liveModulesPid_ = snap.pid;
@@ -4660,7 +4867,7 @@ void BinaryViewTab::renderXrefPopup(AppContext& ctx) {
     ImGui::Text("References to 0x%llX", (unsigned long long)xrefTarget_);
     if (!xrefStatus_.empty()) { ImGui::SameLine(); ImGui::TextDisabled("- %s", xrefStatus_.c_str()); }
 
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     ImGui::BeginChild("xref", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_Borders);
     ui::PushMono();
     for (uint64_t a : xrefHits_) {
@@ -4718,7 +4925,7 @@ void BinaryViewTab::renderXrefPopup(AppContext& ctx) {
 uint64_t BinaryViewTab::xrefSig(AppContext& ctx) {
     return (ctx.binary.loaded() ? ctx.binary.contentHash() : 0)
          ^ ((uint64_t)ctx.project.patches.size() << 8)
-         ^ ((uint64_t)functions_.size() << 1)
+         ^ (functionsGen_ * 0xD6E8FEB86659FD93ull)
          ^ ((uint64_t)ctx.arch << 40)
          ^ ((uint64_t)(ctx.disasm ? ctx.disasm->engine() : Engine::Zydis) << 44);
 }
@@ -4868,7 +5075,7 @@ std::string BinaryViewTab::decompileFunctionText(AppContext& ctx, uint64_t fnSta
     size_t avail = 0;
     const uint8_t* p = ctx.binary.ptrFromVA(fnStart, avail);
     if (!p) return std::string();
-    size_t win = fnSize ? std::min<size_t>(avail, std::min<uint32_t>(fnSize + 16u, 16384u))
+    size_t win = fnSize ? std::min<size_t>(avail, std::min<uint32_t>(fnSize, 16384u))
                         : std::min<size_t>(avail, 4096);
     auto jt = [this, &ctx](const Instruction& in) { return resolveJumpTable(ctx, in); };
     ControlFlowGraph g = BuildCFG(p, win, fnStart, *ctx.disasm, 2000, jt);
@@ -4878,6 +5085,47 @@ std::string BinaryViewTab::decompileFunctionText(AppContext& ctx, uint64_t fnSta
     opt.x86        = ArchIsX86(ctx.arch);   // gate the arg-header to x86/x64 (avoid spurious args on other arches)
     opt.signature  = guessSignature(ctx, fnStart, fnSize);
     return Decompile(g, opt);
+}
+
+void BinaryViewTab::requestFunctionDecompile(AppContext& ctx, uint64_t fnStart,
+                                             uint32_t fnSize, size_t availableBytes) {
+    // Reuse one immutable snapshot across navigation. Rebuilding all function names
+    // for every clicked function made decompile requests O(all functions) on the UI
+    // thread; these generations change exactly when the snapshot can become stale.
+    if (!decompNamesSnapshot_ || decompNamesFunctionsGen_ != functionsGen_
+        || decompNamesNamesGen_ != namesGen_) {
+        auto names = std::make_shared<DecompileNameMap>();
+        names->reserve(importMap_.size() + functions_.size() + names_.size());
+        for (const auto& [va, name] : importMap_)
+            if (!name.empty()) (*names)[va] = name;
+        for (const Func& f : functions_)
+            if (!f.name.empty()) (*names)[f.address] = f.name;
+        // Analyst names are authoritative, including an address that discovery did
+        // not find and explicit overrides of an import/function.
+        for (const auto& [va, name] : names_)
+            if (!name.empty()) (*names)[va] = name;
+        decompNamesSnapshot_ = std::move(names);
+        decompNamesFunctionsGen_ = functionsGen_;
+        decompNamesNamesGen_ = namesGen_;
+    }
+
+    // regionHi is the exclusive end. Respect the discovered extent exactly (the
+    // worker must not add another look-ahead), cap huge/unknown regions, and avoid
+    // both fnSize+16 and address-space overflow.
+    size_t span = fnSize ? std::min<size_t>(availableBytes, std::min<size_t>(fnSize, 16384))
+                         : std::min<size_t>(availableBytes, 4096);
+    span = (size_t)std::min<uint64_t>((uint64_t)span,
+                                      std::numeric_limits<uint64_t>::max() - fnStart);
+    if (!span) {
+        DecompResult unavailable{ "// function extent is empty or crosses the address-space limit\n", { 0 } };
+        applyDecompLang(unavailable);
+        decompPending_ = false;
+        return;
+    }
+    const uint64_t end = fnStart + (uint64_t)span;
+    ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_Decompile,
+                             guessNames_, ctx.analysis.epoch(), 0, fnStart, end,
+                             decompNamesSnapshot_, guessSignature(ctx, fnStart, fnSize), namesGen_);
 }
 
 // File > Export Analysis: gather annotations + decompiled named functions and write
@@ -4942,12 +5190,15 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
         ImGui::SetNextItemWidth(110.0f * theme::UiScale());
         const char* kLangs[] = { "Pseudo-C", "Python" };
         if (ImGui::Combo("##pseudolang", &pseudoLang_, kLangs, 2)) {
-            if (const DecompResult* hit = decompLruGet(decompVA_)) applyDecompLang(*hit);
-            else decompVA_ = 0;   // not cached: force a re-decompile in the new language
+            const DecompResult* hit = decompValid_ ? decompLruGet(decompVA_) : nullptr;
+            if (hit) applyDecompLang(*hit);
+            else { decompValid_ = false; decompPending_ = false; } // force a refresh, including VA 0
         }
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) { decompVA_ = 0; decompLru_.clear(); }   // force a re-decompile
+    if (ImGui::SmallButton("Refresh")) {
+        decompValid_ = false; decompPending_ = false; decompLru_.clear();
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy") && !decompText_.empty()) ImGui::SetClipboardText(decompText_.c_str());
     ImGui::SameLine();
@@ -4962,12 +5213,14 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     const Func* best = funcContaining(cursorVA_);
     if (best && cursorVA_ - best->address < 0x4000) { fnStart = best->address; fnSize = best->size; }
 
-    if (fnStart != decompVA_) {
+    if (!decompValid_ || fnStart != decompVA_) {
         decompVA_ = fnStart;
+        decompValid_ = true;
         size_t avail = 0;
         const uint8_t* p = ctx.binary.ptrFromVA(fnStart, avail);
         if (!p) {
-            setDecompContent("// cursor address is not mapped to file data\n", {});
+            DecompResult unavailable{ "// cursor address is not mapped to file data\n", { 0 } };
+            applyDecompLang(unavailable); // Python mode receives a '# ...' comment
             decompPending_ = false;
         } else if (const DecompResult* hit = decompLruGet(fnStart)) {
             applyDecompLang(*hit);   // already decompiled recently — instant
@@ -4977,10 +5230,7 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
             // bulk-drain loop. Show a placeholder until then so the UI never freezes.
             setDecompContent(std::string(), {});
             decompPending_ = true;
-            uint64_t end = fnStart + (fnSize ? std::min<uint32_t>(fnSize + 16u, 16384u)
-                                             : (uint32_t)std::min<size_t>(avail, 4096));
-            ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_Decompile,
-                                     guessNames_, ctx.analysis.epoch(), 0, fnStart, end);
+            requestFunctionDecompile(ctx, fnStart, fnSize, avail);
         }
     }
 
@@ -5055,12 +5305,15 @@ void BinaryViewTab::renderDecompiler(AppContext& ctx) {
         ImGui::SetNextItemWidth(110.0f * theme::UiScale());
         const char* kLangs[] = { "Pseudo-C", "Python" };
         if (ImGui::Combo("##declang", &pseudoLang_, kLangs, 2)) {
-            if (const DecompResult* hit = decompLruGet(decompVA_)) applyDecompLang(*hit);
-            else decompVA_ = 0;   // not cached: force a re-decompile in the new language
+            const DecompResult* hit = decompValid_ ? decompLruGet(decompVA_) : nullptr;
+            if (hit) applyDecompLang(*hit);
+            else { decompValid_ = false; decompPending_ = false; }
         }
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) { decompVA_ = 0; decompLru_.clear(); }
+    if (ImGui::SmallButton("Refresh")) {
+        decompValid_ = false; decompPending_ = false; decompLru_.clear();
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("Copy") && !decompText_.empty()) ImGui::SetClipboardText(decompText_.c_str());
     ImGui::Separator();
@@ -5074,12 +5327,14 @@ void BinaryViewTab::renderDecompiler(AppContext& ctx) {
     const Func* best = funcContaining(cursorVA_);
     if (best && cursorVA_ - best->address < 0x4000) { fnStart = best->address; fnSize = best->size; }
 
-    if (fnStart != decompVA_) {
+    if (!decompValid_ || fnStart != decompVA_) {
         decompVA_ = fnStart;
+        decompValid_ = true;
         size_t avail = 0;
         const uint8_t* p = ctx.binary.ptrFromVA(fnStart, avail);
         if (!p) {
-            setDecompContent("// cursor address is not mapped to file data\n", {});
+            DecompResult unavailable{ "// cursor address is not mapped to file data\n", { 0 } };
+            applyDecompLang(unavailable);
             decompPending_ = false;
         } else if (const DecompResult* hit = decompLruGet(fnStart)) {
             applyDecompLang(*hit);
@@ -5087,10 +5342,7 @@ void BinaryViewTab::renderDecompiler(AppContext& ctx) {
         } else {
             setDecompContent(std::string(), {});
             decompPending_ = true;
-            uint64_t end = fnStart + (fnSize ? std::min<uint32_t>(fnSize + 16u, 16384u)
-                                             : (uint32_t)std::min<size_t>(avail, 4096));
-            ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_Decompile,
-                                     guessNames_, ctx.analysis.epoch(), 0, fnStart, end);
+            requestFunctionDecompile(ctx, fnStart, fnSize, avail);
         }
     }
 
@@ -5555,7 +5807,8 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
 // Build call edges between discovered functions (cached). Each function is
 // swept once; direct CALLs whose target is another function become edges.
 void BinaryViewTab::buildCallGraph(AppContext& ctx) {
-    uint64_t sig = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0) ^ ((uint64_t)functions_.size() << 1);
+    uint64_t sig = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0)
+                 ^ (functionsGen_ * 0xD6E8FEB86659FD93ull);
     if (sig == callGraphSig_) return;
     callGraphSig_ = sig;
     callees_.clear(); callers_.clear();
@@ -5586,7 +5839,8 @@ void BinaryViewTab::buildCallGraph(AppContext& ctx) {
 // off-thread K_CallGraph build (coalesced at the current epoch) and return false so
 // the tab shows progress instead of sweeping every function body on the UI thread.
 bool BinaryViewTab::ensureCallGraphReady(AppContext& ctx) {
-    uint64_t sig = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0) ^ ((uint64_t)functions_.size() << 1);
+    uint64_t sig = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0)
+                 ^ (functionsGen_ * 0xD6E8FEB86659FD93ull);
     if (sig == callGraphSig_) return true;
     if (callGraphRequestedSig_ != sig && ctx.binary.loaded() && ctx.disasm) {
         ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch, K_CallGraph, guessNames_, ctx.analysis.epoch());
@@ -5819,7 +6073,7 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
     swatch(IM_COL32(120, 230, 120, 255), "current (RIP)");
     ImGui::NewLine();
 
-    DbgSnapshot snap = ctx.debug.snapshot();
+    const DbgSnapshot& snap = *frameSnap_;
     const float lineH = ImGui::GetTextLineHeightWithSpacing();
     const float pad   = 9.0f;
     const float hdrH  = lineH + 6.0f;
@@ -5986,29 +6240,25 @@ void BinaryViewTab::runByteSearch(AppContext& ctx) {
     searchHits_.clear();
     if (!byteSearch_[0]) return;
     if (byteSearchLive_) {                 // scan the attached process instead of the file
-        if (!ctx.debug.snapshot().attached()) return;
+        if (!frameSnap_->attached()) return;
         std::string st;
         searchHits_ = liveMemorySearch(ctx.debug, byteSearch_, 2 /*hex bytes*/, st);
         return;
     }
     if (!ctx.binary.loaded()) return;
-    // Parse hex bytes (spaces optional), no wildcards for this quick search.
-    std::vector<uint8_t> pat;
-    std::string s = byteSearch_;
-    for (size_t i = 0; i < s.size();) {
-        if (std::isspace((unsigned char)s[i])) { ++i; continue; }
-        // Require a full two-hex-digit byte; a lone trailing nibble is malformed.
-        if (i + 1 >= s.size() || !std::isxdigit((unsigned char)s[i]) || !std::isxdigit((unsigned char)s[i + 1])) break;
-        char b[3] = { s[i], s[i + 1], 0 }; unsigned v = 0;
-        std::sscanf(b, "%x", &v);
-        pat.push_back((uint8_t)v); i += 2;
-    }
-    if (pat.empty()) return;
+    // Reuse the masked Boyer-Moore-Horspool matcher used by Sig Scanner. Besides
+    // accepting ?? wildcards, this avoids the old O(file_bytes * pattern_bytes)
+    // render-thread loop for ordinary concrete patterns.
+    SigPattern pat;
+    if (!ParseSignature(byteSearch_, pat)) return;
     const auto& d = ctx.binary.bytes();
-    for (size_t i = 0; i + pat.size() <= d.size(); ++i) {
-        bool hit = true;
-        for (size_t j = 0; j < pat.size(); ++j) if (d[i+j] != pat[j]) { hit = false; break; }
-        if (hit) { uint64_t va; if (ctx.binary.offsetToVA(i, va)) searchHits_.push_back(va); if (searchHits_.size() > 1024) break; }
+    size_t from = 0;
+    while (from + pat.size() <= d.size() && searchHits_.size() < 1024) {
+        const size_t at = FindFirstMasked(d.data(), d.size(), pat, from);
+        if (at == SIZE_MAX) break;
+        uint64_t va = 0;
+        if (ctx.binary.offsetToVA(at, va)) searchHits_.push_back(va);
+        from = at + 1; // preserve overlapping-match behavior
     }
 }
 
@@ -6016,11 +6266,11 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
     // (Drag the panel's tab to float/re-dock it — docking replaced the manual pop-out.)
     ImGui::SeparatorText("Byte Pattern Search");
     ImGui::SetNextItemWidth(-60);
-    ImGui::InputTextWithHint("##bsearch", "DE AD BE EF", byteSearch_, sizeof(byteSearch_));
+    ImGui::InputTextWithHint("##bsearch", "DE AD ?? EF", byteSearch_, sizeof(byteSearch_));
     ImGui::SameLine();
     if (ImGui::Button("Find")) runByteSearch(ctx);
     if (ImGui::Checkbox("Live (process memory)", &byteSearchLive_)) searchHits_.clear();
-    if (byteSearchLive_ && !ctx.debug.snapshot().attached())
+    if (byteSearchLive_ && !frameSnap_->attached())
         ImGui::TextDisabled("Attach to a process to search its memory.");
     if (!searchHits_.empty()) {
         ImGui::Text("%d hit(s)", (int)searchHits_.size());
@@ -6124,6 +6374,22 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                             ImGui::SetTooltip("guessed name - %s",
                                 rit != guessReason_.end() ? rit->second.c_str() : "heuristic");
                         }
+                        if (ImGui::BeginPopupContextItem("fnctx")) {
+                            if (ImGui::MenuItem("Go to")) gotoStatic(ctx, f.address);
+                            if (ImGui::MenuItem("Rename...")) {
+                                annPopupVA_ = f.address;
+                                std::snprintf(renameBuf_, sizeof(renameBuf_), "%s", nm.c_str());
+                                openRenamePopup_ = true;
+                            }
+                            if (ImGui::MenuItem("Copy address")) {
+                                char address[24];
+                                std::snprintf(address, sizeof(address), "0x%llX",
+                                              (unsigned long long)f.address);
+                                ImGui::SetClipboardText(address);
+                            }
+                            if (ImGui::MenuItem("Copy name")) ImGui::SetClipboardText(nm.c_str());
+                            ImGui::EndPopup();
+                        }
                         ImGui::PopID();
                     }
                 ui::PopMono();
@@ -6133,7 +6399,7 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Strings")) {
-            DbgSnapshot ssnap = ctx.debug.snapshot();
+            const DbgSnapshot& ssnap = *frameSnap_;
             // Discoverability: the first time we're attached to a new process, flip to
             // Live and scan once automatically so live strings "just work" without the
             // user having to find the Live toggle.
@@ -6148,14 +6414,18 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Checkbox("Live", &stringsLive_)) {
-                strings_.clear(); stringsScanned_ = false;
-                // Re-scan immediately on toggle when we can, so the list never looks empty.
-                if (stringsLive_ ? ssnap.attached() : ctx.binary.loaded()) scanStrings(ctx);
+                // Always invalidate the old mode/token; scanStrings gracefully leaves
+                // an actionable empty state when no process/file is available.
+                scanStrings(ctx);
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Scan the attached process's memory instead of the file on disk.");
-            ImGui::SameLine(); ImGui::TextDisabled("%d (ASCII/UTF-8 + UTF-16)", (int)strings_.size());
+            ImGui::SameLine();
+            ImGui::TextDisabled("%zu%s (ASCII/UTF-8 + UTF-16LE)", strings_.size(),
+                                stringsTruncated_ ? "+" : "");
+            if (stringsTruncated_ && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Scan stopped at a string-count or byte-count safety limit; results may be incomplete.");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputTextWithHint("##strf", "filter...", strFilter_, sizeof(strFilter_));
+            ImGui::InputTextWithHint("##strf", "filter text (case-insensitive)...", strFilter_, sizeof(strFilter_));
 
             // Fixed-width columns so addresses, type, and text line up (the old
             // single-label render was ragged because hex addresses vary in width).
@@ -6167,21 +6437,19 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             const bool showUsedBy = !stringsLive_ && !xrefIndex_.empty();
             if (ImGui::BeginTable("strtbl", showUsedBy ? 4 : 3,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV)) {
-                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150);
-                ImGui::TableSetupColumn("T",       ImGuiTableColumnFlags_WidthFixed, 22);
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150.0f * theme::UiScale());
+                ImGui::TableSetupColumn("T",       ImGuiTableColumnFlags_WidthFixed, 22.0f * theme::UiScale());
                 ImGui::TableSetupColumn("String");
                 if (showUsedBy)
                     ImGui::TableSetupColumn("Used by", ImGuiTableColumnFlags_WidthFixed, 170.0f * theme::UiScale());
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
-                uint64_t strSig = (uint64_t)strings_.size();
-                if (!strings_.empty()) strSig ^= strings_.front().address ^ (strings_.back().address << 1);
-                if (std::strcmp(strFilter_, strFilterLast_) != 0 || strSig != strVisSig_) {
+                if (std::strcmp(strFilter_, strFilterLast_) != 0 || stringsGen_ != strVisSig_) {
                     std::snprintf(strFilterLast_, sizeof(strFilterLast_), "%s", strFilter_);
-                    strVisSig_ = strSig;
+                    strVisSig_ = stringsGen_;
                     strVisible_.clear();
                     for (int i = 0; i < (int)strings_.size(); ++i)
-                        if (!strFilter_[0] || strings_[i].text.find(strFilter_) != std::string::npos) strVisible_.push_back(i);
+                        if (containsAsciiInsensitive(strings_[i].text, strFilter_)) strVisible_.push_back(i);
                 }
                 ImGuiListClipper strClip;
                 strClip.Begin((int)strVisible_.size());
@@ -6192,18 +6460,34 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                     ImGui::PushID((void*)(uintptr_t)s.address);
                     ImGui::TableSetColumnIndex(0);
                     char al[24]; std::snprintf(al, sizeof(al), "0x%llX", (unsigned long long)s.address);
-                    if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns)) { if (stringsLive_) { mainView_ = 4; liveNavigate(s.address); } else navigateTo(s.address); }
+                    if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (stringsLive_) { mainView_ = 4; liveNavigate(s.address); }
+                        else gotoStatic(ctx, s.address);
+                    }
                     if (ImGui::BeginPopupContextItem("sm")) {
-                        if (ImGui::MenuItem("Go to"))                       { if (stringsLive_) { mainView_ = 4; liveNavigate(s.address); } else navigateTo(s.address); }
-                        if (ImGui::MenuItem("Find references (where used)")) startXrefSearch(ctx, s.address);
+                        if (ImGui::MenuItem("Go to")) {
+                            if (stringsLive_) { mainView_ = 4; liveNavigate(s.address); }
+                            else gotoStatic(ctx, s.address);
+                        }
+                        if (ImGui::MenuItem("Find references (where used)")) {
+                            uint64_t target = (!stringsLive_ && ssnap.attached())
+                                            ? fileVAtoLive(ctx, s.address) : s.address;
+                            startXrefSearch(ctx, target);
+                        }
                         if (ImGui::MenuItem("Copy address")) {
                             char c[24]; std::snprintf(c, sizeof(c), "0x%llX", (unsigned long long)s.address); ImGui::SetClipboardText(c);
                         }
-                        if (ImGui::MenuItem("Copy string")) ImGui::SetClipboardText(s.text.c_str());
+                        if (ImGui::MenuItem(s.textTruncated ? "Copy stored prefix" : "Copy string"))
+                            ImGui::SetClipboardText(s.text.c_str());
                         ImGui::EndPopup();
                     }
                     ImGui::TableSetColumnIndex(1); ImGui::TextDisabled(s.wide ? "L" : "A");
                     ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(s.text.c_str());
+                    if (s.textTruncated) {
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Stored 512-byte prefix shown; the original run is longer.");
+                        ImGui::SameLine(0.0f, 0.0f); ImGui::TextDisabled("...");
+                    }
                     if (showUsedBy) {
                         ImGui::TableSetColumnIndex(3);
                         // Owning function of the first referencing instruction.
@@ -6227,11 +6511,18 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                 ImGui::EndTable();
             }
             ui::PopMono();
-            if (stringsScanning_) {                 // a live scan is running off-thread
-                ImGui::TextDisabled("Scanning process memory...");
+            if (stringsScanning_) {
+                ImGui::TextDisabled(stringsScanLive_ ? "Scanning process memory..." : "Scanning file strings...");
                 ImGui::SameLine();
-                LiveProgress lp = ctx.livescan.progress();
-                float frac = lp.total > 0 ? (float)lp.current / (float)lp.total : -1.0f;
+                float frac = -1.0f;
+                if (stringsScanLive_) {
+                    LiveProgress lp = ctx.livescan.progress();
+                    if (lp.total > 0) frac = (float)lp.current / (float)lp.total;
+                } else {
+                    ProgressSnapshot ap = ctx.analysis.progress();
+                    if (ap.phase == AnalysisPhase::Strings && ap.total > 0)
+                        frac = (float)ap.current / (float)ap.total;
+                }
                 float w = 140.0f * theme::UiScale();
                 if (frac >= 0.0f) ImGui::ProgressBar(frac, ImVec2(w, 0.0f));
                 else { float t = (float)ImGui::GetTime(); ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), ""); }
@@ -6241,6 +6532,9 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                 if (stringsLive_ && !ssnap.attached()) ImGui::TextDisabled("Attach to a process, then Scan.");
                 else ImGui::TextDisabled("Press Scan to extract strings.");
             }
+            if (stringsTruncated_)
+                ImGui::TextColored(theme::col::warn(),
+                                   "Showing %zu strings; a scan safety limit was reached.", strings_.size());
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
@@ -6436,7 +6730,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
         renderJavaTab(ctx);
         renderGameContextTab(ctx);
         if (ImGui::BeginTabItem("Breakpoints")) {
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             ImGui::SeparatorText("Software (0xCC)");
             if (snap.attached()) {
                 if (snap.breakpoints.empty()) ImGui::TextDisabled("None. Click the gutter or right-click an address.");
@@ -6568,7 +6862,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Registers")) {
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             if (!snap.attached()) {
                 ImGui::TextDisabled("Attach a process to view registers and stack.");
             } else {
@@ -6679,7 +6973,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Watch")) {
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             ImGui::SetNextItemWidth(-90);
             bool add = ImGui::InputTextWithHint("##watchadd", "expression  e.g.  rax   [rsp+8]   0x140001000",
                                                 watchEntry_, sizeof(watchEntry_), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -6752,7 +7046,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Threads")) {
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             if (!snap.attached()) {
                 ImGui::TextDisabled("Attach a process to list threads.");
             } else {
@@ -6791,7 +7085,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
         if (ImGui::BeginTabItem("Modules")) {
             // Live module list from LOAD_DLL/UNLOAD_DLL events (follows dynamic
             // loads during the session; the Communications tab's static pane stays).
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             if (!snap.attached()) {
                 ImGui::TextDisabled("Attach a process to track its loaded modules live.");
             } else if (snap.modules.empty()) {
@@ -6835,7 +7129,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
         }
         if (ImGui::BeginTabItem("Debug Output")) {
             // OutputDebugString capture (bounded ring on the Debugger).
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             if (ImGui::SmallButton("Clear")) { ctx.debug.clearDebugOutput(); dbgOutSeen_ = 0; }
             ImGui::SameLine();
             if (ImGui::SmallButton("Copy all") && !snap.debugOutput.empty()) {
@@ -6873,7 +7167,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Functions")) {
-            DbgSnapshot snap = ctx.debug.snapshot();
+            const DbgSnapshot& snap = *frameSnap_;
             ImGui::BeginDisabled(!ctx.binary.loaded() || !ctx.disasm);
             if (ImGui::SmallButton("Analyze binary")) analyzeFunctions(ctx);
             ImGui::EndDisabled();
@@ -6897,22 +7191,30 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 // Pre-filter into a dense index list so a clipper can skip off-screen
-                // rows; annName() (a map probe + alloc) then runs only for visible rows
-                // (this table iterated every function with a per-row probe each frame).
-                std::vector<int> vis; vis.reserve(functions_.size());
-                for (int i = 0; i < (int)functions_.size(); ++i) {
-                    if (!funcTabFilter_[0]) { vis.push_back(i); continue; }
-                    const auto& f = functions_[(size_t)i];
-                    std::string dn = annName(ctx, f.address);
-                    const std::string& nm = dn.empty() ? f.name : dn;
-                    if (nm.find(funcTabFilter_) != std::string::npos || f.name.find(funcTabFilter_) != std::string::npos)
-                        vis.push_back(i);
+                // rows. Keep it across frames: on a large binary the old local vector
+                // scanned every function and reallocated even while the filter/data
+                // were unchanged.
+                uint64_t visSig = (uint64_t)functions_.size() ^ ((uint64_t)namesGen_ << 40);
+                if (!functions_.empty()) visSig ^= functions_.front().address ^ (functions_.back().address << 1);
+                if (std::strcmp(funcTabFilter_, funcTabFilterLast_) != 0 || visSig != funcTabVisSig_) {
+                    std::snprintf(funcTabFilterLast_, sizeof(funcTabFilterLast_), "%s", funcTabFilter_);
+                    funcTabVisSig_ = visSig;
+                    funcTabVisible_.clear();
+                    funcTabVisible_.reserve(functions_.size());
+                    for (int i = 0; i < (int)functions_.size(); ++i) {
+                        if (!funcTabFilter_[0]) { funcTabVisible_.push_back(i); continue; }
+                        const auto& f = functions_[(size_t)i];
+                        std::string dn = annName(ctx, f.address);
+                        const std::string& nm = dn.empty() ? f.name : dn;
+                        if (nm.find(funcTabFilter_) != std::string::npos || f.name.find(funcTabFilter_) != std::string::npos)
+                            funcTabVisible_.push_back(i);
+                    }
                 }
                 ImGuiListClipper clip;
-                clip.Begin((int)vis.size());
+                clip.Begin((int)funcTabVisible_.size());
                 while (clip.Step())
                     for (int vi = clip.DisplayStart; vi < clip.DisplayEnd; ++vi) {
-                        auto& f = functions_[(size_t)vis[(size_t)vi]];
+                        auto& f = functions_[(size_t)funcTabVisible_[(size_t)vi]];
                         std::string dn = annName(ctx, f.address);
                         const std::string& nm = dn.empty() ? f.name : dn;
                         ImGui::TableNextRow(); ImGui::PushID((void*)(uintptr_t)f.address);   // full-width id
@@ -6923,7 +7225,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                             if (ImGui::MenuItem("Go to"))         gotoStatic(ctx, f.address);
                             if (ImGui::MenuItem("Rename...")) {
                                 annPopupVA_ = f.address;
-                                std::snprintf(renameBuf_, sizeof(renameBuf_), "%s", dn.c_str());
+                                std::snprintf(renameBuf_, sizeof(renameBuf_), "%s", nm.c_str());
                                 openRenamePopup_ = true;
                             }
                             if (ImGui::MenuItem("Copy address"))  ImGui::SetClipboardText(al);
@@ -7188,7 +7490,9 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
                     if (m.referencedBy.empty()) ImGui::TextDisabled("(no resolved references in this image)");
                     for (const auto& x : m.referencedBy) {
                         char rl[80];
-                        if (x.funcAddress) std::snprintf(rl, sizeof(rl), "0x%llX  %s", (unsigned long long)x.funcAddress, x.funcName.c_str());
+                        std::string displayName = x.funcAddress ? annName(ctx, x.funcAddress) : std::string();
+                        if (displayName.empty()) displayName = x.funcName;
+                        if (x.funcAddress) std::snprintf(rl, sizeof(rl), "0x%llX  %s", (unsigned long long)x.funcAddress, displayName.c_str());
                         else               std::snprintf(rl, sizeof(rl), "ref @ 0x%llX  (function unresolved)", (unsigned long long)x.refInsn);
                         ImGui::PushID((void*)(uintptr_t)x.refInsn);
                         if (ImGui::Selectable(rl)) gotoStatic(ctx, x.funcAddress ? x.funcAddress : x.refInsn);
@@ -7254,7 +7558,20 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
 }
 
 void BinaryViewTab::render(AppContext& ctx) {
-    DbgSnapshot snap = ctx.debug.snapshot();
+    // DbgSnapshot owns breakpoint, thread, module, frame, and debug-output
+    // vectors. Take one deep snapshot for the Binary View frame and share it
+    // across the active main/side/lower subpanels.
+    if (ctx.frameDebugSnapshot) {
+        frameSnap_ = ctx.frameDebugSnapshot;
+    } else {
+        fallbackFrameSnap_ = ctx.debug.snapshot();
+        frameSnap_ = &fallbackFrameSnap_;
+    }
+    struct ResetBorrowedSnapshot {
+        const DbgSnapshot*& snapshot;
+        ~ResetBorrowedSnapshot() { snapshot = nullptr; }
+    } resetBorrowedSnapshot{ frameSnap_ };
+    const DbgSnapshot& snap = *frameSnap_;
     symAttached_ = snap.attached();        // cached for symbolFor() this frame
     symPid_      = snap.pid;
 
@@ -7275,6 +7592,7 @@ void BinaryViewTab::render(AppContext& ctx) {
         symCache_.clear(); symbols_.reset();
         modExports_.clear();
         liveModules_.clear(); liveModulesPid_ = 0;
+        symbolLiveModulesSig_ = ~0ull;
         liveInsns_.clear(); liveIdxOf_.clear(); liveFuncSet_.clear();
         liveBuf_.clear(); liveBuf_.shrink_to_fit();
         liveCacheSig_ = ~0ull; liveCacheStart_ = 0; ++liveGen_;
@@ -7299,12 +7617,43 @@ void BinaryViewTab::render(AppContext& ctx) {
         ProcessManager pm;
         liveModules_    = pm.modules(snap.pid);
         liveModulesPid_ = snap.pid;
+        symbolLiveModulesSig_ = debugModuleSignature(snap);
         for (auto& mi : liveModules_) ctx.modules.addOrUpdate(mi.name, mi.base, mi.size, mi.path);
         if (!liveModules_.empty()) {
             const ModuleInfo& main = liveModules_.front();   // Toolhelp lists the main EXE first
             if (LoadedModule* mm = ctx.modules.byBase(main.base)) mm->isMain = true;
             if (!ctx.binary.loaded() && ctx.loadLiveModule(main.base, main.size, main.name))
                 mainView_ = 0;   // show the static assembly of the just-loaded main module
+        }
+    }
+    // LOAD_DLL/UNLOAD_DLL events change the debugger snapshot after attach. Refresh
+    // the Toolhelp-backed module/export caches only on that edge so symbolization and
+    // the module registry never retain an unloaded DLL (or miss a newly loaded one).
+    if (symAttached_ && wasAttached_) {
+        const uint64_t moduleSig = debugModuleSignature(snap);
+        if (moduleSig != symbolLiveModulesSig_) {
+            ProcessManager pm;
+            liveModules_ = pm.modules(snap.pid);
+            liveModulesPid_ = snap.pid;
+            symbolLiveModulesSig_ = moduleSig;
+            modExports_.clear(); symCache_.clear(); symbols_.reset();
+            symbolIndexSig_ = ~0ull;
+
+            std::unordered_set<uint64_t> liveBases;
+            liveBases.reserve(liveModules_.size());
+            for (const ModuleInfo& module : liveModules_) {
+                liveBases.insert(module.base);
+                ctx.modules.addOrUpdate(module.name, module.base, module.size, module.path);
+            }
+            std::vector<uint64_t> unloaded;
+            for (const auto& module : ctx.modules.all())
+                if (module && !liveBases.count(module->base)) unloaded.push_back(module->base);
+            if (!unloaded.empty()) {
+                // Registry entries own BinaryFiles that module-analysis workers may
+                // still read. Join them before releasing an unloaded entry.
+                ctx.analysis.cancelAndWaitIdle();
+                for (uint64_t base : unloaded) ctx.modules.removeByBase(base);
+            }
         }
     }
     wasAttached_ = symAttached_;
@@ -7332,16 +7681,16 @@ void BinaryViewTab::render(AppContext& ctx) {
     // background worker (coalesced via the dirty flag) so the decompiler / CFG use
     // current bounds. Bumping the epoch supersedes any in-flight job, and because the
     // patch's writeImage() already ran on this thread, the worker sees the patched bytes.
-    // Only the immediately-visible passes run here (functions + strings + the listing
-    // index, which needs the strings for its data-section rows). The heavier whole-
-    // program xref index and the algorithm scan are deferred: the Xrefs tab rebuilds
-    // its index lazily (ensureXrefReady) and the algorithm matches stay until the next
-    // full load — so a patch doesn't pay for indexes the user may not look at.
+    // Rebuild every code-derived index. Retaining AlgoScan results until the next
+    // full load displayed evidence for bytes that no longer existed. All passes
+    // below run off-thread, so correctness does not stall the renderer.
     if (functionsDirty_ && ctx.binary.loaded()) {
         functionsDirty_ = false;
         uint64_t e = ctx.analysis.bumpEpoch();
+        if (!stringsLive_) { stringsScanning_ = true; stringsScanLive_ = false; }
         ctx.analysis.requestBulk(&ctx.binary, ctx.engine, ctx.arch,
-                                 K_Funcs | K_Strings | K_Listing, guessNames_, e);
+                                 K_Funcs | K_Strings | K_Listing | K_Xref | K_Intent,
+                                 guessNames_, e);
     }
 
     // Swap in any finished background analysis atomically (between ImGui calls, so no
@@ -7357,7 +7706,11 @@ void BinaryViewTab::render(AppContext& ctx) {
                 // "Analyze all modules" result: cache it on the registry module (not the
                 // active tab). Switching to that module later restores from this cache.
                 if (LoadedModule* m = ctx.modules.byBase(ar.moduleBase)) {
-                    if (ar.stringsValid) { m->cache.strings = std::move(ar.strings); m->cache.stringsValid = true; }
+                    if (ar.stringsValid) {
+                        m->cache.strings = std::move(ar.strings);
+                        m->cache.stringsTruncated = ar.stringsTruncated;
+                        m->cache.stringsValid = true;
+                    }
                     if (ar.funcsValid)   { m->cache.functions = std::move(ar.functions); m->cache.summary = std::move(ar.summary); m->cache.funcsValid = true; }
                     if (ar.listingValid) { m->cache.listRows = std::move(ar.listRows); m->cache.listInsnCount = ar.listInsnCount; m->cache.listingValid = true; }
                     if (ar.xref)         { m->cache.xref = ar.xref; }
@@ -7367,22 +7720,37 @@ void BinaryViewTab::render(AppContext& ctx) {
                 continue;
             }
             if (ar.stringsValid) {
-                strings_.clear();
-                strings_.reserve(ar.strings.size());
-                for (auto& s : ar.strings) strings_.push_back({ s.address, s.text, s.wide });
-                stringsScanned_ = true;
+                // A file-analysis result must never overwrite the live-memory list
+                // after the user toggled modes while that worker job was in flight.
+                if (!stringsLive_) {
+                    strings_.clear();
+                    strings_.reserve(ar.strings.size());
+                    for (auto& s : ar.strings)
+                        strings_.push_back({ s.address, s.text, s.wide, s.textTruncated });
+                    ++stringsGen_;
+                    stringsScanned_ = true;
+                    stringsScanning_ = false;
+                    stringsTruncated_ = ar.stringsTruncated;
+                    if (ar.kinds & K_Listing) {
+                        listRows_.erase(std::remove_if(listRows_.begin(), listRows_.end(),
+                                        [](const ListRow& r) { return r.strData; }), listRows_.end());
+                        listBuilt_ = true;
+                        listSig_ = listingSig(ctx); // wait for worker listing; do not sweep here
+                    }
+                }
             }
             if (ar.funcsValid) {
                 functions_.clear();
                 functions_.reserve(ar.functions.size());
                 guessReason_.clear();
                 for (auto& f : ar.functions) {
-                    functions_.push_back({ f.address, f.name, f.size, f.guessed });
+                    functions_.push_back({ f.address, f.name, f.size, f.guessed, f.isExport });
                     if (f.guessed && !f.reason.empty()) guessReason_[f.address] = f.reason;
                 }
                 fnSummary_      = ar.summary;
                 funcIndexDirty_ = true;     // function set changed: rebuild the sorted lookup
-                symCache_.clear();          // resolved names changed: drop the cache
+                ++functionsGen_;
+                invalidateNameDependentCaches(); // refilter/reindex guessed/discovered names + pseudocode
                 ++liveGen_;                 // invalidate the live decode's divider set
                 if (ar.kinds & K_Listing) {
                     // The worker is (re)building the full listing too — don't sweep on
@@ -7401,7 +7769,13 @@ void BinaryViewTab::render(AppContext& ctx) {
                 // the guard from re-sweeping (which would otherwise rebuild on the UI).
                 listRows_.clear();
                 listRows_.reserve(ar.listRows.size());
-                for (const auto& r : ar.listRows) listRows_.push_back({ r.addr, r.divider, r.strData, r.strIdx });
+                for (const auto& r : ar.listRows) {
+                    // Runtime strings do not index the file listing. If the user
+                    // switched to Live while this result was running, retain only
+                    // its instruction/divider rows.
+                    if (!stringsLive_ || !r.strData)
+                        listRows_.push_back({ r.addr, r.divider, r.strData, r.strIdx });
+                }
                 listInsnCount_ = ar.listInsnCount;
                 listBuilt_     = true;
                 listSig_       = listingSig(ctx);
@@ -7425,7 +7799,8 @@ void BinaryViewTab::render(AppContext& ctx) {
                     callees_[e.from].push_back(e.to);
                     callers_[e.to].push_back(e.from);
                 }
-                callGraphSig_ = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0) ^ ((uint64_t)functions_.size() << 1);
+                callGraphSig_ = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0)
+                              ^ (functionsGen_ * 0xD6E8FEB86659FD93ull);
             }
             if (ar.synthValid) {            // F1 clean-room synthesis result
                 synth_ = std::move(ar.synth);
@@ -7438,9 +7813,10 @@ void BinaryViewTab::render(AppContext& ctx) {
                 if (!pathHave_) pathStatus_ = "No reachable paths (region did not decode to a CFG).";
             }
             if (ar.decompValid) {           // K_Decompile (static Pseudocode) result
+                if (ar.decompContext != namesGen_) continue; // rename/function update superseded its snapshot
                 DecompResult dr{ std::move(ar.decompText), std::move(ar.decompLineVA) };
                 decompLruPut(ar.decompVA, dr);              // cache for nav back/forward (pseudo-C)
-                if (ar.decompVA == decompVA_) {             // still the function on screen
+                if (decompValid_ && ar.decompVA == decompVA_) { // still the function on screen (VA 0 valid)
                     applyDecompLang(dr);                    // render in the selected language
                     decompPending_ = false;
                 }
@@ -7455,11 +7831,19 @@ void BinaryViewTab::render(AppContext& ctx) {
         while (ctx.livescan.tryTake(lr)) {
             if (lr.epoch != ctx.livescan.epoch()) continue;   // superseded by detach/reload
             if (lr.kind == LiveKind::Strings) {
-                if (lr.token != stringsToken_) continue;       // not the latest request
+                if (lr.token != stringsToken_ || !stringsLive_) continue; // stale request/mode
                 strings_.clear();
                 strings_.reserve(lr.strings.size());
-                for (auto& s : lr.strings) strings_.push_back({ s.address, s.text, s.wide });
+                for (auto& s : lr.strings)
+                    strings_.push_back({ s.address, s.text, s.wide, s.textTruncated });
+                ++stringsGen_;
+                stringsTruncated_ = lr.truncated;
                 stringsScanned_ = true; stringsScanning_ = false;
+                // scanStrings already removed file-string rows. The generation
+                // changed again on adoption, so restamp rather than rebuilding the
+                // static listing from runtime addresses on the render thread.
+                listBuilt_ = true;
+                listSig_ = listingSig(ctx);
             } else if (lr.kind == LiveKind::Xref) {
                 if (lr.token != xrefToken_) continue;
                 xrefHits_ = std::move(lr.hits);
@@ -7481,6 +7865,40 @@ void BinaryViewTab::render(AppContext& ctx) {
                     }
                 }
             }
+        }
+    }
+
+    // Cancellation drops queued/results and advances the service epoch, so no
+    // completion object exists to clear per-view spinners. Retire those flags once
+    // the corresponding pool is genuinely idle instead of showing "Scanning" or
+    // "Decompiling" forever after the toolbar Cancel action.
+    if (!ctx.analysis.bulkPending()) {
+        if (stringsScanning_ && !stringsScanLive_) {
+            stringsScanning_ = false;
+            stringsScanned_ = false;
+        }
+        if (synthPending_) { synthPending_ = false; synthHave_ = false; }
+        if (pathPending_) {
+            pathPending_ = false; pathHave_ = false;
+            pathStatus_ = "Path exploration did not complete (canceled or unavailable).";
+        }
+        if (decompPending_) {
+            DecompResult stopped{
+                "// decompilation did not complete; click Refresh to retry\n", { 0 }
+            };
+            applyDecompLang(stopped);
+            decompPending_ = false;
+            decompValid_ = true; // keep the message stable until an explicit retry/navigation
+        }
+    }
+    if (!ctx.livescan.busy()) {
+        if (stringsScanning_ && stringsScanLive_) {
+            stringsScanning_ = false;
+            stringsScanned_ = false;
+        }
+        if (xrefScanning_) {
+            xrefScanning_ = false;
+            if (xrefStatus_ == "scanning...") xrefStatus_ = "Scan canceled or did not complete.";
         }
     }
 

@@ -51,6 +51,9 @@ int main() {
     std::memcpy(mem.data() + 0x10, str, std::strlen(str));
     mem[0x10 + (int)std::strlen(str)] = 0x00;     // terminate the run
     mem[0x40] = 0xE8; mem[0x41] = mem[0x42] = mem[0x43] = mem[0x44] = 0x00;
+    const char* str2 = "SecondLiveString";
+    std::memcpy(mem.data() + 0x70, str2, std::strlen(str2));
+    mem[0x70 + (int)std::strlen(str2)] = 0x00;
 
     // Stub MemReader over the fake image.
     MemReader reader = [imgBase, &mem](uint64_t va, void* out, size_t n) -> size_t {
@@ -87,6 +90,27 @@ int main() {
         bool found = false;
         for (auto& s : got.strings) if (s.text == "HelloLiveWorld" && s.address == imgBase + 0x10) found = true;
         CHECK(found, "live string scan found the planted ASCII string at the right VA");
+    }
+
+    // Exactly filling the cap is complete, while a real omitted result is surfaced.
+    {
+        std::vector<LiveRange> ranges = { { imgBase, mem.size() } };
+        uint64_t tok = svc.requestStrings(ranges, reader, svc.epoch(), 2);
+        LiveScanResult got;
+        CHECK(collect(3000, tok, got), "exact-cap strings job produced a result");
+        CHECK(got.strings.size() == 2 && !got.truncated,
+              "exactly filling the live string cap is not falsely marked truncated");
+
+        tok = svc.requestStrings(ranges, reader, svc.epoch(), 1);
+        got = LiveScanResult{};
+        CHECK(collect(3000, tok, got), "over-cap strings job produced a result");
+        CHECK(got.strings.size() == 1 && got.truncated,
+              "live string result reports a genuinely omitted match");
+
+        tok = svc.requestStrings(ranges, reader, svc.epoch(), 100, 0x60);
+        got = LiveScanResult{};
+        CHECK(collect(3000, tok, got), "byte-capped strings job produced a result");
+        CHECK(got.truncated, "a partial final range reports byte-cap truncation");
     }
 
     // ---- Xref ----

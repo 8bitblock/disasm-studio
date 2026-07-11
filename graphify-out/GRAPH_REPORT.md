@@ -1,16 +1,16 @@
-# Graph Report - debugger  (2026-06-14)
+# Graph Report - debugger  (2026-07-09)
 
 ## Corpus Check
-- 227 files · ~324,895 words
+- 243 files · ~348,093 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2835 nodes · 5526 edges · 188 communities (147 shown, 41 thin omitted)
-- Extraction: 94% EXTRACTED · 6% INFERRED · 0% AMBIGUOUS · INFERRED: 323 edges (avg confidence: 0.8)
+- 2994 nodes · 5849 edges · 198 communities (159 shown, 39 thin omitted)
+- Extraction: 94% EXTRACTED · 6% INFERRED · 0% AMBIGUOUS · INFERRED: 352 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `1b25568c`
+- Built from commit: `95d36e2e`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -182,12 +182,23 @@
 - [[_COMMUNITY_Community 176|Community 176]]
 - [[_COMMUNITY_Community 177|Community 177]]
 - [[_COMMUNITY_Community 178|Community 178]]
+- [[_COMMUNITY_Community 179|Community 179]]
+- [[_COMMUNITY_Community 181|Community 181]]
 - [[_COMMUNITY_Community 182|Community 182]]
 - [[_COMMUNITY_Community 183|Community 183]]
 - [[_COMMUNITY_Community 184|Community 184]]
 - [[_COMMUNITY_Community 185|Community 185]]
 - [[_COMMUNITY_Community 186|Community 186]]
 - [[_COMMUNITY_Community 187|Community 187]]
+- [[_COMMUNITY_Community 188|Community 188]]
+- [[_COMMUNITY_Community 189|Community 189]]
+- [[_COMMUNITY_Community 190|Community 190]]
+- [[_COMMUNITY_Community 192|Community 192]]
+- [[_COMMUNITY_Community 193|Community 193]]
+- [[_COMMUNITY_Community 194|Community 194]]
+- [[_COMMUNITY_Community 195|Community 195]]
+- [[_COMMUNITY_Community 196|Community 196]]
+- [[_COMMUNITY_Community 197|Community 197]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `AppContext` - 87 edges
@@ -210,8 +221,8 @@
   docs/GENEREAL.md → CLAUDE.md
 - `FLIRT-Style Library Recognition (Feature Survey)` --semantically_similar_to--> `Heuristic Function Name Guessing (FunctionNamer)`  [INFERRED] [semantically similar]
   docs/GENEREAL.md → CLAUDE.md
-- `pseudoLine()` --calls--> `target`  [INFERRED]
-  src/Tabs/BinaryViewTab.cpp → tests/step_logic_test.cpp
+- `main()` --calls--> `SynthesizeJob()`  [INFERRED]
+  tests/synthesisjob_test.cpp → src/Core/SynthesisJob.cpp
 
 ## Import Cycles
 - None detected.
@@ -221,7 +232,7 @@
 - **Engine-Agnostic Disassembly/Assembly Stack** — claude_disassembler_abstraction, claude_zydis, claude_capstone, claude_keystone [EXTRACTED 1.00]
 - **Java/JVM Hybrid Analysis Chain** — claude_jvmclass_parser, claude_jvm_identity_mapping, claude_jvmannotate, claude_jdwp_debugging, additions_java_analysis_layer [INFERRED 0.85]
 
-## Communities (188 total, 41 thin omitted)
+## Communities (198 total, 39 thin omitted)
 
 ### Community 0 - "Binary View Tab & Listing"
 Cohesion: 0.05
@@ -229,23 +240,23 @@ Nodes (153): AnnEntry, flag, NoteKindName(), Func, ImDrawList, JvmAnnEntry, Note
 
 ### Community 1 - "App Shell & Java Scan"
 Cohesion: 0.11
-Nodes (44): MachineArch, analyzeModule(), archFromMachine(), buildPatchedImage(), closeBinary(), Arch, BinaryFile, DbgSnapshot (+36 more)
+Nodes (44): analyzeModule(), archFromMachine(), buildPatchedImage(), closeBinary(), Arch, BinaryFile, DbgSnapshot, JavaZipEntry (+36 more)
 
 ### Community 2 - "Decompiler Structuring"
 Cohesion: 0.05
 Nodes (61): computeIdom(), condOp(), condString(), cOperand(), Decompile(), DecompileToPython(), DecompileWithMap(), liftStmt() (+53 more)
 
 ### Community 3 - "UI Tabs & Widgets"
-Cohesion: 0.08
-Nodes (47): ds(), ds(), PaletteItem, PaletteSymbol, RowT, namespace, namespace, AppContext (+39 more)
+Cohesion: 0.12
+Nodes (37): ds(), RowT, namespace, AppContext, string, vector, wchar_t, AppContext (+29 more)
 
 ### Community 4 - "JDWP Protocol & Client"
 Cohesion: 0.07
 Nodes (69): JdwpBuildBreakpointRequest(), JdwpBuildClearRequest(), JdwpBuildStepRequest(), JdwpDecodePacket(), JdwpEncodeCommand(), JdwpParseAllClasses(), JdwpParseAllThreads(), JdwpParseBytecodes() (+61 more)
 
 ### Community 5 - "Project Docs & Specs"
-Cohesion: 0.17
-Nodes (26): FindAllMasked(), FindFirstMasked(), matchAt(), ParseSignature(), SigPattern, string, vector, AppContext (+18 more)
+Cohesion: 0.12
+Nodes (41): addSpecific(), answerCategory(), archName(), AskCortex(), briefForGuessName(), BuildCortexReport(), CatInfo, explain (+33 more)
 
 ### Community 6 - "Function Annotation Engine"
 Cohesion: 0.07
@@ -260,8 +271,8 @@ Cohesion: 0.09
 Nodes (40): ClassBytes, AnalyzeJvmMethod(), categorizeCall(), checkLikeName(), cpIndexOf(), fieldTypeSlots(), isAuthHandshakeLiteral(), isKeepAliveLiteral() (+32 more)
 
 ### Community 9 - "CFG & Path Exploration"
-Cohesion: 0.11
-Nodes (12): namespace, namespace, namespace, namespace, namespace, namespace, ds(), ds() (+4 more)
+Cohesion: 0.07
+Nodes (18): namespace, namespace, namespace, namespace, namespace, namespace, namespace, namespace (+10 more)
 
 ### Community 10 - "Theme & Palettes"
 Cohesion: 0.06
@@ -272,16 +283,16 @@ Cohesion: 0.22
 Nodes (14): buildG(), ControlFlowGraph, Engine, Instruction, string, unordered_map, vector, lineWith() (+6 more)
 
 ### Community 12 - "Runtime Detection Scan"
-Cohesion: 0.12
-Nodes (38): exactPat(), findStr(), hexs(), javaKindName(), joinWhats(), lower(), mk(), Scan (+30 more)
+Cohesion: 0.07
+Nodes (64): exactPat(), findStr(), hexs(), javaKindName(), joinWhats(), lower(), mk(), Scan (+56 more)
 
 ### Community 13 - "Algorithm Scanning"
 Cohesion: 0.10
 Nodes (38): addByteTable(), addWord32(), addWord64(), B64Sets, std_, url_, exact(), Rule (+30 more)
 
 ### Community 14 - "Symbolic Execution Engine"
-Cohesion: 0.09
-Nodes (35): architecture_e, CollectVars(), DefaultSolver, findBlock(), MakeSolver(), MakeSymEngine(), seedRegs(), StubSymEngine (+27 more)
+Cohesion: 0.16
+Nodes (21): architecture_e, findBlock(), seedRegs(), StubSymEngine, tritonArch(), tritonReg(), TritonSymEngine, Register (+13 more)
 
 ### Community 15 - "AMD-V Hypervisor Driver"
 Cohesion: 0.10
@@ -292,8 +303,8 @@ Cohesion: 0.07
 Nodes (28): AnalyzeDataFlow(), Analyzer, argCount_, argName_, assigned_, blockStmts_, callArgs_, is32_ (+20 more)
 
 ### Community 17 - "Capability Tech Scan"
-Cohesion: 0.09
-Nodes (31): ApiRule, base, category, keys, label, findAllPattern(), lower(), mk() (+23 more)
+Cohesion: 0.14
+Nodes (20): ApiRule, base, category, keys, label, findAllPattern(), lower(), mk() (+12 more)
 
 ### Community 18 - "Win32 Debugger Core"
 Cohesion: 0.08
@@ -316,8 +327,8 @@ Cohesion: 0.14
 Nodes (29): InspectJvm(), isModuleNamed(), LoadJdwpAgent(), parseCompletion(), ProcessHostsJvm(), processIs64(), putPtr(), putStr() (+21 more)
 
 ### Community 23 - "Debugger Thread & Net Tap"
-Cohesion: 0.12
-Nodes (29): applyHwAllThreads(), applyHwToThread(), armBreakpoint(), armNetTap(), captureContext(), ctxReadFull(), ctxReadRip(), ctxSetRip() (+21 more)
+Cohesion: 0.15
+Nodes (24): applyHwAllThreads(), applyHwToThread(), armBreakpoint(), armNetTap(), captureContext(), ctxReadFull(), ctxReadRip(), ctxSetRip() (+16 more)
 
 ### Community 24 - "Signature Scanning"
 Cohesion: 0.20
@@ -328,12 +339,12 @@ Cohesion: 0.13
 Nodes (25): ds(), MakeDisassembler(), namespace, Arch, Engine, IDisassembler, unique_ptr, AppContext (+17 more)
 
 ### Community 26 - "Binary File Loader"
-Cohesion: 0.08
+Cohesion: 0.09
 Nodes (46): clear(), firstCodeSection(), load(), loadFromMemory(), loadRaw(), parseELF(), parseImports(), parseJavaClass() (+38 more)
 
 ### Community 27 - "Decompiler Fix Tests"
-Cohesion: 0.06
-Nodes (36): BuildCFG(), endsBlock(), isRet(), isUncondJmp(), CfgSymCfg, cfg_, idx_, PathExploreJob() (+28 more)
+Cohesion: 0.10
+Nodes (17): CfgSymCfg, cfg_, idx_, PathExploreJob(), StructuralSolver, Arch, BinaryFile, BranchInfo (+9 more)
 
 ### Community 28 - "Decompiler Line-Map Tests"
 Cohesion: 0.15
@@ -352,12 +363,16 @@ Cohesion: 0.25
 Nodes (20): CondContext, CondOp, CondOperand, CondProgram, applyOp(), CompileCondition(), CompileExpression(), compileOperand() (+12 more)
 
 ### Community 32 - "Disassembler Interfaces"
-Cohesion: 0.14
-Nodes (8): ds(), ds(), ds(), namespace, namespace, namespace, namespace, ds()
+Cohesion: 0.07
+Nodes (16): ds(), ds(), ds(), ds(), ds(), ds(), ds(), ds() (+8 more)
+
+### Community 33 - "Tab Interfaces"
+Cohesion: 0.15
+Nodes (29): anyOf(), BuildPrismReport(), ClassifySample(), contains(), isAllocFrame(), isGpuFrame(), isIoFrame(), isLockFrame() (+21 more)
 
 ### Community 34 - "Analysis Jobs"
-Cohesion: 0.15
-Nodes (25): AnalyzeOut, BulkJob, CallEdgeR, AnalyzeFunctionsNamed(), BuildCallEdges(), BuildListingRows(), DecompileRegion(), ScanAlgorithmsJob() (+17 more)
+Cohesion: 0.18
+Nodes (22): AnalyzeOut, BulkJob, CallEdgeR, AnalyzeFunctionsNamed(), BuildCallEdges(), BuildListingRows(), DecompileRegion(), ScanAlgorithmsJob() (+14 more)
 
 ### Community 35 - "Live Scan Service"
 Cohesion: 0.15
@@ -372,8 +387,8 @@ Cohesion: 0.17
 Nodes (20): appendHexBytes(), attachClass(), AttachJvmClass(), bciFor(), decodeAt(), decodeOne(), disassemble(), newarrayType() (+12 more)
 
 ### Community 38 - "Path Explore Tests"
-Cohesion: 0.15
-Nodes (10): ByteSolver, BranchInfo, ExprRef, PathConstraint, unordered_map, VarBinding, vector, EscapeCfg (+2 more)
+Cohesion: 0.14
+Nodes (11): ISymCfg, ByteSolver, BranchInfo, ExprRef, PathConstraint, unordered_map, VarBinding, vector (+3 more)
 
 ### Community 39 - "Synthesis Engine Tests"
 Cohesion: 0.12
@@ -388,24 +403,24 @@ Cohesion: 0.14
 Nodes (13): AnalysisPhase, AnalysisResult, AnalysisService(), progress(), requestBulk(), setPhase(), threadMain(), tryTakeBulk() (+5 more)
 
 ### Community 42 - "Analysis Service Worker"
-Cohesion: 0.12
-Nodes (22): ImVec4, string, ToastKind, IconsLoaded(), PopMono(), PushMono(), AccentButton(), Badge() (+14 more)
+Cohesion: 0.06
+Nodes (43): ds(), PaletteItem, PaletteSymbol, namespace, AppContext, BinaryFile, AppContext, ImVec4 (+35 more)
 
 ### Community 43 - "Data-Flow Rendering"
 Cohesion: 0.32
 Nodes (5): immText(), lhsFor(), Env, set, string
 
 ### Community 44 - "Function Naming Heuristics"
-Cohesion: 0.18
-Nodes (22): bareApi(), GuessFromEvidence(), identifierString(), isNoiseApi(), joinApis(), name(), norm(), semanticName() (+14 more)
+Cohesion: 0.27
+Nodes (17): bareApi(), GuessFromEvidence(), identifierString(), isNoiseApi(), joinApis(), name(), norm(), semanticName() (+9 more)
 
 ### Community 45 - "Path Exploration"
-Cohesion: 0.21
-Nodes (18): Classify(), DependsOnInput(), Explore(), NotPred(), PathSat(), PathTagName(), SolvePath(), PathTag (+10 more)
+Cohesion: 0.22
+Nodes (17): Classify(), DependsOnInput(), Explore(), NotPred(), PathSat(), PathTagName(), SolvePath(), PathTag (+9 more)
 
 ### Community 46 - "Java Scan Tests"
-Cohesion: 0.08
-Nodes (52): containsBytes(), ExtractZipEntry(), FindZipEOCD(), JavaWrapKindName(), lower(), parseMainClass(), ParseZipCentralDir(), rdp() (+44 more)
+Cohesion: 0.18
+Nodes (18): containsBytes(), ExtractZipEntry(), FindZipEOCD(), JavaWrapKindName(), lower(), parseMainClass(), ParseZipCentralDir(), rdp() (+10 more)
 
 ### Community 47 - "Constant Expression Eval"
 Cohesion: 0.26
@@ -476,8 +491,8 @@ Cohesion: 0.20
 Nodes (12): ctxWriteFull(), regions(), restoreSnapshot(), setRegister(), setRegisters(), snapshot(), takeSnapshot(), writeMemory() (+4 more)
 
 ### Community 64 - "Disassembler Test Stubs"
-Cohesion: 0.24
-Nodes (5): IDisassembler, Engine, Instruction, vector, NopDis
+Cohesion: 0.20
+Nodes (6): IDisassembler, Engine, Instruction, vector, main(), NopDis
 
 ### Community 65 - "Driver Load Script"
 Cohesion: 0.36
@@ -496,8 +511,8 @@ Cohesion: 0.44
 Nodes (10): isAllOnes(), isConstVal(), isOne(), isZero(), rebuild(), Simplify(), simplifyOnce(), ExprOp (+2 more)
 
 ### Community 69 - "Synthesis Job"
-Cohesion: 0.29
-Nodes (7): SynthesizeJob(), Arch, BinaryFile, IDisassembler, SynthesisOptions, SynthResult, main()
+Cohesion: 0.20
+Nodes (11): MakeSolver(), MakeSymEngine(), SynthesizeJob(), ISolver, Arch, unique_ptr, Arch, BinaryFile (+3 more)
 
 ### Community 70 - "Patch Pristine Tests"
 Cohesion: 0.44
@@ -512,16 +527,16 @@ Cohesion: 0.24
 Nodes (4): Engine, Instruction, vector, StubDisasm
 
 ### Community 73 - "Net Capture Logging"
-Cohesion: 0.33
-Nodes (9): firstChanceCodes(), netCaptures(), pushNetCapture(), writeHexPayload(), writeNetCaptureLog(), writePrintablePayload(), FILE, NetCapture (+1 more)
+Cohesion: 0.36
+Nodes (8): firstChanceCodes(), netCaptures(), writeHexPayload(), writeNetCaptureLog(), writePrintablePayload(), FILE, NetCapture, vector
 
 ### Community 74 - "PE Overlay Tests"
 Cohesion: 0.56
 Nodes (8): buildPE32(), BinaryFile, vector, loadBytes(), main(), put16(), put32(), putstr()
 
 ### Community 75 - "Debugger Attach Helpers"
-Cohesion: 0.21
-Nodes (14): buildG(), countOf(), ControlFlowGraph, Engine, Instruction, string, unordered_map, vector (+6 more)
+Cohesion: 0.20
+Nodes (15): algToIdx(), clearTimers(), cycle(), fill(), info(), mark(), placePieces(), setStatus() (+7 more)
 
 ### Community 76 - "Findings & Game Headers"
 Cohesion: 0.25
@@ -552,8 +567,8 @@ Cohesion: 0.67
 Nodes (6): buildPE32(), vector, main(), put16(), put32(), putstr()
 
 ### Community 83 - "Function Analyzer Stubs"
-Cohesion: 0.27
-Nodes (12): analyze(), collectExports(), isNoreturnImportName(), prologueScan(), rdle(), BinaryFile, DiscoveredFunction, IDisassembler (+4 more)
+Cohesion: 0.20
+Nodes (14): analyze(), collectExports(), isNoreturnImportName(), prologueScan(), rdle(), BinaryFile, DiscoveredFunction, IDisassembler (+6 more)
 
 ### Community 84 - "JVM-Aware PE Tests"
 Cohesion: 0.67
@@ -612,8 +627,8 @@ Cohesion: 0.11
 Nodes (18): 07. The Binary View Workspace (Centerpiece), Analysis export, Caching strategy (performance), Cross-references, Inline annotations (the "explain it to me" layer), Limitations & notes, Live↔file VA translation under ASLR, Lower sub-tabs (+10 more)
 
 ### Community 106 - "ExcName Header"
-Cohesion: 0.25
-Nodes (11): Asm, base, cur, ins, countOf(), string, vector, decompile() (+3 more)
+Cohesion: 0.16
+Nodes (16): Asm, base, cur, ins, countOf(), Engine, Instruction, string (+8 more)
 
 ### Community 123 - "SymEngine Header"
 Cohesion: 0.12
@@ -622,6 +637,10 @@ Nodes (16): 01. Architecture & Application Shell, `AppContext` — the single sh
 ### Community 127 - "Capstone Header"
 Cohesion: 0.12
 Nodes (16): 01. Architecture & Application Shell, `AppContext` — the single shared-state struct, Binary loading & project lifecycle, Data flow & frame contract (summary), Debug toolbar (`renderDebugToolbar`), Embedded application icon (`app.rc`, `resource.h`), Limitations & notes, Main window & the tab strip (`renderMainWindow`) (+8 more)
+
+### Community 129 - "JvmDisassembler Header"
+Cohesion: 0.18
+Nodes (14): resumeThread(), suspendThread(), ~PrismSampler(), run(), sampleCount(), sampleThread(), snapshot(), start() (+6 more)
 
 ### Community 130 - "ZydisDisassembler Header"
 Cohesion: 0.13
@@ -700,8 +719,8 @@ Cohesion: 0.20
 Nodes (9): Build, Compile, DisasmStudio, Distribution (self-contained exe), Layout, On the performance / hypervisor requirements, Prerequisites, Using it (+1 more)
 
 ### Community 164 - "Community 164"
-Cohesion: 0.32
-Nodes (4): Engine, Instruction, vector, StubDisasm
+Cohesion: 0.21
+Nodes (7): Engine, Instruction, string, vector, main(), StubDisasm, writeTempBlob()
 
 ### Community 166 - "Community 166"
 Cohesion: 0.22
@@ -736,12 +755,16 @@ Cohesion: 0.25
 Nodes (8): 11. Hypervisor (AMD-V/SVM) Backend & Kernel Driver, Boundaries and reality, Kernel-mode side — `driver/`, Limitations & notes, Role within the project, Two halves: user-mode client and kernel-mode driver, User-mode side — `src/Hv/`, Why hardware-assisted, and what it buys
 
 ### Community 174 - "Community 174"
-Cohesion: 0.31
-Nodes (5): Engine, Instruction, unordered_map, MockDisassembler, at
+Cohesion: 0.25
+Nodes (11): Engine, Instruction, string, unordered_map, vector, decompile(), has(), main() (+3 more)
 
 ### Community 175 - "Community 175"
 Cohesion: 0.40
 Nodes (5): 13. Appendix — Source Map, Limitations, Non-Goals & Roadmap, Explicit non-goals, Heuristic / best-effort areas, Roadmap / plausible future enhancements, Source coverage map
+
+### Community 176 - "Community 176"
+Cohesion: 0.40
+Nodes (9): applyFilters(), cardById(), discover(), fullLabel(), rarityLabel(), render(), save(), updateMeter() (+1 more)
 
 ### Community 177 - "Community 177"
 Cohesion: 0.61
@@ -751,28 +774,68 @@ Nodes (7): esc(), hex(), mdcell(), RenderReportHtml(), RenderReportMarkdown(), R
 Cohesion: 0.29
 Nodes (4): Engine, Instruction, vector, StubDis
 
+### Community 181 - "Community 181"
+Cohesion: 0.25
+Nodes (7): Design, Editing the deck, Notes & honesty, Pages, Rookspell — Marketing Website, Run it, Structure
+
+### Community 182 - "Community 182"
+Cohesion: 0.61
+Nodes (7): AppContext, CortexInput, string, analyze(), ask(), inputFor(), render()
+
+### Community 184 - "Community 184"
+Cohesion: 0.53
+Nodes (5): apis(), FuncEvidence, string, vector, main()
+
+### Community 185 - "Community 185"
+Cohesion: 0.40
+Nodes (5): decodeAt(), evalConditionFor(), readMemory(), readMemoryMasked(), StepDecode
+
+### Community 192 - "Community 192"
+Cohesion: 0.21
+Nodes (14): buildG(), countOf(), ControlFlowGraph, Engine, Instruction, string, unordered_map, vector (+6 more)
+
+### Community 193 - "Community 193"
+Cohesion: 0.31
+Nodes (17): app16(), app32(), appS(), buildPE32(), buildZip(), BinaryFile, string, vector (+9 more)
+
+### Community 194 - "Community 194"
+Cohesion: 0.25
+Nodes (17): app16(), app32(), appS(), buildZip(), JavaZipEntry, string, vector, dogPayload() (+9 more)
+
+### Community 195 - "Community 195"
+Cohesion: 0.21
+Nodes (9): CollectVars(), DefaultSolver, Subst(), map, class, JdwpClient(), ExprRef, PathConstraint (+1 more)
+
+### Community 196 - "Community 196"
+Cohesion: 0.39
+Nodes (8): BuildCFG(), endsBlock(), isRet(), isUncondJmp(), JumpTableResolver, ControlFlowGraph, IDisassembler, Instruction
+
+### Community 197 - "Community 197"
+Cohesion: 0.52
+Nodes (6): BinaryFile, Capability, vector, find(), loadBlob(), main()
+
 ## Ambiguous Edges - Review These
 - `No Scripting/Plugin API (Explicit Non-Goal)` → `Plugin-Friendly Analyzer Architecture (Spec)`  [AMBIGUOUS]
   additions.md · relation: conceptually_related_to
 
 ## Knowledge Gaps
-- **798 isolated node(s):** `DisasmStudio`, `HVDBG_INFO`, `PUNICODE_STRING`, `ULONG64`, `CONTEXT` (+793 more)
+- **836 isolated node(s):** `DisasmStudio`, `HVDBG_INFO`, `PUNICODE_STRING`, `ULONG64`, `CONTEXT` (+831 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **41 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **39 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
 - **What is the exact relationship between `No Scripting/Plugin API (Explicit Non-Goal)` and `Plugin-Friendly Analyzer Architecture (Spec)`?**
   _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._
-- **Why does `BuildCFG()` connect `Decompiler Fix Tests` to `Binary View Tab & Listing`, `Analysis Jobs`, `Decompiler Structuring`, `Function Annotation Engine`, `ExcName Header`, `Debugger Attach Helpers`, `Java Class Parsing`, `Decompiler Switch Tests`, `Function Namer Tests`, `Decompiler Line-Map Tests`?**
-  _High betweenness centrality (0.056) - this node is a cross-community bridge._
-- **Why does `runJob()` connect `Analysis Jobs` to `Synthesis Job`, `JVM Disassembler`, `Python Decompiler Tests`, `Signature Scanning`, `Decompiler Fix Tests`?**
+- **Why does `BuildCFG()` connect `Community 196` to `Binary View Tab & Listing`, `Community 192`, `Analysis Jobs`, `Decompiler Structuring`, `Function Annotation Engine`, `Function Namer Tests`, `ExcName Header`, `Java Class Parsing`, `Community 174`, `Community 182`, `Decompiler Switch Tests`, `Decompiler Fix Tests`, `Decompiler Line-Map Tests`?**
+  _High betweenness centrality (0.082) - this node is a cross-community bridge._
+- **Why does `analyze()` connect `Community 182` to `Analysis Jobs`, `Community 196`, `Project Docs & Specs`, `Function Annotation Engine`, `Algorithm Scanning`, `Capability Tech Scan`, `Signature Scanning`?**
   _High betweenness centrality (0.053) - this node is a cross-community bridge._
-- **Why does `ScanAlgorithms()` connect `Algorithm Scanning` to `Capability Tech Scan`, `Analysis Jobs`, `Project Docs & Specs`?**
-  _High betweenness centrality (0.046) - this node is a cross-community bridge._
+- **Why does `runJob()` connect `Analysis Jobs` to `Synthesis Job`, `JVM Disassembler`, `Python Decompiler Tests`, `Signature Scanning`, `Decompiler Fix Tests`?**
+  _High betweenness centrality (0.041) - this node is a cross-community bridge._
 - **What connects `DisasmStudio`, `HVDBG_INFO`, `PUNICODE_STRING` to the rest of the system?**
-  _800 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _838 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Binary View Tab & Listing` be split into smaller, more focused modules?**
   _Cohesion score 0.05119396732299958 - nodes in this community are weakly interconnected._
 - **Should `App Shell & Java Scan` be split into smaller, more focused modules?**

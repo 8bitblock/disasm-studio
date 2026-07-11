@@ -85,8 +85,10 @@ int main() {
     // ---- patches reach the image (the patch system path) ------------------------
     {
         const uint8_t nop = 0x00;
+        const uint64_t rev = bf.imageRevision();
         CHECK(bf.writeImage(tc.mainCodeOff, &nop, 1) == 1);
         CHECK(bf.bytes()[tc.mainCodeOff] == 0x00);
+        CHECK(bf.imageRevision() > rev);
     }
 
     // ---- FunctionAnalyzer: method table is authoritative -------------------------

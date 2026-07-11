@@ -16,11 +16,13 @@
 #include "Disasm/IDisassembler.h"
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <limits>
 #include <thread>
 
 using namespace ds;
@@ -30,10 +32,14 @@ static int g_fail = 0;
 
 // Minimal decoder: every byte is a 1-byte "nop"; no branches/calls/rets.
 struct StubDisasm : IDisassembler {
+    uint64_t highestVA = 0;
+    size_t decodeCalls = 0;
     Engine engine() const override { return Engine::Zydis; }
     const char* engineName() const override { return "stub"; }
     bool decodeOne(const uint8_t* data, size_t size, uint64_t va, Instruction& out) override {
         if (!data || size == 0) return false;
+        highestVA = decodeCalls ? std::max(highestVA, va) : va;
+        ++decodeCalls;
         out = Instruction{};
         out.address = va; out.length = 1; out.mnemonic = "nop"; out.bytes = "90";
         return true;
@@ -48,6 +54,22 @@ struct StubDisasm : IDisassembler {
             v.push_back(in); off += in.length;
         }
         return v;
+    }
+};
+
+struct GateDisasm : StubDisasm {
+    std::shared_ptr<std::atomic<bool>> release;
+    std::shared_ptr<std::atomic<int>> entered;
+    GateDisasm(std::shared_ptr<std::atomic<bool>> r,
+               std::shared_ptr<std::atomic<int>> e)
+        : release(std::move(r)), entered(std::move(e)) {}
+    bool decodeOne(const uint8_t* data, size_t size, uint64_t va, Instruction& out) override {
+        if (!release->load(std::memory_order_acquire)) {
+            entered->fetch_add(1, std::memory_order_acq_rel);
+            while (!release->load(std::memory_order_acquire))
+                std::this_thread::yield();
+        }
+        return StubDisasm::decodeOne(data, size, va, out);
     }
 };
 
@@ -81,6 +103,57 @@ int main() {
     CHECK(foundWide,  "utf-16 'Wide'");
     for (size_t i = 1; i < strs.size(); ++i) CHECK(strs[i - 1].address <= strs[i].address, "strings sorted by address");
 
+    // Regression: the old scanner silently stopped at 20,000 and scanned narrow
+    // strings first, so a narrow-heavy file could omit every UTF-16 result. The new
+    // high safety cap must preserve a >20k mixed corpus in address order.
+    {
+        constexpr size_t kMany = 25050;
+        std::vector<uint8_t> bytes;
+        bytes.reserve(kMany * 18);
+        for (size_t i = 0; i < kMany; ++i) {
+            char word[24]; std::snprintf(word, sizeof(word), "%c%05zu", (i & 1) ? 'W' : 'A', i);
+            if (i & 1) {
+                for (const char* p = word; *p; ++p) { bytes.push_back((uint8_t)*p); bytes.push_back(0); }
+            } else {
+                bytes.insert(bytes.end(), word, word + std::strlen(word));
+            }
+            bytes.push_back(0xFF); bytes.push_back(0xFF);
+        }
+        std::vector<StrResult> many;
+        bool truncated = false;
+        ScanStringsBuffer(bytes.data(), bytes.size(), base, many,
+                          kDefaultStringScanCap, &truncated);
+        CHECK(many.size() == kMany, ">20k mixed strings survive the default scan cap");
+        CHECK(!truncated, ">20k mixed scan is not falsely reported as truncated");
+        size_t narrow = 0, wide = 0;
+        for (const auto& s : many) { if (s.wide) ++wide; else ++narrow; }
+        CHECK(narrow > 12000 && wide > 12000, "mixed scan retains both narrow and UTF-16 strings");
+        for (size_t i = 1; i < many.size(); ++i)
+            CHECK(many[i - 1].address < many[i].address, "large mixed result remains address-sorted");
+
+        std::vector<StrResult> capped;
+        truncated = false;
+        ScanStringsBuffer(bytes.data(), bytes.size(), base, capped, 2000, &truncated);
+        CHECK(capped.size() == 2000 && truncated, "explicit low cap is exact and surfaced");
+        bool cappedHasWide = false;
+        for (const auto& s : capped) if (s.wide) { cappedHasWide = true; break; }
+        CHECK(cappedHasWide, "narrow results cannot starve UTF-16 results at the cap");
+    }
+
+    // The UI promises UTF-8 rather than merely accepting 7-bit ASCII.
+    {
+        const uint8_t utf8[] = { 'c','a','f',0xC3,0xA9,0 }; // caf\xC3\xA9: four code points
+        std::vector<StrResult> u;
+        ScanStringsBuffer(utf8, sizeof(utf8), base, u);
+        CHECK(u.size() == 1 && u[0].text == std::string((const char*)utf8, 5),
+              "valid printable UTF-8 string is extracted intact");
+
+        std::vector<uint8_t> huge(5000, (uint8_t)'X'); huge.push_back(0);
+        u.clear(); ScanStringsBuffer(huge.data(), huge.size(), base, u);
+        CHECK(u.size() == 1 && u[0].text.size() == 512 && u[0].textTruncated,
+              "pathological individual run is stored as an explicit bounded prefix");
+    }
+
     // ---- AnalysisService mechanics (worker pool, incremental per-pass delivery) ----
     AnalysisService svc([](Engine, Arch) -> std::unique_ptr<IDisassembler> {
         return std::make_unique<StubDisasm>();
@@ -96,7 +169,11 @@ int main() {
             AnalysisResult tmp;
             while (svc.tryTakeBulk(tmp)) {
                 if (tmp.epoch != wantEpoch) continue;
-                if (tmp.stringsValid) { merged.strings = tmp.strings; merged.stringsValid = true; }
+                if (tmp.stringsValid) {
+                    merged.strings = tmp.strings;
+                    merged.stringsValid = true;
+                    merged.stringsTruncated = tmp.stringsTruncated;
+                }
                 if (tmp.funcsValid)   { merged.functions = tmp.functions; merged.summary = tmp.summary; merged.funcsValid = true; }
                 if (tmp.listingValid) { merged.listRows = tmp.listRows; merged.listInsnCount = tmp.listInsnCount; merged.listingValid = true; }
                 if (tmp.xref)         { merged.xref = tmp.xref; }
@@ -194,8 +271,14 @@ int main() {
     // Decompile turns into a small but non-empty function body.
     {
         StubDisasm stub;
-        DecompResult t = DecompileRegion(bin, stub, /*x86=*/true, base, base + 8);
+        DecompileNameMap names{ { base, "analyst_main" } };
+        DecompResult t = DecompileRegion(bin, stub, /*x86=*/true, base, base + 8,
+                                         &names, "int (a1)");
         CHECK(!t.text.empty(), "DecompileRegion produced non-empty pseudo-C");
+        CHECK(t.text.find("int analyst_main(a1)") != std::string::npos,
+              "DecompileRegion applies analyst function name and inferred signature");
+        CHECK(stub.decodeCalls > 0 && stub.highestVA < base + 8,
+              "DecompileRegion never decodes beyond its exclusive regionHi");
         // The per-line VA map parallels the text: one entry per '\n'-line.
         size_t nl = 0; for (char c : t.text) if (c == '\n') ++nl;
         CHECK(t.lineVA.size() == nl, "DecompileRegion lineVA parallels the text lines");
@@ -203,6 +286,15 @@ int main() {
         CHECK(DecompileRegion(bin, stub, true, base, base).text.empty(), "DecompileRegion empty for hi<=lo");
         CHECK(DecompileRegion(bin, stub, true, 0xDEAD0000ull, 0xDEAD0010ull).text.empty(),
               "DecompileRegion empty for an unmapped region");
+
+        BinaryFile high;
+        const uint64_t highBase = std::numeric_limits<uint64_t>::max() - 32;
+        CHECK(high.loadRaw(path, highBase), "loadRaw near the address-space limit");
+        StubDisasm highStub;
+        DecompResult highResult = DecompileRegion(
+            high, highStub, true, highBase, std::numeric_limits<uint64_t>::max());
+        CHECK(!highResult.text.empty() && highStub.highestVA < std::numeric_limits<uint64_t>::max(),
+              "DecompileRegion handles a high address without interval overflow");
     }
 
     // ---- K_Decompile bulk pass ----
@@ -210,8 +302,11 @@ int main() {
     // the region it targeted (mirrors the K_Synthesis/K_PathExplore region-job contract).
     {
         uint64_t e = svc.epoch();
+        auto names = std::make_shared<DecompileNameMap>();
+        (*names)[base] = "worker_named_main";
         svc.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile, false, e,
-                        /*moduleBase=*/0, /*regionLo=*/base, /*regionHi=*/base + 8);
+                        /*moduleBase=*/0, /*regionLo=*/base, /*regionHi=*/base + 8,
+                        names, "long (a1)", /*decompContext=*/77);
         AnalysisResult got; got.epoch = e;
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
         bool have = false;
@@ -227,6 +322,84 @@ int main() {
         CHECK(got.decompVA == base, "K_Decompile result tagged with the region start VA");
         CHECK(got.regionLo == base && got.regionHi == base + 8, "K_Decompile result carries its region");
         CHECK(!got.decompText.empty(), "K_Decompile result has pseudo-C text");
+        CHECK(got.decompText.find("long worker_named_main(a1)") != std::string::npos,
+              "K_Decompile transports the immutable name/signature snapshot");
+        CHECK(got.decompContext == 77, "K_Decompile echoes the caller name-context generation");
+        svc.cancelAndWaitIdle();
+    }
+
+    // Pending targeted passes for one module must not coalesce when their kinds
+    // differ: they share region storage, so the old merge moved the first pass to
+    // the second pass's address. Occupy every possible pool worker with gated jobs
+    // to make both target requests deterministically pending together.
+    {
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService targeted([release, entered](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<GateDisasm>(release, entered);
+        });
+        const uint64_t e = targeted.epoch();
+        for (uint64_t i = 0; i < 8; ++i)
+            targeted.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                                 false, e, 0x100 + i, base, base + 2);
+
+        auto enteredDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered->load(std::memory_order_acquire)
+               && std::chrono::steady_clock::now() < enteredDeadline)
+            std::this_thread::yield();
+        CHECK(entered->load(std::memory_order_acquire) > 0,
+              "targeted-coalescing test occupied an analysis worker");
+
+        constexpr uint64_t targetModule = 0xBEEF;
+        targeted.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, e, targetModule, base, base + 4);
+        targeted.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Synthesis,
+                             false, e, targetModule, base + 8, base + 12);
+        release->store(true, std::memory_order_release);
+
+        bool sawDecompile = false, sawSynthesis = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline
+               && !(sawDecompile && sawSynthesis)) {
+            AnalysisResult got;
+            while (targeted.tryTakeBulk(got)) {
+                if (got.moduleBase != targetModule) continue;
+                if (got.decompValid) {
+                    sawDecompile = got.decompVA == base
+                                && got.regionLo == base && got.regionHi == base + 4;
+                }
+                if (got.synthValid) {
+                    sawSynthesis = got.regionLo == base + 8 && got.regionHi == base + 12;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(sawDecompile, "different targeted kind preserves decompile region");
+        CHECK(sawSynthesis, "different targeted kind preserves synthesis region");
+        targeted.cancelAndWaitIdle();
+    }
+
+    // VA 0 is a legitimate function address for raw/ELF/Mach-O images. Keep this
+    // backend regression beside the BinaryView validity-flag fix: zero must not be
+    // treated as the decompiler's "not initialized" sentinel.
+    {
+        BinaryFile zeroBin;
+        CHECK(zeroBin.loadRaw(path, 0), "loadRaw at VA 0");
+        uint64_t e = svc.epoch();
+        svc.requestBulk(&zeroBin, Engine::Zydis, Arch::X64, K_Decompile, false, e,
+                        /*moduleBase=*/0, /*regionLo=*/0, /*regionHi=*/8);
+        AnalysisResult got;
+        bool have = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+        while (std::chrono::steady_clock::now() < deadline && !have) {
+            AnalysisResult tmp;
+            while (svc.tryTakeBulk(tmp)) {
+                if (tmp.epoch == e && tmp.decompValid) { got = std::move(tmp); have = true; }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(have && got.decompVA == 0 && !got.decompText.empty(),
+              "K_Decompile supports a real function at VA 0");
         svc.cancelAndWaitIdle();
     }
 
