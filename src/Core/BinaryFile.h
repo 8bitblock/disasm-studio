@@ -99,6 +99,23 @@ public:
     uint32_t exportDirRVA()  const { return exportRVA_; }
     uint32_t exportDirSize() const { return exportSize_; }
 
+    // Complete PE export-address table. There is one row per exported alias;
+    // an ordinal-only slot has an empty name. Forwarders retain their textual
+    // target (for example "KERNEL32.Sleep"), while local targets expose their
+    // VA and whether the containing section is executable. Parsed once with
+    // the image so consumers do not each grow a partial PE parser.
+    struct Export {
+        uint64_t    ordinal  = 0;
+        uint32_t    rva      = 0;
+        uint64_t    va       = 0;
+        std::string name;
+        std::string forwarder;
+        bool        forwarded = false;
+        bool        mapped    = false;
+        bool        isCode    = false;
+    };
+    const std::vector<Export>& exports() const { return exports_; }
+
     // x64 PE exception directory (.pdata): the linker-emitted RUNTIME_FUNCTION
     // table, one [begin, end) VA range per function (chained-unwind continuation
     // entries are folded away). Authoritative function boundaries for function
@@ -135,10 +152,17 @@ public:
     std::shared_ptr<const JvmClassFile> javaClass() const { return javaClass_; }
 
 private:
+    // Turn the already-loaded byte buffer into one flat executable mapping.
+    // Returns false when [base, base + size) cannot be represented in uint64_t.
+    // This is shared by explicit raw loads, unknown files, failed structured
+    // parses, and non-PE live buffers so every BinFormat::Raw has one coherent
+    // section model rather than retaining partial parser state.
+    bool initializeRawLayout(uint64_t base, bool mappedImage = false);
     bool parsePE();
     bool parseELF();
     bool parseMachO();
     bool parseJavaClass();
+    void parseExports();   // PE data directory [0]
     void parseImports();   // PE data directory [1]
     void parseRelocs();    // PE data directory [5]
 
@@ -169,6 +193,8 @@ private:
     uint32_t             securitySize_  = 0;
     uint32_t             clrRva_        = 0;   // data dir [14]: CLR/COM descriptor
     uint32_t             clrSize_       = 0;
+    uint32_t             sizeOfHeaders_ = 0;   // effective PE header span (declared size clamped before sections)
+    std::vector<Export>                    exports_;
     std::vector<Import>                    imports_;
     std::vector<std::pair<uint64_t, int>>  relocs_;
     std::shared_ptr<const JvmClassFile>    javaClass_;   // set for BinFormat::JavaClass

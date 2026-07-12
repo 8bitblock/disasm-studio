@@ -7,8 +7,8 @@
 IDI_APPICON ICON "app.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION DS_VERSION_COMMA
+ PRODUCTVERSION DS_VERSION_COMMA
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -25,11 +25,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "DisasmStudio"
             VALUE "FileDescription",  "DisasmStudio - reverse-engineering workbench"
-            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "FileVersion",      DS_VERSION_STRING
             VALUE "InternalName",     "DisasmStudio"
             VALUE "OriginalFilename", "DisasmStudio.exe"
             VALUE "ProductName",      "DisasmStudio"
-            VALUE "ProductVersion",   "0.1.0.0"
+            VALUE "ProductVersion",   DS_VERSION_STRING
             VALUE "LegalCopyright",   "Copyright (C) 2026"
         END
     END

@@ -40,7 +40,7 @@ all navigable and fast.
 
 Working / real:
 - Disassembly via **Zydis (x86/x64)** + **Capstone**; arches: x86, x64, ARM, ARM64, **MIPS/MIPS64, PowerPC/PPC64, RISC-V 32/64**, and **JVM bytecode** (hand-rolled `Disasm/JvmDisassembler`: every opcode incl. wide/tableswitch/lookupswitch, constant-pool symbolication via `Instruction::comment`, switch cases via `Instruction::extraTargets`). Non-x86 routes to Capstone automatically; `Arch::JVM` routes to the JVM backend.
-- Loaders: **PE32/PE32+, ELF (32/64), Mach-O (thin 32/64)**, **Java .class** (0xCAFEBABE → per-method executable sections, real method names, exact sizes), and **Open as Raw…** (flat blob at chosen base+arch). Arch auto-selected from the header (`BinaryFile::machine()`).
+- Loaders: **PE32/PE32+, ELF (32/64), Mach-O (thin 32/64)**, **Java .class** (0xCAFEBABE → per-method executable sections, real method names, exact sizes), and **Open as Raw…** (flat blob at chosen base+arch). A raw load owns one complete executable `.raw` section; its selected base is an explicit function root (including VA 0), while the exact selected `Arch` gates architecture-specific discovery. Structured formats auto-select from the header (`BinaryFile::machine()`).
 - **JVM debugging over JDWP** (`Core/Jdwp` pure protocol + `Core/JdwpClient` socket thread): attach to `-agentlib:jdwp` JVMs, suspend/resume, breakpoints at (class, method, bci), step into/over/out, threads + frames, live `Method::Bytecodes` fetch disassembled with constant-pool symbolication from `ReferenceType::ConstantPool`. UI lives in the Communications tab.
 - **Full-program assembly listing** with `sub_`/symbol dividers, clipper-rendered (cap 800k insns), auto-loaded functions + strings (ASCII/UTF-8 + UTF-16LE).
 - **Lightweight decompiler** (`Core/Decompiler`): dominators + post-dominators + natural-loop detection → structured if/else + while/do-while, goto fallback; per-line operand lifter; heuristic inferred signature. Output language selectable in the Pseudocode view: **pseudo-C or Python** (`DecompileToPython`, a pure display-side transform).
@@ -146,6 +146,12 @@ src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 li
 
 - **ELF/Mach-O** keep `imageBase_ = 0` and store the absolute VM address in `Section::virtualAddress`,
   so the shared `ptrFromVA`/`vaToOffset` (rva = va - imageBase) math works uniformly with PE.
+- **Raw layout is a real analysis image, not a sectionless fallback.** `initializeRawLayout` creates one
+  executable/readable `.raw` section spanning every byte, leaves `entryRVA_ = 0` (no fabricated header EP),
+  and `FunctionAnalyzer` separately seeds the selected base even at VA 0. The selected `Arch` must be passed
+  to background function discovery so x86/x64 prologue patterns never run on other architectures. Raw loads
+  use the normal full listing, xrefs, call graph, and background jobs. Reject a mapping when its final VA would
+  overflow `uint64_t`; do not leave partial image state.
 - **Keystone** (the patch assembler) supports only x86/x64/ARM/ARM64 — it returns a clear
   "unsupported" for other arches (disasm via Capstone is broader than assembly support).
 - **Java .class loads use an identity mapping** (imageBase 0, every section's
@@ -184,7 +190,8 @@ src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 li
   `ctx.disasm`); every load/patch does `analysis.bumpEpoch()` + `requestBulk(...)` and `render()` applies a result
   only if `epoch` still matches (stale dropped); `App.cpp` calls `analysis.cancelAndWaitIdle()` **before**
   `binary.load/loadRaw/clear` (those realloc the image bytes the worker reads). Listing/xref/decompile stay
-  lazy-synchronous for now (the documented A2 follow-up threads those too).
+  on their existing service/lazy paths. Raw images use this same pipeline through their synthetic executable
+  section; do not special-case them back to a reduced windowed-disassembly path.
 - **DbgHelp is process-global single-threaded.** Both the UI (`SymbolResolver`) and the debug thread
   (`Debugger::unwindStack`) call it on the same handle, so every DbgHelp call takes `DbgHelpMutex()`
   (`Core/DbgHelpLock.h`). Add that lock around any new `Sym*`/`StackWalk64` call.
@@ -207,10 +214,12 @@ src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 li
   at body end, switch→match with +1 indent inside, case-breaks dropped), applied via
   `applyDecompLang`. Never make the worker emit Python — language switches must stay
   instant and the C path byte-identical (`decompiler_python_test` covers the transform).
-- **HiDPI**: `main.cpp` enables per-monitor DPI awareness, loads fonts at `size*dpi`, and calls
-  `theme::SetUiScale(dpi)`; `applyMetrics()` multiplies every pixel metric by that scale, so the
-  layout stays crisp and survives live theme switches. New fixed pixel sizes should multiply by
-  `theme::UiScale()`.
+- **HiDPI**: `main.cpp` handles `WM_DPICHANGED`, applies Windows' suggested rectangle immediately, and queues
+  only the latest DPI for a safe between-frame rebuild: invalidate DX11 font objects → clear/reload the atlas
+  at `size*dpi` → `SetUiScale` + absolute `ApplyTheme` metrics (preserving palette/density) → recreate the DX11
+  font texture. A creation failure remains queued, suppresses invalid rendering, and retries at a bounded rate.
+  Rasterized border/separator widths are rounded to whole physical pixels. New fixed layout sizes should use
+  `theme::UiScale()`; never scale the previous ImGui style cumulatively or touch ImGui/DX resources in WndProc.
 
 ## Verification approach (important)
 

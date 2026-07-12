@@ -97,7 +97,11 @@ int main() {
         BinaryFile raw;
         CHECK(raw.loadFromMemory(blob, runtimeBase, "blob"), "loadFromMemory(non-PE) true");
         CHECK(raw.format() == BinFormat::Raw, "non-PE -> Raw");
+        CHECK(raw.isMappedImage(), "non-PE memory image retains live-mapping provenance");
         CHECK(raw.imageBase() == runtimeBase, "raw imageBase == base");
+        CHECK(raw.sections().size() == 1 && raw.sections()[0].executable &&
+              raw.sections()[0].rawSize == blob.size(),
+              "non-PE memory image exposes one complete executable raw section");
         size_t av2 = 0;
         const uint8_t* rp = raw.ptrFromVA(runtimeBase, av2);
         CHECK(rp && rp[0] == 0x90, "raw ptrFromVA reads the blob");

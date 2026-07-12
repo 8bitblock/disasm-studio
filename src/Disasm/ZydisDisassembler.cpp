@@ -86,8 +86,10 @@ bool ZydisDisassembler::decodeOne(const uint8_t* data, size_t size,
     for (int i = 0; i < insn.operand_count_visible; ++i) {
         if (ops[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[i].imm.is_relative) {
             ZyanU64 target = 0;
-            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &ops[i], va, &target)))
+            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &ops[i], va, &target))) {
                 out.branchTarget = target;
+                out.branchTargetValid = true;
+            }
         }
     }
     return true;

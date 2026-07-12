@@ -1,6 +1,6 @@
 ## 07. The Binary View Workspace (Centerpiece)
 
-The **Binary View** tab is the heart of DisasmStudio: it is where static analysis and live debugging meet. Everything else in the app (Projects, Sig Scanner, Memory Tools, Tech, Diff) ultimately routes the user here to "go look at this address." It lives in `src/Tabs/BinaryViewTab.{h,cpp}` — a single ~5000-line class (`ds::BinaryViewTab`) that owns six switchable **main views**, a three-tab **side panel**, thirteen **lower sub-tabs**, a **debug toolbar**, and a stack of modal popups. This chapter walks through every one of them and the machinery underneath.
+The **Binary View** tab is the heart of DisasmStudio: it is where static analysis and live debugging meet. Everything else in the app (Projects, Sig Scanner, Memory Tools, Tech, Diff) ultimately routes the user here to "go look at this address." It lives in `src/Tabs/BinaryViewTab.{h,cpp}` — a single ~5000-line class (`ds::BinaryViewTab`) that owns six switchable **main views**, a four-tab **side panel**, thirteen **lower sub-tabs**, a **debug toolbar**, and a stack of modal popups. This chapter walks through every one of them and the machinery underneath.
 
 The class implements `ITab`; `render(AppContext&)` is the per-frame entry point. `AppContext` carries the shared `binary` (`BinaryFile`), `debug` (`Debugger`), `disasm` (`IDisassembler`), and `project` (`ProjectState`). The tab keeps its own editing state (comments, renames, bookmarks, breakpoints, the navigation history, caches) and mirrors annotations to/from `ctx.project` each frame.
 
@@ -56,13 +56,15 @@ The live **Pseudocode** mode (`renderLivePseudocode`) runs the same structured `
 
 `symbolFor` is the single resolver used *everywhere* a name appears. Its precedence is deliberate: (1) a **user rename** (`names_`) for the exact address always wins; (2) an **IAT slot** resolves to its import (`importMap_`); then, when attached, (3) DbgHelp/PDB names, (4) the in-house export-table parser, (5) `module+0x..`; or, statically, DbgHelp on the file then the **analyzed-function** fallback (`name+0x..`). Results are cached in `symCache_` (bounded at 100k, cleared on context change). Because guessed function names live in `Func::name`, they flow through `symbolFor` too — but `names_` overrides them.
 
-### The side panel: Bookmarks / Functions / Strings + byte search
+### The side panel: Bookmarks / Functions / Strings / Exports + byte search
 
 At the top sits a **Byte Pattern Search** box (hex, no wildcards) with a **Live (process memory)** toggle; hits list below and into the **Results** lower tab, click-to-navigate (live hits open the live view).
 
 - **Bookmarks**: add "+ here", click to go, right-click to rename/remove; persisted as file VAs.
 - **Functions**: **Analyze** runs `FunctionAnalyzer` (entry/exports/call-targets/prologues) into `functions_`; a **Guess** toggle runs `FunctionNamer` (`guessFunctionNames`) to heuristically name anonymous `sub_` functions (`read_file`, `j_CreateFileW`, `start`, …). Guessed names render in **amber** (when no user rename overrides) with a tooltip giving the *basis* for the guess (`guessReason_`). The list is filtered into `fnVisible_` and clipper-rendered. Guesses are recomputed each analyze and never persisted.
 - **Strings** (`scanStrings`): ASCII/UTF-8 + UTF-16LE runs (≥4 chars), file-mode or **Live** (scans loaded module images so addresses stay stable across rescans; auto-flips to Live + scans once on first attach). Click to navigate, right-click → **Find references (where used)**.
+
+- **Exports**: a filterable view over `BinaryFile::exports()`, the bounded PE export-address-table model. It preserves aliases, ordinal-only entries, forwarders, and local code/data targets; local targets navigate to the appropriate code/Hex location, while forwarder targets remain copyable evidence.
 
 ### Lower sub-tabs
 

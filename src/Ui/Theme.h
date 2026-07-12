@@ -33,10 +33,10 @@ void ApplyTheme(ThemeId id);
 ThemeId     CurrentTheme();
 const char* ThemeName(ThemeId id);   // human label for menus
 
-// Global UI scale (HiDPI). Set once at startup from the window's DPI; all style
-// metrics (padding/spacing/rounding/scrollbars) are multiplied by it in
-// ApplyTheme so the layout scales crisply and survives live theme switches.
-// Fonts are scaled separately at load time. Clamped to a sane range.
+// Global UI scale (HiDPI). Set at startup and again when the main window moves
+// between monitors; all style metrics (padding/spacing/rounding/scrollbars) are
+// derived from fixed baselines in ApplyTheme, so repeated changes never scale
+// cumulatively. Fonts are rebuilt separately. Clamped to a sane range.
 void  SetUiScale(float scale);
 float UiScale();
 

@@ -209,7 +209,10 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
         if (cf->classNameAt(e->a) != cf->thisClass) return;
         if (const JvmCpEntry* nt = cf->at(e->b); nt && nt->tag == CP_NameAndType) {
             auto it = localMethodOff_.find(cf->utf8At(nt->a) + ":" + cf->utf8At(nt->b));
-            if (it != localMethodOff_.end()) out.branchTarget = it->second;
+            if (it != localMethodOff_.end()) {
+                out.branchTarget = it->second;
+                out.branchTargetValid = true;
+            }
         }
     };
 
@@ -263,6 +266,7 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
             const int64_t tgt = (int64_t)va + rel;
             if (tgt < 0) return false;
             out.branchTarget = (uint64_t)tgt;
+            out.branchTargetValid = true;
             std::snprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)out.branchTarget);
             out.operands = buf;
             break;
@@ -308,6 +312,7 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
             if (count > (n - 1 - pad - 12) / 4) return false;  // table must fit the buffer
             len = 1 + pad + 12 + (size_t)count * 4;
             out.branchTarget = va + def;
+            out.branchTargetValid = true;
             std::snprintf(buf, sizeof(buf), "%d..%d, default=0x%llX",
                           low, high, (unsigned long long)out.branchTarget);
             out.operands = buf;
@@ -336,6 +341,7 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
             if ((uint64_t)npairs > (n - 1 - pad - 8) / 8) return false;
             len = 1 + pad + 8 + (size_t)npairs * 8;
             out.branchTarget = va + def;
+            out.branchTargetValid = true;
             std::snprintf(buf, sizeof(buf), "%d pairs, default=0x%llX",
                           npairs, (unsigned long long)out.branchTarget);
             out.operands = buf;

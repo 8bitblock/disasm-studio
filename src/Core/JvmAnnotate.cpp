@@ -395,7 +395,7 @@ JvmMethodAnalysis AnalyzeJvmMethod(const JvmClassFile& cf, const JvmMethod& m,
                        in.mnemonic == "tableswitch" || in.mnemonic == "lookupswitch");
         if (!E.terminator && !uncond && i + 1 < (int)insns.size())
             seed(insns[i + 1].address, after);
-        if (in.branchTarget && in.mnemonic != "ret") {
+        if (HasBranchTarget(in) && in.mnemonic != "ret") {
             // For switch the popped value is gone before the jump: targets see `after`.
             seed(in.branchTarget, after);
         }
@@ -435,7 +435,7 @@ JvmMethodAnalysis AnalyzeJvmMethod(const JvmClassFile& cf, const JvmMethod& m,
         }
         // invoke* edges + category findings.
         if (in.isCall) {
-            JvmCall c; c.bci = in.address; c.local = (in.branchTarget != 0);
+            JvmCall c; c.bci = in.address; c.local = HasBranchTarget(in);
             c.kind = mn == "invokestatic" ? "static" : mn == "invokespecial" ? "special"
                    : mn == "invokeinterface" ? "interface" : mn == "invokedynamic" ? "dynamic" : "virtual";
             if (const JvmCpEntry* cp = cf.at(cpIndexOf(in))) {

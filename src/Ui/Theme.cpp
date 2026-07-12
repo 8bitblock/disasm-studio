@@ -1,6 +1,9 @@
 #include "Theme.h"
 #include "imgui.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace ds::theme {
 
 // A theme is just a small set of core colors; the full ImGui style is derived
@@ -136,6 +139,10 @@ static void applyMetrics() {
     ImGuiStyle& s = ImGui::GetStyle();
     const float k = g_scale;     // scale every pixel metric so HiDPI stays crisp
     const float d = k * densityFactor();   // spacing/padding also scale with density
+    // Borders are rasterized as lines, so keep their physical thickness on an
+    // integer pixel even at fractional Windows DPI scales (125%, 150%, ...).
+    const float linePx = std::max(1.0f, std::round(k));
+    const float separatorPx = std::max(1.0f, std::round(2.0f * k));
     s.WindowRounding    = 6.0f * k;
     s.ChildRounding     = 6.0f * k;
     s.FrameRounding     = 5.0f * k;
@@ -144,11 +151,11 @@ static void applyMetrics() {
     s.GrabRounding      = 4.0f * k;
     s.TabRounding       = 6.0f * k;
 
-    s.WindowBorderSize  = 1.0f;
-    s.ChildBorderSize   = 1.0f;
+    s.WindowBorderSize  = linePx;
+    s.ChildBorderSize   = linePx;
     s.FrameBorderSize   = 0.0f;
     s.TabBorderSize     = 0.0f;
-    s.PopupBorderSize   = 1.0f;
+    s.PopupBorderSize   = linePx;
 
     s.WindowPadding     = ImVec2(12 * d, 12 * d);
     s.FramePadding      = ImVec2(10 * d, 6 * d);
@@ -161,7 +168,7 @@ static void applyMetrics() {
 
     s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
-    s.SeparatorTextBorderSize = 2.0f;
+    s.SeparatorTextBorderSize = separatorPx;
 }
 
 static void applyColors(const Palette& p) {

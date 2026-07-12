@@ -187,7 +187,11 @@ private:
 
 class App {
 public:
-    App();
+    // `startupPath` is the optional file supplied as the first command-line
+    // argument (`DisasmStudio <path>`). It is loaded through the same path as
+    // File > Open so architecture selection, sidecars, and background analysis
+    // stay identical regardless of how the file was opened.
+    explicit App(std::string startupPath = {});
     ~App();
 
     void render();              // called once per frame
@@ -207,6 +211,7 @@ private:
     void renderTabCardStrip(const DbgSnapshot& snap);  // horizontal tab-card strip (section switcher)
     void renderStatusBar(const DbgSnapshot& snap);
     void openCommandPalette(const DbgSnapshot& snap);  // build the Ctrl+K action list + symbol snapshot
+    void renderHelpWindow();                            // grouped F1 shortcut / interaction reference
     void openFileDialog();
     void openRawFileDialog();   // pick a file, then prompt for base + arch
     void renderRawLoadPopup();
@@ -226,6 +231,7 @@ private:
     int                                 activeTab_ = 0;   // index into tabs_ (rail selection)
     bool                                exit_      = false;
     bool                                showDemo_  = false;
+    bool                                showHelp_  = false;
     bool                                showAbout_ = false;
     theme::ThemeId                      theme_     = theme::ThemeId::Paper;
     theme::Density                      density_   = theme::Density::Comfortable;

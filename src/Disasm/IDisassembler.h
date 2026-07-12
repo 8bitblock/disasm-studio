@@ -21,7 +21,8 @@ struct Instruction {
     bool        isCall    = false;
     bool        isRet     = false; // ret/retf/iret family (returns from a call frame)
     bool        isRepString = false; // has a REP/REPE/REPNE prefix (rep movs/stos/cmps/scas/...)
-    uint64_t    branchTarget = 0;  // resolved target if statically known, else 0
+    uint64_t    branchTarget = 0;  // resolved target value (may legitimately be VA 0)
+    bool        branchTargetValid = false; // distinguishes target VA 0 from unresolved
     // Decoder-supplied inline annotation (rendered as a "; ..." comment). The
     // JVM backend fills it with resolved constant-pool text (method/field refs,
     // string literals); the x86/ARM backends leave it empty.
@@ -32,6 +33,13 @@ struct Instruction {
     // switch-case successors.
     std::vector<uint64_t> extraTargets;
 };
+
+// Compatibility helper: older pure tests and small scripted decoders populated
+// only a non-zero branchTarget. New decoders set branchTargetValid explicitly so
+// a direct call/jump to VA 0 remains representable without breaking those users.
+inline bool HasBranchTarget(const Instruction& in) {
+    return in.branchTargetValid || in.branchTarget != 0;
+}
 
 enum class Arch  { X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV32, RISCV64, JVM };
 enum class Engine { Zydis, Capstone };

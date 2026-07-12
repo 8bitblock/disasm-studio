@@ -66,7 +66,8 @@ void CortexTab::analyze(AppContext& ctx) {
     // user-triggered, and cached until the binary changes. (Follow-up: reuse
     // AppContext::analysis results instead of recomputing.)
     strings_ = ScanStringsImage(ctx.binary);
-    funcs_   = AnalyzeFunctionsNamed(ctx.binary, *ctx.disasm, strings_, /*guessNames*/ true).functions;
+    funcs_   = AnalyzeFunctionsNamed(ctx.binary, *ctx.disasm, strings_,
+                                     /*guessNames*/ true, ctx.arch).functions;
 
     // Analyst-owned names are authoritative and must flow into briefs, xrefs,
     // exports, and chat answers. Guesses remain useful only where no rename exists.
@@ -300,7 +301,7 @@ void CortexTab::render(AppContext& ctx) {
             bool clicked = ImGui::Selectable(f.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
             ImGui::PopID();
             ImGui::PopStyleColor();
-            if (clicked && f.address) ctx.gotoAddress(f.address);
+            if (clicked) ctx.gotoAddress(f.address); // VA 0 is valid for raw/ELF images
             if (ImGui::IsItemHovered() && !f.basis.empty()) ImGui::SetTooltip("%s", f.basis.c_str());
             ImGui::TableSetColumnIndex(1);
             ImGui::TextDisabled("%s", f.brief.c_str());

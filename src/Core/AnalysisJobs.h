@@ -26,6 +26,7 @@ namespace ds {
 
 class BinaryFile;
 class IDisassembler;
+enum class Arch;
 struct XrefIndex;
 struct AlgoMatch;
 
@@ -99,6 +100,13 @@ void ScanStringsBuffer(const uint8_t* d, size_t n, uint64_t base,
 // lookup can binary-search.
 AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
                                  const std::vector<StrResult>& strings, bool guessNames);
+
+// Exact-architecture form used by AnalysisService. This matters for raw blobs:
+// their bytes carry no machine field, while x86 prologue signatures must never
+// be applied to an ARM/MIPS/PPC/RISC-V selection.
+AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
+                                 const std::vector<StrResult>& strings, bool guessNames,
+                                 Arch arch);
 
 // Build the linear-sweep listing row index over every section in VA order (a
 // divider row at each function start + one row per decoded instruction in the

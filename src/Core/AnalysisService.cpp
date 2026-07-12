@@ -224,7 +224,7 @@ void AnalysisService::runJob(const BulkJob& job) {
     if ((job.kinds & K_Funcs) && !superseded()) {
         setPhase(AnalysisPhase::Functions, 0, job.modBase);   // FunctionAnalyzer has no granular count
         if (!haveStrings) { strings = ScanStringsImage(*job.bin); haveStrings = true; }
-        AnalyzeOut a = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess);
+        AnalyzeOut a = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess, job.arch);
         funcs = a.functions;
         AnalysisResult r; r.functions = funcs; r.summary = std::move(a.summary); r.funcsValid = true;
         emit(std::move(r));
@@ -237,7 +237,7 @@ void AnalysisService::runJob(const BulkJob& job) {
         // do not emit/churn the UI's existing function list.
         if (funcs.empty()) {
             if (!haveStrings) { strings = ScanStringsImage(*job.bin); haveStrings = true; }
-            funcs = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess).functions;
+            funcs = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess, job.arch).functions;
         }
         std::vector<uint64_t> starts;
         starts.reserve(funcs.size());
@@ -260,7 +260,7 @@ void AnalysisService::runJob(const BulkJob& job) {
         const std::vector<FuncResult>* fp = &funcs;
         if (funcs.empty()) {
             if (!haveStrings) { strings = ScanStringsImage(*job.bin); haveStrings = true; }
-            localFuncs = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess).functions;
+            localFuncs = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess, job.arch).functions;
             fp = &localFuncs;
         }
         std::vector<CallEdgeR> edges = BuildCallEdges(*job.bin, *dis, *fp);

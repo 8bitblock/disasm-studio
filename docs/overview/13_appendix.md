@@ -122,8 +122,8 @@ reversing any of them.
 
 - **No scripting / plugin / automation API.** The user explicitly does not want a
   scripting or plugin surface. It must not be added. The application is a single
-  self-contained tool, driven entirely through its UI (and `wWinMain` ignores argv, so
-  there is no CLI to auto-load a target).
+  self-contained GUI tool. Its optional command-line path only opens a startup target;
+  it is not a scripting or automation interface.
 - **No FLIRT-style library recognition.** Signature-based identification of statically
   linked library functions (IDA-FLIRT style) is not implemented.
 - **No IPv6 connection tables.** The Communications tab enumerates per-process **IPv4**

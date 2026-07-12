@@ -4,10 +4,10 @@ Everything in DisasmStudio starts with a file becoming a `BinaryFile`. This one 
 (`src/Core/BinaryFile.h`, `src/Core/BinaryFile.cpp`) is the single source of truth for
 *what the bytes are*: which executable format, which CPU architecture, where the image is
 based, where it starts executing, how its sections map between file offsets and virtual
-addresses, what it imports, and a stable content hash that keys all persisted analysis. It
-is deliberately small and dependency-free (only `<cstdint>`, `<string>`, `<vector>`,
-`<fstream>`, `<cstring>`, `<algorithm>`), which is why it is one of the Core modules that
-can be unit-tested by compiling it standalone with no Windows/ImGui/Capstone dependencies.
+addresses, what it imports/exports, and a stable content hash that keys all persisted
+analysis. It uses only the C++ standard library (including `<filesystem>` for durable
+Unicode paths), so it can be unit-tested standalone with no Windows/ImGui/Capstone
+dependencies.
 
 ### Supported formats and detection
 
@@ -18,26 +18,36 @@ can be unit-tested by compiling it standalone with no Windows/ImGui/Capstone dep
 - **`\x7FELF`** at offset 0 → attempt `parseELF()` (ELF32 / ELF64, little-endian only).
 - **`0xFEEDFACE` / `0xFEEDFACF`** little-endian at offset 0 → attempt `parseMachO()` (thin
   Mach-O 32 / 64).
+- **`0xCAFEBABE`** → attempt `parseJavaClass()` (method-code sections backed by the parsed
+  Java class model).
 - Anything else → `BinFormat::Raw`.
 
 The key robustness convention: if a recognized magic is present but the structured parse
 *fails*, the format silently degrades to `BinFormat::Raw` rather than refusing the file
-(`if (!parsePE()) format_ = BinFormat::Raw;`). A truncated or malformed PE/ELF/Mach-O still
-loads as a flat blob you can stare at in hex and disassemble from offset 0. `load()` only
-returns `false` for I/O failures (missing file, empty file, short read), never for a parse
-mismatch.
+(`if (!parsePE()) format_ = BinFormat::Raw;`). A truncated or malformed
+PE/ELF/Mach-O/Java class still loads through the same complete raw-image model described
+below. `load()` only returns `false` for I/O failures (missing file, empty file, short read)
+or an unrepresentable flat address range, never merely for a parse mismatch. Successful file and raw loads retain a canonical
+absolute UTF-8 path, so recents/debug launch remain valid after working-directory changes.
 
 `loadRaw(path, base)` is the explicit **Open as Raw…** path: no header parsing at all, the
-caller supplies the load `base`, `format_ = Raw`, and `entryRVA_ = 0` (raw blobs have no
-entry point — views simply start at `base`). This is the route for shellcode, firmware
-dumps, and decrypted blobs where the user separately picks the disassembler arch.
+caller supplies the load `base`, `format_ = Raw`, and `entryRVA_ = 0` (there is no
+fabricated header entry point). `initializeRawLayout` creates one executable/readable code
+section named `.raw`, with virtual/file offset zero and both sizes covering the complete
+blob. Function discovery treats the analyst-selected base as an explicit root even when it
+is VA 0; the separately selected `Arch` is passed to the worker decoder and gates
+architecture-specific discovery. Consequently raw images use the normal background string/
+function/listing jobs and the same full-program listing, xrefs, call graph, navigation, and
+patch mapping as structured images. This is the route for shellcode, firmware dumps, and
+decrypted blobs. A load is rejected, without leaving partial state, if `base + size - 1`
+would overflow `uint64_t`; a mapping ending exactly at `UINT64_MAX` remains valid.
 
-`BinFormat` (`Unknown, PE32, PE32Plus, ELF, MachO, Raw`) and `formatName()` give the UI a
-human label like `"PE32+ (x64)"` or `"Mach-O"`.
+`BinFormat` (`Unknown, PE32, PE32Plus, ELF, MachO, JavaClass, Raw`) and `formatName()`
+give the UI a human label like `"PE32+ (x64)"` or `"Mach-O"`.
 
 ### Machine / architecture recovery
 
-`MachineArch` (`X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV, RISCV64, Unknown`)
+`MachineArch` (`X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV, RISCV64, JVM, Unknown`)
 is recovered from the *format header*, not inferred from the 32/64-bit class. This matters
 because an ARM64 ELF and an x64 ELF are both 64-bit — only the `e_machine` field
 distinguishes them, and `machine()` is what lets the UI auto-select Zydis for x86/x64 and
@@ -89,6 +99,9 @@ decision per format:
 - **Mach-O**: a section is executable if its segment is exec, or the section flags carry
   `S_ATTR_PURE_INSTRUCTIONS (0x80000000)` / `S_ATTR_SOME_INSTRUCTIONS (0x400)`, or the
   section is literally named `__text`.
+- **Raw**: one synthetic `.raw` section spans every file byte and carries code/execute/read
+  characteristics. It is deliberately complete so section-driven analysis does not need a
+  separate raw-only path.
 
 `firstCodeSection()` returns the first executable section, or — if none is flagged — the
 first section, or `nullptr`. This is the default disassembly target when a binary opens.
@@ -141,13 +154,21 @@ sidecar (`%APPDATA%/DisasmStudio/projects/<hash>.json`: comments, renames, bookm
 breakpoints, patches, notes) is keyed by this value, so a patched binary does not split its
 analysis across two files. `clear()` resets `hashValid_` so the next loaded file recomputes.
 
-### PE imports and base relocations
+### PE exports, imports, and base relocations
 
-For PE, `parsePE()` reads the data directory (honoring `NumberOfRvaAndSizes` so it never
-aliases the section table by reading an undeclared slot) and records export
+For PE, `parsePE()` reads only data-directory slots that fit both
+`NumberOfRvaAndSizes` and the declared `SizeOfOptionalHeader`, so a truncated optional
+header cannot alias the section table. It records export
 (`exportDirRVA/Size`), import, and base-relocation directory locations. After sections are
 parsed (imports need them for RVA translation):
 
+- **`parseExports()`** builds the shared `BinaryFile::Export` model from the complete EAT:
+  named aliases, ordinal-only rows, forwarders, local code/data targets, and malformed or
+  unmapped targets. RVA/name/ordinal walks are bounds-checked and hostile inputs are capped
+  by row, stored-string, and aggregate string-scan budgets. The PE header span declared by
+  `SizeOfHeaders` (clamped before the earliest raw section) maps 1:1, so a valid
+  header-resident export directory is supported without treating the virtual gap before the
+  first section as file-backed data.
 - **`parseImports()`** walks `IMAGE_IMPORT_DESCRIPTOR`s, resolving each IAT slot to a
   `{ iatVA, dll, name }` `Import`. It handles bound imports (OFT may be 0, falls back to
   the IAT RVA) and ordinal imports (`#NN` when the high bit is set). `iatVA = imageBase_ +
@@ -157,8 +178,8 @@ parsed (imports need them for RVA translation):
 - **`parseRelocs()`** walks `IMAGE_BASE_RELOCATION` blocks into `(VA, type)` pairs (type =
   `IMAGE_REL_BASED_*`), skipping ABSOLUTE (type 0) padding entries, capped at 200 000.
 
-ELF/Mach-O import and relocation tables are not parsed here — imports are a PE-only feature
-in this loader.
+ELF/Mach-O dynamic symbol/import/export and relocation tables are not parsed here; these
+models are PE-only in this loader.
 
 ### writeImage — in-memory patching that preserves identity
 
@@ -176,22 +197,25 @@ while keeping the original artifact untouched.
 
 `BinaryFile` has no UI of its own; it is pure model. Its outputs drive the chrome:
 `formatName()` and `machine()` populate the title/status, `firstCodeSection()` sets the
-initial cursor, `imports()` feeds the Imports tab and inline IAT annotations, and the
-addressing routines back every navigation, hex pane, and string/byte search. The two
-user-visible entry points are **File ▸ Open** (auto-detect via `load`) and **Open as Raw…**
-(`loadRaw` with a chosen base + arch).
+initial cursor, `imports()` feeds the Imports tab and inline IAT annotations, and
+`exports()` feeds the PE Exports tab and function discovery. The addressing routines back
+every navigation, hex pane, and string/byte search. The file-opening routes are an optional
+startup argument (`DisasmStudio.exe <path>`), **File ▸ Open** (both auto-detect via `load`),
+and **Open as Raw…** (`loadRaw` with a chosen base + arch).
 
 #### Limitations & notes
 
 - ELF is **little-endian only**; big-endian ELF degrades to Raw.
-- Mach-O support is **thin only** — fat/universal binaries are not split here (magic
-  `0xCAFEBABE` is not recognized and would load as Raw).
-- Imports and relocations are parsed for **PE only**; ELF/Mach-O dynamic-symbol resolution
-  is out of scope for this class.
+- Mach-O support is **thin only** — fat/universal binaries are not split here. Their
+  big-endian `0xCAFEBABE` marker overlaps the Java-class signature; an invalid class parse
+  degrades to Raw.
+- Exports, imports, and relocations are parsed for **PE only**; ELF/Mach-O dynamic-symbol
+  resolution is out of scope for this class.
 - Inferred fallbacks (machine defaulting by bit-class for unknown `e_machine`/`cputype`,
   Mach-O entry derived from `__TEXT`, ELF program-header fallback for stripped binaries) are
   best-effort but unlabeled at this layer — they are internal robustness, not surfaced as
   "heuristic" to the user the way the decompiler/tech-scan output is.
 - A failed structured parse becomes `Raw` rather than an error, by design.
+- Explicit raw mappings whose final byte would wrap the 64-bit VA space are rejected.
 - The whole file is held in one contiguous `data_` buffer; loading is O(file size) memory,
   which is fine for typical executables but is the limiting factor for very large images.

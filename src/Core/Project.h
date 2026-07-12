@@ -67,6 +67,7 @@ struct ProjectState {
     std::vector<PjHotPatch>                     hotPatches;     // F2 inline C/Python sources
     std::vector<PjLabel>                        labels;         // class/method/field/resource/event labels
     uint64_t                                    lastCursor = 0;
+    bool                                        lastCursorValid = false; // distinguishes saved VA 0 from no cursor
     std::string                                 notes;
     std::vector<std::string>                    watches;        // watch-panel expressions
     ConnectionConfig                            connection;     // local API framework config (disabled by default)
@@ -83,7 +84,7 @@ struct ProjectState {
                !bookmarks.empty() || !breakpoints.empty() || !patches.empty() ||
                !syntheses.empty() || !hotPatches.empty() || !labels.empty() ||
                connNonDefault ||
-               !notes.empty() || !watches.empty() || lastCursor != 0;
+               !notes.empty() || !watches.empty() || lastCursorValid;
     }
 };
 

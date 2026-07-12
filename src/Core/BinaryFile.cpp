@@ -3,9 +3,46 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ds {
+
+namespace {
+// C++20's filesystem::path has a native char8_t constructor. Build a u8string
+// explicitly instead of using the deprecated filesystem::u8path compatibility
+// shim, while keeping this Core module portable and free of Win32 APIs.
+std::filesystem::path PathFromUtf8(const std::string& path) {
+    std::u8string u8(path.size(), u8'\0');
+    if (!path.empty()) std::memcpy(u8.data(), path.data(), path.size());
+    return std::filesystem::path(u8);
+}
+
+std::string Utf8FromPath(const std::filesystem::path& path) {
+    const std::u8string u8 = path.u8string();
+    std::string out(u8.size(), '\0');
+    if (!u8.empty()) std::memcpy(out.data(), u8.data(), u8.size());
+    return out;
+}
+
+// Store a durable spelling after a successful open. In particular, a binary
+// supplied as a relative startup argument must still reopen after the process
+// working directory changes or the path is written to the recents index.
+std::string DurableUtf8Path(const std::filesystem::path& openedPath) {
+    std::error_code ec;
+    std::filesystem::path absolute = std::filesystem::absolute(openedPath, ec);
+    if (ec) absolute = openedPath;
+    std::error_code canonicalEc;
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(absolute, canonicalEc);
+    if (!canonicalEc) absolute = std::move(canonical);
+    else absolute = absolute.lexically_normal();
+    return Utf8FromPath(absolute);
+}
+} // namespace
 
 void BinaryFile::clear() {
     ++imageRevision_;
@@ -34,6 +71,8 @@ void BinaryFile::clear() {
     securitySize_  = 0;
     clrRva_        = 0;
     clrSize_       = 0;
+    sizeOfHeaders_ = 0;
+    exports_.clear();
     imports_.clear();
     relocs_.clear();
     javaClass_.reset();
@@ -53,45 +92,89 @@ const char* BinaryFile::formatName() const {
 
 bool BinaryFile::load(const std::string& path) {
     clear();
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    // All public paths are UTF-8 (Win32 dialogs and command-line startup both
+    // convert at the boundary). A char8_t filesystem path preserves non-ASCII
+    // file names on Windows instead of sending UTF-8 bytes through the active
+    // ANSI codepage.
+    const std::filesystem::path fsPath = PathFromUtf8(path);
+    std::ifstream f(fsPath, std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize n = f.tellg();
     if (n <= 0) return false;
     f.seekg(0);
     data_.resize(static_cast<size_t>(n));
     if (!f.read(reinterpret_cast<char*>(data_.data()), n)) { clear(); return false; }
-    path_ = path;
+    path_ = DurableUtf8Path(fsPath);
 
     uint32_t magic = 0;
     if (data_.size() >= 4) std::memcpy(&magic, data_.data(), 4);
 
     if (data_.size() >= 2 && data_[0] == 'M' && data_[1] == 'Z') {
-        if (!parsePE()) format_ = BinFormat::Raw;
+        if (!parsePE() && !initializeRawLayout(0)) { clear(); return false; }
     } else if (data_.size() >= 4 && std::memcmp(data_.data(), "\x7F""ELF", 4) == 0) {
-        if (!parseELF()) format_ = BinFormat::Raw;
+        if (!parseELF() && !initializeRawLayout(0)) { clear(); return false; }
     } else if (magic == 0xFEEDFACEu || magic == 0xFEEDFACFu) {   // Mach-O thin (LE)
-        if (!parseMachO()) format_ = BinFormat::Raw;
+        if (!parseMachO() && !initializeRawLayout(0)) { clear(); return false; }
     } else if (IsJavaClassImage(data_.data(), data_.size())) {   // 0xCAFEBABE
-        if (!parseJavaClass()) format_ = BinFormat::Raw;
+        if (!parseJavaClass() && !initializeRawLayout(0)) { clear(); return false; }
     } else {
-        format_ = BinFormat::Raw;
+        if (!initializeRawLayout(0)) { clear(); return false; }
     }
+    return true;
+}
+
+bool BinaryFile::initializeRawLayout(uint64_t base, bool mappedImage) {
+    if (data_.empty()) return false;
+    const uint64_t lastOffset = static_cast<uint64_t>(data_.size() - 1);
+    if (lastOffset > std::numeric_limits<uint64_t>::max() - base) return false;
+
+    // A structured parser may have populated part of its model before rejecting
+    // the image. A Raw fallback must not expose those stale sections/directories.
+    format_       = BinFormat::Raw;
+    machine_      = MachineArch::Unknown; // the Open-as-Raw dialog owns arch selection
+    is64_         = true;
+    mappedImage_  = mappedImage;
+    mappedBase_   = mappedImage ? base : 0;
+    imageBase_    = base;
+    entryRVA_     = 0;                    // no fabricated header entry point
+    exportRVA_    = 0; exportSize_ = 0;
+    importRVA_    = 0; importSize_ = 0;
+    relocRVA_     = 0; relocSize_  = 0;
+    exceptRVA_    = 0; exceptSize_ = 0;
+    overlayOffset_= 0; overlaySize_= 0;
+    securityOff_  = 0; securitySize_ = 0;
+    clrRva_       = 0; clrSize_ = 0;
+    sizeOfHeaders_= 0;
+    sections_.clear();
+    exports_.clear();
+    imports_.clear();
+    relocs_.clear();
+    javaClass_.reset();
+
+    Section raw;
+    raw.name            = ".raw";
+    raw.virtualAddress  = 0;
+    raw.virtualSize     = static_cast<uint64_t>(data_.size());
+    raw.rawOffset       = 0;
+    raw.rawSize         = static_cast<uint64_t>(data_.size());
+    raw.characteristics = 0x60000020u; // code | execute | read (synthetic)
+    raw.executable      = true;
+    sections_.push_back(std::move(raw));
     return true;
 }
 
 bool BinaryFile::loadRaw(const std::string& path, uint64_t base) {
     clear();
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    const std::filesystem::path fsPath = PathFromUtf8(path);
+    std::ifstream f(fsPath, std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize n = f.tellg();
     if (n <= 0) return false;
     f.seekg(0);
     data_.resize(static_cast<size_t>(n));
     if (!f.read(reinterpret_cast<char*>(data_.data()), n)) { clear(); return false; }
-    path_      = path;
-    format_    = BinFormat::Raw;
-    imageBase_ = base;
-    entryRVA_  = 0;        // raw blobs have no entry; views start at base
+    if (!initializeRawLayout(base)) { clear(); return false; }
+    path_ = DurableUtf8Path(fsPath);
     return true;
 }
 
@@ -106,13 +189,9 @@ bool BinaryFile::loadFromMemory(std::vector<uint8_t> bytes, uint64_t base, const
         mappedImage_ = true;
         mappedBase_  = base;
         if (parsePE()) return true;     // parsePE honours mappedImage_/mappedBase_
-        // Not a valid PE after all: fall back to raw.
-        sections_.clear(); imports_.clear(); relocs_.clear();
-        mappedImage_ = false;
+        // Not a valid PE after all: fall back to one clean flat mapping below.
     }
-    format_    = BinFormat::Raw;
-    imageBase_ = base;
-    entryRVA_  = 0;
+    if (!initializeRawLayout(base, true)) { clear(); return false; }
     return true;
 }
 
@@ -172,21 +251,22 @@ bool BinaryFile::parsePE() {
     const uint16_t numSections = rd<uint16_t>(data_, coff + 2);
     const uint16_t optSize     = rd<uint16_t>(data_, coff + 16);
     const size_t opt = coff + 20;
+    if (opt > data_.size() || optSize > data_.size() - opt || optSize < 64) return false;
     const uint16_t magic = rd<uint16_t>(data_, opt);
-    size_t dataDir = 0; // offset of the data-directory array
+    size_t dataDirRel = 0; // optional-header-relative data-directory array offset
 
     if (magic == 0x20B) {        // PE32+
         format_   = BinFormat::PE32Plus;
         is64_     = true;
         entryRVA_ = rd<uint32_t>(data_, opt + 16);
         imageBase_= rd<uint64_t>(data_, opt + 24);
-        dataDir   = opt + 112;
+        dataDirRel= 112;
     } else if (magic == 0x10B) { // PE32
         format_   = BinFormat::PE32;
         is64_     = false;
         entryRVA_ = rd<uint32_t>(data_, opt + 16);
         imageBase_= rd<uint32_t>(data_, opt + 28);
-        dataDir   = opt + 96;
+        dataDirRel= 96;
     } else {
         return false;
     }
@@ -196,20 +276,29 @@ bool BinaryFile::parsePE() {
     // so every resolved VA (IAT slots, reloc targets) is a real runtime address.
     if (mappedImage_) imageBase_ = mappedBase_;
 
+    // SizeOfHeaders is at the same offset in PE32 and PE32+. The optional
+    // header bound above makes this a declared, file-backed field rather than
+    // bytes borrowed from the section table of a truncated header.
+    sizeOfHeaders_ = rd<uint32_t>(data_, opt + 60);
+
     // Data directory: [0] export, [1] import, [5] base relocations. Only read a
     // directory slot the header actually declares (NumberOfRvaAndSizes sits in
     // the 4 bytes immediately before the array); out-of-range slots stay 0 so
     // parseImports/parseRelocs no-op rather than aliasing the section table.
-    const uint32_t numDirs = rd<uint32_t>(data_, dataDir - 4);
-    auto dir = [&](uint32_t i, uint32_t off) -> uint32_t {
-        return (i < numDirs) ? rd<uint32_t>(data_, dataDir + off) : 0u;
+    const uint32_t numDirs = dataDirRel <= optSize
+                           ? rd<uint32_t>(data_, opt + dataDirRel - 4) : 0u;
+    auto dir = [&](uint32_t i, uint32_t fieldOffset) -> uint32_t {
+        const uint64_t rel = static_cast<uint64_t>(dataDirRel) +
+                             static_cast<uint64_t>(i) * 8 + fieldOffset;
+        if (i >= numDirs || rel + sizeof(uint32_t) > optSize) return 0u;
+        return rd<uint32_t>(data_, opt + static_cast<size_t>(rel));
     };
     exportRVA_  = dir(0, 0);  exportSize_ = dir(0, 4);
-    importRVA_  = dir(1, 8);  importSize_ = dir(1, 12);
-    exceptRVA_  = dir(3, 24); exceptSize_ = dir(3, 28);  // [3] exception (.pdata RUNTIME_FUNCTIONs)
-    securityOff_= dir(4, 32); securitySize_ = dir(4, 36); // [4] security: FILE OFFSET, not RVA
-    relocRVA_   = dir(5, 40); relocSize_  = dir(5, 44);
-    clrRva_     = dir(14, 112); clrSize_ = dir(14, 116);  // [14] CLR/COM descriptor (.NET)
+    importRVA_  = dir(1, 0);  importSize_ = dir(1, 4);
+    exceptRVA_  = dir(3, 0);  exceptSize_ = dir(3, 4);  // [3] exception (.pdata RUNTIME_FUNCTIONs)
+    securityOff_= dir(4, 0);  securitySize_ = dir(4, 4); // [4] security: FILE OFFSET, not RVA
+    relocRVA_   = dir(5, 0);  relocSize_  = dir(5, 4);
+    clrRva_     = dir(14, 0); clrSize_ = dir(14, 4);  // [14] CLR/COM descriptor (.NET)
 
     size_t sec = opt + optSize;
     for (uint16_t i = 0; i < numSections; ++i, sec += 40) {
@@ -234,6 +323,20 @@ bool BinaryFile::parsePE() {
         sections_.push_back(s);
     }
 
+    // A malformed SizeOfHeaders may extend over the first section's file bytes.
+    // Header RVA mapping must remain one-to-one, so stop it at the earliest
+    // file-backed section offset as well as at EOF. Offset zero is included:
+    // the mapping routines treat a section with rawSize > 0 / rawOffset == 0
+    // as owning those bytes, so retaining a simultaneous header mapping would
+    // break VA<->offset inversion. For mapped images
+    // rawOffset is the section RVA, giving the equivalent in-memory boundary.
+    uint64_t effectiveHeaders = std::min<uint64_t>(sizeOfHeaders_, data_.size());
+    for (const Section& s : sections_) {
+        if (!s.rawSize) continue;
+        effectiveHeaders = std::min(effectiveHeaders, s.rawOffset);
+    }
+    sizeOfHeaders_ = static_cast<uint32_t>(effectiveHeaders);
+
     // PE overlay: anything in the file past the end of all section raw data (and
     // past the headers, so a sectionless PE doesn't claim the whole file). Only
     // meaningful for an on-disk load — a live mapping repurposes rawOffset as the
@@ -255,9 +358,185 @@ bool BinaryFile::parsePE() {
         }
     }
 
-    parseImports();   // needs sections_ for RVA translation
+    parseExports();   // needs sections_ for RVA translation / code classification
+    parseImports();
     parseRelocs();
     return true;
+}
+
+// IMAGE_EXPORT_DIRECTORY + EAT/name/ordinal tables. The export model retains
+// ordinal-only entries, multiple names for one ordinal (aliases), forwarded
+// exports, and non-code/data exports. Every table and string walk is bounded by
+// mapped bytes plus a hard row cap so hostile counts cannot allocate or spin
+// without limit. Name bytes remain views into data_ until the final bounded
+// rows are materialized, so repeated pointers cannot multiply 4 KiB strings
+// into gigabytes of temporary and result storage.
+void BinaryFile::parseExports() {
+    exports_.clear();
+    if (!exportRVA_) return;
+
+    size_t dirAvail = 0;
+    const uint8_t* dir = ptrFromRVA(exportRVA_, dirAvail);
+    if (!dir || dirAvail < 40) return;
+
+    uint32_t ordinalBase = 0, numberOfFunctions = 0, numberOfNames = 0;
+    uint32_t functionsRVA = 0, namesRVA = 0, ordinalsRVA = 0;
+    std::memcpy(&ordinalBase,       dir + 16, 4);
+    std::memcpy(&numberOfFunctions, dir + 20, 4);
+    std::memcpy(&numberOfNames,     dir + 24, 4);
+    std::memcpy(&functionsRVA,      dir + 28, 4);
+    std::memcpy(&namesRVA,          dir + 32, 4);
+    std::memcpy(&ordinalsRVA,       dir + 36, 4);
+    if (!numberOfFunctions || !functionsRVA) return;
+
+    constexpr size_t kMaxExportRows       = 200000;
+    constexpr size_t kMaxString           = 4096;
+    constexpr size_t kMaxStoredStringBytes= 8 * 1024 * 1024;
+    constexpr size_t kMaxStringScanBytes  = 16 * 1024 * 1024;
+
+    size_t eatAvail = 0;
+    const uint8_t* eatBytes = ptrFromRVA(functionsRVA, eatAvail);
+    if (!eatBytes) return;
+    const size_t functionCount = std::min<size_t>(
+        static_cast<size_t>(std::min<uint64_t>(numberOfFunctions, kMaxExportRows)),
+        eatAvail / sizeof(uint32_t));
+    if (!functionCount) return;
+
+    std::vector<uint32_t> eat(functionCount);
+    std::memcpy(eat.data(), eatBytes, functionCount * sizeof(uint32_t));
+    std::vector<std::vector<std::string_view>> aliases(functionCount);
+
+    // Require a terminator within mapped data and the cap. Malformed names are
+    // ignored instead of leaking an arbitrary section tail into the UI.
+    size_t scannedStringBytes = 0;
+    auto stringAt = [&](uint32_t rva, size_t extraLimit) -> std::string_view {
+        size_t avail = 0;
+        const uint8_t* p = ptrFromRVA(rva, avail);
+        if (!p) return {};
+        if (scannedStringBytes >= kMaxStringScanBytes) return {};
+        const size_t remainingWork = kMaxStringScanBytes - scannedStringBytes;
+        const size_t limit = std::min({avail, extraLimit, remainingWork});
+        size_t n = 0;
+        while (n < limit) {
+            ++scannedStringBytes; // charge every inspected byte, including NUL
+            if (!p[n]) return std::string_view(reinterpret_cast<const char*>(p), n);
+            ++n;
+        }
+        return {};
+    };
+
+    // A hostile table often repeats one long name RVA for every row. Cache the
+    // bounded scan, then dedupe aliases by (ordinal, text), including identical
+    // strings stored at different RVAs. string_views are safe because data_ is
+    // immutable for the duration of this parse.
+    std::unordered_map<uint32_t, std::string_view> nameCache;
+    nameCache.reserve(std::min<size_t>(numberOfNames, kMaxExportRows));
+    auto cachedNameAt = [&](uint32_t rva) -> std::string_view {
+        auto [it, inserted] = nameCache.try_emplace(rva);
+        if (inserted) it->second = stringAt(rva, kMaxString);
+        return it->second;
+    };
+    struct AliasKey {
+        uint32_t ordinalIndex;
+        std::string_view name;
+        bool operator==(const AliasKey&) const = default;
+    };
+    struct AliasKeyHash {
+        size_t operator()(const AliasKey& key) const noexcept {
+            const size_t h1 = std::hash<uint32_t>{}(key.ordinalIndex);
+            const size_t h2 = std::hash<std::string_view>{}(key.name);
+            return h1 ^ (h2 + static_cast<size_t>(0x9e3779b9u) + (h1 << 6) + (h1 >> 2));
+        }
+    };
+    std::unordered_set<AliasKey, AliasKeyHash> seenAliases;
+    seenAliases.reserve(std::min<size_t>(numberOfNames, kMaxExportRows));
+    std::unordered_set<uint64_t> seenAliasPointers;
+    seenAliasPointers.reserve(std::min<size_t>(numberOfNames, kMaxExportRows));
+
+    size_t namesAvail = 0, ordinalsAvail = 0;
+    const uint8_t* nameTable = namesRVA ? ptrFromRVA(namesRVA, namesAvail) : nullptr;
+    const uint8_t* ordinalTable = ordinalsRVA ? ptrFromRVA(ordinalsRVA, ordinalsAvail) : nullptr;
+    if (nameTable && ordinalTable) {
+        const size_t nameCount = std::min<size_t>({
+            static_cast<size_t>(std::min<uint64_t>(numberOfNames, kMaxExportRows)),
+            namesAvail / sizeof(uint32_t), ordinalsAvail / sizeof(uint16_t)
+        });
+        for (size_t i = 0; i < nameCount; ++i) {
+            uint32_t nameRVA = 0;
+            uint16_t ordinalIndex = 0;
+            std::memcpy(&nameRVA, nameTable + i * 4, 4);
+            std::memcpy(&ordinalIndex, ordinalTable + i * 2, 2);
+            if (ordinalIndex >= functionCount || !eat[ordinalIndex]) continue;
+            const uint64_t pointerKey = (static_cast<uint64_t>(ordinalIndex) << 32) | nameRVA;
+            if (!seenAliasPointers.insert(pointerKey).second) continue;
+            const std::string_view name = cachedNameAt(nameRVA);
+            if (!name.empty() && seenAliases.insert({ordinalIndex, name}).second)
+                aliases[ordinalIndex].push_back(name);
+        }
+    }
+
+    const uint64_t exportEnd = static_cast<uint64_t>(exportRVA_) + exportSize_;
+    auto targetIsCode = [&](uint32_t rva) {
+        for (const Section& section : sections_) {
+            if (!section.executable || rva < section.virtualAddress) continue;
+            const uint64_t span = std::max(section.virtualSize, section.rawSize);
+            if (static_cast<uint64_t>(rva) - section.virtualAddress < span) return true;
+        }
+        return false;
+    };
+
+    exports_.reserve(std::min(kMaxExportRows, functionCount + seenAliases.size()));
+    size_t storedStringBytes = 0;
+    for (size_t i = 0; i < functionCount; ++i) {
+        if (exports_.size() >= kMaxExportRows) break;
+        const uint32_t rva = eat[i];
+        if (!rva) continue;                         // an unassigned ordinal gap
+
+        const bool forwarded = exportSize_ && rva >= exportRVA_ &&
+                               static_cast<uint64_t>(rva) < exportEnd;
+        std::string_view forwarder;
+        if (forwarded) {
+            const size_t inDirectory = static_cast<size_t>(exportEnd - rva);
+            forwarder = stringAt(rva, std::min(kMaxString, inDirectory));
+        }
+        const uint64_t va = imageBase_ <= std::numeric_limits<uint64_t>::max() - rva
+                          ? imageBase_ + rva : 0;
+        size_t targetAvail = 0;
+        const bool mapped = !forwarded && va != 0 && ptrFromRVA(rva, targetAvail) != nullptr;
+        const bool isCode = mapped && targetIsCode(rva);
+        auto append = [&](std::string_view name, bool includeForwarder = true) -> bool {
+            if (exports_.size() >= kMaxExportRows) return false;
+            const std::string_view storedForwarder = includeForwarder ? forwarder : std::string_view{};
+            const size_t rowStringBytes = name.size() + storedForwarder.size();
+            if (rowStringBytes > kMaxStoredStringBytes - storedStringBytes) return false;
+            Export ex;
+            ex.ordinal   = static_cast<uint64_t>(ordinalBase) + i;
+            ex.rva       = rva;
+            ex.va        = va;
+            if (!name.empty()) ex.name.assign(name.data(), name.size());
+            if (!storedForwarder.empty())
+                ex.forwarder.assign(storedForwarder.data(), storedForwarder.size());
+            ex.forwarded = forwarded;
+            ex.mapped    = mapped;
+            ex.isCode    = isCode;
+            exports_.push_back(std::move(ex));
+            storedStringBytes += rowStringBytes;
+            return true;
+        };
+        if (aliases[i].empty()) {
+            if (!append({})) append({}, false); // metadata-only row after string-budget exhaustion
+        }
+        else {
+            bool emittedAlias = false;
+            for (const std::string_view alias : aliases[i]) {
+                if (!append(alias)) break;
+                emittedAlias = true;
+            }
+            // Preserve the exported ordinal/target even when a hostile alias
+            // set exhausts the aggregate string budget.
+            if (!emittedAlias && !append({})) append({}, false);
+        }
+    }
 }
 
 // IMAGE_IMPORT_DESCRIPTOR walk: resolve each IAT slot to "DLL.function".
@@ -405,13 +684,18 @@ const Section* BinaryFile::firstCodeSection() const {
 const uint8_t* BinaryFile::ptrFromRVA(uint64_t rva, size_t& availOut) const {
     // rva is 64-bit so callers walking import/reloc tables (rva + k*stride) can't
     // wrap a 32-bit add and alias an earlier in-bounds slot; ptrFromVA bounds-checks.
+    if (rva > std::numeric_limits<uint64_t>::max() - imageBase_) {
+        availOut = 0;
+        return nullptr;
+    }
     return ptrFromVA(imageBase_ + rva, availOut);
 }
 
 const uint8_t* BinaryFile::ptrFromVA(uint64_t va, size_t& availOut) const {
     availOut = 0;
     if (format_ == BinFormat::Raw) {
-        const uint64_t off = (va >= imageBase_) ? va - imageBase_ : va;
+        if (va < imageBase_) return nullptr;
+        const uint64_t off = va - imageBase_;
         if (off < data_.size()) { availOut = data_.size() - (size_t)off; return data_.data() + off; }
         return nullptr;
     }
@@ -430,45 +714,56 @@ const uint8_t* BinaryFile::ptrFromVA(uint64_t va, size_t& availOut) const {
             return data_.data() + fileOff;
         }
     }
+    // PE headers are mapped 1:1 (RVA == file offset), but only for the span
+    // explicitly declared by SizeOfHeaders and actually present in the image.
+    // This lets legitimate header-resident directories resolve without turning
+    // the virtual gap before the first section into file-backed memory.
+    if ((format_ == BinFormat::PE32 || format_ == BinFormat::PE32Plus) &&
+        rva < sizeOfHeaders_ && rva < data_.size()) {
+        availOut = static_cast<size_t>(std::min<uint64_t>(
+            static_cast<uint64_t>(sizeOfHeaders_) - rva, data_.size() - rva));
+        return data_.data() + static_cast<size_t>(rva);
+    }
     return nullptr;
 }
 
 bool BinaryFile::offsetToVA(uint64_t off, uint64_t& vaOut) const {
     if (format_ == BinFormat::Raw) {
         if (off >= data_.size()) return false;
+        if (off > std::numeric_limits<uint64_t>::max() - imageBase_) return false;
         vaOut = imageBase_ + off;   // Raw: VA space == file space
         return true;
     }
     // Find the section whose raw data contains this offset and remap to its RVA.
-    uint64_t firstRaw = 0; bool haveFirst = false;
     for (const auto& s : sections_) {
         if (!s.rawSize) continue;
-        if (!haveFirst || s.rawOffset < firstRaw) { firstRaw = s.rawOffset; haveFirst = true; }
         if (off >= s.rawOffset && off - s.rawOffset < s.rawSize) {   // no-wrap containment
             vaOut = imageBase_ + s.virtualAddress + (off - s.rawOffset);
             return true;
         }
     }
-    // Bytes before the first section's raw data are the PE headers, which map
-    // 1:1 (file offset == RVA). Only PE keeps imageBase_ as the real load base
-    // with that header mapping; for ELF/Mach-O an uncovered offset has no VA.
+    // Only the PE header bytes declared by SizeOfHeaders map 1:1. Using the
+    // first section's raw offset here would accidentally bless padding or a
+    // malformed section-table gap as header data.
     if ((format_ == BinFormat::PE32 || format_ == BinFormat::PE32Plus) &&
-        haveFirst && off < firstRaw) { vaOut = imageBase_ + off; return true; }
+        off < sizeOfHeaders_ && off < data_.size()) {
+        vaOut = imageBase_ + off;
+        return true;
+    }
     return false;
 }
 
 bool BinaryFile::vaToOffset(uint64_t va, uint64_t& offOut) const {
     if (format_ == BinFormat::Raw) {
-        uint64_t off = (va >= imageBase_) ? va - imageBase_ : va;
+        if (va < imageBase_) return false;
+        uint64_t off = va - imageBase_;
         if (off >= data_.size()) return false;
         offOut = off; return true;
     }
     if (va < imageBase_) return false;     // below the image base -> not mapped
     const uint64_t rva = va - imageBase_;
-    uint64_t firstRaw = 0; bool haveFirst = false;
     for (const auto& s : sections_) {
         if (!s.rawSize) continue;
-        if (!haveFirst || s.rawOffset < firstRaw) { firstRaw = s.rawOffset; haveFirst = true; }
         if (rva >= s.virtualAddress && rva - s.virtualAddress < s.virtualSize) {   // no-wrap containment
             uint64_t delta = rva - s.virtualAddress;
             if (delta >= s.rawSize) return false;        // in virtual (zero-filled) padding
@@ -477,12 +772,13 @@ bool BinaryFile::vaToOffset(uint64_t va, uint64_t& offOut) const {
             offOut = off; return true;
         }
     }
-    // Header bytes ahead of the first section's RAW data map 1:1 (RVA == file
-    // offset) for PE only. Bound on firstRaw (matching offsetToVA), NOT firstVA:
-    // the gap [firstRaw, firstVA) is virtual padding with no file backing, so a
-    // patch aimed there must not resolve to unrelated section bytes.
+    // Header bytes explicitly declared by SizeOfHeaders map 1:1 (RVA == file
+    // offset) for PE only. The gap up to the first section RVA remains unmapped.
     if ((format_ == BinFormat::PE32 || format_ == BinFormat::PE32Plus) &&
-        haveFirst && rva < firstRaw && rva < data_.size()) { offOut = rva; return true; }
+        rva < sizeOfHeaders_ && rva < data_.size()) {
+        offOut = rva;
+        return true;
+    }
     return false;
 }
 

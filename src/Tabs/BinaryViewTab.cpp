@@ -8,9 +8,9 @@
 #include "../Core/Report.h"
 #include "../Core/ProcessManager.h"
 #include "../Core/SigMatch.h"
-#include "../Core/SynthesisJob.h"   // F1 synthesize a region
-#include "../Core/PatchCompiler.h"  // F2 compile editor source -> bytes
-#include "../Core/PatchPlacer.h"    // F2 cave-finder + detour placement
+#include "../Core/SynthesisJob.h"   // synthesize a region
+#include "../Core/PatchCompiler.h"  // compile editor source -> bytes
+#include "../Core/PatchPlacer.h"    // cave-finder + detour placement
 #include "../Core/ExcName.h"        // semantic names for the first-chance filter UI
 #include "../Core/JvmClass.h"       // JvmClassFile facts for the Java-class banner
 #include "../Core/ApiInfo.h"        // ApiPurpose(): one-line API behavior (shared with FuncAnnotate)
@@ -307,7 +307,7 @@ static std::string pseudoLine(const Instruction& in, std::string& cmpA, std::str
     std::string A = cOperand(a), B = cOperand(b);
     char tbuf[32];
     auto target = [&]() -> std::string {
-        if (in.branchTarget) { std::snprintf(tbuf, sizeof(tbuf), "loc_%llX", (unsigned long long)in.branchTarget); return tbuf; }
+        if (HasBranchTarget(in)) { std::snprintf(tbuf, sizeof(tbuf), "loc_%llX", (unsigned long long)in.branchTarget); return tbuf; }
         return cOperand(in.operands);
     };
     auto cond = [&](const char* op) -> std::string {
@@ -340,7 +340,7 @@ static std::string pseudoLine(const Instruction& in, std::string& cmpA, std::str
     if (m == "push") return "push(" + cOperand(in.operands) + ");";
     if (m == "pop")  return cOperand(in.operands) + " = pop();";
     if (m == "call") {
-        if (in.branchTarget) { char c[40]; std::snprintf(c, sizeof(c), "sub_%llX();", (unsigned long long)in.branchTarget); return c; }
+        if (HasBranchTarget(in)) { char c[40]; std::snprintf(c, sizeof(c), "sub_%llX();", (unsigned long long)in.branchTarget); return c; }
         return "(*" + cOperand(in.operands) + ")();";
     }
     if (m == "ret" || m == "retn" || m == "retf") return "return;";
@@ -370,7 +370,7 @@ static std::string buildPseudo(const std::vector<Instruction>& insns, uint64_t s
     size_t end = insns.size();
     for (size_t i = 0; i < insns.size(); ++i) {
         const auto& in = insns[i];
-        if (in.isBranch && !in.isCall && in.branchTarget > in.address)
+        if (in.isBranch && !in.isCall && HasBranchTarget(in) && in.branchTarget > in.address)
             maxFwd = std::max(maxFwd, in.branchTarget);
         if (in.isRet && in.address >= maxFwd) { end = i + 1; break; }
         if (i >= 1200) { end = i + 1; break; }
@@ -379,7 +379,7 @@ static std::string buildPseudo(const std::vector<Instruction>& insns, uint64_t s
     std::unordered_map<uint64_t, bool> labels;
     for (size_t i = 0; i < end; ++i) {
         const auto& in = insns[i];
-        if (in.isBranch && in.branchTarget >= start && in.branchTarget < endAddr)
+        if (in.isBranch && HasBranchTarget(in) && in.branchTarget >= start && in.branchTarget < endAddr)
             labels[in.branchTarget] = true;
     }
     std::string out;
@@ -737,12 +737,12 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
     // signature (listingSig) when it delivers a prebuilt listing, so this guard
     // doesn't redundantly re-sweep on the UI thread after a background build.
     uint64_t sig = listingSig(ctx);
-    if (!listBuilt_ || sig != listSig_) { buildFullListing(ctx); listSig_ = sig; lastAsmScroll_ = 0; }
+    if (!listBuilt_ || sig != listSig_) { buildFullListing(ctx); listSig_ = sig; lastAsmScrollValid_ = false; }
 
     // Keep the cursor's function annotated (FuncAnnotate / JvmAnnotate, tiny LRU):
     // the per-row inline path only renders cache hits, so this is the one eager
     // build site. JVM routes to the bytecode engine; x86/x64 to FuncAnnotate.
-    if (showFnNotes_ || (ctx.arch == Arch::JVM && showHints_)) {
+    if (cursorValid_ && (showFnNotes_ || (ctx.arch == Arch::JVM && showHints_))) {
         if (ctx.arch == Arch::JVM) jvmAnnotationsFor(ctx, cursorVA_, true);
         else                       annotationsFor(ctx, cursorVA_, true);
     }
@@ -970,7 +970,7 @@ void BinaryViewTab::renderAnnotationsTab(AppContext& ctx) {
         ImGui::TextDisabled("Function annotations are implemented for x86/x64 only.");
         ImGui::EndTabItem(); return;
     }
-    const AnnEntry* ae = annotationsFor(ctx, cursorVA_, true);
+    const AnnEntry* ae = cursorValid_ ? annotationsFor(ctx, cursorVA_, true) : nullptr;
     if (!ae) {
         ImGui::TextDisabled("Place the cursor inside an analyzed function (run analysis / click a function).");
         ImGui::EndTabItem(); return;
@@ -1193,7 +1193,7 @@ void BinaryViewTab::renderJavaTab(AppContext& ctx) {
     }
 
     // ---- the cursor method's analysis ----
-    const JvmAnnEntry* cur = jvmAnnotationsFor(ctx, cursorVA_, true);
+    const JvmAnnEntry* cur = cursorValid_ ? jvmAnnotationsFor(ctx, cursorVA_, true) : nullptr;
     if (ImGui::BeginTabBar("javasub")) {
         if (ImGui::BeginTabItem("Method")) {
             if (!cur) {
@@ -1613,11 +1613,11 @@ void BinaryViewTab::asmSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) {
     {   // span end = end of the last selected instruction
         Instruction hiIn; uint64_t end = hi;
         if (decodeAt(hi, hiIn)) end = hi + hiIn.length;
-        if (ImGui::MenuItem("Synthesize equivalent (F1)..."))  runSynthesis(ctx, lo, end);
-        if (ImGui::MenuItem("Hot-patch this selection (F2)...")) openHotPatch(ctx, lo, (uint32_t)(end - lo));
-        if (ImGui::MenuItem("Explore paths from here (F3)..."))  runPathExplore(ctx, lo);
+        if (ImGui::MenuItem("Synthesize equivalent..."))       runSynthesis(ctx, lo, end);
+        if (ImGui::MenuItem("Hot-patch this selection..."))      openHotPatch(ctx, lo, (uint32_t)(end - lo));
+        if (ImGui::MenuItem("Explore paths from here..."))       runPathExplore(ctx, lo);
     }
-    if (ImGui::MenuItem("Clear selection")) { selVAs_.clear(); selAnchorVA_ = 0; }
+    if (ImGui::MenuItem("Clear selection")) { selVAs_.clear(); selAnchorVA_ = 0; selAnchorValid_ = false; }
 }
 
 // Batch actions over the live multi-line selection. Mirrors asmSelectionMenu, but
@@ -1687,7 +1687,7 @@ void BinaryViewTab::liveSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) 
         // Bookmarks persist as FILE VAs; translate each runtime address back.
         for (uint64_t va : sel) bookmarks_.push_back({ liveVAtoFile(ctx, va), "bookmark" });
     }
-    if (ImGui::MenuItem("Clear selection##livesel")) { selVAs_.clear(); selAnchorVA_ = 0; }
+    if (ImGui::MenuItem("Clear selection##livesel")) { selVAs_.clear(); selAnchorVA_ = 0; selAnchorValid_ = false; }
 }
 
 // Shared single-instruction copy actions, used by BOTH the static and live per-row
@@ -1706,8 +1706,8 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
     ImGui::PushID((void*)(uintptr_t)in.address);
 
     bool rowAtRip = snap.attached() && snap.regs.rip == in.address;
-    bool rowSel   = in.address == cursorVA_ && !rowAtRip;
-    bool rowJump  = !rowAtRip && !rowSel && hlJumpVA_ && in.address == hlJumpVA_;
+    bool rowSel   = cursorValid_ && in.address == cursorVA_ && !rowAtRip;
+    bool rowJump  = !rowAtRip && !rowSel && hlJumpValid_ && in.address == hlJumpVA_;
     bool rowMulti = selVAs_.size() > 1 && !rowAtRip && !rowSel && selVAs_.count(in.address);
     float flash   = navFlashAt(in.address);
     // Flat fill (under the text) — the glow halo/outline is painted post-table by
@@ -1740,7 +1740,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
     ImGui::Dummy(ImVec2(1.0f, ImGui::GetTextLineHeight()));
     const float rowYMid = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
     asmFlow_.push_back({ in.address, in.branchTarget,
-                         in.isBranch && !in.isCall && in.branchTarget != 0, rowYMid });
+                         in.isBranch && !in.isCall && HasBranchTarget(in), rowYMid });
     pushRowGlow(rowYMid, rowAtRip, rowSel, rowJump, flash);
 
     ImGui::TableSetColumnIndex(2);
@@ -1754,19 +1754,22 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
     else               ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_Text));
     if (ImGui::Selectable(addrLbl, false)) {
         ImGuiIO& io = ImGui::GetIO();
-        if (io.KeyShift && selAnchorVA_) {
+        if (io.KeyShift && selAnchorValid_) {
             selectRange(selAnchorVA_, in.address);                 // extend range from the anchor
         } else if (io.KeyCtrl) {
             if (selVAs_.count(in.address)) selVAs_.erase(in.address); else selVAs_.insert(in.address);
-            selAnchorVA_ = in.address;
+            selAnchorVA_ = in.address; selAnchorValid_ = true;
         } else {
-            selVAs_.clear(); selVAs_.insert(in.address); selAnchorVA_ = in.address;
+            selVAs_.clear(); selVAs_.insert(in.address); selAnchorVA_ = in.address; selAnchorValid_ = true;
         }
-        cursorVA_ = in.address;
+        cursorVA_ = in.address; cursorValid_ = true;
     }
-    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && in.branchTarget) navigateTo(in.branchTarget);
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && HasBranchTarget(in)) navigateTo(in.branchTarget);
     ImGui::PopStyleColor();
-    if (autoScrollHere && in.address == cursorVA_ && cursorVA_ != lastAsmScroll_) { ImGui::SetScrollHereY(0.4f); lastAsmScroll_ = cursorVA_; }
+    if (autoScrollHere && cursorValid_ && in.address == cursorVA_ &&
+        (!lastAsmScrollValid_ || cursorVA_ != lastAsmScroll_)) {
+        ImGui::SetScrollHereY(0.4f); lastAsmScroll_ = cursorVA_; lastAsmScrollValid_ = true;
+    }
     if (ImGui::BeginPopupContextItem("ictx")) {
         const bool inSel = selVAs_.size() > 1 && selVAs_.count(in.address);
         if (inSel) {   // batch actions on the selection (copy/signature/NOP come from here, not per-row)
@@ -1817,7 +1820,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
         ImGui::Separator();
         if (ImGui::MenuItem("Copy address")) { char c[24]; std::snprintf(c, sizeof(c), "0x%llX", (unsigned long long)in.address); ImGui::SetClipboardText(c); }
         if (!inSel) emitInstrCopyMenu(in);   // selection menu already offers these when multi-selecting
-        if (in.branchTarget && ImGui::MenuItem("Follow target")) navigateTo(in.branchTarget);
+        if (HasBranchTarget(in) && ImGui::MenuItem("Follow target")) navigateTo(in.branchTarget);
         // In-encoding switch cases (JVM tableswitch/lookupswitch): jump to any case.
         if (!in.extraTargets.empty() && ImGui::BeginMenu("Follow switch case")) {
             for (size_t k = 0; k < in.extraTargets.size() && k < 64; ++k) {
@@ -1827,7 +1830,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
                 if (ImGui::MenuItem(lbl)) navigateTo(in.extraTargets[k]);
             }
             if (in.extraTargets.size() > 64) ImGui::TextDisabled("(%zu more)", in.extraTargets.size() - 64);
-            if (in.branchTarget) {
+            if (HasBranchTarget(in)) {
                 char lbl[48];
                 std::snprintf(lbl, sizeof(lbl), "default -> 0x%llX", (unsigned long long)in.branchTarget);
                 if (ImGui::MenuItem(lbl)) navigateTo(in.branchTarget);
@@ -1866,11 +1869,13 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
             }
         }
         ImGui::Separator();
-        if (selAnchorVA_ && selAnchorVA_ != in.address && ImGui::MenuItem("Select from anchor to here"))
-            { selectRange(selAnchorVA_, in.address); cursorVA_ = in.address; }
+        if (selAnchorValid_ && selAnchorVA_ != in.address && ImGui::MenuItem("Select from anchor to here"))
+            { selectRange(selAnchorVA_, in.address); cursorVA_ = in.address; cursorValid_ = true; }
         if (ImGui::MenuItem(selVAs_.count(in.address) ? "Remove line from selection" : "Add line to selection")) {
             if (selVAs_.count(in.address)) selVAs_.erase(in.address);
-            else { selVAs_.insert(in.address); if (!selAnchorVA_) selAnchorVA_ = in.address; }
+            else if (selVAs_.insert(in.address).second && !selAnchorValid_) {
+                selAnchorVA_ = in.address; selAnchorValid_ = true;
+            }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Add bookmark here")) bookmarks_.push_back({ in.address, "bookmark" });
@@ -1908,7 +1913,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, const Instruction& in, const D
     }
     ImGui::SameLine(0, 0);
     renderHoverTokens(in.operands.c_str(), ImGui::GetColorU32(ImGuiCol_Text), hoverTok, nextHoverTok);
-    if (in.branchTarget) {
+    if (HasBranchTarget(in)) {
         ImGui::SameLine(); ImGui::TextDisabled("  ; 0x%llX", (unsigned long long)in.branchTarget);
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);   // it's a link
         if (ImGui::IsItemClicked()) navigateTo(in.branchTarget);       // click the target to follow
@@ -2052,14 +2057,16 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
     // Branch target of the instruction under the cursor: its row (if visible)
     // gets the violet jump-target glow, so clicking a jcc/call lights up where
     // it goes. One decode per frame at most (usually a decode-cache hit).
-    hlJumpVA_ = 0;
-    if (cursorVA_) {
+    hlJumpVA_ = 0; hlJumpValid_ = false;
+    if (cursorValid_) {
         if (auto jit = decodeCache_.find(cursorVA_); jit != decodeCache_.end()) {
-            hlJumpVA_ = jit->second.branchTarget;
+            hlJumpVA_ = jit->second.branchTarget; hlJumpValid_ = HasBranchTarget(jit->second);
         } else if (ctx.disasm) {
             size_t javail = 0; Instruction jin;
             const uint8_t* jp = ctx.binary.ptrFromVA(cursorVA_, javail);
-            if (jp && ctx.disasm->decodeOne(jp, javail, cursorVA_, jin)) hlJumpVA_ = jin.branchTarget;
+            if (jp && ctx.disasm->decodeOne(jp, javail, cursorVA_, jin)) {
+                hlJumpVA_ = jin.branchTarget; hlJumpValid_ = HasBranchTarget(jin);
+            }
         }
     }
 
@@ -2085,7 +2092,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
 
         // Jump to the cursor's row when navigation moved it (goto, xref, etc.).
         int scrollToRow = -1;
-        if (cursorVA_ && cursorVA_ != lastAsmScroll_) {
+        if (cursorValid_ && (!lastAsmScrollValid_ || cursorVA_ != lastAsmScroll_)) {
             size_t lo = 0, hi = listRows_.size();
             while (lo < hi) { size_t mid = (lo + hi) / 2; if (listRows_[mid].addr < cursorVA_) lo = mid + 1; else hi = mid; }
             bool exact = lo < listRows_.size() && listRows_[lo].addr == cursorVA_;
@@ -2103,7 +2110,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                         if (cursorVA_ >= sv && cursorVA_ < sv + sp) { inExec = true; break; }
                     }
             }
-            lastAsmScroll_ = cursorVA_;   // don't retrigger (incl. the Hex bounce) for this address
+            lastAsmScroll_ = cursorVA_; lastAsmScrollValid_ = true; // don't retrigger (incl. Hex bounce)
             if (!exact && !inExec && !listRows_.empty()) {
                 mainView_ = 2;            // show the data byte/text in the Hex view
             } else {
@@ -2129,7 +2136,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
                     const Strng& st = strings_[(size_t)row.strIdx];
                     ImGui::TableNextRow();
                     ImGui::PushID((void*)(uintptr_t)row.addr);
-                    if (row.addr == cursorVA_) {
+                    if (cursorValid_ && row.addr == cursorVA_) {
                         ImVec4 sc = theme::col::selection();
                         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImVec4(sc.x, sc.y, sc.z, 0.30f)));
                     }
@@ -2195,7 +2202,7 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
         uint64_t va = cursorVA_;
         size_t size = 0;
         const uint8_t* p = codeWindow(ctx, va, size);
-        if (cursorVA_ == 0) cursorVA_ = va;
+        if (!cursorValid_ && p) { cursorVA_ = va; cursorValid_ = true; }
         if (!p) {
             asmWindowInsns_.clear(); asmWindowFuncSet_.clear();
             asmWindowKey_ = windowKey; asmWindowCursor_ = cursorVA_;
@@ -2217,7 +2224,7 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
             asmWindowFuncSet_.clear();
             asmWindowFuncSet_.reserve(64);
             for (const auto& in : asmWindowInsns_)
-                if (in.isCall && in.branchTarget) asmWindowFuncSet_.insert(in.branchTarget);
+                if (in.isCall && HasBranchTarget(in)) asmWindowFuncSet_.insert(in.branchTarget);
             // Only starts inside this 256-row window can become dividers. The old
             // cache rebuild inserted every discovered function, making each cursor
             // move O(all functions) on large binaries despite rendering 256 rows.
@@ -2249,9 +2256,9 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
 
     // Jump-target highlight: the branch target of the cursor's instruction.
-    hlJumpVA_ = 0;
+    hlJumpVA_ = 0; hlJumpValid_ = false;
     for (const auto& jin : insns)
-        if (jin.address == cursorVA_) { hlJumpVA_ = jin.branchTarget; break; }
+        if (jin.address == cursorVA_) { hlJumpVA_ = jin.branchTarget; hlJumpValid_ = HasBranchTarget(jin); break; }
 
     ui::PushMono();
     if (ImGui::BeginTable("asm", 5,
@@ -2310,7 +2317,7 @@ void BinaryViewTab::drawAsmArrows(float x0, float y0, float x1, float y1) {
     arrs.reserve(asmFlow_.size());
     for (const auto& r : asmFlow_) {
         if (!r.branch) continue;
-        bool active = (r.addr == cursorVA_) || (r.target == cursorVA_);
+        bool active = cursorValid_ && ((r.addr == cursorVA_) || (r.target == cursorVA_));
         ImU32 col = active              ? IM_COL32(120, 220, 120, 235)
                   : (r.target < r.addr) ? IM_COL32(220, 170,  90, 210)    // backward
                                         : IM_COL32(110, 170, 230, 210);   // forward
@@ -2348,9 +2355,9 @@ void BinaryViewTab::drawAsmArrows(float x0, float y0, float x1, float y1) {
 // Set by navigateTo/navBack/navForward; expires by time so the clipper never
 // has to render the row for it to clear.
 float BinaryViewTab::navFlashAt(uint64_t addr) {
-    if (!navFlashVA_ || addr != navFlashVA_) return 0.0f;
+    if (!navFlashValid_ || addr != navFlashVA_) return 0.0f;
     float dt = (float)(ImGui::GetTime() - navFlashT0_);
-    if (dt >= 1.1f) { navFlashVA_ = 0; return 0.0f; }
+    if (dt >= 1.1f) { navFlashValid_ = false; return 0.0f; }
     return 1.0f - dt / 1.1f;
 }
 
@@ -2395,7 +2402,7 @@ void BinaryViewTab::drawRowGlows(float x0, float y0, float x1, float y1) {
 // the function-divider marker rows (which share an address with the first
 // instruction of the function). Backs J/K and the Prev/Next buttons.
 void BinaryViewTab::stepAsmCursor(int delta) {
-    if (listRows_.empty() || delta == 0 || !cursorVA_) return;
+    if (listRows_.empty() || delta == 0 || !cursorValid_) return;
     // Anchor on the instruction CONTAINING the cursor (largest instruction addr
     // <= cursorVA_): with a ceil anchor a forward step from a non-aligned cursor
     // would overshoot by one (the ceil row is already the "next" instruction).
@@ -2414,7 +2421,8 @@ void BinaryViewTab::stepAsmCursor(int delta) {
     }
     if (idx >= 0 && idx < (long)listRows_.size() && !listRows_[(size_t)idx].divider) {
         cursorVA_      = listRows_[(size_t)idx].addr;
-        lastAsmScroll_ = 0;   // trigger the SetScrollHereY re-centering next frame
+        cursorValid_   = true;
+        lastAsmScrollValid_ = false;
     }
 }
 
@@ -2478,7 +2486,7 @@ void BinaryViewTab::revertPatchAt(AppContext& ctx, uint64_t va) {
 void BinaryViewTab::analyzeFunctions(AppContext& ctx) {
     if (!ctx.binary.loaded() || !ctx.disasm) return;
     FunctionAnalyzer fa;
-    auto found = fa.analyze(ctx.binary, *ctx.disasm);
+    auto found = fa.analyze(ctx.binary, *ctx.disasm, ctx.arch);
     functions_.clear();
     functions_.reserve(found.size());
     for (auto& f : found) functions_.push_back({ f.address, f.name, f.size, false, f.isExport });
@@ -2520,9 +2528,14 @@ void BinaryViewTab::guessFunctionNames(AppContext& ctx) {
         return (it != strings_.end() && it->address == va) ? it->text : std::string();
     };
 
-    uint64_t entryVA = ctx.binary.entryPoint() ? ctx.binary.imageBase() + ctx.binary.entryPoint() : 0;
+    const bool rawStart = ctx.binary.format() == BinFormat::Raw;
+    const bool headerEntry = ctx.binary.entryPoint() != 0;
+    const uint64_t entryVA = rawStart ? ctx.binary.imageBase()
+                                      : (headerEntry ? ctx.binary.imageBase() + ctx.binary.entryPoint() : 0);
     FunctionNamer namer;
-    auto guesses = namer.name(ctx.binary, *ctx.disasm, in, entryVA, importNameFor, stringRefFor);
+    auto guesses = namer.name(ctx.binary, *ctx.disasm, in, entryVA,
+                              rawStart || headerEntry, rawStart,
+                              importNameFor, stringRefFor);
 
     int n = 0;
     for (size_t i = 0; i < functions_.size() && i < guesses.size(); ++i) {
@@ -2625,15 +2638,22 @@ void BinaryViewTab::scanStrings(AppContext& ctx) {
 // so functions / names / references are ready immediately.
 void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     if (!ctx.binary.loaded()) return;
+    bool haveCursor = false;
     uint64_t entry = ctx.binary.entryPoint()
                    ? ctx.binary.imageBase() + ctx.binary.entryPoint()
                    : 0;
-    if (!entry) {   // DLLs/raw blobs may have no entry point: fall back to first code section
-        if (const Section* s = ctx.binary.firstCodeSection())
+    if (ctx.binary.entryPoint()) haveCursor = true;
+    if (!haveCursor) { // DLLs/raw blobs may have no entry point: use first code section (VA 0 allowed)
+        if (const Section* s = ctx.binary.firstCodeSection()) {
             entry = ctx.binary.imageBase() + s->virtualAddress;
+            size_t avail = 0;
+            haveCursor = ctx.binary.ptrFromVA(entry, avail) != nullptr && avail != 0;
+        }
     }
     cursorVA_      = entry;
-    lastAsmScroll_ = 0;          // force the Assembly view to re-center on the new cursor
+    cursorValid_   = haveCursor;
+    lastAsmScrollValid_ = false; // force re-centering, including VA 0 / UINT64_MAX
+    hexLastScrollValid_ = false;
     runtimeBannerDismissed_ = false;   // new binary: re-show the runtime-wrapper/archive banner if detected
     navHist_.clear(); navPos_ = -1;
     strings_.clear(); ++stringsGen_;
@@ -2743,7 +2763,13 @@ void BinaryViewTab::loadProjectState(AppContext& ctx) {
     std::snprintf(notes_, sizeof(notes_), "%s", p.notes.c_str());
     watches_ = p.watches;
     recompileWatches();   // parse once; per-frame eval uses the compiled form
-    if (p.lastCursor) cursorVA_ = p.lastCursor;
+    if (p.lastCursorValid) {
+        size_t avail = 0;
+        if (ctx.binary.ptrFromVA(p.lastCursor, avail)) {
+            cursorVA_ = p.lastCursor;
+            cursorValid_ = true;
+        }
+    }
 
     // If we're already attached, arm any saved breakpoints now.
     if (frameSnap_->attached())
@@ -2777,7 +2803,8 @@ void BinaryViewTab::saveProjectState(AppContext& ctx) {
     for (const auto& kv : everyNBuf_) if (kv.second > 1) p.bpEveryN[kv.first] = kv.second;
     p.notes = notes_;
     p.watches = watches_;
-    if (cursorVA_) p.lastCursor = cursorVA_;
+    p.lastCursor = cursorVA_;
+    p.lastCursorValid = cursorValid_;
     // The comment / name maps can hold thousands of entries on a heavily-annotated
     // binary; deep-copying them every frame was the real cost. Only mirror them when
     // an edit actually changed them (set by the comment/rename popups + clears).
@@ -2796,8 +2823,8 @@ std::string BinaryViewTab::annName(AppContext& /*ctx*/, uint64_t addr) {
 }
 
 void BinaryViewTab::navigateTo(uint64_t va) {
-    if (!va) return;
     const bool live = (mainView_ == 4);   // live view cursors are runtime VAs
+    if (live && !va) return;              // keep debugger RIP/address zero as "unavailable"
     // Push onto history unless we're already sitting on this exact (address, view).
     if (navPos_ < 0 || navHist_.empty() || navHist_[navPos_].va != va || navHist_[navPos_].live != live) {
         if (navPos_ >= 0 && navPos_ + 1 < (int)navHist_.size())
@@ -2806,9 +2833,10 @@ void BinaryViewTab::navigateTo(uint64_t va) {
         navPos_ = (int)navHist_.size() - 1;
     }
     cursorVA_      = va;
-    lastAsmScroll_ = 0;       // re-center the static full-program listing
+    cursorValid_   = true;
+    lastAsmScrollValid_ = false;
     followLiveRip_ = false;
-    navFlashVA_ = va; navFlashT0_ = ImGui::GetTime();   // arrival flash on the landing row
+    navFlashVA_ = va; navFlashValid_ = true; navFlashT0_ = ImGui::GetTime();
 }
 // Restore the history entry at navPos_, switching the view to the space (live vs
 // static) that entry belongs to so a runtime VA never lands in a file-VA view.
@@ -2818,8 +2846,8 @@ void BinaryViewTab::navBack() {
     const NavEntry& e = navHist_[navPos_];
     if (e.live) mainView_ = 4;                 // runtime entry -> live view
     else if (mainView_ == 4) mainView_ = 0;    // leaving live for a file entry -> static Assembly
-    cursorVA_ = e.va; lastAsmScroll_ = 0; lastScrolledRip_ = 0; followLiveRip_ = false;
-    navFlashVA_ = e.va; navFlashT0_ = ImGui::GetTime();
+    cursorVA_ = e.va; cursorValid_ = true; lastAsmScrollValid_ = false; lastScrolledRip_ = 0; followLiveRip_ = false;
+    navFlashVA_ = e.va; navFlashValid_ = true; navFlashT0_ = ImGui::GetTime();
 }
 void BinaryViewTab::navForward() {
     if (navPos_ < 0 || navPos_ + 1 >= (int)navHist_.size()) return;
@@ -2827,12 +2855,20 @@ void BinaryViewTab::navForward() {
     const NavEntry& e = navHist_[navPos_];
     if (e.live) mainView_ = 4;
     else if (mainView_ == 4) mainView_ = 0;
-    cursorVA_ = e.va; lastAsmScroll_ = 0; lastScrolledRip_ = 0; followLiveRip_ = false;
-    navFlashVA_ = e.va; navFlashT0_ = ImGui::GetTime();
+    cursorVA_ = e.va; cursorValid_ = true; lastAsmScrollValid_ = false; lastScrolledRip_ = 0; followLiveRip_ = false;
+    navFlashVA_ = e.va; navFlashValid_ = true; navFlashT0_ = ImGui::GetTime();
 }
 void BinaryViewTab::gotoStatic(AppContext& ctx, uint64_t fileVA) {
     if (mainView_ == 4) liveNavigate(fileVAtoLive(ctx, fileVA));   // live view: shift to the runtime VA
     else navigateTo(fileVA);
+}
+void BinaryViewTab::gotoExportTarget(const BinaryFile::Export& ex) {
+    if (ex.forwarded || !ex.mapped || !ex.va) return;
+    // Export navigation is explicitly static. Choose the representation before
+    // navigateTo() so the history entry is recorded in file-address space.
+    mainView_ = ex.isCode ? 0 : 2;
+    if (!ex.isCode) hexLastScrollValid_ = false; // force VA -> file-offset centering in Hex
+    navigateTo(ex.va);
 }
 void BinaryViewTab::liveNavigate(uint64_t va) { navigateTo(va); }
 
@@ -2955,7 +2991,7 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     ImGui::Checkbox("Follow RIP", &followLiveRip_);
     ImGui::SameLine();
     ImGui::BeginDisabled(rip == 0);
-    if (ImGui::SmallButton("Sync")) { followLiveRip_ = true; cursorVA_ = rip; lastScrolledRip_ = 0; }
+    if (ImGui::SmallButton("Sync")) { followLiveRip_ = true; cursorVA_ = rip; cursorValid_ = true; lastScrolledRip_ = 0; }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Jump to and follow RIP");
     ImGui::SameLine();
@@ -2984,7 +3020,7 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     ImGui::Separator();
 
     // ---- Resolve the focus address, then lay out: main view | register box ----
-    if (followLiveRip_ && rip) cursorVA_ = rip;
+    if (followLiveRip_ && rip) { cursorVA_ = rip; cursorValid_ = true; }
     uint64_t base = cursorVA_ ? cursorVA_ : rip;
     if (base == 0) {
         ImGui::TextDisabled("Waiting for the first debug event. Press Pause if the process is running.");
@@ -3053,7 +3089,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
         // Function starts: in-window call targets + analyzed functions + the containing
         // module's exports -> a "sub_X" divider is printed before each one.
         liveFuncSet_.clear();
-        for (const auto& in : liveInsns_) if (in.isCall && in.branchTarget) liveFuncSet_.insert(in.branchTarget);
+        for (const auto& in : liveInsns_) if (in.isCall && HasBranchTarget(in)) liveFuncSet_.insert(in.branchTarget);
         for (const auto& f : functions_) liveFuncSet_.insert(fileVAtoLive(ctx, f.address));   // file-base -> runtime base (ASLR)
         if (symAttached_) {
             if (liveModulesPid_ != symPid_ || liveModules_.empty()) {
@@ -3091,9 +3127,11 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
     // Jump-target highlight: the branch target of the cursor's instruction
     // (violet glow on its row when visible). Index lookup — no decode.
     rowGlow_.clear();
-    hlJumpVA_ = 0;
-    if (auto jit = idxOf.find(cursorVA_); jit != idxOf.end())
+    hlJumpVA_ = 0; hlJumpValid_ = false;
+    if (auto jit = idxOf.find(cursorVA_); jit != idxOf.end()) {
         hlJumpVA_ = insns[jit->second].branchTarget;
+        hlJumpValid_ = HasBranchTarget(insns[jit->second]);
+    }
 
     ui::PushMono();
     ImVec2 tableMin   = ImGui::GetCursorScreenPos();
@@ -3120,8 +3158,8 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
             ImGui::PushID((void*)(uintptr_t)in.address);
 
             bool rowAtRip = rip == in.address;
-            bool rowSel   = in.address == cursorVA_ && !rowAtRip;
-            bool rowJump  = !rowAtRip && !rowSel && hlJumpVA_ && in.address == hlJumpVA_;
+            bool rowSel   = cursorValid_ && in.address == cursorVA_ && !rowAtRip;
+            bool rowJump  = !rowAtRip && !rowSel && hlJumpValid_ && in.address == hlJumpVA_;
             bool rowMulti = selVAs_.size() > 1 && !rowAtRip && !rowSel && selVAs_.count(in.address);
             float flash   = navFlashAt(in.address);
             {   // Flat fill under the text; the glow halo is painted post-table
@@ -3174,30 +3212,30 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
             ImGui::PushStyleColor(ImGuiCol_Text, acol);
             if (ImGui::Selectable(addrLbl, false)) {
                 ImGuiIO& io = ImGui::GetIO();
-                if (io.KeyShift && selAnchorVA_) {           // range from the anchor over the live insns
+                if (io.KeyShift && selAnchorValid_) {        // range from the anchor over the live insns
                     uint64_t a = selAnchorVA_, b = in.address; if (a > b) { uint64_t t = a; a = b; b = t; }
                     selVAs_.clear();
                     for (const auto& q : insns) if (q.address >= a && q.address <= b) selVAs_.insert(q.address);
                 } else if (io.KeyCtrl) {                      // toggle this line in/out of the selection
                     if (selVAs_.count(in.address)) selVAs_.erase(in.address); else selVAs_.insert(in.address);
-                    selAnchorVA_ = in.address;
+                    selAnchorVA_ = in.address; selAnchorValid_ = true;
                 } else {                                      // plain click: single select + new anchor
-                    selVAs_.clear(); selVAs_.insert(in.address); selAnchorVA_ = in.address;
+                    selVAs_.clear(); selVAs_.insert(in.address); selAnchorVA_ = in.address; selAnchorValid_ = true;
                 }
-                cursorVA_ = in.address; followLiveRip_ = false;
+                cursorVA_ = in.address; cursorValid_ = true; followLiveRip_ = false;
             }
             ImGui::PopStyleColor();
             if (in.address == base && base != lastScrolledRip_) {
                 ImGui::SetScrollHereY(0.4f);   // center the focus line (RIP or navigated cursor)
                 lastScrolledRip_ = base;
             }
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && in.branchTarget)
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && HasBranchTarget(in))
                 liveNavigate(in.branchTarget);
             if (ImGui::BeginPopupContextItem("live_ictx")) {
                 const bool inSel = selVAs_.size() > 1 && selVAs_.count(in.address);
                 if (inSel) { liveSelectionMenu(ctx, snap); ImGui::Separator(); }
                 if (ImGui::MenuItem("Run to cursor")) ctx.debug.runToCursor(in.address);
-                if (in.branchTarget && ImGui::MenuItem("Follow target")) liveNavigate(in.branchTarget);
+                if (HasBranchTarget(in) && ImGui::MenuItem("Follow target")) liveNavigate(in.branchTarget);
                 ImGui::Separator();
                 bool swbp = hasBreakpoint(snap, in.address) || hasBreakpoint(breakpoints_, in.address);
                 if (ImGui::MenuItem("Software breakpoint", nullptr, swbp)) {
@@ -3309,7 +3347,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
             }
             ImGui::SameLine(0, 0);
             renderHoverTokens(in.operands.c_str(), ImGui::GetColorU32(ImGuiCol_Text), hoverTok, nextHoverTok);
-            if (in.branchTarget) {
+            if (HasBranchTarget(in)) {
                 ImGui::SameLine();
                 ImGui::TextColored(theme::col::muted(), "; 0x%llX", (unsigned long long)in.branchTarget);
                 if (ImGui::IsItemHovered()) {
@@ -3423,7 +3461,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
         arrs.reserve(insns.size());
         for (int i = 0; i < (int)insns.size(); ++i) {
             const auto& in = insns[i];
-            if (!in.isBranch || in.isCall || !in.branchTarget || rowY[i] < 0) continue;
+            if (!in.isBranch || in.isCall || !HasBranchTarget(in) || rowY[i] < 0) continue;
             auto it = idxOf.find(in.branchTarget);
             bool active = (in.address == rip) || (it != idxOf.end() && insns[it->second].address == rip);
             ImU32 col = active                         ? IM_COL32(120, 220, 120, 235)
@@ -3468,7 +3506,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
     if (!ImGui::GetIO().WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
             auto it = idxOf.find(cursorVA_);
-            if (it != idxOf.end() && insns[it->second].branchTarget) liveNavigate(insns[it->second].branchTarget);
+            if (it != idxOf.end() && HasBranchTarget(insns[it->second])) liveNavigate(insns[it->second].branchTarget);
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) navBack();
     }
@@ -3799,7 +3837,7 @@ std::string BinaryViewTab::buildSignature(AppContext& ctx, uint64_t lo, uint64_t
         // off-x86 we emit a literal signature, matching the non-wildcard menu item.
         uint32_t wcStart = len, wcCount = 0;
         if (wildcard && (live || ArchIsX86(ctx.arch)) &&
-            (in.isCall || in.isBranch) && in.branchTarget) {
+            (in.isCall || in.isBranch) && HasBranchTarget(in)) {
             // Walk past legacy prefixes to the opcode byte; a 0x66 operand-size prefix
             // shrinks a direct near branch's displacement from rel32 to rel16.
             uint32_t oi = 0; bool has66 = false;
@@ -4183,7 +4221,13 @@ uint64_t BinaryViewTab::liveVAtoFile(AppContext& ctx, uint64_t liveVA) {
 }
 
 std::string BinaryViewTab::symbolFor(AppContext& ctx, uint64_t addr) {
-    if (!addr) return std::string();
+    // Static raw/ELF mappings may legitimately contain a symbol at VA 0. Keep
+    // live null-address semantics separate: the debugger never resolves 0.
+    if (!addr) {
+        size_t avail = 0;
+        if (mainView_ == 4 || !ctx.binary.loaded() || !ctx.binary.ptrFromVA(0, avail))
+            return std::string();
+    }
 
     // Project annotations use file VAs. If this is a relocated live-main-module
     // address, resolve its canonical file VA first; static listing addresses still
@@ -4403,9 +4447,9 @@ void BinaryViewTab::renderCallStack(AppContext& ctx) {
             ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%d", i);
             ImGui::TableSetColumnIndex(1);
             char al[24]; std::snprintf(al, sizeof(al), "0x%llX", (unsigned long long)f.pc);
-            if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns)) { cursorVA_ = f.pc; followLiveRip_ = false; }
+            if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns) && f.pc) { cursorVA_ = f.pc; cursorValid_ = true; followLiveRip_ = false; }
             if (ImGui::BeginPopupContextItem("csm")) {
-                if (ImGui::MenuItem("Go to")) { cursorVA_ = f.pc; followLiveRip_ = false; }
+                if (ImGui::MenuItem("Go to") && f.pc) { cursorVA_ = f.pc; cursorValid_ = true; followLiveRip_ = false; }
                 if (ImGui::MenuItem("Copy address")) { char c[24]; std::snprintf(c, sizeof(c), "0x%llX", (unsigned long long)f.pc); ImGui::SetClipboardText(c); }
                 if (ImGui::MenuItem("Copy function") && !f.name.empty()) ImGui::SetClipboardText(f.name.c_str());
                 ImGui::EndPopup();
@@ -4574,28 +4618,31 @@ void BinaryViewTab::buildSymbolIndex(AppContext& ctx) {
     }
 }
 
-uint64_t BinaryViewTab::lookupSymbol(AppContext& ctx, const char* name) {
-    if (!name || !name[0]) return 0;
+bool BinaryViewTab::lookupSymbol(AppContext& ctx, const char* name, uint64_t& addressOut) {
+    addressOut = 0;
+    if (!name || !name[0]) return false;
     buildSymbolIndex(ctx);
     std::string q = name;
     for (char& c : q) c = (char)std::tolower((unsigned char)c);
-    uint64_t sub = 0;
+    uint64_t sub = 0; bool haveSub = false;
     for (const auto& s : symbolIndex_) {
         const std::string& n = s.lower;                        // pre-lowercased at build time
-        if (n == q) return s.addr;                             // exact "module.name"
+        if (n == q) { addressOut = s.addr; return true; }      // exact "module.name"
         size_t dot = n.find('.');
-        if (dot != std::string::npos && n.compare(dot + 1, std::string::npos, q) == 0) return s.addr;  // bare name
-        if (!sub && n.find(q) != std::string::npos) sub = s.addr;  // first substring match
+        if (dot != std::string::npos && n.compare(dot + 1, std::string::npos, q) == 0) {
+            addressOut = s.addr; return true;                  // bare name
+        }
+        if (!haveSub && n.find(q) != std::string::npos) { sub = s.addr; haveSub = true; }
     }
-    if (sub) return sub;
+    if (haveSub) { addressOut = sub; return true; }
     // Fallback: ask DbgHelp to resolve the name against the PDB / export table
     // (covers symbols that never made it into our in-tab index). In the static
     // case bind the file session on demand; live sessions are already bound.
     if (!symAttached_ && ctx.binary.loaded())
         symbols_.useBinary(ctx.binary.path(), ctx.binary.imageBase());
     uint64_t va = 0;
-    if (symbols_.addressOf(name, va)) return va;
-    return 0;
+    if (symbols_.addressOf(name, va)) { addressOut = va; return true; }
+    return false;
 }
 
 void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
@@ -4642,10 +4689,10 @@ void BinaryViewTab::renderGotoPopup(AppContext& ctx) {
         if (hexPref && std::sscanf(gotoNameBuf_ + 2, "%llx", &a) == 1)  go((uint64_t)a);
         else if (!gotoMatches_.empty())                                 goSymbol(symbolIndex_[gotoMatches_[0]]);
         else if (std::sscanf(gotoNameBuf_, "%llx", &a) == 1)            go((uint64_t)a);
-        else if (uint64_t s = lookupSymbol(ctx, gotoNameBuf_)) { // DbgHelp PDB/export fallback
+        else { uint64_t s = 0; if (lookupSymbol(ctx, gotoNameBuf_, s)) { // DbgHelp/PDB/export fallback
             if (symAttached_) { mainView_ = 4; liveNavigate(s); ImGui::CloseCurrentPopup(); }
             else              go(s);
-        }
+        } }
     }
 
     ImGui::BeginChild("glist", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_Borders);
@@ -4966,6 +5013,7 @@ bool BinaryViewTab::ensureXrefReady(AppContext& ctx) {
 // its enclosing function, from the precomputed index (no per-query code sweep).
 void BinaryViewTab::renderXrefsTab(AppContext& ctx) {
     if (!ctx.binary.loaded()) { ImGui::TextDisabled("Load a binary to see cross-references."); return; }
+    if (!cursorValid_) { ImGui::TextDisabled("Place the cursor on an address to see cross-references."); return; }
     if (!ensureXrefReady(ctx)) {
         ImGui::TextDisabled("Building cross-reference index\xE2\x80\xA6");
         drawAnalysisProgress(ctx, false);
@@ -4975,7 +5023,8 @@ void BinaryViewTab::renderXrefsTab(AppContext& ctx) {
     // The index is keyed in file space; translate a live-view cursor back to it.
     uint64_t cur     = (mainView_ == 4) ? liveVAtoFile(ctx, cursorVA_) : cursorVA_;
     const Func* fn   = funcContaining(cur);
-    uint64_t fnStart = (fn && cur - fn->address < 0x100000) ? fn->address : 0;
+    const bool fnStartValid = fn && cur >= fn->address && cur - fn->address < 0x100000;
+    uint64_t fnStart = fnStartValid ? fn->address : 0;
 
     ImGui::TextDisabled("%zu reference edge(s) indexed.", xrefIndex_.edgeCount());
     ImGui::SameLine();
@@ -5012,9 +5061,9 @@ void BinaryViewTab::renderXrefsTab(AppContext& ctx) {
         ImGui::PopID();
     };
 
-    auto section = [&](const char* title, uint64_t target) {
-        std::string sym = target ? symbolFor(ctx, target) : std::string();
-        if (target) ImGui::TextColored(theme::col::accent(), "%s to 0x%llX%s%s%s", title,
+    auto section = [&](const char* title, uint64_t target, bool targetValid) {
+        std::string sym = targetValid ? symbolFor(ctx, target) : std::string();
+        if (targetValid) ImGui::TextColored(theme::col::accent(), "%s to 0x%llX%s%s%s", title,
                         (unsigned long long)target, sym.empty() ? "" : "  (", sym.c_str(), sym.empty() ? "" : ")");
         else        { ImGui::TextDisabled("%s: no address at cursor", title); return; }
         const std::vector<uint64_t>* src = xrefIndex_.sources(target);
@@ -5059,10 +5108,10 @@ void BinaryViewTab::renderXrefsTab(AppContext& ctx) {
     };
 
     ImGui::BeginChild("xrefs", ImVec2(0, 0), ImGuiChildFlags_None);
-    section("References", cur);
-    if (fnStart && fnStart != cur) {
+    section("References", cur, true);
+    if (fnStartValid && fnStart != cur) {
         ImGui::Dummy(ImVec2(0, 6)); ImGui::Separator();
-        section("References to enclosing function", fnStart);
+        section("References to enclosing function", fnStart, true);
     }
     ImGui::EndChild();
 }
@@ -5205,6 +5254,7 @@ void BinaryViewTab::renderPseudocode(AppContext& ctx) {
     ImGui::TextDisabled("if/else + while recovery via dominator analysis; goto fallback for irreducible flow. Click a line to show it in the listing.");
     ImGui::Separator();
     if (!ctx.binary.loaded() || !ctx.disasm) { ImGui::TextDisabled("No binary loaded."); return; }
+    if (!cursorValid_) { ImGui::TextDisabled("Place the cursor inside mapped code."); return; }
 
     // Decompile the function enclosing the cursor (so we structure a whole fn,
     // not just the window under the cursor). Cached until the function changes.
@@ -5318,6 +5368,7 @@ void BinaryViewTab::renderDecompiler(AppContext& ctx) {
     if (ImGui::SmallButton("Copy") && !decompText_.empty()) ImGui::SetClipboardText(decompText_.c_str());
     ImGui::Separator();
     if (!ctx.binary.loaded() || !ctx.disasm) { ImGui::TextDisabled("No binary loaded."); return; }
+    if (!cursorValid_) { ImGui::TextDisabled("Place the cursor inside mapped code."); return; }
 
     // Decompile the function enclosing the cursor — IDENTICAL request flow to the
     // Pseudocode view (decompVA_ keyed; off-thread K_Decompile; LRU-cached). Kept in
@@ -5549,7 +5600,9 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
             if (std::sscanf(hexGotoOff_, "%llx", &o) == 1 && o < total) {
                 hexCursorOff_ = o; hexPendScroll_ = o; hexEditNibble_ = -1;
                 uint64_t va = 0;
-                if (ctx.binary.offsetToVA(o, va)) { navigateTo(va); hexLastScroll_ = cursorVA_; }
+                if (ctx.binary.offsetToVA(o, va)) {
+                    navigateTo(va); hexLastScroll_ = cursorVA_; hexLastScrollValid_ = true;
+                }
             }
             hexGotoOff_[0] = 0;
         }
@@ -5616,12 +5669,12 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
 
     // External navigation (goto box, xref, data-address bounce) moved cursorVA_:
     // follow it once, mapping the VA to its file offset.
-    if (cursorVA_ && cursorVA_ != hexLastScroll_) {
+    if (cursorValid_ && (!hexLastScrollValid_ || cursorVA_ != hexLastScroll_)) {
         uint64_t off = 0;
         if (ctx.binary.vaToOffset(cursorVA_, off) && off < total) {
             hexCursorOff_ = off; hexPendScroll_ = off; hexEditNibble_ = -1;
         }
-        hexLastScroll_ = cursorVA_;
+        hexLastScroll_ = cursorVA_; hexLastScrollValid_ = true;
     }
 
     // ---- keyboard: cursor movement + nibble/ascii editing -------------------
@@ -5728,7 +5781,10 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
                 if (ImGui::GetIO().KeyShift && hexSelA_ != ~0ull) hexSelB_ = (uint64_t)off;
                 else { hexSelA_ = hexSelB_ = (uint64_t)off; hexDragging_ = true; }
                 uint64_t va = 0;
-                if (ctx.binary.offsetToVA((uint64_t)off, va)) { cursorVA_ = va; hexLastScroll_ = va; }
+                if (ctx.binary.offsetToVA((uint64_t)off, va)) {
+                    cursorVA_ = va; cursorValid_ = true;
+                    hexLastScroll_ = va; hexLastScrollValid_ = true;
+                }
             }
             if (hexDragging_ && hovered && ImGui::IsMouseDown(0)) {
                 bool ascii = false;
@@ -5825,7 +5881,7 @@ void BinaryViewTab::buildCallGraph(AppContext& ctx) {
         while (off < win && guard++ < 50000) {
             Instruction in;
             if (!ctx.disasm->decodeOne(p + off, win - off, f.address + off, in) || !in.length) { ++off; continue; }
-            if (in.isCall && in.branchTarget && fset.count(in.branchTarget) &&
+            if (in.isCall && HasBranchTarget(in) && fset.count(in.branchTarget) &&
                 std::find(outv.begin(), outv.end(), in.branchTarget) == outv.end()) {
                 outv.push_back(in.branchTarget);
                 callers_[in.branchTarget].push_back(f.address);
@@ -5851,6 +5907,7 @@ bool BinaryViewTab::ensureCallGraphReady(AppContext& ctx) {
 
 void BinaryViewTab::renderCallGraph(AppContext& ctx) {
     if (!ctx.binary.loaded() || !ctx.disasm) { ImGui::TextDisabled("Load a binary to view the call graph."); return; }
+    if (!cursorValid_) { ImGui::TextDisabled("Place the cursor inside an analyzed function."); return; }
     if (!ensureCallGraphReady(ctx)) {
         ImGui::TextDisabled("Building call graph\xE2\x80\xA6");
         drawAnalysisProgress(ctx, false);
@@ -6032,7 +6089,7 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
     uint64_t va = cursorVA_;
     size_t size = 0;
     const uint8_t* p = codeWindow(ctx, va, size);
-    if (cursorVA_ == 0) cursorVA_ = va;
+    if (!cursorValid_ && p) { cursorVA_ = va; cursorValid_ = true; }
     if (!p) { ImGui::TextDisabled("Cursor address is not mapped to code."); return; }
 
     // Build the CFG for the function at the cursor -- cached. BuildCFG decodes up to
@@ -6090,7 +6147,7 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
         char line[224];
         std::snprintf(line, sizeof(line), "%-7s %-6s %s", head, in.mnemonic.c_str(), in.operands.c_str());
         std::string r = line;
-        if (showNames_ && in.branchTarget && (in.isCall || in.isBranch)) {
+        if (showNames_ && HasBranchTarget(in) && (in.isCall || in.isBranch)) {
             std::string nm = symbolFor(ctx, in.branchTarget);
             if (!nm.empty()) { r += "  -> "; r += nm; }
         }
@@ -6144,7 +6201,9 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
         ImGui::SetCursorScreenPos(pos[i]);
         ImGui::PushID((void*)(uintptr_t)g.blocks[i].start);
         ImGui::InvisibleButton("blk", sz[i]);
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) cursorVA_ = g.blocks[i].start;
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            cursorVA_ = g.blocks[i].start; cursorValid_ = true;
+        }
         if (ImGui::IsItemActive()) {
             blockActive = true;
             if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
@@ -6196,7 +6255,7 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
         const auto& b = g.blocks[i];
         ImVec2 a = pos[i], c = ImVec2(pos[i].x + sz[i].x, pos[i].y + sz[i].y);
         bool hasRip = snap.attached() && snap.regs.rip >= b.start && snap.regs.rip < b.end;
-        bool isCur  = cursorVA_ >= b.start && cursorVA_ < b.end;
+        bool isCur  = cursorValid_ && cursorVA_ >= b.start && cursorVA_ < b.end;
 
         dl->AddRectFilled(ImVec2(a.x + 3, a.y + 4), ImVec2(c.x + 3, c.y + 4), IM_COL32(0, 0, 0, 70), 7.0f);      // shadow
         dl->AddRectFilled(a, c, b.isReturn ? IM_COL32(44, 29, 33, 250) : IM_COL32(25, 29, 37, 250), 7.0f);       // body
@@ -6286,7 +6345,7 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
     if (ImGui::BeginTabBar("side")) {
         if (ImGui::BeginTabItem("Bookmarks")) {
             // Bookmarks persist as FILE VAs; in the live view translate the runtime cursor back.
-            if (ImGui::SmallButton("+ here") && ctx.binary.loaded())
+            if (ImGui::SmallButton("+ here") && ctx.binary.loaded() && cursorValid_)
                 bookmarks_.push_back({ mainView_ == 4 ? liveVAtoFile(ctx, cursorVA_) : cursorVA_, "bookmark" });
             ImGui::SameLine(); ImGui::TextDisabled("(persists with the project)");
             int removeAt = -1;
@@ -6538,14 +6597,16 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
+        renderExportsTab(ctx);
         ImGui::EndTabBar();
     }
 }
 
-// ---- F1/F2/F3 advanced features --------------------------------------------
+// ---- Advanced analysis features ---------------------------------------------
 // Run synchronously on demand (matching the decompiler's lazy-synchronous model);
 // the AnalysisService worker path is a documented follow-up. With the stub engine
-// (engines feature off) F1/F3 report "engine unavailable"; F2's asm tier works now.
+// (engines feature off) synthesis/path exploration report "engine unavailable";
+// the hot-patch assembly tier works now.
 
 static Arch archOf(AppContext& ctx) { return ctx.binary.is64Bit() ? Arch::X64 : Arch::X86; }
 
@@ -6568,8 +6629,8 @@ void BinaryViewTab::renderSynthesisTab(AppContext& ctx) {
         return;
     }
     if (!synthHave_) {
-        ImGui::TextDisabled("Select a loop-free region, right-click \xE2\x86\x92 \"Synthesize equivalent (F1)\".");
-        ImGui::TextDisabled("F1 simplifies MBA / opaque-predicate / junk into clean code, verified by");
+        ImGui::TextDisabled("Select a loop-free region, right-click \xE2\x86\x92 \"Synthesize equivalent\".");
+        ImGui::TextDisabled("Synthesis simplifies MBA / opaque-predicate / junk into clean code, verified by");
         ImGui::TextDisabled("N random input/output samples (a best-effort badge, not a formal proof).");
         ImGui::EndTabItem();
         return;
@@ -6653,7 +6714,7 @@ void BinaryViewTab::renderHotPatchTab(AppContext& ctx) {
     hotFocus_ = false;
     if (!ImGui::BeginTabItem("Hot-Patch", nullptr, f)) return;
     if (hotSiteVA_ == 0) {
-        ImGui::TextDisabled("Right-click a selection \xE2\x86\x92 \"Hot-patch this selection (F2)\".");
+        ImGui::TextDisabled("Right-click a selection \xE2\x86\x92 \"Hot-patch this selection\".");
         ImGui::TextDisabled("Write a replacement; it is compiled and injected (in-span or via a code-cave detour).");
     } else {
         ImGui::Text("Site 0x%llX   span %u bytes", (unsigned long long)hotSiteVA_, hotOrigLen_);
@@ -6691,7 +6752,7 @@ void BinaryViewTab::renderPathExplorerTab(AppContext& ctx) {
         return;
     }
     if (!pathHave_) {
-        ImGui::TextDisabled("Right-click a region \xE2\x86\x92 \"Explore paths from here (F3)\" for a CFG look-ahead tree.");
+        ImGui::TextDisabled("Right-click a region \xE2\x86\x92 \"Explore paths from here\" for a CFG look-ahead tree.");
         ImGui::TextDisabled("Structural now; symbolic tags (overflow) + input solving arrive with the engines build.");
         if (!pathStatus_.empty()) ImGui::TextWrapped("%s", pathStatus_.c_str());
         ImGui::EndTabItem();
@@ -6717,6 +6778,173 @@ void BinaryViewTab::renderPathExplorerTab(AppContext& ctx) {
     };
     if (!pathTree_.nodes.empty()) drawNode(0);
     if (pathTree_.truncated) ImGui::TextDisabled("(tree truncated at the depth/node budget)");
+    ImGui::EndTabItem();
+}
+
+// Complete PE export-address-table browser. BinaryFile owns the bounded parser;
+// this view therefore refreshes directly with each loaded image and never mixes
+// guessed/user functions into the export set.
+void BinaryViewTab::renderExportsTab(AppContext& ctx) {
+    if (!ImGui::BeginTabItem("Exports")) return;
+
+    if (!ctx.binary.loaded()) {
+        ImGui::TextDisabled("Load a PE image to browse its exports.");
+        ImGui::EndTabItem();
+        return;
+    }
+    const bool isPE = ctx.binary.format() == BinFormat::PE32 ||
+                      ctx.binary.format() == BinFormat::PE32Plus;
+    if (!isPE) {
+        ImGui::TextDisabled("Exports are a PE-only view. Current image: %s.", ctx.binary.formatName());
+        ImGui::EndTabItem();
+        return;
+    }
+
+    const auto& exports = ctx.binary.exports();
+    const uint64_t visSig = ctx.binary.imageRevision();
+    if (visSig != exportVisSig_ || std::strcmp(exportFilter_, exportFilterLast_) != 0) {
+        exportVisSig_ = visSig;
+        std::snprintf(exportFilterLast_, sizeof(exportFilterLast_), "%s", exportFilter_);
+        exportVisible_.clear();
+        exportVisible_.reserve(exports.size());
+        exportCodeCount_ = exportForwardCount_ = exportDataCount_ = exportUnmappedCount_ = 0;
+
+        for (int i = 0; i < (int)exports.size(); ++i) {
+            const BinaryFile::Export& ex = exports[(size_t)i];
+            if (ex.forwarded) ++exportForwardCount_;
+            else if (!ex.mapped) ++exportUnmappedCount_;
+            else if (ex.isCode) ++exportCodeCount_;
+            else ++exportDataCount_;
+
+            char numeric[96];
+            std::snprintf(numeric, sizeof(numeric), "#%llu 0x%X 0x%llX",
+                          (unsigned long long)ex.ordinal, ex.rva,
+                          (unsigned long long)ex.va);
+            const char* kind = ex.forwarded ? "forwarder" :
+                               (!ex.mapped ? "unmapped malformed" : (ex.isCode ? "code" : "data"));
+            if (!exportFilter_[0] || containsAsciiInsensitive(ex.name, exportFilter_) ||
+                containsAsciiInsensitive(ex.forwarder, exportFilter_) ||
+                containsAsciiInsensitive(numeric, exportFilter_) ||
+                containsAsciiInsensitive(kind, exportFilter_))
+                exportVisible_.push_back(i);
+        }
+    }
+
+    ImGui::TextDisabled("%d rows: %llu code, %llu data, %llu forwarded, %llu unmapped",
+                        (int)exports.size(),
+                        (unsigned long long)exportCodeCount_,
+                        (unsigned long long)exportDataCount_,
+                        (unsigned long long)exportForwardCount_,
+                        (unsigned long long)exportUnmappedCount_);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##exportFilter", "filter name / ordinal / target...",
+                             exportFilter_, sizeof(exportFilter_));
+
+    if (!ctx.binary.exportDirRVA()) {
+        ImGui::TextDisabled("This PE has no export directory.");
+        ImGui::EndTabItem();
+        return;
+    }
+    if (exports.empty()) {
+        ImGui::TextDisabled("The PE export directory contains no valid export entries.");
+        ImGui::EndTabItem();
+        return;
+    }
+
+    ImGui::BeginChild("exportList", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    ui::PushMono();
+    if (exportVisible_.empty()) {
+        ImGui::TextDisabled("No exports match the current filter.");
+    } else if (ImGui::BeginTable("exportTable", 5,
+               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+               ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit)) {
+        const float scale = theme::UiScale();
+        ImGui::TableSetupColumn("Ordinal", ImGuiTableColumnFlags_WidthFixed, 76.0f * scale);
+        ImGui::TableSetupColumn("RVA",     ImGuiTableColumnFlags_WidthFixed, 96.0f * scale);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150.0f * scale);
+        ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthFixed, 220.0f * scale);
+        ImGui::TableSetupColumn("Target / kind", ImGuiTableColumnFlags_WidthFixed, 200.0f * scale);
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clip;
+        clip.Begin((int)exportVisible_.size());
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
+                const BinaryFile::Export& ex = exports[(size_t)exportVisible_[(size_t)row]];
+                const bool navigable = !ex.forwarded && ex.mapped && ex.va != 0;
+                char ordinal[32], rva[24], address[24];
+                std::snprintf(ordinal, sizeof(ordinal), "#%llu", (unsigned long long)ex.ordinal);
+                std::snprintf(rva, sizeof(rva), "0x%X", ex.rva);
+                std::snprintf(address, sizeof(address), "0x%llX", (unsigned long long)ex.va);
+                const char* displayName = ex.name.empty() ? ordinal : ex.name.c_str();
+
+                ImGui::TableNextRow();
+                ImGui::PushID(row);       // aliases can deliberately share ordinal + VA
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextDisabled("%s", ordinal);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextDisabled("%s", rva);
+                ImGui::TableSetColumnIndex(2);
+                if (!navigable) ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+                const char* addressLabel = navigable ? address : "-";
+                const bool clicked = ImGui::Selectable(addressLabel, false, ImGuiSelectableFlags_SpanAllColumns);
+                if (!navigable) ImGui::PopStyleColor();
+                if (clicked && navigable) gotoExportTarget(ex);
+                if (ImGui::IsItemHovered() && !navigable)
+                    ImGui::SetTooltip(ex.forwarded ? "Forwarders have no local target address."
+                                                   : "The target RVA is not mapped by this image.");
+
+                if (ImGui::BeginPopupContextItem("exportContext")) {
+                    if (ImGui::MenuItem("Go to target", nullptr, false, navigable)) gotoExportTarget(ex);
+                    if (ImGui::MenuItem("Find references", nullptr, false, navigable)) startXrefSearch(ctx, ex.va);
+                    if (ImGui::MenuItem("Rename analysis symbol...", nullptr, false, navigable)) {
+                        annPopupVA_ = ex.va;
+                        std::string current = annName(ctx, ex.va);
+                        std::snprintf(renameBuf_, sizeof(renameBuf_), "%s",
+                                      current.empty() ? displayName : current.c_str());
+                        openRenamePopup_ = true;
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Copy ordinal")) ImGui::SetClipboardText(ordinal);
+                    if (ImGui::MenuItem("Copy RVA")) ImGui::SetClipboardText(rva);
+                    if (ImGui::MenuItem("Copy address", nullptr, false, navigable))
+                        ImGui::SetClipboardText(address);
+                    if (ImGui::MenuItem("Copy export name")) ImGui::SetClipboardText(displayName);
+                    if (ex.forwarded && !ex.forwarder.empty() && ImGui::MenuItem("Copy forwarder target"))
+                        ImGui::SetClipboardText(ex.forwarder.c_str());
+                    ImGui::EndPopup();
+                }
+
+                ImGui::TableSetColumnIndex(3);
+                if (ex.name.empty()) ImGui::TextDisabled("%s  (ordinal only)", ordinal);
+                else ImGui::TextUnformatted(ex.name.c_str());
+                if (ImGui::IsItemHovered() && !ex.forwarded && ex.va) {
+                    std::string userName = annName(ctx, ex.va);
+                    if (!userName.empty())
+                        ImGui::SetTooltip("Analysis symbol: %s\nPE export name is unchanged.", userName.c_str());
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                if (ex.forwarded) {
+                    if (ex.forwarder.empty())
+                        ImGui::TextColored(theme::col::warn(), "Malformed forwarder");
+                    else
+                        ImGui::TextColored(theme::col::jump(), "%s", ex.forwarder.c_str());
+                } else if (!ex.mapped) {
+                    ImGui::TextColored(theme::col::warn(), "Unmapped / malformed RVA");
+                } else if (ex.isCode) {
+                    ImGui::TextColored(theme::col::good(), "Code");
+                } else {
+                    ImGui::TextDisabled("Data / non-executable");
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+    ui::PopMono();
+    ImGui::EndChild();
     ImGui::EndTabItem();
 }
 
@@ -7508,12 +7736,15 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Hotkeys")) {
+            ImGui::SeparatorText("Global");
+            ImGui::BulletText("F1            Open the complete shortcut / view-controls reference");
+            ImGui::BulletText("Ctrl+O        Open Binary             Ctrl+K      Command palette");
+            ImGui::BulletText("Ctrl+1..9     Switch workbench tab");
             ImGui::SeparatorText("Debugger");
             ImGui::BulletText("F5            Continue / Pause");
             ImGui::BulletText("F10           Step Over");
             ImGui::BulletText("F11           Step Into");
             ImGui::BulletText("Shift+F11     Step Out");
-            ImGui::BulletText("Ctrl+O        Open Binary");
             ImGui::SeparatorText("Navigation (any view)");
             ImGui::BulletText("Alt+Left / Alt+Right    Back / Forward  (also mouse back/fwd buttons, and the < > toolbar)");
             ImGui::BulletText("Double-click address    Follow the branch / call target");
@@ -7531,7 +7762,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx) {
             ImGui::SeparatorText("Live Assembly view");
             ImGui::BulletText("Ctrl+F            Search live process memory");
             ImGui::BulletText("Enter             Follow the selected jump / call target");
-            ImGui::BulletText("Backspace / <     Navigate back   ( > = forward )");
+            ImGui::BulletText("Backspace         Navigate back   (toolbar < / > = back / forward)");
             ImGui::BulletText("Disasm / Pseudo   Switch listing vs naive pseudocode");
             ImGui::BulletText("Click gutter      Toggle software breakpoint (updates instantly)");
             ImGui::BulletText("Double-click row  Follow the branch / call target");
@@ -7661,7 +7892,7 @@ void BinaryViewTab::render(AppContext& ctx) {
     if (ctx.requestedLiveAssembly) {
         mainView_ = 4;
         followLiveRip_ = true;
-        if (snap.regs.rip) cursorVA_ = snap.regs.rip;
+        if (snap.regs.rip) { cursorVA_ = snap.regs.rip; cursorValid_ = true; }
         ctx.requestedLiveAssembly = false;
     }
 
@@ -7802,11 +8033,11 @@ void BinaryViewTab::render(AppContext& ctx) {
                 callGraphSig_ = (ctx.binary.loaded() ? ctx.binary.contentHash() : 0)
                               ^ (functionsGen_ * 0xD6E8FEB86659FD93ull);
             }
-            if (ar.synthValid) {            // F1 clean-room synthesis result
+            if (ar.synthValid) {            // clean-room synthesis result
                 synth_ = std::move(ar.synth);
                 synthHave_ = true; synthPending_ = false; synthFocus_ = true;
             }
-            if (ar.pathValid) {             // F3 static path-exploration result
+            if (ar.pathValid) {             // static path-exploration result
                 pathTree_ = std::move(ar.pathTree);
                 pathHave_ = !pathTree_.nodes.empty();
                 pathPending_ = false; pathFocus_ = true;
@@ -7955,7 +8186,7 @@ void BinaryViewTab::render(AppContext& ctx) {
             for (const char* s = gotoBuf_ + ((gotoBuf_[0] == '0' && (gotoBuf_[1] == 'x' || gotoBuf_[1] == 'X')) ? 2 : 0); *s; ++s)
                 if (!std::isxdigit((unsigned char)*s)) { looksHex = false; break; }
             if (looksHex && std::sscanf(gotoBuf_, "%llx", &a) == 1)        navigateTo((uint64_t)a);
-            else if (uint64_t sym = lookupSymbol(ctx, gotoBuf_))           navigateTo(sym);
+            else { uint64_t sym = 0; if (lookupSymbol(ctx, gotoBuf_, sym)) navigateTo(sym); }
         }
         ImGui::SameLine(0, 6.0f * k);
         if (ui::ToolbarIconButton(DS_ICON_CODE, "Goto sym", "Fuzzy symbol picker (Ctrl+G)"))
@@ -8126,7 +8357,7 @@ void BinaryViewTab::render(AppContext& ctx) {
         // selVAs_ is shared by the static and live listings (file-base vs runtime VAs),
         // so drop the selection when crossing between them to avoid ghost highlights.
         if ((mainView_ == 0 || mainView_ == 4) && mainView_ != selView_) {
-            if (selView_ == 0 || selView_ == 4) { selVAs_.clear(); selAnchorVA_ = 0; }
+            if (selView_ == 0 || selView_ == 4) { selVAs_.clear(); selAnchorVA_ = 0; selAnchorValid_ = false; }
             selView_ = mainView_;
         }
 
@@ -8264,7 +8495,7 @@ void BinaryViewTab::render(AppContext& ctx) {
         if (ImGui::IsMouseClicked(4) || (kio.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow))) navForward();
     }
     // Per-instruction shortcuts on the assembly views (operate on the cursor row).
-    if (!kio.WantTextInput && !kio.KeyCtrl && !kio.KeyAlt && cursorVA_ && ctx.binary.loaded() &&
+    if (!kio.WantTextInput && !kio.KeyCtrl && !kio.KeyAlt && cursorValid_ && ctx.binary.loaded() &&
         (mainView_ == 0 || mainView_ == 4)) {
         // Comments/renames are keyed in FILE space (persisted to the sidecar); in the
         // live view the cursor is a runtime VA, so translate it back. (B/X intentionally
@@ -8308,7 +8539,7 @@ void BinaryViewTab::render(AppContext& ctx) {
         if (mainView_ == 0 && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
             size_t avail = 0; const uint8_t* p = ctx.binary.ptrFromVA(cursorVA_, avail);
             Instruction in;
-            if (p && ctx.disasm && ctx.disasm->decodeOne(p, avail, cursorVA_, in) && in.branchTarget)
+            if (p && ctx.disasm && ctx.disasm->decodeOne(p, avail, cursorVA_, in) && HasBranchTarget(in))
                 navigateTo(in.branchTarget);
         }
     }
@@ -8341,7 +8572,7 @@ void BinaryViewTab::render(AppContext& ctx) {
     // the static views hold file VAs, so translate them for the attached process
     // (fileVAtoLive is a no-op when not attached / base unknown).
     ctx.runtimeCursorVA = (mainView_ == 4) ? cursorVA_ : fileVAtoLive(ctx, cursorVA_);
-    ctx.hasCursor  = cursorVA_ != 0 && ctx.binary.loaded();
+    ctx.hasCursor  = cursorValid_ && ctx.binary.loaded() && (mainView_ != 4 || cursorVA_ != 0);
     ctx.cursorFuncName.clear();
     if (ctx.hasCursor) {
         const Func* best = funcContaining(cursorVA_);

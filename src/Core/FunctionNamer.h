@@ -7,7 +7,7 @@
 // those anonymous functions the way a human reverse-engineer does on a first
 // pass:
 //   - thunks/wrappers that tail-jump to one import      -> j_<API>
-//   - the image entry point                             -> start
+//   - the image entry point / selected raw base         -> start
 //   - empty / return-only stubs                         -> nullsub / ret_zero
 //   - a recognizable set of imported APIs               -> a semantic verb
 //                                                          (read_file, net_send,
@@ -61,6 +61,7 @@ struct FuncEvidence {
     std::string thunkApi;               // API a thunk tail-jumps to ("" if its target isn't an API)
     bool selfRecursive = false;
     bool isEntry      = false;          // this is the image entry point
+    bool isRawStart   = false;          // analyst-selected base of a raw mapping
     bool retOnly      = false;          // body is just ret / leave;ret / nop*;ret  (no calls)
     bool retZero      = false;          // sets eax/rax=0 then returns, no calls
 };
@@ -85,6 +86,16 @@ public:
     std::vector<GuessedName>
     name(const BinaryFile& bin, IDisassembler& dis,
          const std::vector<NamerInput>& funcs, uint64_t entryVA,
+         const std::function<std::string(uint64_t)>& importNameFor,
+         const std::function<std::string(uint64_t)>& stringRefFor);
+
+    // Explicit-validity form for analysis roots whose address may legitimately
+    // be zero. `rawAnalysisStart` changes only the evidence wording: the result
+    // is still `start`, but it never claims the blob had a header entry point.
+    std::vector<GuessedName>
+    name(const BinaryFile& bin, IDisassembler& dis,
+         const std::vector<NamerInput>& funcs, uint64_t startVA,
+         bool startValid, bool rawAnalysisStart,
          const std::function<std::string(uint64_t)>& importNameFor,
          const std::function<std::string(uint64_t)>& stringRefFor);
 

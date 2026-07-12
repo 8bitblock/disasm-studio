@@ -30,65 +30,36 @@ static bool isNoreturnImportName(const std::string& name) {
     return false;
 }
 
-template <typename T>
-static T rdle(const uint8_t* p) { T v{}; std::memcpy(&v, p, sizeof(T)); return v; }
-
-// Parse the PE export directory: seed function starts and record names.
+// Seed local code exports from BinaryFile's complete, bounds-checked EAT model.
+// Prefer a real alias as the function label; an ordinal-only export still gets
+// an authoritative #ordinal label and must not be replaced by a heuristic guess.
 void FunctionAnalyzer::collectExports(const BinaryFile& bin,
                                       std::vector<uint64_t>& seeds,
                                       std::vector<std::pair<uint64_t,std::string>>& named) {
-    uint32_t edRVA = bin.exportDirRVA();
-    if (!edRVA) return;
-    // An EAT RVA that points back inside the export directory is a forwarder
-    // (an ASCII "DLL.func" string), not code - never seed/name it as a function.
-    const uint64_t edEnd = (uint64_t)edRVA + bin.exportDirSize();   // 64-bit: edRVA+size can wrap uint32_t
-    auto isForwarder = [&](uint32_t fr) { return fr >= edRVA && fr < edEnd; };
-    size_t avail = 0;
-    const uint8_t* ed = bin.ptrFromRVA(edRVA, avail);
-    if (!ed || avail < 40) return;
-
-    uint32_t numFuncs   = rdle<uint32_t>(ed + 20);
-    uint32_t numNames   = rdle<uint32_t>(ed + 24);
-    uint32_t funcsRVA   = rdle<uint32_t>(ed + 28);
-    uint32_t namesRVA   = rdle<uint32_t>(ed + 32);
-    uint32_t ordsRVA    = rdle<uint32_t>(ed + 36);
-
-    size_t a1 = 0, a2 = 0, a3 = 0;
-    const uint8_t* funcs = bin.ptrFromRVA(funcsRVA, a1);
-    const uint8_t* names = bin.ptrFromRVA(namesRVA, a2);
-    const uint8_t* ords  = bin.ptrFromRVA(ordsRVA,  a3);
-    if (!funcs) return;
-
-    // EAT entries -> seed addresses.
-    for (uint32_t i = 0; i < numFuncs && (size_t)(i + 1) * 4 <= a1; ++i) {
-        uint32_t fr = rdle<uint32_t>(funcs + i * 4);
-        if (fr && !isForwarder(fr)) seeds.push_back(bin.imageBase() + fr);
-    }
-
-    // Name table -> map ordinal->name->address.
-    if (names && ords) {
-        for (uint32_t i = 0; i < numNames && (size_t)(i + 1) * 4 <= a2; ++i) {
-            uint32_t nameRVA = rdle<uint32_t>(names + i * 4);
-            uint16_t ord = ((size_t)i * 2 + 2 <= a3) ? rdle<uint16_t>(ords + i * 2) : 0;
-            size_t na = 0;
-            const uint8_t* np = bin.ptrFromRVA(nameRVA, na);
-            if (!np) continue;
-            std::string nm((const char*)np, strnlen((const char*)np, std::min<size_t>(na, 256)));
-            if (ord < numFuncs && (size_t)(ord + 1) * 4 <= a1) {
-                uint32_t fr = rdle<uint32_t>(funcs + ord * 4);
-                if (fr && !isForwarder(fr)) named.emplace_back(bin.imageBase() + fr, nm);
-            }
+    std::map<uint64_t, std::string> labels;
+    for (const BinaryFile::Export& ex : bin.exports()) {
+        if (!ex.isCode || !ex.va) continue;
+        auto it = labels.find(ex.va);
+        if (!ex.name.empty()) {
+            // A true export name wins over an earlier ordinal-only alias.
+            if (it == labels.end() || (!it->second.empty() && it->second[0] == '#'))
+                labels[ex.va] = ex.name;
+        } else if (it == labels.end()) {
+            labels[ex.va] = "#" + std::to_string(ex.ordinal);
         }
+    }
+    for (auto& [va, name] : labels) {
+        seeds.push_back(va); // aliases share one authoritative function seed
+        named.emplace_back(va, std::move(name));
     }
 }
 
-// Heuristic prologue scan across executable sections, gated on the image's
-// actual CPU (the byte patterns are meaningless on ARM/MIPS/...). Raw blobs
-// (machine Unknown) fall back on the 32/64-bit class.
-void FunctionAnalyzer::prologueScan(const BinaryFile& bin, std::vector<uint64_t>& seeds) {
-    const MachineArch m = bin.machine();
-    const bool x64 = m == MachineArch::X64 || (m == MachineArch::Unknown && bin.is64Bit());
-    const bool x86 = m == MachineArch::X86 || (m == MachineArch::Unknown && !bin.is64Bit());
+// Heuristic prologue scan across executable sections, gated on the effective
+// decoder architecture (the byte patterns are meaningless on ARM/MIPS/...).
+void FunctionAnalyzer::prologueScan(const BinaryFile& bin, Arch arch,
+                                    std::vector<uint64_t>& seeds) {
+    const bool x64 = arch == Arch::X64;
+    const bool x86 = arch == Arch::X86;
     if (!x64 && !x86) return;
     for (const auto& s : bin.sections()) {
         if (!s.executable) continue;
@@ -120,6 +91,31 @@ void FunctionAnalyzer::prologueScan(const BinaryFile& bin, std::vector<uint64_t>
 
 std::vector<DiscoveredFunction>
 FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
+                          size_t maxFunctions, size_t maxInstrPerFunc) {
+    Arch arch = Arch::ARM64; // conservative non-x86 fallback for unknown Capstone blobs
+    switch (bin.machine()) {
+        case MachineArch::X86:     arch = Arch::X86; break;
+        case MachineArch::X64:     arch = Arch::X64; break;
+        case MachineArch::ARM:     arch = Arch::ARM; break;
+        case MachineArch::ARM64:   arch = Arch::ARM64; break;
+        case MachineArch::MIPS:    arch = Arch::MIPS; break;
+        case MachineArch::MIPS64:  arch = Arch::MIPS64; break;
+        case MachineArch::PPC:     arch = Arch::PPC; break;
+        case MachineArch::PPC64:   arch = Arch::PPC64; break;
+        case MachineArch::RISCV:   arch = Arch::RISCV32; break;
+        case MachineArch::RISCV64: arch = Arch::RISCV64; break;
+        case MachineArch::JVM:     arch = Arch::JVM; break;
+        case MachineArch::Unknown:
+            // Zydis is x86-only. Capstone can be any architecture, so without
+            // the exact caller hint skipping byte-pattern prologues is safer.
+            if (dis.engine() == Engine::Zydis) arch = bin.is64Bit() ? Arch::X64 : Arch::X86;
+            break;
+    }
+    return analyze(bin, dis, arch, maxFunctions, maxInstrPerFunc);
+}
+
+std::vector<DiscoveredFunction>
+FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis, Arch arch,
                           size_t maxFunctions, size_t maxInstrPerFunc) {
     summary_.clear();
     std::vector<DiscoveredFunction> out;
@@ -158,6 +154,17 @@ FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
     std::vector<std::pair<uint64_t,std::string>> named;
 
     if (bin.entryPoint()) seeds.push_back(bin.imageBase() + bin.entryPoint());
+    // A raw image has no header entry point. Its analyst-selected mapping base
+    // is nevertheless an authoritative first analysis root, including VA 0.
+    // Keep it separate from entryRVA_ so callers never report a fabricated EP.
+    if (bin.format() == BinFormat::Raw) {
+        const Section* raw = bin.firstCodeSection();
+        if (raw && raw->executable) {
+            const uint64_t start = bin.imageBase() + raw->virtualAddress;
+            size_t avail = 0;
+            if (bin.ptrFromVA(start, avail) && avail) seeds.push_back(start);
+        }
+    }
     collectExports(bin, seeds, named);
 
     // .pdata seeding (x64 PE): every RUNTIME_FUNCTION begin is an authoritative
@@ -173,8 +180,8 @@ FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
             if (it == sizeHint.end() || it->second < len) sizeHint[b] = len;
         }
     }
-    size_t exportSeeds = seeds.size();                     // entry + exports + pdata: high confidence
-    prologueScan(bin, seeds);
+    size_t exportSeeds = seeds.size(); // entry/raw root + exports + pdata: high confidence
+    prologueScan(bin, arch, seeds);
 
     std::map<uint64_t,std::string> nameMap;
     for (auto& n : named) nameMap[n.first] = n.second;
@@ -218,7 +225,7 @@ FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
     // A call/jmp that transfers into the exit family (directly via the IAT, or
     // through a recognized wrapper) never comes back.
     auto isNoreturnTransfer = [&](const Instruction& in) -> bool {
-        if (in.branchTarget && noretFuncs.count(in.branchTarget)) return true;
+        if (HasBranchTarget(in) && noretFuncs.count(in.branchTarget)) return true;
         if (!noretIat.empty() && noretIat.count(instrDataRef(in))) return true;
         return false;
     };
@@ -239,7 +246,7 @@ FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
 
         auto insns = dis.disassemble(p, window, fn, maxInstrPerFunc);
         for (auto& in : insns) {
-            if (in.isCall && in.branchTarget) {
+            if (in.isCall && HasBranchTarget(in)) {
                 if (!visited.count(in.branchTarget)) {
                     visited.insert(in.branchTarget);
                     // Only follow targets that map into the image.
@@ -256,12 +263,12 @@ FunctionAnalyzer::analyze(const BinaryFile& bin, IDisassembler& dis,
             // through an import thunk ends THIS function; the target is its own
             // function (seeded when it isn't already).
             if (!in.isCall && in.isBranch && in.mnemonic == "jmp") {
-                const bool toKnownStart = in.branchTarget &&
+                const bool toKnownStart = HasBranchTarget(in) &&
                     (starts.count(in.branchTarget) || nameMap.count(in.branchTarget) ||
                      sizeHint.count(in.branchTarget));
                 const bool toImport = !iatSlots.empty() && iatSlots.count(instrDataRef(in)) != 0;
                 if (toKnownStart || toImport || isNoreturnTransfer(in)) {
-                    if (in.branchTarget && !visited.count(in.branchTarget)) {
+                    if (HasBranchTarget(in) && !visited.count(in.branchTarget)) {
                         visited.insert(in.branchTarget);
                         size_t a2 = 0;
                         if (bin.ptrFromVA(in.branchTarget, a2)) work.push_back(in.branchTarget);

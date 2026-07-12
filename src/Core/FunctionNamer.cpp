@@ -350,7 +350,9 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
         g.name = std::move(name); g.reason = std::move(reason); g.guessed = true;
     };
 
-    // 1) Image entry point.
+    // 1) Authoritative initial analysis root. A raw base is deliberately not
+    // described as an image entry point: flat blobs have no such header field.
+    if (e.isRawStart) { set("start", "analyst-selected raw image base"); return g; }
     if (e.isEntry) { set("start", "image entry point"); return g; }
 
     // 2) Thunk / wrapper that tail-jumps straight to a known import.
@@ -399,6 +401,16 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                     const std::vector<NamerInput>& funcs, uint64_t entryVA,
                     const std::function<std::string(uint64_t)>& importNameFor,
                     const std::function<std::string(uint64_t)>& stringRefFor) {
+    return name(bin, dis, funcs, entryVA, entryVA != 0, false,
+                importNameFor, stringRefFor);
+}
+
+std::vector<GuessedName>
+FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
+                    const std::vector<NamerInput>& funcs, uint64_t startVA,
+                    bool startValid, bool rawAnalysisStart,
+                    const std::function<std::string(uint64_t)>& importNameFor,
+                    const std::function<std::string(uint64_t)>& stringRefFor) {
     guessed_ = 0;
     std::vector<GuessedName> out(funcs.size());
 
@@ -410,7 +422,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     // an IAT slot referenced through memory). "" when it isn't an import.
     auto resolveTargetApi = [&](const Instruction& in) -> std::string {
         std::string nm;
-        if (in.branchTarget && importNameFor) nm = importNameFor(in.branchTarget);
+        if (HasBranchTarget(in) && importNameFor) nm = importNameFor(in.branchTarget);
         if (nm.empty()) {
             uint64_t mem = instrDataRef(in);                     // call/jmp [iat]
             if (mem && importNameFor) nm = importNameFor(mem);
@@ -429,7 +441,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     };
 
     // ---- Pass 1: detect thunks so calls *to* a thunk resolve to its API. ----
-    struct ThunkInfo { bool isThunk = false; std::string api; uint64_t target = 0; };
+    struct ThunkInfo { bool isThunk = false; bool targetValid = false; std::string api; uint64_t target = 0; };
     std::unordered_map<uint64_t, ThunkInfo> thunks;
     std::vector<std::vector<Instruction>> bodies(funcs.size());
     for (size_t i = 0; i < funcs.size(); ++i) {
@@ -443,6 +455,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                 t.isThunk = true;
                 t.api    = bareApi(resolveTargetApi(in));
                 t.target = in.branchTarget;
+                t.targetValid = HasBranchTarget(in);
             }
             break;                                               // only the first real instruction matters
         }
@@ -455,7 +468,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         bool changed = false;
         for (auto& [address, t] : thunks) {
             (void)address;
-            if (!t.api.empty() || !t.target) continue;
+            if (!t.api.empty() || !t.targetValid) continue;
             auto next = thunks.find(t.target);
             if (next != thunks.end() && !next->second.api.empty()) {
                 t.api = next->second.api;
@@ -476,7 +489,9 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         if (!isGuessable(f)) continue;
 
         FuncEvidence e;
-        e.isEntry = (entryVA && f.address == entryVA);
+        const bool isStart = startValid && f.address == startVA;
+        e.isRawStart = isStart && rawAnalysisStart;
+        e.isEntry    = isStart && !rawAnalysisStart;
         if (auto it = thunks.find(f.address); it != thunks.end()) {
             e.isThunk  = it->second.isThunk;
             e.thunkApi = it->second.api;
@@ -502,7 +517,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                 ++e.callCount;
                 accKnownZero = false;                                // x86 calls return through eax/rax
                 std::string nm = resolveTargetApi(in);
-                if (nm.empty() && in.branchTarget) {                 // call to another local fn?
+                if (nm.empty() && HasBranchTarget(in)) {             // call to another local fn?
                     if (in.branchTarget == f.address) e.selfRecursive = true;
                     else if (auto it = thunks.find(in.branchTarget); it != thunks.end() && !it->second.api.empty())
                         nm = it->second.api;                          // call to a thunk -> its API

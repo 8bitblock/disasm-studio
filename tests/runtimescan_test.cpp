@@ -402,6 +402,26 @@ int main() {
         CHECK(fs && fs->confidence == 0.5f);
         CHECK(fs && fs->detail.find("compressed resources also look like this") != std::string::npos);
         CHECK(fs && fs->evidence[0].fileOffset == 0x400);
+
+        // Raw blobs now expose one real executable `.raw` section to every
+        // whole-program pass. Retain the existing honest entropy heuristic for
+        // that section (it is low-confidence evidence, never a packer-name hit).
+        std::vector<uint8_t> rawBytes(8192);
+        for (uint8_t& b : rawBytes) b = xsByte();
+        const char* rawPath = "rs_raw_entropy.bin";
+        { std::ofstream f(rawPath, std::ios::binary);
+          f.write((const char*)rawBytes.data(), (std::streamsize)rawBytes.size()); }
+        BinaryFile raw;
+        CHECK(raw.loadRaw(rawPath, 0));
+        std::remove(rawPath);
+        auto rr = ScanRuntimes(raw, kNoJava);
+        checkInvariants(rr);
+        const Finding* fr = byTitle(rr, "High-entropy section .raw");
+        CHECK(fr != nullptr);
+        CHECK(fr && fr->confidence == 0.5f);
+        CHECK(fr && fr->evidence[0].va == 0 && fr->evidence[0].fileOffset == 0);
+        CHECK(fr && fr->detail.find("heuristic") != std::string::npos);
+        CHECK(!rr.wrapperLikely);
     }
 
     // ---- 10. ShannonEntropy directly ----

@@ -30,6 +30,7 @@ int main() {
     st.engine     = "Capstone";
     st.name       = "blob.bin";
     st.lastCursor = 0x1400123456ull;
+    st.lastCursorValid = true;
     st.notes      = "raw firmware @ 0";
     st.comments[0x1400001000ull] = "entry";
     st.names[0x1400002000ull]    = "decrypt";
@@ -69,6 +70,7 @@ int main() {
     // The rest of the state still round-trips (incl. 64-bit hash/cursor/addresses).
     CHECK(rt.hash == st.hash);
     CHECK(rt.lastCursor == st.lastCursor);
+    CHECK(rt.lastCursorValid == st.lastCursorValid);
     CHECK(rt.notes == st.notes);
     CHECK(rt.comments.size() == 1 && rt.comments[0x1400001000ull] == "entry");
     CHECK(rt.names.size() == 1 && rt.names[0x1400002000ull] == "decrypt");
@@ -91,6 +93,12 @@ int main() {
     CHECK(w.hasContent());
     ProjectState ev; ev.hash = 3; ev.connectionEvents.push_back({ "event", "tool" });
     CHECK(ev.hasContent());
+    ProjectState zeroCursor; zeroCursor.hash = 4;
+    zeroCursor.lastCursor = 0; zeroCursor.lastCursorValid = true;
+    CHECK(zeroCursor.hasContent());
+    ProjectState zeroCursorRt;
+    CHECK(DeserializeProject(SerializeProject(zeroCursor), zeroCursorRt));
+    CHECK(zeroCursorRt.lastCursorValid && zeroCursorRt.lastCursor == 0);
 
     // hasContent() gates the empty-project save guard.
     ProjectState empty; empty.hash = 1; empty.arch = "x64"; empty.engine = "Zydis";

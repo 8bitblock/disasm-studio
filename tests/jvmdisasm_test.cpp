@@ -123,6 +123,28 @@ int main() {
         CHECK(!bare.decodeOne(wbad, sizeof(wbad), 0, in));
     }
 
+    // A resolved target of zero is distinct from an unresolved branch. This is
+    // the decoder-level contract used by raw mappings based at VA 0.
+    {
+        JvmDisassembler bare;
+        const uint8_t goZero[] = { 0xA7, 0xFF, 0xFD }; // goto -3, decoded at VA 3
+        Instruction in;
+        CHECK(bare.decodeOne(goZero, sizeof(goZero), 3, in));
+        CHECK(in.mnemonic == "goto" && in.branchTarget == 0 && HasBranchTarget(in));
+
+        const uint8_t loopToZero[] = { 0x00, 0x00, 0x00, 0xA7, 0xFF, 0xFD };
+        ControlFlowGraph g = BuildCFG(loopToZero, sizeof(loopToZero), 0, bare, 32);
+        size_t zeroBlock = g.blocks.size(), jumpBlock = g.blocks.size();
+        for (size_t i = 0; i < g.blocks.size(); ++i) {
+            if (g.blocks[i].start == 0) zeroBlock = i;
+            if (g.blocks[i].start == 3) jumpBlock = i;
+        }
+        bool linkedToZero = false;
+        if (jumpBlock < g.blocks.size())
+            for (size_t s : g.blocks[jumpBlock].succ) if (s == zeroBlock) linkedToZero = true;
+        CHECK(zeroBlock < g.blocks.size() && jumpBlock < g.blocks.size() && linkedToZero);
+    }
+
     // ---- lookupswitch at window start (pad 3) -----------------------------------
     {
         JvmDisassembler bare;

@@ -7,11 +7,10 @@
 //   (#2) A VA *below* imageBase_ must be "not mapped". The old code did
 //        `rva = (va >= imageBase_) ? va - imageBase_ : va`, so a sub-base VA was
 //        reinterpreted as an RVA and could resolve onto a real section.
-//   (#3) vaToOffset's PE header-region 1:1 mapping must be bounded by the first
-//        section's RAW offset (firstRaw), matching offsetToVA -- NOT by its
-//        virtual address (firstVA). The gap [firstRaw, firstVA) is virtual
-//        padding with no file backing; the old firstVA gate mapped it onto
-//        unrelated section bytes (a patch-to-file hazard).
+//   (#3) PE header-region 1:1 mapping must be bounded by SizeOfHeaders -- NOT
+//        inferred from the first section's virtual address. The gap after the
+//        declared headers is virtual padding with no file backing; the old
+//        firstVA gate mapped it onto unrelated section bytes (a patch hazard).
 //
 // Builds a minimal, byte-accurate PE32 in memory: imageBase 0x400000, one
 // ".text" section at RVA 0x1000 / file offset 0x400, SizeOfHeaders 0x400. So
@@ -25,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -34,6 +34,12 @@ using namespace ds;
 static int g_fail = 0;
 #define CHECK(cond) do { if (!(cond)) { \
     std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); ++g_fail; } } while (0)
+
+static std::filesystem::path pathFromUtf8(const std::string& path) {
+    std::u8string u8(path.size(), u8'\0');
+    if (!path.empty()) std::memcpy(u8.data(), path.data(), path.size());
+    return std::filesystem::path(u8);
+}
 
 static void put16(std::vector<uint8_t>& b, size_t off, uint16_t v) { std::memcpy(b.data() + off, &v, 2); }
 static void put32(std::vector<uint8_t>& b, size_t off, uint32_t v) { std::memcpy(b.data() + off, &v, 4); }
@@ -86,6 +92,8 @@ int main() {
 
     BinaryFile bf;
     CHECK(bf.load(tmp));
+    CHECK(pathFromUtf8(bf.path()).is_absolute());
+    CHECK(std::filesystem::exists(pathFromUtf8(bf.path())));
     CHECK(bf.format() == BinFormat::PE32);
     CHECK(bf.machine() == MachineArch::X86);
     CHECK(!bf.is64Bit());
@@ -108,7 +116,7 @@ int main() {
     const uint8_t* p = bf.ptrFromVA(base + 0x1000, avail);
     CHECK(p != nullptr && avail >= 1 && p[0] == 0x90);              // points at section raw bytes
 
-    // --- PE header region maps 1:1 (rva < firstRaw == 0x400) ---
+    // --- PE header region maps 1:1 (rva < SizeOfHeaders == 0x400) ---
     CHECK(bf.vaToOffset(base + 0x200, off) && off == 0x200);
     CHECK(bf.offsetToVA(0x200, va) && va == base + 0x200);
 
@@ -121,6 +129,68 @@ int main() {
     //     it as an RVA and mapped 0x1000 straight onto the .text section. ---
     CHECK(!bf.vaToOffset(0x1000, off));
     CHECK(bf.ptrFromVA(0x1000, avail) == nullptr);
+
+    // A hostile SizeOfHeaders must not overlap the first section's raw bytes.
+    // Otherwise RVA 0x500 aliases file offset 0x500 as a fake header while the
+    // inverse correctly treats that offset as .text RVA 0x1100.
+    {
+        auto oversizedHeaders = buildPE32();
+        put32(oversizedHeaders, 0x98 + 60, 0x800); // beyond first raw offset 0x400
+        const std::string oversizedTmp = "pe32_oversized_headers.bin";
+        {
+            std::ofstream f(oversizedTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(oversizedHeaders.data()),
+                    static_cast<std::streamsize>(oversizedHeaders.size()));
+        }
+        BinaryFile oversized;
+        CHECK(oversized.load(oversizedTmp));
+        CHECK(!oversized.vaToOffset(base + 0x500, off));
+        CHECK(oversized.ptrFromVA(base + 0x500, avail) == nullptr);
+        CHECK(oversized.offsetToVA(0x500, va) && va == base + 0x1100);
+        CHECK(oversized.vaToOffset(base + 0x3FF, off) && off == 0x3FF);
+        std::remove(oversizedTmp.c_str());
+    }
+
+    // The same ownership rule applies to a malformed nonempty section whose
+    // raw offset is zero. Section translation already maps file offset 0 to its
+    // RVA, so header translation must be disabled instead of aliasing it.
+    {
+        auto zeroRawSection = buildPE32();
+        constexpr size_t sec = 0x98 + 0xE0;
+        put32(zeroRawSection, sec + 20, 0);
+        const std::string zeroRawTmp = "pe32_zero_raw_section.bin";
+        {
+            std::ofstream f(zeroRawTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(zeroRawSection.data()),
+                    static_cast<std::streamsize>(zeroRawSection.size()));
+        }
+        BinaryFile zeroRaw;
+        CHECK(zeroRaw.load(zeroRawTmp));
+        CHECK(!zeroRaw.vaToOffset(base, off));
+        CHECK(zeroRaw.ptrFromVA(base, avail) == nullptr);
+        CHECK(zeroRaw.offsetToVA(0, va) && va == base + 0x1000);
+        CHECK(zeroRaw.vaToOffset(base + 0x1000, off) && off == 0);
+        std::remove(zeroRawTmp.c_str());
+    }
+
+    // Public paths are UTF-8. On Windows the old narrow std::ifstream(path)
+    // interpreted these bytes through the ANSI codepage, so a command-line or
+    // file-dialog target with a non-ASCII name could not be opened.
+    const std::string utf8Tmp = "pe32_\xE6\xB5\x8B\xE8\xAF\x95.bin"; // pe32_测试.bin
+    {
+        std::ofstream f(pathFromUtf8(utf8Tmp), std::ios::binary);
+        f.write((const char*)bytes.data(), (std::streamsize)bytes.size());
+    }
+    BinaryFile utf8Bf;
+    CHECK(utf8Bf.load(utf8Tmp));
+    CHECK(utf8Bf.format() == BinFormat::PE32);
+    CHECK(pathFromUtf8(utf8Bf.path()).is_absolute());
+    CHECK(pathFromUtf8(utf8Bf.path()).filename() == pathFromUtf8(utf8Tmp).filename());
+    BinaryFile utf8Raw;
+    CHECK(utf8Raw.loadRaw(utf8Tmp, 0x12340000));
+    CHECK(pathFromUtf8(utf8Raw.path()).is_absolute());
+    CHECK(utf8Raw.imageBase() == 0x12340000);
+    std::filesystem::remove(pathFromUtf8(utf8Tmp));
 
     std::remove(tmp.c_str());
 

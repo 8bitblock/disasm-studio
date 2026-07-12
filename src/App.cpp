@@ -16,6 +16,7 @@
 #include "Ui/Fonts.h"
 #include "Ui/Icons.h"
 #include "Ui/Widgets.h"
+#include "resource.h"
 #include "imgui.h"
 
 #include <windows.h>
@@ -24,17 +25,23 @@
 #include <cctype>
 #include <cfloat>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <initializer_list>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ds {
 
-App::App() {
+App::App(std::string startupPath) {
     loadPrefs();                 // restore the last-used theme + density, if any
     theme::SetDensity(density_);
     theme::ApplyTheme(theme_);
@@ -54,6 +61,15 @@ App::App() {
     tabs_.emplace_back(std::make_unique<BinaryTechTab>());
     tabs_.emplace_back(std::make_unique<CortexTab>());   // RE brain (additions.md #3)
     tabs_.emplace_back(std::make_unique<PrismTab>());    // explanatory profiler (additions.md #5)
+
+    if (!startupPath.empty()) {
+        if (ctx_.loadBinaryPath(startupPath)) {
+            ctx_.requestedTab = "Binary View";
+            ui::Toast(ui::ToastKind::Success, "Opened command-line target: " + startupPath);
+        } else {
+            ui::Toast(ui::ToastKind::Error, "Could not open command-line target: " + startupPath);
+        }
+    }
 }
 
 App::~App() {
@@ -61,6 +77,50 @@ App::~App() {
 }
 
 namespace {
+constexpr DWORD kDialogPathChars = 32768;
+
+// Win32's common dialogs return UTF-16 paths. Convert with a sizing pass so
+// non-ASCII paths are never truncated into a fixed narrow buffer. Explicit
+// source lengths also avoid writing a terminator past std::string's storage.
+bool utf8FromWide(const wchar_t* value, std::string& out) {
+    out.clear();
+    if (!value) return false;
+    const size_t len = std::wcslen(value);
+    if (len > static_cast<size_t>((std::numeric_limits<int>::max)())) return false;
+    if (!len) return true;
+    const int inputLen = static_cast<int>(len);
+    const int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                            value, inputLen, nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return false;
+    out.resize(static_cast<size_t>(needed));
+    const int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                             value, inputLen, out.data(), needed,
+                                             nullptr, nullptr);
+    if (written != needed) { out.clear(); return false; }
+    return true;
+}
+
+bool wideFromUtf8(const std::string& value, std::wstring& out) {
+    out.clear();
+    if (value.size() > static_cast<size_t>((std::numeric_limits<int>::max)())) return false;
+    if (value.empty()) return true;
+    const int inputLen = static_cast<int>(value.size());
+    const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                           value.data(), inputLen, nullptr, 0);
+    if (needed <= 0) return false;
+    out.resize(static_cast<size_t>(needed));
+    const int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                            value.data(), inputLen, out.data(), needed);
+    if (written != needed) { out.clear(); return false; }
+    return true;
+}
+
+std::filesystem::path pathFromUtf8(const std::string& value) {
+    std::u8string utf8(value.size(), u8'\0');
+    if (!value.empty()) std::memcpy(utf8.data(), value.data(), value.size());
+    return std::filesystem::path(utf8);
+}
+
 // Small persisted-prefs file alongside the project sidecars in %APPDATA%.
 std::string prefsPath() {
     char appdata[MAX_PATH] = {0};
@@ -184,9 +244,13 @@ bool AppContext::loadBinaryPath(const std::string& path) {
 }
 
 bool AppContext::loadRawPath(const std::string& path, uint64_t base, Arch a) {
+    // Stage the new mapping first. A malformed base/overflow/I/O failure must not
+    // clear the currently-open target or detach its live debug session.
+    BinaryFile candidate;
+    if (!candidate.loadRaw(path, base)) return false;
     saveProject();
     analysis.cancelAndWaitIdle();  // see loadBinaryPath
-    if (!binary.loadRaw(path, base)) return false;
+    binary = std::move(candidate);  // keep the AppContext BinaryFile object address stable
     {   // see loadBinaryPath: a leftover session belongs to the previous target
         DbgSnapshot s = debug.snapshot();
         if (s.attached()) {
@@ -199,7 +263,7 @@ bool AppContext::loadRawPath(const std::string& path, uint64_t base, Arch a) {
     rebuildDisassembler();
     loadProjectForBinary(/*applySavedArchEngine=*/false);   // the dialog's arch choice wins
     javaInfo = JavaScanResult{};   // raw blobs: no PE overlay semantics
-    runtimeInfo = RuntimeScanResult{};
+    runtimeInfo = ScanRuntimes(binary, javaInfo); // includes low-confidence entropy/runtime heuristics
     binaryJustLoaded = true;
     return true;
 }
@@ -243,18 +307,21 @@ void AppContext::analyzeModule(LoadedModule& m, bool guess) {
 }
 
 bool AppContext::openBinaryDialog() {
-    wchar_t file[MAX_PATH] = L"";
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
     ofn.lpstrFilter = L"Executables\0*.exe;*.dll;*.sys;*.bin;*.class;*.jar;*.zip\0All Files\0*.*\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return false;
 
-    char path[MAX_PATH * 2] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
+    std::string path;
+    if (!utf8FromWide(file.data(), path)) {
+        ui::Toast(ui::ToastKind::Error, "Open failed: the selected path is not valid Unicode.");
+        return false;
+    }
     return loadBinaryPath(path);
 }
 
@@ -263,18 +330,21 @@ void App::openFileDialog() {
 }
 
 void App::openRawFileDialog() {
-    wchar_t file[MAX_PATH] = L"";
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
     ofn.lpstrFilter = L"All Files\0*.*\0Shellcode/bin\0*.bin;*.shc;*.dat\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!GetOpenFileNameW(&ofn)) return;
-    char path[MAX_PATH * 2] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
-    rawPendingPath_ = path;
+    std::string path;
+    if (!utf8FromWide(file.data(), path)) {
+        ui::Toast(ui::ToastKind::Error, "Open Raw failed: the selected path is not valid Unicode.");
+        return;
+    }
+    rawPendingPath_ = std::move(path);
     openRawPopup_   = true;   // prompt for base + arch
 }
 
@@ -299,21 +369,18 @@ static std::vector<uint8_t> buildPatchedImage(const BinaryFile& bin,
 
 void App::saveBinaryAs() {
     if (!ctx_.binary.loaded()) return;
-    wchar_t file[MAX_PATH] = L"";
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
     ofn.lpstrFilter = L"All Files\0*.*\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    char path[MAX_PATH * 2] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
-
     int applied = 0, skipped = 0;
     std::vector<uint8_t> img = buildPatchedImage(ctx_.binary, ctx_.project.patches, applied, skipped);
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
     char msg[256];
     if (f && f.write(reinterpret_cast<const char*>(img.data()), (std::streamsize)img.size())) {
         std::snprintf(msg, sizeof(msg), "Wrote %zu bytes with %d patch(es) applied%s%s.",
@@ -347,27 +414,22 @@ void App::extractEmbeddedJar() {
         size_t dot = base.find_last_of('.');
         if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
         base += ji.isJar ? ".jar" : ".zip";
-        int n = MultiByteToWideChar(CP_UTF8, 0, base.c_str(), -1, nullptr, 0);
-        def.resize(n > 0 ? n - 1 : 0);
-        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, base.c_str(), -1, def.data(), n);
+        if (!wideFromUtf8(base, def)) def = ji.isJar ? L"embedded.jar" : L"embedded.zip";
     }
-    wchar_t file[MAX_PATH] = L"";
-    wcsncpy_s(file, def.c_str(), _TRUNCATE);
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
 
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
     ofn.lpstrFilter = ji.isJar ? L"JAR archive (*.jar)\0*.jar\0ZIP archive (*.zip)\0*.zip\0All Files\0*.*\0"
                                : L"ZIP archive (*.zip)\0*.zip\0All Files\0*.*\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.lpstrDefExt = ji.isJar ? L"jar" : L"zip";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    char path[MAX_PATH * 2] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
-
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
     if (f && f.write(reinterpret_cast<const char*>(bytes.data() + ji.jarOffset),
                      (std::streamsize)ji.jarSize)) {
         char msg[256];
@@ -392,7 +454,7 @@ namespace {
 bool extractArchiveEntryBytes(const std::string& srcPath, uint64_t zipBase,
                               const JavaZipEntry& e, std::vector<uint8_t>& out,
                               std::string& err) {
-    std::ifstream f(srcPath, std::ios::binary | std::ios::ate);
+    std::ifstream f(pathFromUtf8(srcPath), std::ios::binary | std::ios::ate);
     if (!f) { err = "could not open " + srcPath; return false; }
     std::streamsize n = f.tellg();
     if (n <= 0) { err = "could not read " + srcPath; return false; }
@@ -459,25 +521,20 @@ void App::extractArchiveEntryToFile(const JavaZipEntry& e) {
     std::string base = sanitizeEntryBaseName(e.name);
     std::wstring def;
     {
-        int n = MultiByteToWideChar(CP_UTF8, 0, base.c_str(), -1, nullptr, 0);
-        def.resize(n > 0 ? n - 1 : 0);
-        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, base.c_str(), -1, def.data(), n);
+        if (!wideFromUtf8(base, def)) def = L"entry";
     }
-    wchar_t file[MAX_PATH] = L"";
-    wcsncpy_s(file, def.c_str(), _TRUNCATE);
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
 
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
     ofn.lpstrFilter = L"All Files\0*.*\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    char path[MAX_PATH * 2] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
-
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
     if (f && (bytes.empty() ||
               f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size()))) {
         char msg[512];
@@ -596,26 +653,26 @@ bool AppContext::exportAnalysisFile(const std::string& defaultBaseName,
     {
         std::string base = defaultBaseName.empty() ? std::string("analysis") : defaultBaseName;
         base += "_analysis.md";
-        int n = MultiByteToWideChar(CP_UTF8, 0, base.c_str(), -1, nullptr, 0);
-        def.resize(n > 0 ? n - 1 : 0);
-        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, base.c_str(), -1, def.data(), n);
+        if (!wideFromUtf8(base, def)) def = L"analysis_analysis.md";
     }
-    wchar_t file[MAX_PATH] = L"";
-    wcsncpy_s(file, def.c_str(), _TRUNCATE);
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
 
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
     ofn.lpstrFilter = L"Markdown (*.md)\0*.md\0HTML (*.html)\0*.html\0All Files\0*.*\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.lpstrDefExt = L"md";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) { msg.clear(); return false; }   // cancelled
 
-    char path[MAX_PATH * 2] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
-    std::string p(path);
+    std::string p;
+    if (!utf8FromWide(file.data(), p)) {
+        msg = "Failed to encode the selected path as UTF-8.";
+        return false;
+    }
 
     // HTML when the chosen name ends in .htm/.html (case-insensitive), else Markdown.
     auto endsWithCI = [&](const char* suf) {
@@ -627,7 +684,7 @@ bool AppContext::exportAnalysisFile(const std::string& defaultBaseName,
     };
     const std::string& body = (endsWithCI(".html") || endsWithCI(".htm")) ? html : markdown;
 
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
     if (f && f.write(body.data(), (std::streamsize)body.size())) {
         msg = "Wrote " + std::to_string(body.size()) + " bytes to " + p;
         return true;
@@ -650,6 +707,8 @@ void App::closeBinary() {
     // Stale cross-tab requests must not fire into the next binary.
     ctx_.requestedGotoVA = 0; ctx_.hasGotoRequest = false; ctx_.requestedGotoLive = false;
     ctx_.requestedLiveAssembly = false; ctx_.binaryJustLoaded = false;
+    ctx_.hasCursor = false; ctx_.cursorVA = 0; ctx_.runtimeCursorVA = 0;
+    ctx_.cursorFuncName.clear();
     ctx_.pendingSignature.clear(); ctx_.pendingSignatureLive = false;
     ctx_.requestedExtractJava = false; ctx_.requestedBrowseArchive = false;
 }
@@ -750,6 +809,8 @@ void App::renderMenuBar() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("Keyboard Shortcuts", "F1")) showHelp_ = true;
+            ImGui::Separator();
             ImGui::MenuItem("About", nullptr, &showAbout_);
             ImGui::EndMenu();
         }
@@ -1426,13 +1487,24 @@ void App::renderRawLoadPopup() {
 
     ImGui::Separator();
     if (ImGui::Button("Load", ImVec2(120, 0))) {
-        unsigned long long base = 0;
-        std::sscanf(rawBaseBuf_, "%llx", &base);                 // accepts 0x-prefixed or bare hex
-        if (rawBaseBuf_[0] == '0' && (rawBaseBuf_[1] == 'x' || rawBaseBuf_[1] == 'X')) std::sscanf(rawBaseBuf_ + 2, "%llx", &base);
-        Arch a = rawArchSel_ == 0 ? Arch::X86 : rawArchSel_ == 1 ? Arch::X64 : rawArchSel_ == 2 ? Arch::ARM : Arch::ARM64;
-        ctx_.loadRawPath(rawPendingPath_, (uint64_t)base, a);
-        ctx_.requestedTab = "Binary View";
-        ImGui::CloseCurrentPopup();
+        const char* begin = rawBaseBuf_;
+        while (*begin && std::isspace((unsigned char)*begin)) ++begin;
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long base = std::strtoull(begin, &end, 16); // accepts 0x-prefixed or bare hex
+        while (end && *end && std::isspace((unsigned char)*end)) ++end;
+        if (begin == end || errno == ERANGE || !end || *end != '\0') {
+            ui::Toast(ui::ToastKind::Error, "Open Raw failed: enter a valid 64-bit hexadecimal base address.");
+        } else {
+            Arch a = rawArchSel_ == 0 ? Arch::X86 : rawArchSel_ == 1 ? Arch::X64 : rawArchSel_ == 2 ? Arch::ARM : Arch::ARM64;
+            if (ctx_.loadRawPath(rawPendingPath_, (uint64_t)base, a)) {
+                ctx_.requestedTab = "Binary View";
+                ImGui::CloseCurrentPopup();
+            } else {
+                ui::Toast(ui::ToastKind::Error,
+                          "Open Raw failed: check the file and ensure base + file size fits the 64-bit address space.");
+            }
+        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
@@ -1553,6 +1625,117 @@ bool App::wantsContinuousRedraw() {
     return false;
 }
 
+void App::renderHelpWindow() {
+    if (!showHelp_) return;
+
+    const float s = theme::UiScale();
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(760.0f * s, 640.0f * s), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Keyboard Shortcuts & View Controls", &showHelp_)) {
+        ImGui::TextColored(theme::col::accent(), "DisasmStudio quick reference");
+        ImGui::SameLine();
+        ImGui::TextDisabled("F1 opens this window from anywhere");
+        ImGui::Separator();
+
+        ImGui::BeginChild("##help_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
+        auto group = [&](const char* id, const char* title,
+                         std::initializer_list<std::pair<const char*, const char*>> rows) {
+            ImGui::SeparatorText(title);
+            if (ImGui::BeginTable(id, 2,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                    ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Shortcut / control", ImGuiTableColumnFlags_WidthFixed, 190.0f * s);
+                ImGui::TableSetupColumn("Action");
+                ImGui::TableHeadersRow();
+                for (const auto& row : rows) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextColored(theme::col::accent(), "%s", row.first);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextWrapped("%s", row.second);
+                }
+                ImGui::EndTable();
+            }
+        };
+
+        group("##help_global", "Global", {
+            { "F1",             "Open this grouped shortcut and interaction reference." },
+            { "Ctrl+O",         "Open a binary." },
+            { "Ctrl+K",         "Open or close the command palette." },
+            { "Ctrl+1 ... 9",   "Switch directly to one of the first nine workbench tabs." },
+            { "Alt+F4",         "Save the current project sidecar and exit." },
+            { "Palette Up/Down", "Move through command-palette matches; Enter runs one and Escape closes it." },
+        });
+        group("##help_debug", "Debugger", {
+            { "F5",             "Continue a paused target, or pause a running target." },
+            { "F10",            "Step over the current instruction." },
+            { "F11",            "Step into the current instruction." },
+            { "Shift+F11",      "Step out of the current function." },
+            { "Ctrl+F9",        "Run to the Binary View cursor." },
+        });
+        group("##help_nav", "Navigation", {
+            { "Ctrl+G",         "Open the fuzzy address/symbol picker." },
+            { "Ctrl+Shift+F",   "Search disassembly text." },
+            { "Alt+Left/Right", "Navigate backward or forward." },
+            { "Mouse Back/Fwd", "Navigate backward or forward." },
+            { "Double-click assembly/live row", "Follow that row's direct call or branch target." },
+        });
+        group("##help_asm", "Assembly / linear view", {
+            { "Enter",          "Follow the cursor instruction's direct target." },
+            { "J / K",          "Move to the next / previous instruction." },
+            { "Shift+J / K",    "Move sixteen instructions at a time." },
+            { ";",              "Add or edit the cursor instruction's comment." },
+            { "N",              "Rename the symbol at the cursor." },
+            { "B",              "Toggle a software breakpoint." },
+            { "X",              "Find cross-references to the cursor address." },
+            { "P",              "Open the instruction patch editor." },
+            { "Shift/Ctrl+click","Extend a range selection / toggle a row in the selection." },
+            { "Right-click",    "Follow, copy, patch, NOP, bookmark, define a function, or resolve a jump table." },
+        });
+        group("##help_live", "Live Assembly", {
+            { "Ctrl+F",         "Search the attached process's memory." },
+            { "Enter",          "Follow the selected live call or branch." },
+            { "Backspace",      "Navigate back in the live cursor history." },
+            { "Click gutter",   "Toggle a software breakpoint." },
+            { "Double-click row","Follow the row's call or branch target." },
+            { "Click register", "Follow the register value; right-click it to copy." },
+        });
+        group("##help_hex", "Hex editor", {
+            { "Arrow keys",     "Move the byte caret (up/down moves one 16-byte row)." },
+            { "Page Up/Down",   "Move the caret by one visible page." },
+            { "Tab",            "Switch between the hex and ASCII caret columns." },
+            { "0-9 / A-F",      "Overwrite the selected byte nibble in the hex column." },
+            { "Printable text", "Overwrite bytes from the ASCII column." },
+            { "Ctrl+C",         "Copy the selected byte range." },
+            { "Escape",         "Cancel an in-progress nibble edit." },
+            { "Click/drag",     "Select bytes; Shift+click extends the current selection." },
+            { "Enter in Goto",  "Submit the file-offset field and move the caret there." },
+        });
+        group("##help_graph", "Control-flow graph", {
+            { "Drag empty space","Pan the graph canvas." },
+            { "Drag block",     "Move an individual basic-block card." },
+            { "Double-click block", "Re-root the graph at that basic block." },
+            { "Reset layout",   "Discard manual block offsets and restore the automatic layout." },
+            { "Click caller/callee", "Navigate to that function in the Call Graph view." },
+        });
+        group("##help_decomp", "Pseudocode / Decompiler", {
+            { "Click pseudo line", "Navigate the assembly cursor to the line's mapped source address." },
+            { "Click asm row",  "Navigate from the compact synchronized assembly pane." },
+            { "Hover either pane", "Cross-highlight the corresponding pseudo/assembly location." },
+            { "Language",       "Switch the display instantly between Pseudo-C and Python." },
+            { "Copy",           "Copy the complete current decompilation." },
+            { "Right-click line", "Copy one pseudo line or show its mapped source in the listing." },
+        });
+        group("##help_diff", "Binary Diff", {
+            { "F3",             "Move to the next changed region while the diff view is focused." },
+            { "Shift+F3",       "Move to the previous changed region." },
+        });
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
 void App::render() {
     // Cleared each frame; a tab rendered this frame may set it to request that the
     // idle throttle keep redrawing (e.g. the live connection monitor's auto-refresh).
@@ -1577,6 +1760,19 @@ void App::render() {
         AppContext& ctx;
         ~ResetFrameDebugSnapshot() { ctx.frameDebugSnapshot = nullptr; }
     } resetFrameDebugSnapshot{ ctx_ };
+
+    // Application-wide shortcuts live here so they work regardless of the
+    // selected workbench tab. F1 intentionally has no text-input guard; it is a
+    // help key, not a character-producing key. Ctrl+O is suppressed while any
+    // ImGui popup is open: modal editors retain ownership of their target state,
+    // and loading another binary cannot leave them applying to a stale address.
+    if (ImGui::IsKeyPressed(ImGuiKey_F1)) showHelp_ = true;
+    const bool popupOpen = ImGui::IsPopupOpen(nullptr,
+        ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    if (!ImGui::GetIO().WantTextInput && !popupOpen &&
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O))
+        openFileDialog();
+
     renderMenuBar();
     renderDebugToolbar(dbg);
     renderTabCardStrip(dbg);
@@ -1599,6 +1795,7 @@ void App::render() {
         openArchiveBrowser();
     }
     renderArchiveBrowser();
+    renderHelpWindow();
 
     // Ctrl+K command palette (toggle; safe unguarded - the chord types nothing).
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_K)) {
@@ -1617,10 +1814,21 @@ void App::render() {
             ImGui::TextColored(theme::col::accent(), "DisasmStudio");
             ImGui::SetWindowFontScale(1.0f);
             ImGui::TextDisabled("Fast, GPU-accelerated reverse-engineering workbench");
+            ImGui::Text("Version %s", DS_VERSION_STRING);
             ImGui::Separator();
+            ImGui::SeparatorText("Feature overview");
+            ImGui::BulletText("Static analysis for PE, ELF, Mach-O, raw blobs, and Java class files");
+            ImGui::BulletText("Multi-architecture disassembly, CFGs, xrefs, decompilation, and patching");
+            ImGui::BulletText("Live Win32 and JVM/JDWP debugging plus process-memory tools");
+            ImGui::SeparatorText("Runtime");
             ImGui::Text("Disassembly   Zydis (x86/x64) + Capstone (ARM/ARM64/MIPS/PPC/RISC-V)");
             ImGui::Text("Assembler     Keystone (x86/x64/ARM/ARM64)");
-            ImGui::Text("UI            Dear ImGui + Direct3D 11 (hardware)");
+            ImGui::Text("UI            Dear ImGui + Direct3D 11");
+#ifdef _DEBUG
+            ImGui::Text("Build         Debug, Windows x64, C++20");
+#else
+            ImGui::Text("Build         Release, Windows x64, C++20");
+#endif
             ImGui::Spacing();
             ImGui::TextDisabled("A static disassembler and a live Win32 debugger in one tool.");
         }

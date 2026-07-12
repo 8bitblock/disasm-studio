@@ -278,7 +278,7 @@ const char* jccExprOp(const std::string& m, bool& isSigned, bool& isUnsigned) {
 }
 
 bool isCondJump(const Instruction& in) {
-    return in.isBranch && !in.isCall && !in.isRet && in.branchTarget &&
+    return in.isBranch && !in.isCall && !in.isRet && HasBranchTarget(in) &&
            in.mnemonic != "jmp" && in.mnemonic[0] == 'j';
 }
 
@@ -339,7 +339,7 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
     // The display name a call resolves to: relative target, or the IAT slot it
     // reads through ("call [rip+x]"), or "" for register-indirect.
     auto callName = [&](const Instruction& in) -> std::string {
-        if (in.branchTarget) {
+        if (HasBranchTarget(in)) {
             std::string n = nameFor(in.branchTarget);
             return n.empty() ? ("sub_" + vaHex(in.branchTarget).substr(2)) : n;
         }
@@ -631,7 +631,7 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
             // ---- calls ----
             if (in.isCall) {
                 std::string nm = callName(in);
-                bool indirect = nm.empty() && !in.branchTarget;
+                bool indirect = nm.empty() && !HasBranchTarget(in);
                 // Argument sniffing: scan backwards for the most recent writes to arg
                 // regs (x64) / pushes (x86) since the previous call/branch.
                 std::vector<std::string> argTexts;

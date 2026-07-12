@@ -279,7 +279,7 @@ void SigScannerTab::render(AppContext& ctx) {
             ImGui::BeginDisabled(!ctx.binary.loaded() || !ctx.disasm);
             if (ImGui::Button("Analyze Functions")) {
                 FunctionAnalyzer fa;
-                auto found = fa.analyze(ctx.binary, *ctx.disasm);
+                auto found = fa.analyze(ctx.binary, *ctx.disasm, ctx.arch);
                 functions_.clear();
                 functions_.reserve(found.size());
                 for (auto& f : found)

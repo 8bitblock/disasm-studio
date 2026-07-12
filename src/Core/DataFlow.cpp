@@ -867,7 +867,7 @@ struct Analyzer {
                 // registers below (rcx/rdx/r8/r9 hold the Win64 integer args here).
                 std::string args = renderCallArgs(e, reads);
                 std::string callee;
-                if (in.branchTarget) { std::string nm = nameFor ? nameFor(in.branchTarget) : std::string();
+                if (HasBranchTarget(in)) { std::string nm = nameFor ? nameFor(in.branchTarget) : std::string();
                     if (nm.empty()) { char c[24]; std::snprintf(c, sizeof(c), "sub_%llX", (unsigned long long)in.branchTarget); nm = c; }
                     callee = nm; }
                 else {

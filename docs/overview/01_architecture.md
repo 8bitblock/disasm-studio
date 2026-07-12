@@ -11,7 +11,10 @@ stack: the **Win32 + D3D11 host** (`src/main.cpp`) and the **application shell**
 ### The Win32 + Direct3D 11 host (`main.cpp`)
 
 The program entry point is `wWinMain`. It is a Unicode `WinMain`, so the binary is a
-GUI subsystem app (no console). The flow is the canonical Dear ImGui
+GUI subsystem app (no console). `CommandLineToArgvW` reads an optional first target
+argument and converts it to the UTF-8 path representation used by the loader; after
+UI initialization that path is opened through the same `loadBinaryPath` flow as the
+File menu. The rest of the flow is the canonical Dear ImGui
 `example_win32_directx11` skeleton, adapted for this project:
 
 1. **Register the window class** (`WNDCLASSEXW` with class name `DisasmStudioWnd`,
@@ -26,14 +29,14 @@ GUI subsystem app (no console). The flow is the canonical Dear ImGui
    fallback path.
 3. The window is then shown **maximized** (`SW_SHOWMAXIMIZED`), matching the "fixed
    single full-window" UX intent.
-4. **ImGui setup**: create the context, enable `ImGuiConfigFlags_NavEnableKeyboard`,
-   and — important to the design — set `io.IniFilename = nullptr` so ImGui does
-   **not** persist or restore any window layout. The UI geometry is computed from
-   scratch every run; nothing about pane sizes is saved to an `imgui.ini`.
+4. **ImGui setup**: create the context; enable keyboard navigation, platform viewports,
+   docking support, and `DpiEnableScaleViewports`; and point `io.IniFilename` at the
+   durable `%APPDATA%\DisasmStudio\imgui.ini`. The app-owned workbench geometry remains
+   explicit, while ImGui can preserve platform-window state and logical DPI geometry.
 5. **Backends**: `ImGui_ImplWin32_Init(hwnd)` and `ImGui_ImplDX11_Init(device, ctx)`.
 6. **Fonts** (`src/Ui/Fonts.h` globals `ds::ui::gUiFont` / `ds::ui::gMonoFont`): the
-   host prefers crisp Windows system fonts — `segoeui.ttf` at 17px for the
-   proportional UI font and `consola.ttf` (or `cour.ttf`) at 16px for the monospace
+   host prefers crisp Windows system fonts — `segoeui.ttf` at `17px*dpi` for the
+   proportional UI font and `consola.ttf` (or `cour.ttf`) at `16px*dpi` for the monospace
    code/hex font — checking each file exists first and falling back to the ImGui
    built-in font. The monospace handle may be null, in which case `PushMono()`
    callers fall back to the default font. This is why disassembly/hex views stay
@@ -53,6 +56,10 @@ in `_DEBUG` builds. The render-target view is created from back-buffer 0 in
 
 - Drain all pending Win32 messages (`PeekMessage`/`TranslateMessage`/`DispatchMessage`);
   `WM_QUIT` ends the loop.
+- **Deferred DPI rebuild**: after message draining and before a new ImGui frame, consume
+  only the latest queued DPI, invalidate the old DX11 font objects, rebuild the atlas,
+  rederive absolute theme metrics, and recreate the font texture. Failed creation remains
+  queued and is retried without rendering against a missing texture.
 - **Occlusion skip**: if the swapchain was occluded last frame and a
   `Present(0, DXGI_PRESENT_TEST)` still reports `DXGI_STATUS_OCCLUDED` (e.g. window
   minimized/covered), it `Sleep(10)`s and continues without rendering — saving GPU
@@ -72,10 +79,9 @@ in `_DEBUG` builds. The render-target view is created from back-buffer 0 in
 `WndProc` first forwards every message to `ImGui_ImplWin32_WndProcHandler` so ImGui
 receives input. It then handles `WM_SIZE` (ignoring `SIZE_MINIMIZED`), suppresses the
 ALT application menu (`WM_SYSCOMMAND` / `SC_KEYMENU` returns 0 so ALT-key chords like
-`Alt+←/→` are free for navigation), and posts quit on `WM_DESTROY`. There is a
-viewports branch (`ImGuiConfigFlags_ViewportsEnable`) left in from the upstream
-example, but viewports are not enabled, so it is inert — the single-window, no-docking
-posture holds.
+`Alt+←/→` are free for navigation), and posts quit on `WM_DESTROY`. For
+`WM_DPICHANGED`, it applies Windows' suggested rectangle and stores only the latest DPI;
+font/style/DX11 resource mutation remains outside `WndProc` at the between-frame boundary.
 
 #### Embedded application icon (`app.rc`, `resource.h`)
 
@@ -92,8 +98,8 @@ embedded into the EXE and loaded at startup for window, taskbar, and alt-tab use
 `ds::App` is the top-level controller, instantiated once on the stack in `wWinMain`.
 Its constructor (`App()`):
 
-- `loadPrefs()` reads `%APPDATA%/DisasmStudio/prefs.ini` (a tiny `key=value` file,
-  currently only `theme=`) and `theme::ApplyTheme(theme_)` restyles ImGui.
+- `loadPrefs()` reads `%APPDATA%/DisasmStudio/prefs.ini` (a tiny `key=value` file storing
+  `theme=` and `density=`) and `theme::ApplyTheme(theme_)` restyles ImGui.
 - `ctx_.rebuildDisassembler()` builds the initial disassembler.
 - It constructs the **seven tabs in fixed order** and stores them as
   `std::vector<std::unique_ptr<ITab>>`: `ProjectsTab`, `CommunicationsTab`,
@@ -189,7 +195,8 @@ A standard `BeginMainMenuBar`:
   actually decoding. Any change calls `rebuildDisassembler()`.
 - **View**: Theme submenu (iterates `theme::ThemeId` up to `Count`, applies + persists
   via `savePrefs()`) and an *ImGui Demo* toggle.
-- **Help**: *About*.
+- **Help**: *Keyboard Shortcuts* (F1, a grouped global/debugger/navigation/view
+  reference) and *About* (version, feature overview, and runtime stack).
 - A right-aligned status string (`Engine: … | <format or "no binary">`) is laid out by
   measuring text width and `SameLine`-offsetting from the window width.
 
@@ -231,7 +238,9 @@ mirrored copy Binary View writes each frame.
 
 `renderRawLoadPopup` is the "Open as Raw" modal: it shows the chosen file, a base-address
 hex input (accepts `0x`-prefixed or bare hex via `sscanf("%llx")`), and x86/x64/ARM/ARM64
-radio buttons, then calls `loadRawPath` and switches to Binary View. `renderSaveResultPopup`
+radio buttons, then calls `loadRawPath` and switches to Binary View. The chosen architecture
+is retained as the exact worker/discovery architecture; the loader creates the complete
+executable `.raw` section and rejects a base+length range that would overflow. `renderSaveResultPopup`
 shows the result message from *Save Binary As…*.
 
 #### Save Binary As — patch splicing
@@ -263,23 +272,26 @@ tab, Binary View consumes `requestedGotoVA`/`binaryJustLoaded`/`requestedExportA
 and writes back `cursorVA`/`hasCursor`/`runtimeCursorVA`). Because everything is
 immediate-mode and single-threaded on the UI side, this "set a flag this frame, consume
 it next frame" handshake is the entire inter-tab messaging system — there are no
-signals, callbacks, or event queues. The only background concurrency is inside the
-`Debugger`, which runs its own thread and exposes a lock-guarded `snapshot()`.
+signals, callbacks, or event queues. Background concurrency lives in the `Debugger` and
+the epoch-guarded `AnalysisService`; the latter runs the same selected-architecture
+function/string/listing pipeline for structured and raw images.
 
 #### Limitations & notes
 
-- **No docking / no layout persistence**: intentional. `io.IniFilename = nullptr`, and
-  the bars are manually positioned each frame; you cannot rearrange or float panels.
+- **App-owned workbench layout**: the bars/panels are explicitly positioned rather than
+  exposed as a user dockspace; ImGui's platform/layout state still persists in its ini file.
 - **No plugin/scripting API**: excluded by project spec; the shell offers no extension
   point — tabs are compiled in.
-- The **viewports** branch in `main.cpp` is dead code (viewports are never enabled).
+- ImGui platform viewports and DPI geometry scaling are enabled, while the workbench's
+  browser-style panel arrangement remains an explicit app layout rather than a user dockspace.
 - **Hardware-first, WARP fallback**: if no D3D11 hardware device is available the app
   silently falls back to the WARP software rasterizer; if even that fails, startup aborts.
 - `Open as Raw` exposes only **x86/x64/ARM/ARM64** in its radio set, even though the
   Engine menu offers more architectures (MIPS/PPC/RISC-V); raw blobs of those arches
   would need the Engine-menu arch switch after loading.
-- The base-address parser in the raw popup tolerant-parses hex but does no validation
-  of overlap with a real image — it is a flat-blob convenience, not a loader.
+- The base-address parser in the raw popup tolerant-parses hex and does not reason about
+  overlap with another real image; `BinaryFile` still rejects a flat range whose final VA
+  would overflow.
 - Cross-tab state is a per-frame flag handshake, not a robust event bus; it works
   because the whole UI is single-threaded immediate mode, but it means requests are
   effectively "fire on the next frame" and one-shot.

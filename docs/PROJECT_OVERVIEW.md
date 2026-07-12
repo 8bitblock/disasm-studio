@@ -199,7 +199,10 @@ stack: the **Win32 + D3D11 host** (`src/main.cpp`) and the **application shell**
 ### The Win32 + Direct3D 11 host (`main.cpp`)
 
 The program entry point is `wWinMain`. It is a Unicode `WinMain`, so the binary is a
-GUI subsystem app (no console). The flow is the canonical Dear ImGui
+GUI subsystem app (no console). `CommandLineToArgvW` reads an optional first target
+argument and converts it to the UTF-8 path representation used by the loader; after
+UI initialization that path is opened through the same `loadBinaryPath` flow as the
+File menu. The rest of the flow is the canonical Dear ImGui
 `example_win32_directx11` skeleton, adapted for this project:
 
 1. **Register the window class** (`WNDCLASSEXW` with class name `DisasmStudioWnd`,
@@ -214,14 +217,14 @@ GUI subsystem app (no console). The flow is the canonical Dear ImGui
    fallback path.
 3. The window is then shown **maximized** (`SW_SHOWMAXIMIZED`), matching the "fixed
    single full-window" UX intent.
-4. **ImGui setup**: create the context, enable `ImGuiConfigFlags_NavEnableKeyboard`,
-   and — important to the design — set `io.IniFilename = nullptr` so ImGui does
-   **not** persist or restore any window layout. The UI geometry is computed from
-   scratch every run; nothing about pane sizes is saved to an `imgui.ini`.
+4. **ImGui setup**: create the context; enable keyboard navigation, platform viewports,
+   docking support, and `DpiEnableScaleViewports`; and point `io.IniFilename` at the
+   durable `%APPDATA%\DisasmStudio\imgui.ini`. The app-owned workbench geometry remains
+   explicit, while ImGui can preserve platform-window state and logical DPI geometry.
 5. **Backends**: `ImGui_ImplWin32_Init(hwnd)` and `ImGui_ImplDX11_Init(device, ctx)`.
 6. **Fonts** (`src/Ui/Fonts.h` globals `ds::ui::gUiFont` / `ds::ui::gMonoFont`): the
-   host prefers crisp Windows system fonts — `segoeui.ttf` at 17px for the
-   proportional UI font and `consola.ttf` (or `cour.ttf`) at 16px for the monospace
+   host prefers crisp Windows system fonts — `segoeui.ttf` at `17px*dpi` for the
+   proportional UI font and `consola.ttf` (or `cour.ttf`) at `16px*dpi` for the monospace
    code/hex font — checking each file exists first and falling back to the ImGui
    built-in font. The monospace handle may be null, in which case `PushMono()`
    callers fall back to the default font. This is why disassembly/hex views stay
@@ -241,6 +244,10 @@ in `_DEBUG` builds. The render-target view is created from back-buffer 0 in
 
 - Drain all pending Win32 messages (`PeekMessage`/`TranslateMessage`/`DispatchMessage`);
   `WM_QUIT` ends the loop.
+- **Deferred DPI rebuild**: after message draining and before a new ImGui frame, consume
+  only the latest queued DPI, invalidate the old DX11 font objects, rebuild the atlas,
+  rederive absolute theme metrics, and recreate the font texture. Failed creation remains
+  queued and is retried without rendering against a missing texture.
 - **Occlusion skip**: if the swapchain was occluded last frame and a
   `Present(0, DXGI_PRESENT_TEST)` still reports `DXGI_STATUS_OCCLUDED` (e.g. window
   minimized/covered), it `Sleep(10)`s and continues without rendering — saving GPU
@@ -260,10 +267,9 @@ in `_DEBUG` builds. The render-target view is created from back-buffer 0 in
 `WndProc` first forwards every message to `ImGui_ImplWin32_WndProcHandler` so ImGui
 receives input. It then handles `WM_SIZE` (ignoring `SIZE_MINIMIZED`), suppresses the
 ALT application menu (`WM_SYSCOMMAND` / `SC_KEYMENU` returns 0 so ALT-key chords like
-`Alt+←/→` are free for navigation), and posts quit on `WM_DESTROY`. There is a
-viewports branch (`ImGuiConfigFlags_ViewportsEnable`) left in from the upstream
-example, but viewports are not enabled, so it is inert — the single-window, no-docking
-posture holds.
+`Alt+←/→` are free for navigation), and posts quit on `WM_DESTROY`. For
+`WM_DPICHANGED`, it applies Windows' suggested rectangle and stores only the latest DPI;
+font/style/DX11 resource mutation remains outside `WndProc` at the between-frame boundary.
 
 #### Embedded application icon (`app.rc`, `resource.h`)
 
@@ -280,8 +286,8 @@ embedded into the EXE and loaded at startup for window, taskbar, and alt-tab use
 `ds::App` is the top-level controller, instantiated once on the stack in `wWinMain`.
 Its constructor (`App()`):
 
-- `loadPrefs()` reads `%APPDATA%/DisasmStudio/prefs.ini` (a tiny `key=value` file,
-  currently only `theme=`) and `theme::ApplyTheme(theme_)` restyles ImGui.
+- `loadPrefs()` reads `%APPDATA%/DisasmStudio/prefs.ini` (a tiny `key=value` file storing
+  `theme=` and `density=`) and `theme::ApplyTheme(theme_)` restyles ImGui.
 - `ctx_.rebuildDisassembler()` builds the initial disassembler.
 - It constructs the **seven tabs in fixed order** and stores them as
   `std::vector<std::unique_ptr<ITab>>`: `ProjectsTab`, `CommunicationsTab`,
@@ -377,7 +383,8 @@ A standard `BeginMainMenuBar`:
   actually decoding. Any change calls `rebuildDisassembler()`.
 - **View**: Theme submenu (iterates `theme::ThemeId` up to `Count`, applies + persists
   via `savePrefs()`) and an *ImGui Demo* toggle.
-- **Help**: *About*.
+- **Help**: *Keyboard Shortcuts* (F1, a grouped global/debugger/navigation/view
+  reference) and *About* (version, feature overview, and runtime stack).
 - A right-aligned status string (`Engine: … | <format or "no binary">`) is laid out by
   measuring text width and `SameLine`-offsetting from the window width.
 
@@ -419,7 +426,9 @@ mirrored copy Binary View writes each frame.
 
 `renderRawLoadPopup` is the "Open as Raw" modal: it shows the chosen file, a base-address
 hex input (accepts `0x`-prefixed or bare hex via `sscanf("%llx")`), and x86/x64/ARM/ARM64
-radio buttons, then calls `loadRawPath` and switches to Binary View. `renderSaveResultPopup`
+radio buttons, then calls `loadRawPath` and switches to Binary View. The chosen architecture
+is retained as the exact worker/discovery architecture; the loader creates the complete
+executable `.raw` section and rejects a base+length range that would overflow. `renderSaveResultPopup`
 shows the result message from *Save Binary As…*.
 
 #### Save Binary As — patch splicing
@@ -451,23 +460,26 @@ tab, Binary View consumes `requestedGotoVA`/`binaryJustLoaded`/`requestedExportA
 and writes back `cursorVA`/`hasCursor`/`runtimeCursorVA`). Because everything is
 immediate-mode and single-threaded on the UI side, this "set a flag this frame, consume
 it next frame" handshake is the entire inter-tab messaging system — there are no
-signals, callbacks, or event queues. The only background concurrency is inside the
-`Debugger`, which runs its own thread and exposes a lock-guarded `snapshot()`.
+signals, callbacks, or event queues. Background concurrency lives in the `Debugger` and
+the epoch-guarded `AnalysisService`; the latter runs the same selected-architecture
+function/string/listing pipeline for structured and raw images.
 
 #### Limitations & notes
 
-- **No docking / no layout persistence**: intentional. `io.IniFilename = nullptr`, and
-  the bars are manually positioned each frame; you cannot rearrange or float panels.
+- **App-owned workbench layout**: the bars/panels are explicitly positioned rather than
+  exposed as a user dockspace; ImGui's platform/layout state still persists in its ini file.
 - **No plugin/scripting API**: excluded by project spec; the shell offers no extension
   point — tabs are compiled in.
-- The **viewports** branch in `main.cpp` is dead code (viewports are never enabled).
+- ImGui platform viewports and DPI geometry scaling are enabled, while the workbench's
+  browser-style panel arrangement remains an explicit app layout rather than a user dockspace.
 - **Hardware-first, WARP fallback**: if no D3D11 hardware device is available the app
   silently falls back to the WARP software rasterizer; if even that fails, startup aborts.
 - `Open as Raw` exposes only **x86/x64/ARM/ARM64** in its radio set, even though the
   Engine menu offers more architectures (MIPS/PPC/RISC-V); raw blobs of those arches
   would need the Engine-menu arch switch after loading.
-- The base-address parser in the raw popup tolerant-parses hex but does no validation
-  of overlap with a real image — it is a flat-blob convenience, not a loader.
+- The base-address parser in the raw popup tolerant-parses hex and does not reason about
+  overlap with another real image; `BinaryFile` still rejects a flat range whose final VA
+  would overflow.
 - Cross-tab state is a per-frame flag handshake, not a robust event bus; it works
   because the whole UI is single-threaded immediate mode, but it means requests are
   effectively "fire on the next frame" and one-shot.
@@ -584,10 +596,10 @@ Everything in DisasmStudio starts with a file becoming a `BinaryFile`. This one 
 (`src/Core/BinaryFile.h`, `src/Core/BinaryFile.cpp`) is the single source of truth for
 *what the bytes are*: which executable format, which CPU architecture, where the image is
 based, where it starts executing, how its sections map between file offsets and virtual
-addresses, what it imports, and a stable content hash that keys all persisted analysis. It
-is deliberately small and dependency-free (only `<cstdint>`, `<string>`, `<vector>`,
-`<fstream>`, `<cstring>`, `<algorithm>`), which is why it is one of the Core modules that
-can be unit-tested by compiling it standalone with no Windows/ImGui/Capstone dependencies.
+addresses, what it imports/exports, and a stable content hash that keys all persisted
+analysis. It uses only the C++ standard library (including `<filesystem>` for durable
+Unicode paths), so it can be unit-tested standalone with no Windows/ImGui/Capstone
+dependencies.
 
 ### Supported formats and detection
 
@@ -598,26 +610,36 @@ can be unit-tested by compiling it standalone with no Windows/ImGui/Capstone dep
 - **`\x7FELF`** at offset 0 → attempt `parseELF()` (ELF32 / ELF64, little-endian only).
 - **`0xFEEDFACE` / `0xFEEDFACF`** little-endian at offset 0 → attempt `parseMachO()` (thin
   Mach-O 32 / 64).
+- **`0xCAFEBABE`** → attempt `parseJavaClass()` (method-code sections backed by the parsed
+  Java class model).
 - Anything else → `BinFormat::Raw`.
 
 The key robustness convention: if a recognized magic is present but the structured parse
 *fails*, the format silently degrades to `BinFormat::Raw` rather than refusing the file
-(`if (!parsePE()) format_ = BinFormat::Raw;`). A truncated or malformed PE/ELF/Mach-O still
-loads as a flat blob you can stare at in hex and disassemble from offset 0. `load()` only
-returns `false` for I/O failures (missing file, empty file, short read), never for a parse
-mismatch.
+(`if (!parsePE()) format_ = BinFormat::Raw;`). A truncated or malformed
+PE/ELF/Mach-O/Java class still loads through the same complete raw-image model described
+below. `load()` only returns `false` for I/O failures (missing file, empty file, short read)
+or an unrepresentable flat address range, never merely for a parse mismatch. Successful file and raw loads retain a canonical
+absolute UTF-8 path, so recents/debug launch remain valid after working-directory changes.
 
 `loadRaw(path, base)` is the explicit **Open as Raw…** path: no header parsing at all, the
-caller supplies the load `base`, `format_ = Raw`, and `entryRVA_ = 0` (raw blobs have no
-entry point — views simply start at `base`). This is the route for shellcode, firmware
-dumps, and decrypted blobs where the user separately picks the disassembler arch.
+caller supplies the load `base`, `format_ = Raw`, and `entryRVA_ = 0` (there is no
+fabricated header entry point). `initializeRawLayout` creates one executable/readable code
+section named `.raw`, with virtual/file offset zero and both sizes covering the complete
+blob. Function discovery treats the analyst-selected base as an explicit root even when it
+is VA 0; the separately selected `Arch` is passed to the worker decoder and gates
+architecture-specific discovery. Consequently raw images use the normal background string/
+function/listing jobs and the same full-program listing, xrefs, call graph, navigation, and
+patch mapping as structured images. This is the route for shellcode, firmware dumps, and
+decrypted blobs. A load is rejected, without leaving partial state, if `base + size - 1`
+would overflow `uint64_t`; a mapping ending exactly at `UINT64_MAX` remains valid.
 
-`BinFormat` (`Unknown, PE32, PE32Plus, ELF, MachO, Raw`) and `formatName()` give the UI a
-human label like `"PE32+ (x64)"` or `"Mach-O"`.
+`BinFormat` (`Unknown, PE32, PE32Plus, ELF, MachO, JavaClass, Raw`) and `formatName()`
+give the UI a human label like `"PE32+ (x64)"` or `"Mach-O"`.
 
 ### Machine / architecture recovery
 
-`MachineArch` (`X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV, RISCV64, Unknown`)
+`MachineArch` (`X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV, RISCV64, JVM, Unknown`)
 is recovered from the *format header*, not inferred from the 32/64-bit class. This matters
 because an ARM64 ELF and an x64 ELF are both 64-bit — only the `e_machine` field
 distinguishes them, and `machine()` is what lets the UI auto-select Zydis for x86/x64 and
@@ -669,6 +691,9 @@ decision per format:
 - **Mach-O**: a section is executable if its segment is exec, or the section flags carry
   `S_ATTR_PURE_INSTRUCTIONS (0x80000000)` / `S_ATTR_SOME_INSTRUCTIONS (0x400)`, or the
   section is literally named `__text`.
+- **Raw**: one synthetic `.raw` section spans every file byte and carries code/execute/read
+  characteristics. It is deliberately complete so section-driven analysis does not need a
+  separate raw-only path.
 
 `firstCodeSection()` returns the first executable section, or — if none is flagged — the
 first section, or `nullptr`. This is the default disassembly target when a binary opens.
@@ -721,13 +746,21 @@ sidecar (`%APPDATA%/DisasmStudio/projects/<hash>.json`: comments, renames, bookm
 breakpoints, patches, notes) is keyed by this value, so a patched binary does not split its
 analysis across two files. `clear()` resets `hashValid_` so the next loaded file recomputes.
 
-### PE imports and base relocations
+### PE exports, imports, and base relocations
 
-For PE, `parsePE()` reads the data directory (honoring `NumberOfRvaAndSizes` so it never
-aliases the section table by reading an undeclared slot) and records export
+For PE, `parsePE()` reads only data-directory slots that fit both
+`NumberOfRvaAndSizes` and the declared `SizeOfOptionalHeader`, so a truncated optional
+header cannot alias the section table. It records export
 (`exportDirRVA/Size`), import, and base-relocation directory locations. After sections are
 parsed (imports need them for RVA translation):
 
+- **`parseExports()`** builds the shared `BinaryFile::Export` model from the complete EAT:
+  named aliases, ordinal-only rows, forwarders, local code/data targets, and malformed or
+  unmapped targets. RVA/name/ordinal walks are bounds-checked and hostile inputs are capped
+  by row, stored-string, and aggregate string-scan budgets. The PE header span declared by
+  `SizeOfHeaders` (clamped before the earliest raw section) maps 1:1, so a valid
+  header-resident export directory is supported without treating the virtual gap before the
+  first section as file-backed data.
 - **`parseImports()`** walks `IMAGE_IMPORT_DESCRIPTOR`s, resolving each IAT slot to a
   `{ iatVA, dll, name }` `Import`. It handles bound imports (OFT may be 0, falls back to
   the IAT RVA) and ordinal imports (`#NN` when the high bit is set). `iatVA = imageBase_ +
@@ -737,8 +770,8 @@ parsed (imports need them for RVA translation):
 - **`parseRelocs()`** walks `IMAGE_BASE_RELOCATION` blocks into `(VA, type)` pairs (type =
   `IMAGE_REL_BASED_*`), skipping ABSOLUTE (type 0) padding entries, capped at 200 000.
 
-ELF/Mach-O import and relocation tables are not parsed here — imports are a PE-only feature
-in this loader.
+ELF/Mach-O dynamic symbol/import/export and relocation tables are not parsed here; these
+models are PE-only in this loader.
 
 ### writeImage — in-memory patching that preserves identity
 
@@ -756,23 +789,26 @@ while keeping the original artifact untouched.
 
 `BinaryFile` has no UI of its own; it is pure model. Its outputs drive the chrome:
 `formatName()` and `machine()` populate the title/status, `firstCodeSection()` sets the
-initial cursor, `imports()` feeds the Imports tab and inline IAT annotations, and the
-addressing routines back every navigation, hex pane, and string/byte search. The two
-user-visible entry points are **File ▸ Open** (auto-detect via `load`) and **Open as Raw…**
-(`loadRaw` with a chosen base + arch).
+initial cursor, `imports()` feeds the Imports tab and inline IAT annotations, and
+`exports()` feeds the PE Exports tab and function discovery. The addressing routines back
+every navigation, hex pane, and string/byte search. The file-opening routes are an optional
+startup argument (`DisasmStudio.exe <path>`), **File ▸ Open** (both auto-detect via `load`),
+and **Open as Raw…** (`loadRaw` with a chosen base + arch).
 
 #### Limitations & notes
 
 - ELF is **little-endian only**; big-endian ELF degrades to Raw.
-- Mach-O support is **thin only** — fat/universal binaries are not split here (magic
-  `0xCAFEBABE` is not recognized and would load as Raw).
-- Imports and relocations are parsed for **PE only**; ELF/Mach-O dynamic-symbol resolution
-  is out of scope for this class.
+- Mach-O support is **thin only** — fat/universal binaries are not split here. Their
+  big-endian `0xCAFEBABE` marker overlaps the Java-class signature; an invalid class parse
+  degrades to Raw.
+- Exports, imports, and relocations are parsed for **PE only**; ELF/Mach-O dynamic-symbol
+  resolution is out of scope for this class.
 - Inferred fallbacks (machine defaulting by bit-class for unknown `e_machine`/`cputype`,
   Mach-O entry derived from `__TEXT`, ELF program-header fallback for stripped binaries) are
   best-effort but unlabeled at this layer — they are internal robustness, not surfaced as
   "heuristic" to the user the way the decompiler/tech-scan output is.
 - A failed structured parse becomes `Raw` rather than an error, by design.
+- Explicit raw mappings whose final byte would wrap the 64-bit VA space are rejected.
 - The whole file is held in one contiguous `data_` buffer; loading is O(file size) memory,
   which is fine for typical executables but is the limiting factor for very large images.
 ## 04. Static Code Analysis — Discovery, Naming, CFG, Xrefs, Symbols, Tech Scan
@@ -793,45 +829,57 @@ best-effort, and a **user rename always wins** over everything.
 
 ### Function discovery — `FunctionAnalyzer`
 
-`src/Core/FunctionAnalyzer.{h,cpp}` finds where functions start. Its public surface is a
-single `analyze(bin, dis, maxFunctions = 50000, maxInstrPerFunc = 4000)` returning a
+`src/Core/FunctionAnalyzer.{h,cpp}` finds where functions start. Its public surface includes
+`analyze(bin, dis, arch, maxFunctions = 50000, maxInstrPerFunc = 4000)` for the exact
+architecture selected by the load/background pipeline, returning a
 vector of `DiscoveredFunction { address, size, name, isExport }` sorted by address, plus a
-human-readable `lastSummary()` string. It combines three independent seed sources and then
+human-readable `lastSummary()` string. It combines five independent seed sources and then
 expands them by recursive descent:
 
 1. **Entry point** — if `bin.entryPoint()` is non-zero, `imageBase() + entryPoint` is the
    first seed.
-2. **PE export table** (`collectExports`) — parses the export directory at
-   `bin.exportDirRVA()`. Every Export Address Table (EAT) entry becomes a seed
-   (`imageBase + funcRVA`), and the name-pointer/ordinal tables are walked to build a
-   `va -> name` map so exports are *named*, not just `sub_`. Two correctness details worth
-   noting: (a) **forwarder rejection** — an EAT RVA that points back inside the export
-   directory `[edRVA, edRVA + exportDirSize)` is an ASCII `"DLL.func"` forwarder string, not
-   code, and is never seeded or named (the bound is computed in 64-bit so `edRVA + size`
-   can't wrap a `uint32_t`); (b) every table read is bounds-checked against the available
-   mapped bytes returned by `ptrFromRVA`, so a malformed header can't read out of range.
-3. **Prologue heuristic scan** (`prologueScan`) — a byte sweep over every executable
-   section looking for common x64 prologues: `push rbp; mov rbp,rsp` (`55 48 8B EC` or
-   `55 48 89 E5`), `sub rsp, imm8` (`48 83 EC xx`), and MS-x64 home-slot stores
-   (`48 89 5C/4C/54 24 xx`). Each match seeds a candidate start. This is deliberately
-   x64-specific and best-effort; it catches functions that are neither exported nor reached
-   by a direct call.
+2. **Explicit raw root** — a raw image deliberately retains `entryRVA_ = 0`, but its
+   analyst-selected mapping base is an authoritative function seed. Validity is explicit,
+   so a raw image mapped at VA 0 is seeded correctly rather than lost to a truthiness test.
+3. **PE code exports** (`collectExports`) — consumes the bounds-checked
+   `BinaryFile::exports()` model rather than reparsing PE tables. Only mapped local code
+   targets become function seeds; forwarders, exported data, and unmapped targets remain
+   visible in the Exports panel but are not functions. Aliases collapse to one seed per VA,
+   a real export name wins over an ordinal label, and an ordinal-only code export is named
+   `#N` instead of being presented as a heuristic `sub_`.
+4. **PE32+ exception ranges** (`pdataRanges`) — linker-emitted x64
+   `RUNTIME_FUNCTION` begin addresses are authoritative seeds, and their `[begin,end)`
+   extents provide stronger size hints than the ordinary gap estimate.
+5. **Prologue heuristic scan** (`prologueScan`) — a byte sweep over every executable
+   section looking for common x64 prologues (`55 48 8B/89 …`, `48 83 EC …`, home-slot
+   stores) or x86 frame prologues (`55 8B EC` / `55 89 E5`). The exact selected `Arch`
+   gates these byte-pattern scans; ARM/ARM64/MIPS/PPC/RISC-V raw bytes never receive x86
+   prologue guesses. Each match is best-effort and seeds a candidate start.
 
 The seeds then drive a **recursive-descent** pass. A worklist disassembles up to an
 8 KiB window per seed (capped at `maxInstrPerFunc` instructions); every direct `CALL` whose
 `branchTarget` maps into the image is pushed as a new function start (deduped via a
 `visited` set), and scanning of a body stops at the first `isRet` so size estimates stay
-tight. A key ordering trick: the **high-confidence seeds** (entry + named exports, which are
-`seeds[0..exportSeeds)`) are inserted into the `starts` set *first*, so the heuristic
+tight. A key ordering trick: the **high-confidence seeds** (entry/raw root + code exports + x64
+`.pdata`, which are `seeds[0..exportSeeds)`) are inserted into the `starts` set *first*, so the heuristic
 prologue flood can never crowd them out when the `maxFunctions` cap is hit.
+
+For a raw load, the synthetic executable `.raw` section spans the complete blob, so the
+same worker-owned decoder and background jobs produce strings, discovered functions, and
+full-program rows. Recursive calls feed the call graph, while the normal section sweep feeds
+the whole-program xref index; these are not separate reduced raw-only views. The executable
+section also participates in `RuntimeScan`: a high-entropy blob can receive the existing
+clearly low-confidence `High-entropy section .raw` finding, which is evidence only and not a
+packer-name classification.
 
 **Size estimation** is gap-based: with starts sorted, each function's size is the distance
 to the next start, clamped to `0x4000` bytes; the last function uses the remaining mapped
 bytes. This is an estimate (it doesn't follow actual flow), which is why downstream consumers
 treat the size as a *window hint* rather than a hard boundary. The two caps
 (`maxFunctions`, `maxInstrPerFunc`) exist purely for responsiveness on large images, and the
-summary string (`"N functions (X export seeds, Y total seeds) via <engine>"`) reports what
-happened. Names are `sub_<HEXADDR>` for anything not matched to an export.
+summary string reports the high-confidence seed, `.pdata`, and total-seed counts plus the
+decoder engine. Names are `sub_<HEXADDR>` for anything not matched to an authoritative
+name.
 
 ### Heuristic name guessing — `FunctionNamer`
 
@@ -844,7 +892,8 @@ meaningful name. It is split into two layers so the interesting part is pure and
   `FuncEvidence` struct (instruction/call counts, the de-duped list of called API names, a
   few referenced string literals, and the thunk/entry/ret-only/ret-zero flags) and returns a
   `GuessedName { name, reason, guessed }`. Decision order (first match wins):
-  1. **Entry point** → `start` ("image entry point").
+  1. **Entry point or explicit raw image base** → `start`, with the reason distinguishing
+     a real image entry point from an analyst-selected raw root.
   2. **Thunk/wrapper** whose first real instruction is an unconditional `jmp` to a known
      import → `j_<API>` ("tail-jumps to …").
   3. **Trivial stubs** → `nullsub` (returns immediately, no calls) or `ret_zero` (zeroes the
@@ -999,7 +1048,8 @@ explicit "no notable capabilities detected" empty state make the heuristic natur
 
 #### Limitations & notes
 
-- Function discovery is best-effort: the prologue scan is **x64-specific**, sizes are
+- Function discovery is best-effort: prologue patterns are limited to **x86/x64** and are
+  enabled only for the exact selected architecture; sizes are
   **gap estimates** (not flow-accurate), and the analyze/per-function caps trade completeness
   for responsiveness on huge images.
 - All `FunctionNamer` output is **heuristic and labelled** (amber tint + reason tooltip),
@@ -1554,7 +1604,7 @@ re-walking every frame.
   design; user-frozen threads are auto-thawed on detach.
 ## 07. The Binary View Workspace (Centerpiece)
 
-The **Binary View** tab is the heart of DisasmStudio: it is where static analysis and live debugging meet. Everything else in the app (Projects, Sig Scanner, Memory Tools, Tech, Diff) ultimately routes the user here to "go look at this address." It lives in `src/Tabs/BinaryViewTab.{h,cpp}` — a single ~5000-line class (`ds::BinaryViewTab`) that owns six switchable **main views**, a three-tab **side panel**, thirteen **lower sub-tabs**, a **debug toolbar**, and a stack of modal popups. This chapter walks through every one of them and the machinery underneath.
+The **Binary View** tab is the heart of DisasmStudio: it is where static analysis and live debugging meet. Everything else in the app (Projects, Sig Scanner, Memory Tools, Tech, Diff) ultimately routes the user here to "go look at this address." It lives in `src/Tabs/BinaryViewTab.{h,cpp}` — a single ~5000-line class (`ds::BinaryViewTab`) that owns six switchable **main views**, a four-tab **side panel**, thirteen **lower sub-tabs**, a **debug toolbar**, and a stack of modal popups. This chapter walks through every one of them and the machinery underneath.
 
 The class implements `ITab`; `render(AppContext&)` is the per-frame entry point. `AppContext` carries the shared `binary` (`BinaryFile`), `debug` (`Debugger`), `disasm` (`IDisassembler`), and `project` (`ProjectState`). The tab keeps its own editing state (comments, renames, bookmarks, breakpoints, the navigation history, caches) and mirrors annotations to/from `ctx.project` each frame.
 
@@ -1610,13 +1660,15 @@ The live **Pseudocode** mode (`renderLivePseudocode`) runs the same structured `
 
 `symbolFor` is the single resolver used *everywhere* a name appears. Its precedence is deliberate: (1) a **user rename** (`names_`) for the exact address always wins; (2) an **IAT slot** resolves to its import (`importMap_`); then, when attached, (3) DbgHelp/PDB names, (4) the in-house export-table parser, (5) `module+0x..`; or, statically, DbgHelp on the file then the **analyzed-function** fallback (`name+0x..`). Results are cached in `symCache_` (bounded at 100k, cleared on context change). Because guessed function names live in `Func::name`, they flow through `symbolFor` too — but `names_` overrides them.
 
-### The side panel: Bookmarks / Functions / Strings + byte search
+### The side panel: Bookmarks / Functions / Strings / Exports + byte search
 
 At the top sits a **Byte Pattern Search** box (hex, no wildcards) with a **Live (process memory)** toggle; hits list below and into the **Results** lower tab, click-to-navigate (live hits open the live view).
 
 - **Bookmarks**: add "+ here", click to go, right-click to rename/remove; persisted as file VAs.
 - **Functions**: **Analyze** runs `FunctionAnalyzer` (entry/exports/call-targets/prologues) into `functions_`; a **Guess** toggle runs `FunctionNamer` (`guessFunctionNames`) to heuristically name anonymous `sub_` functions (`read_file`, `j_CreateFileW`, `start`, …). Guessed names render in **amber** (when no user rename overrides) with a tooltip giving the *basis* for the guess (`guessReason_`). The list is filtered into `fnVisible_` and clipper-rendered. Guesses are recomputed each analyze and never persisted.
 - **Strings** (`scanStrings`): ASCII/UTF-8 + UTF-16LE runs (≥4 chars), file-mode or **Live** (scans loaded module images so addresses stay stable across rescans; auto-flips to Live + scans once on first attach). Click to navigate, right-click → **Find references (where used)**.
+
+- **Exports**: a filterable view over `BinaryFile::exports()`, the bounded PE export-address-table model. It preserves aliases, ordinal-only entries, forwarders, and local code/data targets; local targets navigate to the appropriate code/Hex location, while forwarder targets remain copyable evidence.
 
 ### Lower sub-tabs
 
@@ -2038,7 +2090,7 @@ cancelled dialog produces no popup.
   back persistence without adding a dependency.
 ## 10. UI, Theming & Fonts
 
-DisasmStudio renders its entire interface through **Dear ImGui** on a hardware **Direct3D 11** device. Two small, self-contained support modules give that interface a consistent identity: `src/Ui/Theme.{h,cpp}` defines the colour and metrics system (eight built-in palettes plus a set of semantic colour accessors), and `src/Ui/Fonts.{h,cpp}` manages the proportional/monospace font pair. This chapter covers both, plus the wider ImGui usage philosophy and the visual design language they enforce.
+DisasmStudio renders its entire interface through **Dear ImGui** on a hardware **Direct3D 11** device. Two small, self-contained support modules give that interface a consistent identity: `src/Ui/Theme.{h,cpp}` defines the colour and metrics system (nine built-in palettes plus a set of semantic colour accessors), and `src/Ui/Fonts.{h,cpp}` manages the proportional/monospace font pair. This chapter covers both, plus the wider ImGui usage philosophy and the visual design language they enforce.
 
 ### Why a centralized theme module
 
@@ -2047,7 +2099,7 @@ ImGui's style is a single mutable global (`ImGui::GetStyle()`): one array of ~50
 1. **`ApplyTheme(id)`** derives the *entire* ImGui style from a tiny `Palette` of core colours, so every theme stays internally consistent and a switch restyles the whole UI in one call.
 2. **`ds::theme::col::*`** accessors resolve semantic colours against the *current* theme, so any widget that needs an accent, "good/warn/bad" status colour, or call/branch tint reads it from one place and automatically recolours when the theme changes.
 
-### The `Palette` and the eight themes
+### The `Palette` and the nine themes
 
 A theme is *not* a full ImGui colour array. It is a compact `Palette` struct (in the anonymous namespace of `Theme.cpp`) holding only the seed colours:
 
@@ -2068,6 +2120,7 @@ A theme is *not* a full ImGui colour array. It is a compact `Palette` struct (in
 | **Dracula** | purple/pink dark |
 | **Nord** | cold blue-grey |
 | **Matrix** | near-black background, phosphor-green text |
+| **Paper** (default) | warm paper/ink with an amber accent |
 
 The `Count` sentinel is kept last so the menu and the prefs loader can iterate or range-check the set generically. The default `switch` case also falls through to Midnight, so an out-of-range id never produces an undefined palette.
 
@@ -2089,14 +2142,17 @@ The `light` flag tunes two derivations that would otherwise look wrong on a brig
 
 ### Layout metrics: `applyMetrics()`
 
-`applyMetrics()` sets the geometry once (it is theme-independent — the same metrics apply to all palettes). Highlights:
+`applyMetrics()` derives geometry from fixed baseline values multiplied by the current
+per-monitor UI scale; spacing/padding also include the selected density factor. It assigns
+absolute results rather than scaling the previous style, so repeated monitor transitions
+cannot accumulate error and the same metrics apply to all palettes. Highlights:
 
 - **Rounding:** windows/children 6px, frames/popups 5px, scrollbars 9px, grabs 4px, tabs 6px — a soft, modern, slightly rounded look.
-- **Borders:** 1px on windows/children/popups; **0px on frames and tabs** (frames rely on fill contrast, not outlines).
+- **Borders:** a 1px baseline on windows/children/popups; **0px on frames and tabs** (frames rely on fill contrast, not outlines). Rasterized border and separator widths are rounded to whole physical pixels at fractional Windows scales such as 125% and 150%.
 - **Spacing/padding:** `WindowPadding (12,12)`, `FramePadding (10,6)`, `CellPadding (8,5)`, `ItemSpacing (10,8)`, `IndentSpacing 20`, `ScrollbarSize 14`, `GrabMinSize 12` — generous touch targets and breathing room.
 - `WindowTitleAlign` left-aligned, `WindowMenuButtonPosition = ImGuiDir_None` (no collapse caret), `SeparatorTextBorderSize 2` for stronger section rules.
 
-`ApplyTheme(id)` clamps the id, stores `g_theme`/`g_pal`, then calls `applyMetrics()` followed by `applyColors(g_pal)`. The no-argument `ApplyTheme()` re-applies the current theme (used to restyle after the context is ready). `g_theme`/`g_pal` are statically initialized to Midnight, so the `col::*` accessors are valid even before any `ApplyTheme()` call.
+`ApplyTheme(id)` clamps the id, stores `g_theme`/`g_pal`, then calls `applyMetrics()` followed by `applyColors(g_pal)`. The no-argument `ApplyTheme()` re-applies the current palette and density after `SetUiScale()` during a DPI transition; it does not reset either preference. `g_theme`/`g_pal` are initialized before the first frame, so the `col::*` accessors are always valid.
 
 ### Semantic colour accessors: `ds::theme::col`
 
@@ -2121,29 +2177,30 @@ The function side panel distinguishes three name sources. A **user rename** rend
 
 `Fonts.h` declares two global `ImFont*` handles and a push/pop pair:
 
-- `gUiFont` — proportional UI face. Loaded in `main.cpp` from `C:\Windows\Fonts\segoeui.ttf` at **17px**, falling back to ImGui's built-in font (`AddFontDefault()`) if Segoe UI is absent.
-- `gMonoFont` — monospace face for code/hex. Loaded from `consola.ttf` (Consolas) at **16px**, falling back to `cour.ttf` (Courier New), or left **null** if neither exists.
+- `gUiFont` — proportional UI face. Loaded in `main.cpp` from `C:\Windows\Fonts\segoeui.ttf` at a **17px × DPI-scale** size, falling back to ImGui's built-in font at the same scaled size if Segoe UI is absent.
+- `gMonoFont` — monospace face for code/hex. Loaded from `consola.ttf` (Consolas) at a **16px × DPI-scale** size, falling back to `cour.ttf` (Courier New), or left **null** if neither exists.
 - `PushMono()` / `PopMono()` — wrap `ImGui::PushFont`/`PopFont`. `PushMono()` is null-safe: if `gMonoFont` is null it pushes the current font instead, so the stack stays balanced and `PopMono()` is always valid regardless of which fonts loaded.
 
-The monospace face is what makes the disassembly listing, hex view, and live assembly align into clean columns — addresses, raw bytes, mnemonics, and operands all share a fixed advance width. Code views bracket their tables with `ui::PushMono()` / `ui::PopMono()` (e.g. the full-program listing and the focused assembly view in `BinaryViewTab.cpp`); the rest of the chrome uses the proportional `gUiFont`. Fonts are atlased once at startup (before `ds::App` is constructed) and never reloaded, so there is no per-frame font cost. Sizes are fixed constants — there is no runtime font-scaling slider, and `io.FontGlobalScale` is left at its default.
+The monospace face is what makes the disassembly listing, hex view, and live assembly align into clean columns — addresses, raw bytes, mnemonics, and operands all share a fixed advance width. Code views bracket their tables with `ui::PushMono()` / `ui::PopMono()` (e.g. the full-program listing and the focused assembly view in `BinaryViewTab.cpp`); the rest of the chrome uses the proportional `gUiFont`. The complete atlas is built at startup and rebuilt only when the main window changes DPI, so there is no per-frame font cost. `WM_DPICHANGED` applies Windows' suggested rectangle immediately but queues resource work: between frames, only the latest queued DPI invalidates the old DX11 objects, clears/reloads the atlas, reapplies absolute theme metrics, and creates the replacement font texture. Creation failure leaves the DPI uncommitted, suppresses rendering with the missing texture, and retries at a bounded cadence while messages continue to pump.
 
 ### ImGui usage philosophy & visual design language
 
 Several deliberate choices in `main.cpp` and the theme module define the app's "feel":
 
-- **Fixed, browser-style single window.** `io.IniFilename = nullptr` disables ImGui's layout persistence — window positions and sizes are never saved or restored. There is no docking or multi-viewport tear-off in normal use (the spec mandates a single window with a top tab strip), so window state is recomputed each session.
+- **Fixed browser-style shell.** The workbench's core panel arrangement is app-owned rather than a user dockspace. ImGui platform viewports remain enabled for platform-window/DPI bookkeeping, and `DpiEnableScaleViewports` preserves logical geometry across monitor changes.
 - **Hardware-accelerated.** ImGui draws via `ImGui_ImplDX11` on a real D3D11 device; large lists (the full-program listing capped at ~800k instructions) are clipper-rendered so only visible rows cost anything.
-- **Theme is a user preference.** The **View ▸ Theme** submenu (`App.cpp`) iterates `ThemeId` from 0 to `Count`, listing each `ThemeName(id)` with a check on the active theme; selecting one sets `theme_`, calls `ApplyTheme(id)`, and persists it. Persistence is a tiny line-based prefs file `theme=<int>` in `%APPDATA%\DisasmStudio`, loaded in the `App` constructor (`loadPrefs()` → `ApplyTheme(theme_)`) and range-checked against `ThemeId::Count`.
+- **Live per-monitor DPI.** The Win32 host is per-monitor aware, ImGui preserves logical viewport geometry, and fonts are re-atlased at the destination monitor's native scale rather than bitmap-stretched.
+- **Theme and density are user preferences.** The **View** submenus update the active palette/density and persist both in a tiny line-based `%APPDATA%\DisasmStudio\prefs.ini`. `loadPrefs()` restores them before `ApplyTheme`; a DPI rebuild reuses these active values rather than overwriting them.
 - **One source of truth for colour.** Because every status, syntax, and accent colour resolves through `col::*` against `g_pal`, switching themes live recolours debug indicators, instruction tints, selection highlights, and guessed-name amber uniformly — no tab carries its own literals for these.
 
 `ThemeName(id)` provides the human label for the menu (e.g. `SolarizedDark` → "Solarized Dark"), returning "?" for an unknown id.
 
 #### Limitations & notes
 
-- **Fixed sizes, no scaling.** Font sizes (17px UI / 16px mono) and all layout metrics are compile-time constants; there is no UI scale or font-size control, and no DPI-aware re-atlasing.
+- **Automatic DPI, no manual font slider.** The 17px UI / 16px mono values are 96-DPI baselines and scale automatically per monitor; there is no user font-size slider.
 - **Windows font paths are hard-coded.** Font loading probes `C:\Windows\Fonts\…` directly; if those faces are missing the UI falls back to ImGui's default and the monospace handle may be null (still safe via `PushMono`). No font fallback for non-Latin glyph ranges is configured (default ASCII range only).
-- **No custom themes.** The eight palettes are built-in and not user-editable; there is no theme editor, import/export, or per-colour override. Adding a theme means extending `ThemeId`, `PaletteFor`, and `ThemeName`.
-- **Theme prefs only.** The persisted prefs file stores just the theme index; window layout is intentionally not persisted (`IniFilename = nullptr`).
+- **No custom themes.** The nine palettes are built-in and not user-editable; there is no theme editor, import/export, or per-colour override. Adding a theme means extending `ThemeId`, `PaletteFor`, and `ThemeName`.
+- **Visual prefs only.** The prefs file stores the theme and density; it is separate from binary-analysis sidecars and ImGui's layout file.
 - The `light` flag tunes only scrollbar/alt-row derivations; all other colours come straight from the palette seeds, so a new light theme must pick legible `text`/`accent` seeds itself.
 ## 11. Hypervisor (AMD-V/SVM) Backend & Kernel Driver
 
@@ -2210,7 +2267,7 @@ The build is driven by **Visual Studio 2022 / MSBuild**, x64 only. There is a si
 - **Preprocessor defines (all configs):** `UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS`. `NOMINMAX` matters because the codebase uses `std::min`/`std::max` freely; `WIN32_LEAN_AND_MEAN` keeps the Win32 headers (used heavily by `Debugger`, `ProcessManager`, the IP Helper paths) lean. Debug adds `_DEBUG`; Release adds `NDEBUG`.
 - **Output paths:** binaries land in `build\$(Platform)\$(Configuration)\` and intermediates in `build\int\$(Platform)\$(Configuration)\`. The Release exe is `build\x64\Release\DisasmStudio.exe`.
 - **Release optimization:** `WholeProgramOptimization` (LTCG), `/O2` (`MaxSpeed`), `FunctionLevelLinking`, `IntrinsicFunctions`, plus linker `EnableCOMDATFolding` and `OptimizeReferences` to strip dead code. Debug is `/Od` (`Disabled`).
-- **Subsystem:** `Windows` (a GUI app, entry via `wWinMain` in `main.cpp` — note that argv is ignored, so there is no CLI to auto-open a binary).
+- **Subsystem:** `Windows` (a GUI app, entry via `wWinMain` in `main.cpp`). An optional first command-line argument opens that target immediately; `CommandLineToArgvW` preserves quoted/Unicode paths.
 - **Resources:** `src\app.rc` (compiled by the resource compiler) embeds `src\app.ico`, giving the window/taskbar/Explorer icon. The icon is regenerated with `gen_app_icon.ps1`.
 
 The full source membership is enumerated in the `.vcxproj` `ItemGroup`s: `main.cpp`, `App.cpp`, the UI helpers (`Ui/Theme`, `Ui/Fonts`), the entire `Core/` set (`BinaryFile`, `ProcessManager`, `FunctionAnalyzer`, `FunctionNamer`, `Debugger`, `SymbolResolver`, `CFG`, `Cond`, `Json`, `Project`, `Decompiler`, `DataFlow`, `TechScan`, `XrefIndex`, `Report`), the `Disasm/` backends (`ZydisDisassembler`, `CapstoneDisassembler`, `DisassemblerFactory`, `Assembler`), every tab in `Tabs/`, and the hypervisor user-mode client `Hv/HvDbgClient` + `Hv/HvDbgLoader`. The kernel driver under `driver/` is *not* part of this project — it is reviewable source only (packaging/signing/loading are out of scope).
@@ -2287,8 +2344,8 @@ A recurring design rule is to **add no new third-party dependency** for things t
 
 #### Limitations & notes
 
-- **No automated GUI/integration harness.** The ImGui/Win32/Tabs layer is verified by review + `.sln` build + `smoke_run.ps1` (a 5-second liveness check). Deeper interactive paths (live assembly view, Stack/Xrefs tabs, run-to-cursor, the export dialog) require manual GUI use; there is no CLI to auto-load a binary (`wWinMain` ignores argv).
-- **The unit tests are not auto-run by the build.** `build.ps1` builds only the app; the `tests/*.cpp` are compiled and run separately (one `cl` invocation each) and are not wired into MSBuild or a test runner. There is no single "run all tests" command in-repo.
+- **No automated GUI/integration harness.** The ImGui/Win32/Tabs layer is verified by review + `.sln` build + `smoke_run.ps1` (a 5-second liveness check). Deeper interactive paths (live assembly view, Stack/Xrefs tabs, run-to-cursor, and export dialogs) still require manual GUI use. The startup target argument supports deterministic file loading, but it is not a general UI-automation interface.
+- **The unit tests are not auto-run by the build.** The solution build produces the app only. Run `tests\run_core_tests.bat` separately to compile and execute the complete MSVC-compatible Core regression set (one isolated `cl` invocation per harness); pass a test stem such as `binaryfile_exports_test` to run only that declaration.
 - **Off-target reality vs. docs.** CLAUDE.md describes the tests as g++-on-Linux; in the real Windows environment they are built with MSVC `cl` in a VS Dev Shell (only the header-only `step_logic_test` is g++-portable as documented). A noted sandbox quirk is that a mounted copy of a just-edited file can be stale/torn — the real Windows files are authoritative.
 - **First-build cost.** The `x64-windows-static` triplet recompiles all four vcpkg deps from source on a clean tree; this is a one-time cost traded for a redist-free single exe.
 - **x64-only, static-CRT-only.** There is no 32-bit (Win32) app configuration; the static CRT choice must match across the app and any test linking the same Core sources (hence `/MT` in the engine-linking test recipes).
@@ -2417,8 +2474,8 @@ reversing any of them.
 
 - **No scripting / plugin / automation API.** The user explicitly does not want a
   scripting or plugin surface. It must not be added. The application is a single
-  self-contained tool, driven entirely through its UI (and `wWinMain` ignores argv, so
-  there is no CLI to auto-load a target).
+  self-contained GUI tool. The optional startup path only opens a target; it is not a
+  scripting, plugin, or headless automation surface.
 - **No FLIRT-style library recognition.** Signature-based identification of statically
   linked library functions (IDA-FLIRT style) is not implemented.
 - **No IPv6 connection tables.** The Communications tab enumerates per-process **IPv4**

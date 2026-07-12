@@ -17,6 +17,18 @@ bool IconsLoaded() { return gIconsLoaded; }
 // Private Use Area, so the merge can't shadow any real text glyph).
 void LoadFonts(float dpi) {
     ImGuiIO& io = ImGui::GetIO();
+    if (!(dpi > 0.5f && dpi < 8.0f)) dpi = 1.0f;
+
+    // Font pointers and the atlas texture are invalidated as one unit. The host
+    // calls the renderer's InvalidateDeviceObjects() before a live rebuild, so
+    // clearing here cannot leave the DX11 backend referring to the old texture.
+    io.FontDefault = nullptr;
+    gUiFont = nullptr;
+    gMonoFont = nullptr;
+    gIconFontLarge = nullptr;
+    gIconsLoaded = false;
+    io.Fonts->Clear();
+
     auto fileExists = [](const char* p) { std::ifstream f(p); return f.good(); };
     const float uiPx   = 17.0f * dpi;
     const float monoPx = 16.0f * dpi;
@@ -27,7 +39,13 @@ void LoadFonts(float dpi) {
     ImFont* uiFont = nullptr;
     if (fileExists("C:\\Windows\\Fonts\\segoeui.ttf"))
         uiFont = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", uiPx);
-    if (!uiFont) uiFont = io.Fonts->AddFontDefault();
+    if (!uiFont) {
+        // Keep the built-in fallback at the same physical size as Segoe UI;
+        // AddFontDefault() without a config would stay at its 13 px baseline.
+        ImFontConfig fallback;
+        fallback.SizePixels = uiPx;
+        uiFont = io.Fonts->AddFontDefault(&fallback);
+    }
 
     // Merge the icon glyphs into whatever UI font we ended up with (MergeMode
     // appends to the most recently added font). Slightly undersized + snapped
@@ -42,6 +60,7 @@ void LoadFonts(float dpi) {
             gIconsLoaded = true;
     }
     gUiFont = uiFont;
+    io.FontDefault = gUiFont;
 
     ImFont* mono = nullptr;
     if (fileExists("C:\\Windows\\Fonts\\consola.ttf"))

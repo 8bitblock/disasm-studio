@@ -34,49 +34,49 @@ static bool isRepStringInsn(const cs_insn* insn) {
 // reading the IMM operand from the arch-specific detail union yields the same
 // branchTarget the Zydis backend produces for x86 - now for ARM/ARM64/MIPS/PPC/
 // RISC-V too, which is what CFG, xref, call-graph and goto navigation rely on.
-static uint64_t branchTargetFor(const cs_insn* insn, Arch arch) {
+static bool branchTargetFor(const cs_insn* insn, Arch arch, uint64_t& target) {
     const cs_detail* d = insn->detail;
-    if (!d) return 0;
+    if (!d) return false;
     switch (arch) {
         case Arch::X86: case Arch::X64: {
             const cs_x86& a = d->x86;
             for (uint8_t i = 0; i < a.op_count; ++i)
-                if (a.operands[i].type == X86_OP_IMM) return (uint64_t)a.operands[i].imm;
+                if (a.operands[i].type == X86_OP_IMM) { target = (uint64_t)a.operands[i].imm; return true; }
             break;
         }
         case Arch::ARM64: {
             const cs_arm64& a = d->arm64;
             for (uint8_t i = 0; i < a.op_count; ++i)
-                if (a.operands[i].type == ARM64_OP_IMM) return (uint64_t)a.operands[i].imm;
+                if (a.operands[i].type == ARM64_OP_IMM) { target = (uint64_t)a.operands[i].imm; return true; }
             break;
         }
         case Arch::ARM: {
             const cs_arm& a = d->arm;
             for (uint8_t i = 0; i < a.op_count; ++i)
-                if (a.operands[i].type == ARM_OP_IMM) return (uint64_t)(uint32_t)a.operands[i].imm;
+                if (a.operands[i].type == ARM_OP_IMM) { target = (uint64_t)(uint32_t)a.operands[i].imm; return true; }
             break;
         }
         case Arch::MIPS: case Arch::MIPS64: {
             const cs_mips& a = d->mips;
             for (uint8_t i = 0; i < a.op_count; ++i)
-                if (a.operands[i].type == MIPS_OP_IMM) return (uint64_t)a.operands[i].imm;
+                if (a.operands[i].type == MIPS_OP_IMM) { target = (uint64_t)a.operands[i].imm; return true; }
             break;
         }
         case Arch::PPC: case Arch::PPC64: {
             const cs_ppc& a = d->ppc;
             for (uint8_t i = 0; i < a.op_count; ++i)
-                if (a.operands[i].type == PPC_OP_IMM) return (uint64_t)a.operands[i].imm;
+                if (a.operands[i].type == PPC_OP_IMM) { target = (uint64_t)a.operands[i].imm; return true; }
             break;
         }
         case Arch::RISCV32: case Arch::RISCV64: {
             const cs_riscv& a = d->riscv;
             for (uint8_t i = 0; i < a.op_count; ++i)
-                if (a.operands[i].type == RISCV_OP_IMM) return (uint64_t)a.operands[i].imm;
+                if (a.operands[i].type == RISCV_OP_IMM) { target = (uint64_t)a.operands[i].imm; return true; }
             break;
         }
         case Arch::JVM: break;   // never decoded by Capstone (JvmDisassembler backend)
     }
-    return 0;
+    return false;
 }
 
 static void appendHexBytes(std::string& out, const uint8_t* p, uint32_t n) {
@@ -183,8 +183,8 @@ static void fillInstruction(const cs_insn* insn, Arch arch, Instruction& out) {
         if (ret) { out.isRet = true; out.isBranch = true; }
     }
 
-    if (out.isBranch || out.isCall)
-        out.branchTarget = branchTargetFor(insn, arch);
+    if ((out.isBranch || out.isCall) && !out.isRet)
+        out.branchTargetValid = branchTargetFor(insn, arch, out.branchTarget);
 
     if (arch == Arch::X86 || arch == Arch::X64)
         out.isRepString = isRepStringInsn(insn);

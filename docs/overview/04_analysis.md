@@ -16,45 +16,57 @@ best-effort, and a **user rename always wins** over everything.
 
 ### Function discovery — `FunctionAnalyzer`
 
-`src/Core/FunctionAnalyzer.{h,cpp}` finds where functions start. Its public surface is a
-single `analyze(bin, dis, maxFunctions = 50000, maxInstrPerFunc = 4000)` returning a
+`src/Core/FunctionAnalyzer.{h,cpp}` finds where functions start. Its public surface includes
+`analyze(bin, dis, arch, maxFunctions = 50000, maxInstrPerFunc = 4000)` for the exact
+architecture selected by the load/background pipeline, returning a
 vector of `DiscoveredFunction { address, size, name, isExport }` sorted by address, plus a
-human-readable `lastSummary()` string. It combines three independent seed sources and then
+human-readable `lastSummary()` string. It combines five independent seed sources and then
 expands them by recursive descent:
 
 1. **Entry point** — if `bin.entryPoint()` is non-zero, `imageBase() + entryPoint` is the
    first seed.
-2. **PE export table** (`collectExports`) — parses the export directory at
-   `bin.exportDirRVA()`. Every Export Address Table (EAT) entry becomes a seed
-   (`imageBase + funcRVA`), and the name-pointer/ordinal tables are walked to build a
-   `va -> name` map so exports are *named*, not just `sub_`. Two correctness details worth
-   noting: (a) **forwarder rejection** — an EAT RVA that points back inside the export
-   directory `[edRVA, edRVA + exportDirSize)` is an ASCII `"DLL.func"` forwarder string, not
-   code, and is never seeded or named (the bound is computed in 64-bit so `edRVA + size`
-   can't wrap a `uint32_t`); (b) every table read is bounds-checked against the available
-   mapped bytes returned by `ptrFromRVA`, so a malformed header can't read out of range.
-3. **Prologue heuristic scan** (`prologueScan`) — a byte sweep over every executable
-   section looking for common x64 prologues: `push rbp; mov rbp,rsp` (`55 48 8B EC` or
-   `55 48 89 E5`), `sub rsp, imm8` (`48 83 EC xx`), and MS-x64 home-slot stores
-   (`48 89 5C/4C/54 24 xx`). Each match seeds a candidate start. This is deliberately
-   x64-specific and best-effort; it catches functions that are neither exported nor reached
-   by a direct call.
+2. **Explicit raw root** — a raw image deliberately retains `entryRVA_ = 0`, but its
+   analyst-selected mapping base is an authoritative function seed. Validity is explicit,
+   so a raw image mapped at VA 0 is seeded correctly rather than lost to a truthiness test.
+3. **PE code exports** (`collectExports`) — consumes the bounds-checked
+   `BinaryFile::exports()` model rather than reparsing PE tables. Only mapped local code
+   targets become function seeds; forwarders, exported data, and unmapped targets remain
+   visible in the Exports panel but are not functions. Aliases collapse to one seed per VA,
+   a real export name wins over an ordinal label, and an ordinal-only code export is named
+   `#N` instead of being presented as a heuristic `sub_`.
+4. **PE32+ exception ranges** (`pdataRanges`) — linker-emitted x64
+   `RUNTIME_FUNCTION` begin addresses are authoritative seeds, and their `[begin,end)`
+   extents provide stronger size hints than the ordinary gap estimate.
+5. **Prologue heuristic scan** (`prologueScan`) — a byte sweep over every executable
+   section looking for common x64 prologues (`55 48 8B/89 …`, `48 83 EC …`, home-slot
+   stores) or x86 frame prologues (`55 8B EC` / `55 89 E5`). The exact selected `Arch`
+   gates these byte-pattern scans; ARM/ARM64/MIPS/PPC/RISC-V raw bytes never receive x86
+   prologue guesses. Each match is best-effort and seeds a candidate start.
 
 The seeds then drive a **recursive-descent** pass. A worklist disassembles up to an
 8 KiB window per seed (capped at `maxInstrPerFunc` instructions); every direct `CALL` whose
 `branchTarget` maps into the image is pushed as a new function start (deduped via a
 `visited` set), and scanning of a body stops at the first `isRet` so size estimates stay
-tight. A key ordering trick: the **high-confidence seeds** (entry + named exports, which are
-`seeds[0..exportSeeds)`) are inserted into the `starts` set *first*, so the heuristic
+tight. A key ordering trick: the **high-confidence seeds** (entry/raw root + code exports + x64
+`.pdata`, which are `seeds[0..exportSeeds)`) are inserted into the `starts` set *first*, so the heuristic
 prologue flood can never crowd them out when the `maxFunctions` cap is hit.
+
+For a raw load, the synthetic executable `.raw` section spans the complete blob, so the
+same worker-owned decoder and background jobs produce strings, discovered functions, and
+full-program rows. Recursive calls feed the call graph, while the normal section sweep feeds
+the whole-program xref index; these are not separate reduced raw-only views. The executable
+section also participates in `RuntimeScan`: a high-entropy blob can receive the existing
+clearly low-confidence `High-entropy section .raw` finding, which is evidence only and not a
+packer-name classification.
 
 **Size estimation** is gap-based: with starts sorted, each function's size is the distance
 to the next start, clamped to `0x4000` bytes; the last function uses the remaining mapped
 bytes. This is an estimate (it doesn't follow actual flow), which is why downstream consumers
 treat the size as a *window hint* rather than a hard boundary. The two caps
 (`maxFunctions`, `maxInstrPerFunc`) exist purely for responsiveness on large images, and the
-summary string (`"N functions (X export seeds, Y total seeds) via <engine>"`) reports what
-happened. Names are `sub_<HEXADDR>` for anything not matched to an export.
+summary string reports the high-confidence seed, `.pdata`, and total-seed counts plus the
+decoder engine. Names are `sub_<HEXADDR>` for anything not matched to an authoritative
+name.
 
 ### Heuristic name guessing — `FunctionNamer`
 
@@ -67,7 +79,8 @@ meaningful name. It is split into two layers so the interesting part is pure and
   `FuncEvidence` struct (instruction/call counts, the de-duped list of called API names, a
   few referenced string literals, and the thunk/entry/ret-only/ret-zero flags) and returns a
   `GuessedName { name, reason, guessed }`. Decision order (first match wins):
-  1. **Entry point** → `start` ("image entry point").
+  1. **Entry point or explicit raw image base** → `start`, with the reason distinguishing
+     a real image entry point from an analyst-selected raw root.
   2. **Thunk/wrapper** whose first real instruction is an unconditional `jmp` to a known
      import → `j_<API>` ("tail-jumps to …").
   3. **Trivial stubs** → `nullsub` (returns immediately, no calls) or `ret_zero` (zeroes the
@@ -222,7 +235,8 @@ explicit "no notable capabilities detected" empty state make the heuristic natur
 
 #### Limitations & notes
 
-- Function discovery is best-effort: the prologue scan is **x64-specific**, sizes are
+- Function discovery is best-effort: prologue patterns are limited to **x86/x64** and are
+  enabled only for the exact selected architecture; sizes are
   **gap estimates** (not flow-accurate), and the analyze/per-function caps trade completeness
   for responsiveness on huge images.
 - All `FunctionNamer` output is **heuristic and labelled** (amber tint + reason tooltip),

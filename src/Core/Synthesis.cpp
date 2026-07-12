@@ -95,7 +95,7 @@ EnvelopeReport CheckEnvelope(const std::vector<Instruction>& insns, uint64_t lo,
         std::string m; for (char c : in.mnemonic) m.push_back((char)std::tolower((unsigned char)c));
         if (m == "syscall" || m == "sysenter" || (m.size() >= 3 && m.substr(0,3) == "int"))
             { r.reason = "region contains a syscall/int (out of envelope)"; return r; }
-        if (in.isBranch && in.branchTarget != 0) {
+        if (in.isBranch && HasBranchTarget(in)) {
             const uint64_t t = in.branchTarget;
             if (t <= in.address && t >= lo) { r.reason = "region contains a loop (back-edge)"; return r; }
             if (t < lo || t >= hi)          { r.reason = "branch leaves the region";          return r; }

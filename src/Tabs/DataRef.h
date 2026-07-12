@@ -128,8 +128,8 @@ inline uint64_t instrImmRef(const Instruction& in) {
 // precise (a constant rarely equals a specific .rdata address by accident). Shared by
 // the UI's xref popup and the Core live-xref sweep (FindRefsInBuffer).
 inline bool instrRefsAddr(const Instruction& in, uint64_t target) {
-    if (!target) return false;
-    if (in.branchTarget == target) return true;
+    if (HasBranchTarget(in) && in.branchTarget == target) return true;
+    if (!target) return false; // data/immediate address parsers still reserve 0 as "none"
     if (instrDataRef(in) == target) return true;
     const std::string& o = in.operands;
     for (size_t i = 0; i + 1 < o.size(); ++i)

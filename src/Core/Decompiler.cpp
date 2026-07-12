@@ -131,7 +131,7 @@ static std::string liftStmt(const Instruction& in, FlagState& fl,
     if (m == "cmp")  { fl = { CmpKind::Cmp, A, B }; return std::string(); }
     if (m == "test") { fl = (two && a == b) ? FlagState{ CmpKind::TestZero, A, "" } : FlagState{ CmpKind::TestAnd, A, B }; return std::string(); }
     if (m == "call") {
-        if (in.branchTarget) return callName(in.branchTarget) + "();";
+        if (HasBranchTarget(in)) return callName(in.branchTarget) + "();";
         return "(*" + cOperand(in.operands) + ")();";
     }
     // Flag-consuming forms: render against the condition the preceding cmp/test set.
@@ -360,16 +360,20 @@ struct Structurer {
             } else if (b.isReturn) {
                 term[i] = Term::Return;
             } else if (b.isUncond) {
-                int t = idxOf(last.branchTarget);
+                int t = HasBranchTarget(last) ? idxOf(last.branchTarget) : -1;
                 if (t < 0) { term[i] = Term::External; extTarget[i] = last.branchTarget; }
                 else       { term[i] = Term::Uncond;   uncondIdx[i] = t; }
             } else if (last.isBranch && !last.isCall) {
                 // Conditional jump.
-                term[i] = Term::Cond;
-                condMnem[i] = last.mnemonic;
-                trueIdx[i]  = idxOf(last.branchTarget);
-                falseIdx[i] = fall;
-                if (trueIdx[i] < 0) extTarget[i] = last.branchTarget;
+                if (HasBranchTarget(last)) {
+                    term[i] = Term::Cond;
+                    condMnem[i] = last.mnemonic;
+                    trueIdx[i]  = idxOf(last.branchTarget);
+                    falseIdx[i] = fall;
+                    if (trueIdx[i] < 0) extTarget[i] = last.branchTarget;
+                } else {
+                    term[i] = Term::External; // unresolved indirect control transfer
+                }
             } else {
                 // Straight-line (incl. ending in a call): fall through.
                 term[i] = Term::Fall; fallIdx[i] = fall;

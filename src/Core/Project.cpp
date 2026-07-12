@@ -61,6 +61,7 @@ std::string SerializeProject(const ProjectState& st) {
     root.set("status",         Value::Str(st.status));
     root.set("lastOpenedUnix", Value::Int(st.lastOpenedUnix));
     root.set("lastCursor",     Value::Str(hexU64(st.lastCursor)));
+    root.set("lastCursorValid",Value::Bool(st.lastCursorValid));
     root.set("notes",          Value::Str(st.notes));
 
     // names / comments: arrays of {a, v} sorted by address for stable output.
@@ -194,6 +195,9 @@ bool DeserializeProject(const std::string& text, ProjectState& out) {
     st.status         = root.getStr("status", "analyzed");
     st.lastOpenedUnix = root.getInt("lastOpenedUnix");
     st.lastCursor     = parseU64(root.getStr("lastCursor", "0"));
+    // Old sidecars had no explicit flag; preserve their non-zero cursor while
+    // allowing new sidecars to distinguish a real VA 0 from "not saved".
+    st.lastCursorValid= root.getBool("lastCursorValid", st.lastCursor != 0);
     st.notes          = root.getStr("notes");
 
     auto loadMap = [&](const char* key, std::unordered_map<uint64_t, std::string>& m) {

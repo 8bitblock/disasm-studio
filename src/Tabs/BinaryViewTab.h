@@ -9,8 +9,8 @@
 #include "../Core/FuncAnnotate.h"      // FuncAnnotations ("Annotations" lower tab + inline notes)
 #include "../Core/GameContext.h"       // game/crackme workflow context panel
 #include "../Core/JvmAnnotate.h"       // JvmMethodAnalysis ("Java" lower tab + inline stack effects)
-#include "../Core/Synthesis.h"         // SynthResult (F1 "Synthesis" lower tab)
-#include "../Core/PathExplore.h"       // PathTree (F3 "Path Explorer" lower tab)
+#include "../Core/Synthesis.h"         // SynthResult ("Synthesis" lower tab)
+#include "../Core/PathExplore.h"       // PathTree ("Path Explorer" lower tab)
 #include "../Core/Cond.h"              // CondOperand (compiled Watch expressions)
 #include <cstdint>
 #include <deque>
@@ -110,7 +110,7 @@ private:
     void computeCallStack(AppContext& ctx, const struct DbgSnapshot& snap);
     void renderGotoPopup(AppContext& ctx);
     void buildSymbolIndex(AppContext& ctx);
-    uint64_t lookupSymbol(AppContext& ctx, const char* name);   // name -> address, 0 if none
+    bool lookupSymbol(AppContext& ctx, const char* name, uint64_t& addressOut);
     void startTextSearch(AppContext& ctx);                      // search disassembly text
     void renderTextSearchPopup(AppContext& ctx);
     // Render text as hover-highlightable tokens: matches of `hl` get a background;
@@ -131,14 +131,15 @@ private:
     std::vector<uint64_t> resolveJumpTable(AppContext& ctx, const Instruction& in); // switch tables
     void renderSidePanel(AppContext& ctx);
     void renderLowerTabs(AppContext& ctx);
-    // F1/F2/F3 advanced features (synchronous on-demand, like the decompiler).
-    void runSynthesis(AppContext& ctx, uint64_t lo, uint64_t end);   // F1: synthesize a region
-    void renderSynthesisTab(AppContext& ctx);                        // F1: results lower tab
-    void openHotPatch(AppContext& ctx, uint64_t siteVA, uint32_t origLen); // F2: open the editor
-    void applyHotPatch(AppContext& ctx);                             // F2: compile + place + patch
-    void renderHotPatchTab(AppContext& ctx);                         // F2: editor lower tab
-    void runPathExplore(AppContext& ctx, uint64_t rootVA);           // F3: explore from here
-    void renderPathExplorerTab(AppContext& ctx);                     // F3: path tree lower tab
+    void renderExportsTab(AppContext& ctx);             // complete PE EAT browser (aliases/ordinals/forwarders)
+    // Advanced analysis features (synchronous on-demand, like the decompiler).
+    void runSynthesis(AppContext& ctx, uint64_t lo, uint64_t end);   // synthesize a region
+    void renderSynthesisTab(AppContext& ctx);                        // results lower tab
+    void openHotPatch(AppContext& ctx, uint64_t siteVA, uint32_t origLen); // open editor
+    void applyHotPatch(AppContext& ctx);                             // compile + place + patch
+    void renderHotPatchTab(AppContext& ctx);                         // editor lower tab
+    void runPathExplore(AppContext& ctx, uint64_t rootVA);           // explore from here
+    void renderPathExplorerTab(AppContext& ctx);                     // path tree lower tab
     void renderCommentPopup(AppContext& ctx);   // edit address -> comment
     void renderRenamePopup(AppContext& ctx);    // edit address -> name
     void invalidateNameDependentCaches();       // user/discovered names changed: refresh picker/pseudocode/etc.
@@ -156,6 +157,7 @@ private:
     // Navigate to a FILE-space address from a side panel / list (functions, bookmarks,
     // imports, ...): records history, and in the live view translates to the runtime VA.
     void gotoStatic(AppContext& ctx, uint64_t fileVA);
+    void gotoExportTarget(const BinaryFile::Export& ex); // code -> Assembly, mapped data -> Hex
     void navBack();                    // step back in navigation history
     void navForward();                 // step forward in navigation history
     void toggleBreakpoint(AppContext& ctx, uint64_t va);   // SW breakpoint at va (+ live debugger)
@@ -176,7 +178,8 @@ private:
     };
     struct CallFrame { uint64_t pc; uint64_t frameSp; std::string name; };
 
-    uint64_t cursorVA_  = 0;     // current focus address
+    uint64_t cursorVA_  = 0;     // current focus address (VA 0 is valid when cursorValid_)
+    bool     cursorValid_ = false;
     int      mainView_  = 0;     // 0=asm 1=pseudo 2=hex 3=cfg 4=live asm 5=callgraph
 
     // The body is a FIXED wireframe layout (disassembler-wireframes.html .wf-body.va):
@@ -210,6 +213,7 @@ private:
     // Shift+click = range from the anchor, Ctrl+click = toggle one line.
     std::unordered_set<uint64_t> selVAs_;
     uint64_t                     selAnchorVA_ = 0;
+    bool                         selAnchorValid_ = false;
     int                          selView_ = -1;   // which listing (0=static,4=live) owns the current selection
 
     // Full-program listing: a cached row index (instruction addresses + function
@@ -266,7 +270,9 @@ private:
     void  pushRowGlow(float yCenter, bool rowAtRip, bool rowSel, bool rowJump, float flash);
     float navFlashAt(uint64_t addr);   // 1..0 decaying flash if addr was just navigated to
     uint64_t hlJumpVA_   = 0;          // branch target of the cursor's instruction (per frame)
-    uint64_t navFlashVA_ = 0;          // navigation arrival flash target (0 = none)
+    bool     hlJumpValid_ = false;     // target VA 0 is representable
+    uint64_t navFlashVA_ = 0;          // navigation arrival flash target (VA 0 allowed)
+    bool     navFlashValid_ = false;
     double   navFlashT0_ = 0.0;        // ImGui::GetTime() when the flash started
     bool     followLiveRip_ = true;
     char     gotoBuf_[32] = "";
@@ -302,7 +308,8 @@ private:
     std::unordered_map<uint64_t, std::string> strCmtCache_;
     uint64_t  strCmtCacheKey_ = 0;
     uint64_t  lastScrolledRip_ = 0;    // focus addr we last auto-scrolled to (live view)
-    uint64_t  lastAsmScroll_   = 0;    // ...and for the static Assembly view
+    uint64_t  lastAsmScroll_   = 0;    // last centered static VA
+    bool      lastAsmScrollValid_ = false;
     // Back/forward history. Each entry remembers whether it was a LIVE (runtime VA,
     // shown in the live view) or STATIC (file VA) location, so navBack/navForward
     // restore the right view instead of feeding a runtime VA into a file-VA view.
@@ -400,7 +407,8 @@ private:
     // ways (external navigation scrolls the hex view; clicking a mapped byte moves
     // the global cursor).
     uint64_t hexCursorOff_   = 0;
-    uint64_t hexLastScroll_  = ~0ull;   // last cursorVA_ we auto-scrolled to
+    uint64_t hexLastScroll_  = 0;       // last cursorVA_ synchronized into Hex
+    bool     hexLastScrollValid_ = false;
     uint64_t hexPendScroll_  = ~0ull;   // pending scroll-to file offset (~0 = none)
     int      hexEditNibble_  = -1;      // -1 idle; 0 = high nibble typed (in hexEditByte_)
     uint8_t  hexEditByte_    = 0;
@@ -419,6 +427,14 @@ private:
     // BinaryFile import table), so call/jmp through the IAT shows the API name.
     std::unordered_map<uint64_t, std::string> importMap_;
     char                  importFilter_[64] = "";
+    char                  exportFilter_[96] = "";
+    char                  exportFilterLast_[96] = "\x01";
+    std::vector<int>      exportVisible_;
+    uint64_t              exportVisSig_ = ~0ull;
+    size_t                exportCodeCount_ = 0;
+    size_t                exportForwardCount_ = 0;
+    size_t                exportDataCount_ = 0;
+    size_t                exportUnmappedCount_ = 0;
     // Comment / rename / breakpoint-condition edit popups.
     uint64_t              annPopupVA_ = 0;
     char                  commentBuf_[512] = "";
@@ -622,13 +638,13 @@ private:
     char                     watchEntry_[160] = "";
     void recompileWatches();                // refill watchProgs_/watchOk_ from watches_
 
-    // ---- F1 clean-room synthesis ("Synthesis" lower tab) ----
+    // ---- clean-room synthesis ("Synthesis" lower tab) ----
     SynthResult synth_;
     bool        synthHave_    = false;
     bool        synthPending_ = false;  // a K_Synthesis worker job is in flight
     bool        synthFocus_   = false;  // focus the Synthesis tab next frame
 
-    // ---- F2 hot-patch editor ("Hot-Patch" lower tab) ----
+    // ---- hot-patch editor ("Hot-Patch" lower tab) ----
     uint64_t    hotSiteVA_  = 0;
     uint32_t    hotOrigLen_ = 0;
     int         hotLang_    = 0;        // 0=asm 1=C 2=Python
@@ -636,7 +652,7 @@ private:
     std::string hotStatus_;
     bool        hotFocus_   = false;
 
-    // ---- F3 path explorer ("Path Explorer" lower tab) ----
+    // ---- path explorer ("Path Explorer" lower tab) ----
     PathTree    pathTree_;
     bool        pathHave_    = false;
     bool        pathPending_ = false;   // a K_PathExplore worker job is in flight

@@ -54,7 +54,7 @@ ControlFlowGraph BuildCFG(const uint8_t* code, size_t size, uint64_t va,
     if (resolveTable) {
         for (const auto& in : lin) {
             if (!endsBlock(in) || !isUncondJmp(in)) continue;
-            if (in.branchTarget) continue;                              // direct jmp: handled normally
+            if (HasBranchTarget(in)) continue;                          // direct jmp: handled normally
             if (in.operands.find('[') == std::string::npos) continue;  // need a memory (table) operand
             std::vector<uint64_t> kept;
             for (uint64_t t : resolveTable(in)) if (idx.count(t)) kept.push_back(t);
@@ -69,7 +69,7 @@ ControlFlowGraph BuildCFG(const uint8_t* code, size_t size, uint64_t va,
         if (!endsBlock(in)) continue;
         uint64_t fall = in.address + in.length;
         if (fall >= lo && fall < hi) leaders.insert(fall);
-        if (in.branchTarget && in.branchTarget >= lo && in.branchTarget < hi)
+        if (HasBranchTarget(in) && in.branchTarget >= lo && in.branchTarget < hi)
             leaders.insert(in.branchTarget);
         for (uint64_t t : in.extraTargets)                      // in-encoding switch cases (JVM)
             if (t >= lo && t < hi) leaders.insert(t);
@@ -135,10 +135,10 @@ ControlFlowGraph BuildCFG(const uint8_t* code, size_t size, uint64_t va,
                     b.succ.push_back(bo->second);
             };
             for (uint64_t tgt : last.extraTargets) link(tgt);
-            if (last.branchTarget) link(last.branchTarget);
+            if (HasBranchTarget(last)) link(last.branchTarget);
             continue;
         }
-        if (last.branchTarget) {
+        if (HasBranchTarget(last)) {
             auto t = blockOf.find(last.branchTarget);
             if (t != blockOf.end()) b.succ.push_back(t->second);
         }

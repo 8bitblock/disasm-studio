@@ -16,6 +16,7 @@ namespace ds {
 
 class BinaryFile;
 class IDisassembler;
+enum class Arch;
 
 struct DiscoveredFunction {
     uint64_t    address = 0;
@@ -32,13 +33,21 @@ public:
     analyze(const BinaryFile& bin, IDisassembler& dis,
             size_t maxFunctions = 50000, size_t maxInstrPerFunc = 4000);
 
+    // Exact-architecture form used by the background pipeline. Raw images do
+    // not encode a machine in their bytes, so the caller's selected Arch must
+    // gate x86/x64 prologue byte-pattern heuristics. The start-at-base seed and
+    // recursive call discovery remain architecture-neutral.
+    std::vector<DiscoveredFunction>
+    analyze(const BinaryFile& bin, IDisassembler& dis, Arch arch,
+            size_t maxFunctions = 50000, size_t maxInstrPerFunc = 4000);
+
     const std::string& lastSummary() const { return summary_; }
 
 private:
     void collectExports(const BinaryFile& bin,
                         std::vector<uint64_t>& seeds,
                         std::vector<std::pair<uint64_t,std::string>>& named);
-    void prologueScan(const BinaryFile& bin, std::vector<uint64_t>& seeds);
+    void prologueScan(const BinaryFile& bin, Arch arch, std::vector<uint64_t>& seeds);
 
     std::string summary_;
 };

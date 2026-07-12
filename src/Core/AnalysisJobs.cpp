@@ -225,20 +225,9 @@ void ScanStringsBuffer(const uint8_t* d, size_t n, uint64_t base,
     if (truncated) *truncated = wasTruncated;
 }
 
-AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
-                                 const std::vector<StrResult>& strings, bool guessNames) {
-    AnalyzeOut out;
-    if (!bin.loaded()) return out;
-
-    FunctionAnalyzer fa;
-    std::vector<DiscoveredFunction> found = fa.analyze(bin, dis);
-    out.functions.reserve(found.size());
-    for (auto& f : found)
-        out.functions.push_back({ f.address, f.size, f.name, false, std::string(), f.isExport });
-    out.summary = fa.lastSummary();
-
-    if (!guessNames || out.functions.empty()) return out;
-
+static void ApplyGuessedNames(AnalyzeOut& out, const BinaryFile& bin,
+                              IDisassembler& dis,
+                              const std::vector<StrResult>& strings) {
     // Imports: an IAT-slot / import-target VA -> "dll.func". Restricted to the import
     // map so the guesser never recurses into the sub_ names we're replacing.
     std::unordered_map<uint64_t, std::string> importMap;
@@ -259,9 +248,14 @@ AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
         return (it != strings.end() && it->address == va) ? it->text : std::string();
     };
 
-    uint64_t entryVA = bin.entryPoint() ? bin.imageBase() + bin.entryPoint() : 0;
+    const bool rawStart = bin.format() == BinFormat::Raw;
+    const bool headerEntry = bin.entryPoint() != 0;
+    const uint64_t startVA = rawStart ? bin.imageBase()
+                                     : (headerEntry ? bin.imageBase() + bin.entryPoint() : 0);
     FunctionNamer namer;
-    std::vector<GuessedName> guesses = namer.name(bin, dis, in, entryVA, importNameFor, stringRefFor);
+    std::vector<GuessedName> guesses = namer.name(
+        bin, dis, in, startVA, rawStart || headerEntry, rawStart,
+        importNameFor, stringRefFor);
 
     int guessed = 0;
     for (size_t i = 0; i < out.functions.size() && i < guesses.size(); ++i) {
@@ -275,6 +269,36 @@ AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
         char extra[48]; std::snprintf(extra, sizeof(extra), "  (+%d named by heuristics)", guessed);
         out.summary += extra;
     }
+}
+
+static AnalyzeOut MaterializeFunctions(std::vector<DiscoveredFunction> found,
+                                       std::string summary) {
+    AnalyzeOut out;
+    out.functions.reserve(found.size());
+    for (auto& f : found)
+        out.functions.push_back({ f.address, f.size, f.name, false, std::string(), f.isExport });
+    out.summary = std::move(summary);
+    return out;
+}
+
+AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
+                                 const std::vector<StrResult>& strings, bool guessNames) {
+    if (!bin.loaded()) return {};
+    FunctionAnalyzer fa;
+    std::vector<DiscoveredFunction> found = fa.analyze(bin, dis);
+    AnalyzeOut out = MaterializeFunctions(std::move(found), fa.lastSummary());
+    if (guessNames && !out.functions.empty()) ApplyGuessedNames(out, bin, dis, strings);
+    return out;
+}
+
+AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
+                                 const std::vector<StrResult>& strings, bool guessNames,
+                                 Arch arch) {
+    if (!bin.loaded()) return {};
+    FunctionAnalyzer fa;
+    std::vector<DiscoveredFunction> found = fa.analyze(bin, dis, arch);
+    AnalyzeOut out = MaterializeFunctions(std::move(found), fa.lastSummary());
+    if (guessNames && !out.functions.empty()) ApplyGuessedNames(out, bin, dis, strings);
     return out;
 }
 
@@ -360,7 +384,7 @@ std::vector<CallEdgeR> BuildCallEdges(const BinaryFile& bin, IDisassembler& dis,
         while (off < win && guard++ < 50000) {
             Instruction in;
             if (!dis.decodeOne(p + off, win - off, f.address + off, in) || !in.length) { ++off; continue; }
-            if (in.isCall && in.branchTarget && fset.count(in.branchTarget) && seen.insert(in.branchTarget).second)
+            if (in.isCall && HasBranchTarget(in) && fset.count(in.branchTarget) && seen.insert(in.branchTarget).second)
                 edges.push_back({ f.address, in.branchTarget });
             off += in.length;
         }
