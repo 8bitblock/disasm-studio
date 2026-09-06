@@ -1,6 +1,6 @@
 # DisasmStudio — Project Overview, Purpose & Architecture
 
-> **DisasmStudio is a fast, GPU-accelerated reverse-engineering workbench for Windows: a static disassembler *and* a real live debugger in one self-contained application.** It loads PE/ELF/Mach-O and raw binaries across ten CPU architectures, disassembles them, recovers functions and control flow, **guesses meaningful names for unknown functions**, decompiles them into readable pseudo-C, lets you debug a running process down to the instruction, scan and edit memory, diff binaries, detect capabilities, patch bytes, and persist all of your analysis — inside one polished, themeable, single-window UI. Think "x64dbg meets a lite IDA," built in C++20 on Dear ImGui + Direct3D 11.
+> **DisasmStudio is a fast, GPU-accelerated reverse-engineering workbench for Windows: a static disassembler *and* a real live debugger in one self-contained application.** It loads PE/ELF/Mach-O, Java class, and raw binaries across twelve native CPU modes plus JVM bytecode, including x86-16 real mode and Thumb/Thumb-2, disassembles them, recovers functions and control flow, **guesses meaningful names for unknown functions**, decompiles them into readable pseudo-C, lets you debug a running process down to the instruction, scan and edit memory, diff binaries, detect capabilities, patch bytes, and persist all of your analysis — inside one polished, themeable, single-window UI. Think "x64dbg meets a lite IDA," built in C++20 on Dear ImGui + Direct3D 11.
 
 **Audience for this document:** an engineer or technical evaluator who has never seen the codebase and wants to understand, completely, what DisasmStudio *is*, *what it is for*, *everything it can do*, and *how it is built*. Every chapter is grounded in the actual source; nothing here is aspirational unless explicitly labelled "roadmap" or "out of scope."
 
@@ -17,7 +17,8 @@ It is built around a deliberate philosophy:
 - **Be a real tool, not a mockup.** Every headline feature is backed by working code: accurate multi-architecture disassembly, an actual control-flow-and-data-flow decompiler, a genuine Win32 debugger that attaches to and single-steps live processes, real PE/ELF/Mach-O parsing, real network/process inspection, real binary patching that writes back to disk.
 - **Static *and* dynamic in one place.** Most tools make you choose between reading code (a disassembler) and running it (a debugger). DisasmStudio unifies both: the same addresses, names, comments, and breakpoints carry across the static listing and the live debuggee, with automatic translation for ASLR.
 - **Recover *meaning*, not just bytes.** A raw disassembly is a wall of `sub_140001000` and `mov rax, [rcx+8]`. DisasmStudio layers understanding on top: it **guesses function names** from behaviour (`read_file`, `net_send`, `inject_thread`, `j_CreateFileW`), inlines the strings and API calls each instruction touches, writes a plain-language gloss of what each instruction does, and decompiles whole functions into structured pseudo-C with named locals and inferred signatures.
-- **Be fast and stay fast.** The UI is GPU-accelerated (hardware Direct3D 11) and every large list (instructions, functions, strings, hex) is clipper-rendered and aggressively cached so that even an 800,000-instruction program stays fluid.
+- **Organize authorization evidence honestly.** The bounded Authorization Trail presents input/format evidence, request and entitlement handling, exact verifier and persistent-field lineage, ranked global/secondary predicates, and protected operations in conceptual stage order. Independently evidenced stages are not presented as one connected path; exact edges are claimed only where data/control-flow proof exists. It keeps local format validity, server acceptance, signature verification, and feature permission as separate conclusions instead of turning a nearby “Pro” string or successful API call into a verdict.
+- **Be fast and stay fast.** The UI is GPU-accelerated (hardware Direct3D 11), and every large list (instructions, functions, strings, hex) is clipper-rendered and aggressively cached. The assembly view has no fixed instruction cap: multi-million-instruction images use a virtual row index and decode only visible 4 KiB code pages into a bounded cache.
 - **Be self-contained and dependency-light.** The whole product compiles to a *single* statically-linked `DisasmStudio.exe` that needs no installer, no runtime redistributable, and no DLLs beside it. Where a dependency would add weight or risk, the project hand-rolls a focused replacement (its own JSON library, its own decompiler, its own capability scanner).
 - **Keep the analyst in control.** There is, by deliberate design, **no scripting or plugin API** — the surface area is the curated, hand-built workbench, not an extension platform. Heuristic results are always *labelled* as heuristic (and colour-coded), and any guess the tool makes can be overridden by a one-keystroke rename that then propagates everywhere.
 
@@ -35,10 +36,10 @@ DisasmStudio is one self-contained Windows executable that can do **all** of the
 3. **Load thin Mach-O** (32- and 64-bit macOS binaries).
 4. **Open arbitrary bytes as a flat "raw" blob** at a chosen base address (shellcode, firmware, memory dumps) with a chosen architecture.
 5. **Auto-detect the file format** from its magic bytes and **auto-select the CPU architecture** from the header.
-6. **Disassemble ten architectures:** x86, x64, ARM, ARM64, MIPS, MIPS64, PowerPC, PPC64, RISC-V 32, and RISC-V 64.
-7. **Use the right engine automatically:** Zydis for the x86/x64 fast path, Capstone for everything else, behind one engine-neutral interface (switchable at runtime).
-8. **Render a full-program assembly listing** with function dividers, clipper-rendered up to ~800k instructions without stalling.
-9. **Never get stuck on undecodable bytes** — they fall back to `db` pseudo-ops so the listing always advances.
+6. **Disassemble twelve native CPU modes plus JVM bytecode:** x86-16, x86, x64, A32, Thumb/Thumb-2, A64, MIPS, MIPS64, PowerPC, PPC64, RISC-V 32, and RISC-V 64.
+7. **Use the right engine automatically:** Zydis for the x86-family fast path, Capstone for every other native architecture, and the JVM backend for bytecode, behind one engine-neutral interface.
+8. **Render a full-program assembly listing** with function dividers and no global instruction cap; a virtual row index materializes only requested 4 KiB code pages into a bounded cache.
+9. **Never get stuck on undecodable bytes** — they fall back to data pseudo-ops with an ISA-aligned stride so the listing always advances without destroying ARM/Thumb alignment.
 10. **Translate freely between virtual addresses and file offsets**, uniformly across all formats.
 
 ### Discover & understand code
@@ -77,7 +78,7 @@ DisasmStudio is one self-contained Windows executable that can do **all** of the
 37. **Add your own comments** at any address, shown inline.
 
 ### Debug a live process
-38. **Attach to a running process or launch a new one** under the debugger.
+38. **Attach to a running process, launch an executable, or debug a validated PE DLL** through a bitness-matched trusted `rundll32.exe` or custom host; DllMain/export breakpoint RVAs are retargeted on the DLL's actual ASLR load event.
 39. **Break at the real program entry point**, not the loader stub.
 40. **Set software (`int3`) breakpoints** that auto-restore, step, and re-arm.
 41. **Set conditional breakpoints** with a register/memory comparison expression.
@@ -90,12 +91,12 @@ DisasmStudio is one self-contained Windows executable that can do **all** of the
 48. **Walk the call stack** (clearly labelled heuristic) and inspect the raw stack with symbol/string annotations.
 49. **Debug 32-bit (WOW64) targets** via the WOW64 context.
 50. **Pin watch expressions** that re-evaluate at every stop.
-51. **See a live-updating disassembly and pseudocode** that follow RIP.
+51. **See a live-updating disassembly and pseudocode** that follow RIP, collect bounded one-shot basic-block execution coverage, and run a checked **Break after call** authorization experiment that observes AL/EAX/RAX and temporarily forces/restores only that stopped return register.
 
 ### Inspect & manipulate memory
-52. **Scan process memory like Cheat Engine** — exact / bigger / smaller / changed / unchanged / unknown-initial value scans.
-53. **Edit memory in a viewer/editor** with write-through to the live process.
-54. **Browse memory regions** and **maintain an address table with per-entry freeze.**
+52. **Scan process memory beyond the basic Cheat Engine workflow** — passive or debugger-backed targets; signed/unsigned integers, floats, AOB `??`, and UTF-8/UTF-16; exact/not-equal/ordered/between/changed/unchanged/increased/decreased/delta/unknown scans with exact-count paging and region/range/alignment filters.
+53. **Inspect and edit a 256-byte live hex/ASCII selection**, browse searchable memory regions, follow pointers, and jump directly from Live RIP.
+54. **Find bounded pointer chains** with module-relative roots, and save/load JSON address tables with inert-on-load rows plus identity-checked constant/minimum/maximum freeze policies.
 
 ### Search, scan & compare
 55. **Byte-pattern (signature) scanning with `??` wildcards**, against the file or live memory.
@@ -104,38 +105,38 @@ DisasmStudio is one self-contained Windows executable that can do **all** of the
 58. **Diff two binaries** in synchronized hex panes with per-byte difference highlighting.
 
 ### Detect capabilities & triage
-59. **Run a capability/"tech" scan** that infers what a binary *can do* from its imports, sections (incl. packer signatures), and byte patterns — colour-coded by confidence, with click-to-code.
+59. **Run a capability/"tech" scan and automatic Authorization Trail**: rank boolean predicates by proven consumer fan-out, follow exact call-return/field/guard relationships where available, present other stages as independent evidence, and keep every conclusion evidence-graded and independently navigable.
 60. **Enumerate running processes and their modules** natively.
 61. **View live per-process TCP/UDP (IPv4) connection tables.**
 
 ### Patch binaries
-62. **Patch bytes by hex or by typing assembly** (Keystone-assembled for x86/x64/ARM/ARM64), with NOP-padding of short encodings.
+62. **Patch bytes by hex or by typing assembly** (Keystone-assembled for x86/x64/A32/Thumb/A64), with ISA-correct NOP-padding of short encodings and inert, fail-closed advice for narrowly proved centralized boolean predicates.
 63. **Patch live debuggee memory** or the static image.
-64. **Revert any patch** to its exact original bytes.
+64. **Revert an individual patch or organize patches into named experiment sets**, enable/disable or revert a set independently, and compare Baseline/Current/single-set selections without mutation.
 65. **Save a patched copy of the binary to disk** (patches spliced back through the file offsets).
 
 ### Annotate, persist & report
 66. **Comment, rename, and bookmark** any address.
-67. **Auto-save all analysis per binary** — comments, renames, bookmarks, breakpoints + conditions, patches, notes, watches, and last cursor.
+67. **Auto-save all analysis per binary** — comments, renames, bookmarks, breakpoints + conditions, version-4 named patch sets and membership, notes, watches, and last cursor.
 68. **Key analysis to the binary's content hash**, so it follows the bytes even if the file is moved or renamed.
 69. **Reopen recent targets** from a Projects dashboard with a saved-analysis summary.
 70. **Export a full analysis report** to Markdown or HTML (named, decompiled functions, comments, bookmarks, metadata).
+71. **Save assembly or C source** for the whole analyzed program or the function under the cursor; assembly follows every active decoder, while x86/x64 C can be readable pseudo-C or a self-contained compilable C11 translation unit, generated on a cancellable background worker with progress.
 
 ### Navigate & work efficiently
-71. **Unified back/forward navigation history** (aware of static vs live locations), goto-by-address, and a symbol picker.
-72. **Mouse back/forward, `Alt`+←/→, and per-instruction keys** (`Enter` follow, `;` comment, `N` rename, `B` breakpoint, `X` xrefs, `J`/`K` step).
-73. **Branch arrows** drawn in a flow gutter in the listing.
-74. **Eight built-in colour themes** (Midnight, Slate, Light, Monokai, Solarized Dark, Dracula, Nord, Matrix), switchable live and remembered across sessions.
-75. **A fixed, browser-style single-window UI** with a top tab strip — no fiddly docking to manage.
+72. **Unified back/forward navigation history** (aware of static vs live locations), goto-by-address, and a symbol picker.
+73. **Mouse back/forward, `Alt`+←/→, and per-instruction keys** (`Enter` follow, `;` comment, `N` rename, `B` breakpoint, `X` xrefs, `J`/`K` step).
+74. **Branch arrows** drawn in a flow gutter in the listing.
+75. **Eight built-in colour themes** (Midnight, Slate, Light, Monokai, Solarized Dark, Dracula, Nord, Matrix), switchable live and remembered across sessions.
+76. **A fixed, browser-style single-window UI** with a top tab strip — no fiddly docking to manage.
 
 ### Engineering qualities
-76. **Ships as one statically-linked, self-contained `.exe`** — no installer, no redistributable, no side-by-side DLLs (only the OS's `d3dcompiler_47.dll`).
-77. **GPU-accelerated, vsync-capped rendering** with occlusion-aware frame skipping.
-78. **A testable Core** — the pure logic (loaders, decompiler, data-flow, function namer, xrefs, JSON, conditions, step logic, tech-scan) is decoupled from the UI and unit-tested off-target.
-79. **Dependency-light by design** — hand-rolled JSON, decompiler, and capability scanner; only Zydis/Capstone/Keystone/ImGui as third-party libraries.
+77. **Ships as one statically-linked, self-contained `.exe`** — no installer, no redistributable, no side-by-side DLLs (only the OS's `d3dcompiler_47.dll`).
+78. **GPU-accelerated, vsync-capped rendering** with occlusion-aware frame skipping.
+79. **A testable Core** — the pure logic (loaders, firmware sniffing/jump recovery, listing-region planning, decompiler, data-flow, function namer, xrefs, JSON, conditions, step logic, trace-coverage state, DLL launch planning, tech-scan, source export) is decoupled from the UI and unit-tested off-target.
+80. **Dependency-light by design** — hand-rolled JSON, decompiler, and capability scanner; only Zydis/Capstone/Keystone/ImGui as third-party libraries.
 
 ### Advanced / experimental
-80. **An optional AMD-V (SVM) hardware-assisted debugging backend** (user-mode client + kernel driver) for research into low-artifact introspection — opt-in, hardware-specific, and with driver packaging/signing/loading explicitly out of scope (see Chapter 11).
 
 ---
 
@@ -149,7 +150,7 @@ DisasmStudio is built for anyone who needs to understand a binary they did not w
 - **Firmware & shellcode analysts.** Open raw blobs at the right base/arch and disassemble non-x86 ISAs (ARM/MIPS/PPC/RISC-V).
 - **Students & the curious.** Use the per-instruction "Explain" gloss and readable pseudocode to learn how compiled code actually works.
 
-A typical first-pass workflow: **Open** the target → DisasmStudio auto-analyzes (functions, strings, imports, **guessed names**) → skim the **Functions** list and **Binary Tech** capabilities → **decompile** the interesting functions → **comment/rename** as understanding grows (auto-saved) → **attach/launch** to confirm behaviour dynamically → **patch** and/or **export** the findings.
+A typical first-pass workflow: **Open** the target (or review the detected mapping/entry for raw firmware) → DisasmStudio auto-analyzes (functions, strings, imports, **guessed names**) → choose the visible/folded listing regions in **Sections** → skim the **Functions** list and **Binary Tech** capabilities → **decompile** the interesting functions → **comment/rename** as understanding grows (auto-saved) → **attach/launch** or **Debug DLL…** to confirm behaviour dynamically, optionally collecting execution coverage → **patch** and/or export a report, whole-program/current-function assembly, or readable/compilable C from the **File** menu.
 
 ---
 
@@ -177,11 +178,10 @@ These are the standing rules the codebase holds itself to (see CLAUDE.md and Cha
 | 4 | Static Code Analysis | Function discovery, **name guessing**, CFG, xrefs, symbols, and capability detection. |
 | 5 | Decompiler & Data-Flow | Dominator-based structuring + a data-flow pass producing readable pseudo-C. |
 | 6 | The Live Win32 Debugger | Threaded event loop, breakpoints, stepping, conditions, WOW64, and the debugging UI. |
-| 7 | The Binary View Workspace | The centerpiece: six main views, side panel, lower sub-tabs, navigation, annotations, patching. |
+| 7 | The Binary View Workspace | The centerpiece: six main views, side panel, lower sub-tabs, navigation, annotations, patching, and source export. |
 | 8 | The Other Workbench Tabs | Projects, Communications, Sig Scanner, Memory Tools, Binary Diff, Binary Tech. |
-| 9 | Persistence, Projects & Reporting | Hash-keyed JSON sidecars, the recents index, and Markdown/HTML report export. |
+| 9 | Persistence, Projects & Reporting | Hash-keyed JSON sidecars, recents, ASM/C source export, and Markdown/HTML reports. |
 | 10 | UI, Theming & Fonts | Eight palette-derived themes, semantic colour accents, and the font system. |
-| 11 | Hypervisor (AMD-V/SVM) Backend & Kernel Driver | The optional, experimental hardware-assisted debugging backend (out-of-scope to operationalize). |
 | 12 | Build, Testing & Verification | One static self-contained exe, and how the Core logic is unit-tested off-target. |
 | 13 | Appendix | Source-coverage map, heuristic-output honesty, explicit non-goals, and roadmap. |
 
@@ -277,7 +277,7 @@ font/style/DX11 resource mutation remains outside `WndProc` at the between-frame
 notes it is intentionally the lowest-numbered icon resource so Windows Explorer uses
 it as the executable's shell icon. `src/app.rc` declares
 `IDI_APPICON ICON "app.ico"` (a multi-resolution `.ico`, regenerated by
-`gen_app_icon.ps1`) plus a `VS_VERSION_INFO` block (file/product version `0.1.0.0`,
+`gen_app_icon.ps1`) plus a `VS_VERSION_INFO` block (file/product version `1.0.0.0`,
 company/product `DisasmStudio`, `OriginalFilename DisasmStudio.exe`). The icon is thus
 embedded into the EXE and loaded at startup for window, taskbar, and alt-tab use.
 
@@ -286,13 +286,14 @@ embedded into the EXE and loaded at startup for window, taskbar, and alt-tab use
 `ds::App` is the top-level controller, instantiated once on the stack in `wWinMain`.
 Its constructor (`App()`):
 
-- `loadPrefs()` reads `%APPDATA%/DisasmStudio/prefs.ini` (a tiny `key=value` file storing
-  `theme=` and `density=`) and `theme::ApplyTheme(theme_)` restyles ImGui.
+- `loadPrefs()` reads `%APPDATA%/DisasmStudio/prefs.ini` (bounded theme/density,
+  opt-in symbol policy/cache, and recent-investigation settings) and
+  `theme::ApplyTheme(theme_)` restyles ImGui.
 - `ctx_.rebuildDisassembler()` builds the initial disassembler.
-- It constructs the **seven tabs in fixed order** and stores them as
-  `std::vector<std::unique_ptr<ITab>>`: `ProjectsTab`, `CommunicationsTab`,
-  `SigScannerTab`, `BinaryViewTab`, `MemoryToolsTab`, `BinaryDiffTab`,
-  `BinaryTechTab`. This vector *is* the tab strip order.
+- It constructs the fixed top-level workbench tabs and stores them as
+  `std::vector<std::unique_ptr<ITab>>`: Projects, Communications, Connections,
+  Sig Scanner, Binary View, Memory Tools, Binary Diff, Binary Tech, Cortex, and Prism.
+  This vector *is* the top tab-strip order.
 
 The destructor (`~App()`) calls `ctx_.saveProject()` so analysis is flushed when the
 window closes (Alt+F4 / WM_DESTROY path).
@@ -304,15 +305,20 @@ app's shared blackboard. Key members:
 
 - `BinaryFile binary` — the loaded target (PE/ELF/Mach-O/raw); see chapter on loaders.
 - `Debugger debug` — the live Win32 debugger (own thread, lock-guarded snapshot).
+- `CodeExportService codeExport` — a dedicated one-job source-export worker. It builds
+  an independent decoder and streams ASM/C without borrowing the UI decoder or occupying
+  the load-time analysis worker.
 - `Engine engine` (default `Zydis`), `Arch arch` (default `X64`),
   `std::unique_ptr<IDisassembler> disasm` — the active decode engine. Note the
   Debugger owns its **own** decoder and is *not* wired to the UI's `disasm`.
 - `ProjectState project` — the per-binary analysis sidecar (comments, renames,
-  bookmarks, breakpoints, patches, notes, cursor), persisted as JSON keyed by content
-  hash.
+  bookmarks, breakpoints, patches, notes, cursor, and raw mapping identity), persisted as
+  versioned JSON keyed by content hash.
 - **Cross-tab request flags**: `requestedTab` (name of a tab to switch to next
-  frame), `requestedLiveAssembly`, `requestedExportAnalysis`, `binaryJustLoaded`,
-  `pendingSignature` (Binary View → Sig Scanner pattern handoff).
+  frame), `requestedLiveAssembly`, `requestedExportAnalysis`, `requestedCodeExport`
+  plus `requestedCodeExportFormat`, `requestedDebugDll`, the trace toggle/clear/cancel
+  flags, `binaryJustLoaded`, and `pendingSignature`
+  (Binary View → Sig Scanner pattern handoff).
 - **Go-to plumbing**: `requestedGotoVA` + `hasGotoRequest` (the bool distinguishes
   "go to VA 0" from "no request"). The helper `gotoAddress(va)` sets both and forces
   `requestedTab = "Binary View"` — this is the single canonical way any tab asks the
@@ -325,26 +331,40 @@ app's shared blackboard. Key members:
 `AppContext` also owns the high-level commands shared across tabs:
 `rebuildDisassembler()` (`disasm = MakeDisassembler(engine, arch)`), `openBinaryDialog()`
 (Win32 `commdlg` open), `loadBinaryPath()`, `loadRawPath()`, `saveProject()`,
-`exportAnalysisFile()`, `openLiveAssemblyView()`, and the private
+`exportAnalysisFile()`, `selectCodeExportPath()`, `openLiveAssemblyView()`, and the private
 `loadProjectForBinary()`.
+
+Direct launch eligibility deliberately distinguishes PE executables from DLLs:
+`binaryLaunchable()` excludes `IMAGE_FILE_DLL`, while `binaryDllDebuggable()` requires
+a file-backed x86/x64 PE DLL. The latter routes to the App-owned Debug DLL modal and
+the validated hosted-launch plan instead of ever passing a DLL to `CreateProcessW`.
 
 #### Binary loading & project lifecycle
 
 `loadBinaryPath(path)` is the spine of opening a file:
 1. `saveProject()` first — persist the **outgoing** target's analysis before swapping.
-2. `binary.load(path)`; on failure return false.
-3. `arch = archFromMachine(binary.machine(), binary.is64Bit())` — the architecture is
+2. Drain both image readers: `codeExport.cancelAndWaitIdle()` cancels any source export,
+   then `analysis.cancelAndWaitIdle()` drains load-time analysis before bytes are replaced.
+3. `binary.load(path)`; on failure return false.
+4. `arch = archFromMachine(binary.machine(), binary.is64Bit())` — the architecture is
    auto-selected from the file header (the `archFromMachine` switch maps every
    `MachineArch` to an `Arch`, defaulting to x64/x86 by bitness).
-4. `rebuildDisassembler()`, then `loadProjectForBinary()` to restore the sidecar.
-5. `binaryJustLoaded = true` so Binary View re-homes to the entry point and re-analyzes.
+5. `rebuildDisassembler()`, then `loadProjectForBinary()` to restore the sidecar.
+6. `binaryJustLoaded = true` so Binary View re-homes to the entry point and re-analyzes.
+
+The export request holds a borrowed `BinaryFile*`, so that first drain is a lifetime
+requirement, not just a stale-result optimization. `expectedImageRevision` rejects work
+whose image revision changed at safe checkpoints, but never substitutes for joining the
+worker before load, close, patch, or another mutation that may reallocate image storage.
 
 `loadProjectForBinary(applySavedArchEngine=true)` resets `project`, hashes the binary
 (`binary.contentHash()`), and `LoadProject(h, loaded)`. If a saved sidecar exists and
 `applySavedArchEngine` is true, the **saved engine/arch are reapplied** (via
 `ArchFromName`/`EngineFromName` + `rebuildDisassembler`) so a binary reopens exactly as
-last analyzed — crucial for raw blobs and mis-detected headers. It then stamps fresh
-metadata (hash, path, arch/engine names, display name, `lastOpenedUnix`).
+last analyzed. For a raw candidate, a valid saved base, explicit entry, and named landmark
+set are re-staged before VA-keyed annotations are restored; corrupt saved mapping metadata
+is ignored rather than shifting annotations or making the file unopenable. It then stamps
+fresh metadata (hash, path, arch/engine names, display name, `lastOpenedUnix`).
 
 `loadRawPath(path, base, arch)` is the "Open as Raw" path: it calls `binary.loadRaw`,
 sets the user-chosen arch, and calls `loadProjectForBinary(false)` so the **dialog's
@@ -358,7 +378,7 @@ the persisted arch/engine (so an Engine-menu change since load is captured) and 
 
 Called exactly once per loop iteration, `render()` draws the shell top-to-bottom:
 `renderMenuBar()` → `renderDebugToolbar()` → `renderMainWindow()` → `renderStatusBar()`
-→ `renderRawLoadPopup()` → `renderSaveResultPopup()`, plus the optional ImGui demo and
+→ `renderRawLoadPopup()` → `renderDllDebugPopup()` → `renderSaveResultPopup()`, plus the optional ImGui demo and
 About windows. The three full-width bars are positioned manually against
 `ImGui::GetMainViewport()` work area: a debug toolbar pinned to the top, the tab window
 filling the middle, and a status bar pinned to the bottom. All three are flagged
@@ -371,7 +391,8 @@ as fixed chrome, not floating panels.
 A standard `BeginMainMenuBar`:
 
 - **File**: *Open Binary…* (Ctrl+O, `openFileDialog`), *Open as Raw…*
-  (`openRawFileDialog`), *Save Binary As…* (enabled only when loaded; splices
+  (`openRawFileDialog`), *Debug DLL…* (only for a validated file-backed x86/x64 PE
+  DLL), *Save Binary As…* (enabled only when loaded; splices
   accumulated patches — see below), *Export Analysis…* (sets
   `requestedExportAnalysis` + switches to Binary View, which produces the report),
   *Close Binary* (flush, `binary.clear()`, `project.reset()`), and *Exit* (flush +
@@ -391,12 +412,14 @@ A standard `BeginMainMenuBar`:
 #### Debug toolbar (`renderDebugToolbar`)
 
 A full-width borderless window at the top. It reads a `DbgSnapshot` from the Debugger
-and branches on attach state. When detached: if a binary is loaded it shows
-**Launch & Debug** (calls `debug.launchAndAttach`, on success opens the live assembly
-view, on failure stores `launchMsg_` shown in red); otherwise a hint to attach via the
+and branches on attach state. When detached: an executable shows **Launch & Debug**
+(calls `debug.launchAndAttach`), while a DLL opens **Debug DLL…** instead; successful
+launches open the live assembly view and failures become toasts. Otherwise it shows a hint to attach via the
 Communications tab. When attached it shows **Detach**, **Continue/Pause** (label and
 color flip with run state), **Step Into / Step Over / Step Out / Run to Cursor** (the
-stepping buttons disabled unless paused), and a live status line with PID, bitness,
+stepping buttons disabled unless paused), plus **Trace / Clear Trace**. Trace is
+startable only while paused with an analyzed image, remains stoppable during discovery
+or planting, and forwards its request to Binary View's incremental block planner. A live status line shows PID, bitness,
 state, RIP/EIP, RSP/ESP, and the last debug event. Keyboard shortcuts are bound here
 (only when ImGui is not capturing text input): **F5** continue/pause, **F11** step
 into, **Shift+F11** step out, **F10** step over, **Ctrl+F9** run to cursor (using
@@ -425,11 +448,17 @@ mirrored copy Binary View writes each frame.
 #### Modal popups
 
 `renderRawLoadPopup` is the "Open as Raw" modal: it shows the chosen file, a base-address
-hex input (accepts `0x`-prefixed or bare hex via `sscanf("%llx")`), and x86/x64/ARM/ARM64
-radio buttons, then calls `loadRawPath` and switches to Binary View. The chosen architecture
+hex input (accepts `0x`-prefixed or bare hex via `sscanf("%llx")`), and
+x86-16/x86/x64/A32/Thumb/A64 radio buttons, then calls `loadRawPath` and switches to Binary View. The chosen architecture
 is retained as the exact worker/discovery architecture; the loader creates the complete
 executable `.raw` section and rejects a base+length range that would overflow. `renderSaveResultPopup`
 shows the result message from *Save Binary As…*.
+
+`renderDllDebugPopup` inspects the current image with `InspectDllForDebug`, offers a
+callable export and user arguments, selects the bitness-matched trusted system
+`rundll32.exe` or a browsed/bitness-checked custom host, and lets the analyst arm
+DllMain and/or export stops. It displays planning warnings/errors before enabling
+launch, then calls `Debugger::launchAndAttachDll` with the Windows-quoted plan.
 
 #### Save Binary As — patch splicing
 
@@ -474,8 +503,8 @@ function/string/listing pipeline for structured and raw images.
   browser-style panel arrangement remains an explicit app layout rather than a user dockspace.
 - **Hardware-first, WARP fallback**: if no D3D11 hardware device is available the app
   silently falls back to the WARP software rasterizer; if even that fails, startup aborts.
-- `Open as Raw` exposes only **x86/x64/ARM/ARM64** in its radio set, even though the
-  Engine menu offers more architectures (MIPS/PPC/RISC-V); raw blobs of those arches
+- `Open as Raw` exposes **x86-16/x86/x64/A32/Thumb/A64** directly. The Engine menu offers
+  more architectures (MIPS/PPC/RISC-V); raw blobs of those architectures
   would need the Engine-menu arch switch after loading.
 - The base-address parser in the raw popup tolerant-parses hex and does not reason about
   overlap with another real image; `BinaryFile` still rejects a flat range whose final VA
@@ -518,7 +547,7 @@ Two design choices are worth calling out. First, the text fields (`bytes`, `mnem
 
 #### The `Arch` and `Engine` enums and helpers
 
-`enum class Arch { X86, X64, ARM, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV32, RISCV64 }` enumerates every supported architecture; `enum class Engine { Zydis, Capstone }` the two backends. Several free helpers in the same header glue this to the rest of the app:
+`enum class Arch { X86_16, X86, X64, ARM, THUMB, ARM64, MIPS, MIPS64, PPC, PPC64, RISCV32, RISCV64, JVM }` enumerates every supported architecture and decoder mode; `enum class Engine { Zydis, Capstone }` the two native backends. A32 and Thumb remain distinct fixed modes, and explicit capability helpers gate x86-only decompilation/debugging versus x86/x64/A32/Thumb/A64 assembly. Several free helpers in the same header glue this to the rest of the app:
 
 - `ArchIsX86(Arch a)` — `true` only for `X86`/`X64`. This single predicate drives backend routing (the factory) *and* assembler capability checks.
 - `ArchName(Arch)` / `ArchFromName(const char*, Arch&)` — a name↔enum pair (e.g. `"RISC-V 32"` ↔ `RISCV32`). The inverse exists specifically so the chosen architecture can be saved into the per-binary JSON sidecar and restored exactly on reopen.
@@ -550,14 +579,14 @@ Because Capstone's generic groups don't cover every architecture's idioms, the b
 
 - **Flags from groups:** `CS_GRP_CALL` → `isCall`+`isBranch`; `CS_GRP_RET` → `isRet`; `CS_GRP_JUMP`/`CS_GRP_RET`/`CS_GRP_BRANCH_RELATIVE` → `isBranch`.
 - **Return detection by mnemonic** (`arch != X86/X64`): Capstone's generic `CS_GRP_RET` does not fire for several non-x86 returns, so they are detected textually — MIPS `jr $ra`, PPC `blr`/`blrl`/`bclr`, ARM `bx lr` / `pop {…pc}` / `ldm…{…pc}` / `mov pc, lr`, RISC-V `ret` / `jr ra` / `jalr zero, ra`. This is what keeps CFG block boundaries and step-out classification correct under Capstone for every architecture.
-- **`branchTarget`** is read from the first immediate operand in the arch-specific detail union (`cs_x86`/`cs_arm64`/`cs_arm`/`cs_mips`/`cs_ppc`/`cs_riscv`) via `branchTargetFor`. Capstone resolves relative branches to absolute addresses for every architecture, so this yields the same `branchTarget` the Zydis path produces for x86 — and extends it to ARM/ARM64/MIPS/PPC/RISC-V, which is exactly what CFG, xref, call-graph, and goto navigation depend on.
+- **`branchTarget`** is read from the first immediate operand in the arch-specific detail union (`cs_x86`/`cs_arm64`/`cs_arm`/`cs_mips`/`cs_ppc`/`cs_riscv`) via `branchTargetFor`. Capstone resolves relative branches to absolute addresses for every architecture, so this yields the same `branchTarget` the Zydis path produces for x86 — and extends it to A32/Thumb/A64/MIPS/PPC/RISC-V, which is exactly what CFG, xref, call-graph, and goto navigation depend on.
 - **`isRepString`** is computed only for x86/x64 via `isRepStringInsn`, which checks both the group-1 prefix byte (`cs_x86.prefix[0]`) *and* a `"rep"`-prefixed mnemonic, then requires a real string-op base (`movs/stos/cmps/scas/lods/ins/outs`) to avoid mis-flagging SSE instructions that carry a mandatory `0xF2`/`0xF3`.
 
 ### `decodeOne` vs `disassemble`, and never-stall decoding
 
-`decodeOne` is the surgical path: one instruction from a buffer, `false` on failure. The debugger's live-assembly and step logic use it. `disassemble` is the bulk path used to build listings.
+`decodeOne` is the surgical path: one instruction from a buffer, `false` on failure. The debugger's live assembly, step logic, and lazy 4 KiB listing-page materializer use it. `disassemble` remains the caller-bounded bulk path for analysis and export work.
 
-Both backends share a **resync-on-error** strategy so a bad byte never stalls the stream. On a decode failure, each emits a synthetic 1-byte pseudo-instruction with mnemonic `"db"` and operand `0xNN` (the raw byte), then advances exactly one byte and continues. This guarantees forward progress through data, padding, or genuinely undecodable bytes — important for a full-program listing that must cover every byte of a section. Both honour `maxInstructions` (the full-program listing caps at ~800k instructions per the project conventions).
+Both backends share a **resync-on-error** strategy so malformed input never stalls the stream. x86 emits a one-byte synthetic `db`; fixed-width/halfword-aligned ARM-family modes consume an architecture-aligned fallback unit so one invalid word cannot shift every subsequent decode off its legal boundary. The lazy listing uses the same rule. Bulk `disassemble` calls still honour their caller-provided `maxInstructions`; the virtual full-program listing instead bounds work per requested page and has no global instruction-count cap.
 
 ### Backend selection (`DisassemblerFactory`)
 
@@ -574,7 +603,7 @@ For any non-x86 architecture the requested engine is **ignored** and Capstone is
 
 `ds::Assemble(Arch arch, const std::string& text, uint64_t address)` (`src/Disasm/Assembler.{h,cpp}`) is the inverse path — a thin wrapper over Keystone used by Binary View's live "Patch" feature (type `mov rax, 1`, get bytes). It returns an `AsmResult { bool ok; std::vector<uint8_t> bytes; size_t count; std::string error; }`: the encoded bytes, the number of statements encoded, and a human-readable error when `ok` is false. It accepts one or more instructions separated by `;` or newline, uses Intel syntax, and resolves relative operands against the supplied `address` (so a `jmp`/`call` patch lands correctly at its in-memory location).
 
-The crucial asymmetry: **the assembler supports only x86/x64/ARM/ARM64.** Keystone has no encoder for MIPS/PPC/RISC-V here, so for any other architecture `Assemble` returns immediately with `ok=false` and the explicit message *"patch assembler supports x86 / x64 / ARM / ARM64 only"* — failing clearly rather than mis-encoding as x64. Keystone init failures and assembly errors are likewise surfaced as readable strings (`ks_strerror(ks_errno(ks))`), and the engine handle and encoded buffer are always freed (`ks_free`/`ks_close`) on every exit path. So **disassembly coverage (via Capstone) is strictly broader than assembly coverage (via Keystone)** — a deliberate, documented trade-off: you can read every supported arch but can only patch the four Keystone handles.
+The crucial asymmetry: **the assembler supports only x86/x64/A32/Thumb/A64.** Keystone has no enabled encoder for MIPS/PPC/RISC-V here, so unsupported architectures return immediately with a clear error rather than being mis-encoded. NOP fill is also ISA-aware: A32, Thumb, and A64 use their architectural fixed-width encodings and reject spans that split an instruction. Keystone init failures and assembly errors are surfaced as readable strings, and the engine handle and encoded buffer are freed on every exit path. Disassembly coverage remains broader than assembly coverage.
 
 ### Performance characteristics
 
@@ -585,7 +614,7 @@ The crucial asymmetry: **the assembler supports only x86/x64/ARM/ARM64.** Keysto
 #### Limitations & notes
 
 - **Engine choice only matters for x86/x64.** All other architectures are forced to Capstone by the factory; the requested `Engine` is ignored for them.
-- **Assembly is narrower than disassembly.** Keystone here supports only x86/x64/ARM/ARM64; patching any other arch fails with a clear "unsupported" message — by design, not a bug.
+- **Assembly is narrower than disassembly.** Keystone here supports only x86/x64/A32/Thumb/A64; patching any other arch fails with a clear "unsupported" message — by design, not a bug.
 - **Operands are formatted strings, not structured data.** Consumers needing operand structure re-parse the text; the model carries no per-operand type/size information.
 - **`branchTarget` is best-effort and static.** It is non-zero only when the target is a statically resolvable relative/immediate (register-indirect, memory-indirect, and computed jumps resolve to 0). Indirect control flow is handled by higher layers (e.g. jump-table recovery), not here.
 - **PPC is decoded little-endian** to match every loadable image; big-endian PPC images are out of scope of the loaders, so this is consistent rather than a restriction in practice.
@@ -635,7 +664,7 @@ decrypted blobs. A load is rejected, without leaving partial state, if `base + s
 would overflow `uint64_t`; a mapping ending exactly at `UINT64_MAX` remains valid.
 
 `BinFormat` (`Unknown, PE32, PE32Plus, ELF, MachO, JavaClass, Raw`) and `formatName()`
-give the UI a human label like `"PE32+ (x64)"` or `"Mach-O"`.
+give the UI a width-only format label like `"PE32+"` or `"Mach-O"`; the parsed machine architecture is displayed separately.
 
 ### Machine / architecture recovery
 
@@ -645,8 +674,8 @@ because an ARM64 ELF and an x64 ELF are both 64-bit — only the `e_machine` fie
 distinguishes them, and `machine()` is what lets the UI auto-select Zydis for x86/x64 and
 route everything else to Capstone instead of wrongly defaulting to x86.
 
-- **PE** reads the COFF `Machine` field: `0x014C`→X86, `0x8664`→X64, ARM/Thumb/ARMNT
-  (`0x01C0/01C2/01C4`)→ARM, `0xAA64`→ARM64, MIPS variants, PowerPC (`0x01F0/01F1`), and
+- **PE** reads the COFF `Machine` field: `0x014C`→X86, `0x8664`→X64, A32
+  (`0x01C0`)→ARM, Thumb/ARMNT (`0x01C2/01C4`)→THUMB, `0xAA64`→ARM64, MIPS variants, PowerPC (`0x01F0/01F1`), and
   RISC-V (`0x5032`→RV32, `0x5064`→RV64).
 - **ELF** reads `e_machine` at offset 18, mapping EM_386/EM_X86_64/EM_ARM/EM_AARCH64,
   EM_MIPS (64-bit-aware → MIPS64), EM_PPC/EM_PPC64, and EM_RISCV (→ RISCV64 when 64-bit).
@@ -685,9 +714,9 @@ Each `Section` carries `name`, `virtualAddress`, `virtualSize`, `rawOffset`, `ra
 decision per format:
 
 - **PE**: `executable = characteristics & IMAGE_SCN_MEM_EXECUTE (0x20000000)`.
-- **ELF**: `SHF_EXECINSTR (0x4)`. Non-loaded sections (`sh_addr == 0` and not
-  `SHF_ALLOC`) such as `.symtab`/`.strtab` are skipped entirely. `.bss` (`SHT_NOBITS`)
-  keeps `rawSize = 0` so it is recognized as virtual-only padding.
+- **ELF**: `SHF_EXECINSTR (0x4)`. Non-allocated `.symtab`/`.strtab` sections are retained
+  only in the bounded private header model needed for symbol parsing and are not mapped.
+  `.bss` (`SHT_NOBITS`) keeps `rawSize = 0` so it is recognized as virtual-only padding.
 - **Mach-O**: a section is executable if its segment is exec, or the section flags carry
   `S_ATTR_PURE_INSTRUCTIONS (0x80000000)` / `S_ATTR_SOME_INSTRUCTIONS (0x400)`, or the
   section is literally named `__text`.
@@ -750,7 +779,10 @@ analysis across two files. `clear()` resets `hashValid_` so the next loaded file
 
 For PE, `parsePE()` reads only data-directory slots that fit both
 `NumberOfRvaAndSizes` and the declared `SizeOfOptionalHeader`, so a truncated optional
-header cannot alias the section table. It records export
+header cannot alias the section table. It also preserves the COFF
+`fileCharacteristics()` value; `isDll()` tests `IMAGE_FILE_DLL`, which prevents the App
+from treating a DLL as a directly launchable executable and feeds the validated hosted
+DLL-debug workflow. It records export
 (`exportDirRVA/Size`), import, and base-relocation directory locations. After sections are
 parsed (imports need them for RVA translation):
 
@@ -767,11 +799,56 @@ parsed (imports need them for RVA translation):
   iatRVA + k*ptrSize` is the actual slot address, which lets the UI annotate `call [iat]`
   sites inline as `DLL.func` and populate the Imports tab. Hard caps (descriptor scan to
   64 KB, 50 000 thunks per DLL, 100 000 total imports) bound pathological inputs.
+- **`parseDelayImports()`** walks data directory 13 as bounded
+  `IMAGE_DELAYLOAD_DESCRIPTOR` records. Both modern RVA-based descriptors and legacy
+  VA-based fields are resolved without narrowing. The immutable `delayImports()` model
+  preserves descriptor attributes/timestamp, module/IAT/INT/bound/unload addresses, DLL
+  name, ordinal/name symbols, termination/truncation state, and exact IAT slot VAs. Delay
+  symbols are also appended to the normalized `imports()` model with `delayed == true`.
+- **`parseTlsDirectory()`** decodes the PE32/PE32+ TLS directory (data directory 9), whose
+  members are VAs rather than RVAs. `peTls()` exposes the raw-data/index/callback-table
+  addresses, zero-fill/characteristics, validation state, and an ordered, image-backed,
+  null-terminated callback list capped at 4,096 entries.
+- **`parseDebugDirectory()`** retains bounded generic `IMAGE_DEBUG_DIRECTORY` rows and
+  decodes CodeView **RSDS** payloads into GUID bytes/printable GUID, age, and a bounded PDB
+  path. Payloads may be backed by `AddressOfRawData` or, for disk images only,
+  `PointerToRawData`; mapped images never reinterpret a raw-file pointer. No path parser
+  trusts an unbounded NUL terminator.
+- **`parseLoadConfig()`** reads only the prefix proven by all three of the structure's
+  declared `Size`, the directory size, and mapped bytes. `peLoadConfig()` exposes the
+  dependent-load flags plus presence/mapping state for the security cookie, SafeSEH table,
+  Guard CF check/dispatch pointers, Guard CF function table/count, and Guard flags for both
+  PE32 and PE32+ layouts.
+- **`parseRuntimeFunctions()`** materializes x64 `RUNTIME_FUNCTION` rows and bounded
+  `UNWIND_INFO` prefixes: range VAs, version/flags, prologue size, frame register/offset,
+  exact raw unwind-code slots, exception handlers, CHAININFO, and indirect parent records.
+  The existing `pdataRanges()` compatibility API continues to omit continuation records
+  when seeding function discovery and retains its current-image parsing behavior.
 - **`parseRelocs()`** walks `IMAGE_BASE_RELOCATION` blocks into `(VA, type)` pairs (type =
   `IMAGE_REL_BASED_*`), skipping ABSOLUTE (type 0) padding entries, capped at 200 000.
+- **`parseResources()`** walks the resource directory (data directory [2]) — the three-level
+  `IMAGE_RESOURCE_DIRECTORY` tree Type → Name/ID → Language — into a flat `BinaryFile::Resource`
+  list (`resources()`). Each leaf records its type/name (numeric id or decoded UTF-8 string), language
+  id, data RVA/size/code page, `va = imageBase_ + dataRVA`, and backing `fileOffset`. Directory
+  offsets are relative to the resource base RVA (only the leaf data entry carries a real RVA); a
+  visited-entry cap plus a depth cap keep a self-referential or absurd tree from spinning. The
+  payload decoders (RT_* names, version info, string tables, `.bmp`/`.ico` reconstruction) live in
+  the pure `Core/ResourceDecode` module and drive the Binary View's Resources tab.
 
-ELF/Mach-O dynamic symbol/import/export and relocation tables are not parsed here; these
-models are PE-only in this loader.
+ELF32/64 `.dynsym` and `.symtab` records are parsed through their linked string tables into
+the same normalized symbol/import models, including kind, binding, visibility, size,
+defined/undefined state, and table provenance. Dynamic rows win duplicate precedence and
+mapped function/IFUNC symbols seed analysis. `ET_REL` alloc sections receive checked,
+alignment-aware non-overlapping synthetic VAs so zero-address object-file sections and their
+section-relative symbols remain distinct. Class-aware REL/RELA records retain symbol/type/
+signed-addend data and explicit mapped-target validity; conventional PLT/GOT sections expose
+bounded slots, `DT_NEEDED` entries expose dependencies, GNU version definitions/requirements
+are associated with dynamic symbols, and direct/array initializers retain distinct slot/target
+validity (including VA zero). Sectionless `PT_DYNAMIC` recovery remains out of scope.
+
+Mach-O thin and universal containers retain bounded selected-slice metadata, symbols, dyld
+binding/export-trie records, function starts, and initializer records. Slice/load-command/
+link-edit walks are range-checked and expose explicit validity/truncation.
 
 ### writeImage — in-memory patching that preserves identity
 
@@ -790,7 +867,7 @@ while keeping the original artifact untouched.
 `BinaryFile` has no UI of its own; it is pure model. Its outputs drive the chrome:
 `formatName()` and `machine()` populate the title/status, `firstCodeSection()` sets the
 initial cursor, `imports()` feeds the Imports tab and inline IAT annotations, and
-`exports()` feeds the PE Exports tab and function discovery. The addressing routines back
+`exports()` feeds the unified Exports / Symbols panel and PE/ELF function discovery. The addressing routines back
 every navigation, hex pane, and string/byte search. The file-opening routes are an optional
 startup argument (`DisasmStudio.exe <path>`), **File ▸ Open** (both auto-detect via `load`),
 and **Open as Raw…** (`loadRaw` with a chosen base + arch).
@@ -798,11 +875,15 @@ and **Open as Raw…** (`loadRaw` with a chosen base + arch).
 #### Limitations & notes
 
 - ELF is **little-endian only**; big-endian ELF degrades to Raw.
-- Mach-O support is **thin only** — fat/universal binaries are not split here. Their
-  big-endian `0xCAFEBABE` marker overlaps the Java-class signature; an invalid class parse
-  degrades to Raw.
-- Exports, imports, and relocations are parsed for **PE only**; ELF/Mach-O dynamic-symbol
-  resolution is out of scope for this class.
+- A universal Mach-O opens one deterministic supported slice at a time and exposes all
+  inspected slice descriptors; it does not merge architectures into one analysis image.
+  Chained fixups and Objective-C/Swift metadata remain separate work.
+- PE imports/exports/resources/relocations, TLS, delay imports, CodeView RSDS,
+  security load configuration, and x64 unwind metadata are parsed. ELF section-table
+  symbols, REL/RELA, PLT/GOT ranges, dynamic dependencies, versions, and initializer arrays
+  are parsed; Mach-O symbols, bindings, export trie, function starts, initializers, and
+  universal containers are modeled. Sectionless ELF `PT_DYNAMIC` recovery remains out of
+  scope.
 - Inferred fallbacks (machine defaulting by bit-class for unknown `e_machine`/`cputype`,
   Mach-O entry derived from `__TEXT`, ELF program-header fallback for stripped binaries) are
   best-effort but unlabeled at this layer — they are internal robustness, not surfaced as
@@ -841,7 +922,7 @@ expands them by recursive descent:
 2. **Explicit raw root** — a raw image deliberately retains `entryRVA_ = 0`, but its
    analyst-selected mapping base is an authoritative function seed. Validity is explicit,
    so a raw image mapped at VA 0 is seeded correctly rather than lost to a truthiness test.
-3. **PE code exports** (`collectExports`) — consumes the bounds-checked
+3. **Mapped PE/ELF function symbols** (`collectExports`) — consumes the bounds-checked
    `BinaryFile::exports()` model rather than reparsing PE tables. Only mapped local code
    targets become function seeds; forwarders, exported data, and unmapped targets remain
    visible in the Exports panel but are not functions. Aliases collapse to one seed per VA,
@@ -849,12 +930,13 @@ expands them by recursive descent:
    `#N` instead of being presented as a heuristic `sub_`.
 4. **PE32+ exception ranges** (`pdataRanges`) — linker-emitted x64
    `RUNTIME_FUNCTION` begin addresses are authoritative seeds, and their `[begin,end)`
-   extents provide stronger size hints than the ordinary gap estimate.
+   extents provide authoritative ownership hints.
 5. **Prologue heuristic scan** (`prologueScan`) — a byte sweep over every executable
    section looking for common x64 prologues (`55 48 8B/89 …`, `48 83 EC …`, home-slot
-   stores) or x86 frame prologues (`55 8B EC` / `55 89 E5`). The exact selected `Arch`
-   gates these byte-pattern scans; ARM/ARM64/MIPS/PPC/RISC-V raw bytes never receive x86
-   prologue guesses. Each match is best-effort and seeds a candidate start.
+   stores), x86 frame prologues (`55 8B EC` / `55 89 E5`), or architecture-specific
+   A32/Thumb/A64 frame setup (including PACIASP). The exact selected `Arch` gates every
+   pattern. Bounded true PC-relative ARM literal spans suppress false prologue and recursive
+   call roots; ordinary base-register loads are not literals. Each match remains best-effort.
 
 The seeds then drive a **recursive-descent** pass. A worklist disassembles up to an
 8 KiB window per seed (capped at `maxInstrPerFunc` instructions); every direct `CALL` whose
@@ -872,14 +954,27 @@ section also participates in `RuntimeScan`: a high-entropy blob can receive the 
 clearly low-confidence `High-entropy section .raw` finding, which is evidence only and not a
 packer-name classification.
 
-**Size estimation** is gap-based: with starts sorted, each function's size is the distance
-to the next start, clamped to `0x4000` bytes; the last function uses the remaining mapped
-bytes. This is an estimate (it doesn't follow actual flow), which is why downstream consumers
-treat the size as a *window hint* rather than a hard boundary. The two caps
-(`maxFunctions`, `maxInstrPerFunc`) exist purely for responsiveness on large images, and the
-summary string reports the high-confidence seed, `.pdata`, and total-seed counts plus the
-decoder engine. Names are `sub_<HEXADDR>` for anything not matched to an authoritative
-name.
+**Function ownership** first honors valid ELF symbol and x64 `.pdata` extents, then uses
+bounded recursive basic-block ownership with trusted-entry barriers, calls versus tail
+branches, architectural delay slots, explicit non-contiguous chunks, and noreturn evidence.
+The legacy `address`/`size` pair is the compatible envelope; exact membership uses chunks,
+and `ownershipTruncated` discloses a budget-limited result. Names are `sub_<HEXADDR>` for
+anything not matched to an authoritative name.
+
+### Recursive code/data classification — `CodeDataClassifier`
+
+`src/Core/CodeDataClassifier.{h,cpp}` runs after initial function discovery on the background
+worker with an independent decoder. Exact recursive control-flow reachability is combined with
+bounded strings and literals, ARM-family literal references, absolute/RVA/relative jump tables,
+aligned vtable/code-pointer runs, relocation-backed callbacks, CET landing pads, and ISA-aware
+padding. Strong indirect entries feed one bounded `FunctionAnalyzer` rerun, recovering functions
+that have no direct-call, export, symbol, unwind, or recognizable-prologue evidence.
+
+The result partitions every mapped executable byte into code, string, literal pool, jump table,
+pointer table, padding, data, or deliberately unknown spans. Every positive span carries width,
+confidence, and evidence. Explicit instruction/block/table/scan/claim limits and cancellation keep
+the pass finite, and the production map is stamped with `BinaryFile::imageRevision()` so patches or
+reloads cannot reuse stale boundaries.
 
 ### Heuristic name guessing — `FunctionNamer`
 
@@ -1000,16 +1095,27 @@ hits with a decoded mnemonic and the enclosing `symbolFor` name.
 
 ### Symbols — `SymbolResolver` and the resolution chain
 
-`src/Core/SymbolResolver.{h,cpp}` is a thin DbgHelp wrapper. `useLive(hProcess)` binds to a
-running debuggee, `useBinary(path, imageBase)` opens a static file session (using a fake
-process handle `0x1`), and `ensureModule(base, size, path)` registers a live module so its
-symbols can load. `resolve(addr, name, disp)` returns an **undecorated** symbol name plus
-displacement; `addressOf(name, addr)` is the reverse lookup used by the "go to name" box. It
-is configured for graceful, non-interactive operation: `SYMOPT_UNDNAME |
-SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS`, **no symbol server**
-(local PDBs + exports only — no flaky network), and PDBs load lazily on first query.
-`resolve` returning `false` is the normal degraded path, letting callers fall back to their
+`src/Core/SymbolResolver.{h,cpp}` is the bounded DbgHelp adapter and
+`src/Core/SymbolService.{h,cpp}` is the sole joined owner used by the UI. Static sessions use
+unique DbgHelp keys; live sessions receive a duplicated debugger process handle plus an explicit
+debug-session generation. Every process-global DbgHelp option/load/query is serialized by the
+shared mutex, while debugger unwind has an independent local-only session. Ordinary listing
+lookups are non-blocking cache reads; PDB loading, optional source/type/local queries, and all
+network-capable work run on the symbol worker. A configured cache is supported and symbol-server
+access is **disabled by default**. Enabling it is explicit, search paths are validated, requests
+and returned records are capped, and stale generations cannot publish into a replacement target.
+`resolve` returning `false` remains the normal degraded path, letting callers fall back to their
 own naming.
+
+`Core/Demangle` makes undecoration consistent beyond PDB-backed DbgHelp results. MSVC
+spellings use `UnDecorateSymbolName` while holding the same process-global
+`DbgHelpMutex`; GCC/Clang/ELF spellings use a bounded in-tree Itanium ABI parser with
+nested names, templates/substitutions, operators, constructors/destructors, qualifiers,
+literals, special names, and clone/version suffixes. A capped thread-safe cache serves
+the render and analysis threads. Compact qualified labels feed discovery, listings,
+xrefs, decompilation, source export, and Cortex; Imports/Exports show the full signature
+and can filter/copy either it or the exact raw linker spelling. Raw names remain
+authoritative for reverse lookup, forwarders, DLL invocation, scans, and reconstruction.
 
 The tab's **`symbolFor(ctx, addr)`** ties everything together as a priority chain (with a
 per-session cache hard-reset at 100k entries and dropped when attach ↔ static changes):
@@ -1046,12 +1152,47 @@ disassembly or hex preview at the representative address, with "View in disassem
 double-click routing to the Binary View via `ctx.gotoAddress`. Confidence colours and the
 explicit "no notable capabilities detected" empty state make the heuristic nature legible.
 
+### Automatic Authorization Trail
+
+`Core/AuthorizationTrail` and the bounded `AnalysisService` adapter collect existing input,
+network, persistent-state, xref, call-graph, CFG, and `FuncAnnotate` facts into a conceptually ordered
+**Input → Format → Remote request → Entitlement parsing → Crypto verification → State
+persistence → Global predicate → Feature predicate → Protected operation** report. Small
+x86/x64 boolean-returning functions are ranked by unique callers, proven branch consumers,
+and guarded operations. Every retained call use carries the exact continuation, AL/EAX/RAX
+width, comparison/branch, and proved true/false destinations; rank is an investigation lead,
+not evidence that a function grants access. Stage rows are independently evidenced and are not
+claimed to form one connected path unless explicit data/control-flow identities connect them.
+
+`Core/AuthorizationFieldAlias` keys fields by proved object root + displacement + width and
+merges roots between functions only through exact unchanged direct-call argument bindings.
+Displacement-only, adjusted, ambiguous, cyclic, incomplete, and width-conflicting rows remain
+separate or rejected. A downstream predicate becomes secondary only when it lies on the proved
+permitted arm and its result is required for a retained operation; this drives the explicit
+warning when changing a global/branding predicate cannot authorize every protected path.
+
+The conclusions **locally valid format**, **server accepted**, **signature verified**, and
+**feature permitted** are independent unknown/candidate/supported facts. Exact verifier import
+or call presence is capability only; signature verification additionally requires reply-data
+lineage into a documented verifier argument and its result controlling a branch.
+`feature permitted` additionally requires an authorization-linked Global/Secondary predicate's
+exact branch-exclusive guard over the exact protected operation; a matching operation location or
+unlinked predicate guard is insufficient. “No embedded expected key” and “no private signing
+material” are emitted only for explicitly complete,
+narrow search scopes. Otherwise they stay unknown, and the tool does not claim a real signed key
+can be recovered from an endpoint or public verification material.
+
+`Core/AuthorizationPatchAdvisor` produces inert x86/x64 `mov eax,0/1; ret` advice only for a
+proved centralized predicate with complete entry/return/side-effect coverage, executable bytes,
+a supported ABI, no alternate entry, and sufficient confidence. It refuses string/heap cleanup,
+other side effects, stack-cookie/security epilogues, non-executable targets, and transport-only
+changes. The advisor never mutates the image, project, or process.
+
 #### Limitations & notes
 
 - Function discovery is best-effort: prologue patterns are limited to **x86/x64** and are
-  enabled only for the exact selected architecture; sizes are
-  **gap estimates** (not flow-accurate), and the analyze/per-function caps trade completeness
-  for responsiveness on huge images.
+  enabled only for the exact selected architecture; bounded reachability may set
+  `ownershipTruncated` when the per-function cap trades completeness for responsiveness.
 - All `FunctionNamer` output is **heuristic and labelled** (amber tint + reason tooltip),
   **recomputed each analyze, and never persisted** — exports, PDB symbols, and user renames
   always take priority.
@@ -1060,8 +1201,9 @@ explicit "no notable capabilities detected" empty state make the heuristic natur
   simply not edged.
 - `instrDataRef` resolves only static, non-register memory references; register-relative and
   computed addresses are intentionally reported as none.
-- `SymbolResolver` uses **local PDBs + exports only** (no symbol server); rich names appear
-  only when a `.pdb` is present beside the file or cached on the system.
+- Symbol-server access is opt-in and asynchronous. Even after cancellation, shutdown may need to
+  wait for one in-progress DbgHelp/symsrv call because that API has no safe force-cancel contract;
+  the UI never owns or closes its underlying session.
 - `TechScan` is signature/heuristic detection (imports, section names, fixed byte patterns):
   it can miss obfuscated capabilities and is not a substitute for dynamic analysis; it
   deliberately reports nothing for a trivial binary rather than inventing findings.
@@ -1414,6 +1556,36 @@ for both PE32 and PE32+), falling back to `lpStartAddress` only if that read fai
 breakpoint (`TempKind::EntryPoint`) and continues, landing the user on the first
 instruction of *their* code rather than in the loader.
 
+### Debugging a DLL through a real host
+
+A PE DLL cannot be passed directly to `CreateProcessW`. **Debug DLL…** therefore
+uses the pure `Core/DllDebugPlan` layer before starting a session. `InspectDllForDebug`
+requires a valid PE image with the COFF DLL characteristic, determines PE32/PE32+
+bitness, records DllMain's RVA when its entry is executable, and offers only local,
+non-forwarded exports whose RVAs map to file-backed executable sections. Forwarders,
+data exports, malformed targets, and non-DLL PEs remain visible elsewhere in the UI
+but cannot be selected as launch callbacks.
+
+The default host is the trusted Windows `rundll32.exe` matching the DLL: native
+`System32` for a 64-bit DLL, or `SysWOW64` for a 32-bit DLL on 64-bit Windows. A
+custom host is also supported, with an enforced bitness match when its PE bitness is
+known. The launch request stores typed argument slots (literal, DLL path, export
+invocation, and zero-or-more user arguments); `BuildWindowsCommandLine` applies the
+Microsoft/CRT quoting rules so spaces, empty arguments, embedded quotes, and trailing
+backslashes retain their exact argv boundaries. The system-host route also warns that
+an executable export RVA cannot prove the callback has rundll32's required ABI.
+
+`Debugger::launchAndAttachDll` passes the validated host as `lpApplicationName` and
+the already quoted mutable command line separately. Requested DllMain/export stops
+remain RVAs while the loader runs. When the exact target appears in
+`LOAD_DLL_DEBUG_EVENT`, `RetargetDllDebugLaunchPlan` matches its normalized full path
+(falling back to a leaf name only when the event supplied no directory), adds the
+actual ASLR base, and plants invisible one-shot target breakpoints. `DbgSnapshot`
+publishes the matched path/base/size, active/last target label, and any planting error.
+On a target hit the App copies that mapped module through `loadLiveModule`, so the
+normal Binary View, symbols, listing, and analysis follow the DLL rather than the
+rundll32/custom-host image.
+
 ### Software breakpoints — the int3 dance
 
 A software breakpoint overwrites the first byte of an instruction with `0xCC`
@@ -1481,6 +1653,34 @@ the `0xCC`, and only then realize the command — choosing between a trap-flag s
 or a temp-breakpoint-after based on whether the underlying instruction is a call/rep.
 **Run to cursor** (`runToCursor` / `TempKind::RunTo`) is implemented as a one-shot
 temp breakpoint at the target followed by a normal continue.
+
+### Execution trace / coverage
+
+Trace is bounded coverage sampling built from one-shot basic-block breakpoints, not
+instruction-by-instruction trap-flag tracing. From a paused session the Binary View
+walks the analyzed functions/CFGs in chunks, maps preferred addresses to the live
+module, de-duplicates block starts, and caps a trace plan at **65,536** sites. The
+toolbar exposes planning/planting progress; planning can be cancelled without
+blocking the render thread. `Debugger::startTraceCoverage` hands the completed plan to
+the debug-event thread, which owns all process-memory patching.
+
+`Core/TraceCoverage` is the Win32-free, mutex-protected state machine. Each `begin`
+creates a generation, sorts/de-duplicates/caps sites, and reports requested, planned,
+armed, hit, skipped, and retired totals through `TraceCoverageSnapshot`. Active-state
+and generation checks make stale planting callbacks harmless after Stop, detach, or
+a new target. The debugger keeps the trace `int3` table separate from user software
+breakpoints and masks both tables in `readMemoryMasked`, so live disassembly still
+decodes pristine bytes.
+
+When a trace site fires, the engine restores its original byte, backs RIP up, records
+the block-start/instruction hit, retires the site permanently, and executes the real
+instruction once under TF before free-running. A collision never changes the
+semantics of a user breakpoint or a temporary entry/step/run/JVM stop: the explicit
+operation owns the byte and still contributes coverage when reached. **Stop Trace**
+removes outstanding internal breakpoints but preserves collected hits; **Clear Trace**
+removes the coverage data. The UI translates the runtime hits back to analysis VAs
+and renders executed code with the semantic green `theme::col::good()` treatment in
+the static Assembly listing, Live Assembly, and CFG.
 
 `decodeAt` measures instruction length and classifies call/ret/rep using the debug
 thread's **own private disassembler instances** (`ownDis_` for x64, `ownDis32_` for
@@ -1558,12 +1758,28 @@ Toolhelp32 module snapshot (`TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32`). It can a
 auto-continues), carefully closing every handle the debug API hands back to avoid
 per-event leaks.
 
-**Live TCP/UDP connections** are gathered by the Communications tab
-(`src/Tabs/CommunicationsTab.cpp::refreshConnections`) using the IP Helper API:
+**Live TCP/UDP connections** are gathered by owned tab workers using the IP Helper API:
 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` and
-`GetExtendedUdpTable(UDP_TABLE_OWNER_PID)`, filtered to the selected PID, with TCP
-states rendered to readable names (`ESTABLISHED`, `LISTEN`, …). This is **IPv4 only**
-— IPv6 connection tables are explicitly out of scope per the project spec.
+`GetExtendedUdpTable(UDP_TABLE_OWNER_PID)` for both `AF_INET` and `AF_INET6`, filtered
+to the selected PID, with TCP states rendered to readable names (`ESTABLISHED`,
+`LISTEN`, …). Each table has bounded allocation/retries and reports partial failures
+without hiding successful families. IPv6 endpoints preserve numeric scope IDs. The
+selected-process worker is latest-PID-wins; the system-wide history worker owns its
+process-name/ESTATS work and publishes a bounded snapshot. Epochs reject stale results,
+so no whole-table enumeration, sorting, or history merge runs on the render thread.
+
+### Checked authorization return experiments
+
+Authorization Trail's explicit **Break after call** action uses the exact decoded call
+continuation and requires a matching x86/x64 PID, debugger generation, module incarnation,
+thread, executable committed byte, and checked ASLR range before queuing a one-shot stop. At
+that exact pause the debugger re-reads RIP and validity-bearing AL/EAX/RAX aliases. Temporary
+**Force true/false** and **Restore** operations are accumulator-register writes only: the
+debugger rechecks identity, RIP, and the expected masked value immediately before writing,
+reads the context back, and attempts rollback if verification fails. No predicate/file code
+bytes are changed by return forcing. Resume, RIP/thread change, detach, or module replacement
+invalidates the captured value, and one observed return never upgrades the independent static
+server/signature/feature conclusions by itself.
 
 ### How the UI consumes the snapshot
 
@@ -1587,11 +1803,113 @@ before it decode as a `call` whose length ends exactly at that address. It is
 recomputed only when the stop signature (RIP/RSP/TID/state) changes, to avoid
 re-walking every frame.
 
+### Adaptive unpack workflow
+
+**Debug -> Adaptive Unpack** combines restored ESP/RSP, transfers into changed pages,
+newly executable protection, timed entropy settling, run-free timeout, and analyst-selected
+evidence through the bounded, Win32-free `Core/UnpackEngine`. OEP candidates expose their
+score and evidence; the same telemetry produces a bounded heuristic hot-RIP, exact back-edge,
+high-fan-in, and exception-handler report for VM-like dispatchers.
+
+Fresh targets may be assigned before resume to a disclosed one-process, kill-on-close Windows
+Job. It constrains children/lifetime but does not claim filesystem or network virtualization.
+The sampler reads readable regions with debugger breakpoints masked and remembers changed and
+executable pages. `Core/PeUnpack` then converts mapped PE32/PE32+ bytes to aligned disk sections,
+restores valid ILT thunks or reconstructs imports in `.dsimp` from exact live export matches,
+transactionally normalizes HIGHLOW/DIR64 relocations, and repairs or clears OEP, security-cookie,
+Guard CF, signature, bound-import, and checksum metadata. Uncertain relocation tables fall back
+to the captured runtime base; any failure retains a raw mapping and detailed report. Tests are
+`unpack_engine_test` and `pe_unpack_test`.
+
+### Static packed-PE recovery
+
+**Debug -> Static Packed-PE Recovery** handles samples whose compressed payload can be
+recovered without execution. `Core/StaticUnpack` validates and maps the disk PE, then looks
+for an exact VMProtect-style `PACKER_INFO` plan: the ordered destination RVAs must match all
+virtual-only non-BSS sections, the preceding record must resolve to valid five-byte LZMA1
+properties, and every source and destination receives a finite validated extent. A bounded,
+dependency-free LZMA1 decoder enforces hard input, exact-output, dictionary, candidate, block,
+probability-model, allocation, and cancellation limits. Automatic mode prefers that evidence-rich plan and can
+fall back to an independently valid finite LZMA-alone container; either strategy can be forced.
+
+The operation runs on an owned/path-backed worker, verifies the exact source size/hash before
+decoding, publishes phase/block/byte progress, and never blocks the render thread. In-memory
+patches must be saved and reopened first. Recovered blocks form a mapped image which can pass through the shared
+transactional `PeUnpack` reconstruction. The UI retains and saves three distinct provenances:
+the reconstructed disk PE, decompressed mapped image, and raw/failure artifact. Per-block status,
+confidence, evidence, issues, and a full report remain visible. OEP trust is reported separately:
+a validated manual OEP (resolved against a nested PE's own preferred base) or a header entry inside
+a completed recovered executable destination block is marked runnable; executable-section plausibility or a structurally valid nested PE alone is not
+enough. An unchanged loader entry is saved under an analysis-only filename and can still be loaded
+into ordinary analysis. Encrypted or version-mutated metadata and genuinely virtualized
+code are reported honestly and handed to the live Adaptive Unpack workflow rather than guessed.
+`static_unpack_test` covers PE32/PE32+, descriptor recovery, decoding, bounds, fallback,
+cancellation, reconstruction, and worker result handoff.
+
+### Passive process dump
+
+The Communications process picker has a **Dump** action, mirrored by **Debug -> Passive Process
+Dump**. For an existing PID, `Core/PassiveDump` uses query/read access only unless the analyst
+opts into a brief final `NtSuspendProcess`/`NtResumeProcess` window. It never calls
+`DebugActiveProcess`, injects code, patches bytes, or writes target memory. A launch-and-watch
+source safely requotes analyst arguments, accepts an explicit working directory, and uses ordinary
+`CreateProcess` without debug flags: the target is created suspended, assigned to a mandatory one-process kill-on-close Job, and resumed only after containment
+succeeds. Cancelling or closing the modal cannot strand an owned launch without a visible stop
+control.
+
+Immediate, manual, and automatic timing are available. Automatic timing compares bounded page
+fingerprints and Shannon entropy until both stabilize (or the declared timeout expires). The
+final capture records validity and protection per page and refuses PE reconstruction if a
+required file-backed page is missing. Unreadable discardable pages may be supplied from the
+on-disk module only after strict header/layout identity checks; the original remote bytes and
+validity mask remain separate and backfilled bytes never become import evidence. A 2 GiB aggregate
+peak estimate reserves capture, transactional reconstruction, and export-map storage before work.
+With final suspension, the module list and remote EATs are snapshotted before resume, then local
+captured IAT/data bytes are matched exactly; without it, coherence is explicitly best-effort.
+`PeUnpack` performs import, OEP, relocation, section, and metadata repair, but the original header
+entry remains analysis-only. Runnable classification requires a manual OEP validated on an exactly
+captured executable page and zero disk-backfilled pages; backfill downgrades the artifact without
+mislabeling a validated OEP as unverified. The modal provides progress, cancellation, raw fallback, warnings, reports,
+provenance-aware filenames/save labels, load handoff, and explicit
+contained-launch termination. `passive_dump_test` covers the settle policy, a real read-only
+self-snapshot and PE rebuild, pure memory/OEP policy, plus an opt-in contained-launch smoke test.
+
+### Hide Debugger / anti-anti-debug
+
+**Debug -> Hide Debugger / Anti-Anti-Debug** configures a session-atomic policy before attach or
+launch; every option is off by default. `Core/AntiDebug` owns pure decisions, first-pristine
+bookkeeping, debug-register masking, bounded warnings, and a production-seeded correlated clock.
+The debug loop performs reversible PEB `BeingDebugged`/`NtGlobalFlag` writes and changes heap flags
+only after OS heap-list provenance, region bounds, and a legacy NT-heap signature validate while
+preserving unrelated policy bits. Detach
+attempts conditional best-effort restoration only where the value still equals DisasmStudio's
+concealed value, so a legitimate target-side change is never overwritten.
+
+Target-local entry `int3` traps use bounded exports from the exact canonical, matching-machine
+System32/SysWOW64 `ntdll.dll` and are admitted only on executable `MEM_IMAGE` pages owned by that
+mapping. CET shadow-stack/IP validation disables synthetic-return hooks. The traps mediate selected `NtQueryInformationProcess`,
+`NtQuerySystemInformation`, `NtQueryInformationThread`, `NtSetInformationThread`, invalid
+`NtClose`, `NtGetContextThread`, `NtSetContextThread`, `NtQueryPerformanceCounter`, and
+`NtQuerySystemTime` calls with exact buffer rules and proven self/same-process handles. Context reads
+hide DR0-DR7; context writes omit target-supplied debug-register changes and reapply debugger-owned
+hardware breakpoints. RDTSC/RDTSCP discovery follows decode-valid control flow recursively only from
+the PE entry, fully validated x64 unwind roots, and trusted ntdll roots, with 50k/image and 250k/session
+budgets. QPC, system time, and TSC share live-machine seeds and actual resumed-run intervals while
+excluding debugger-paused time. Per-thread/same-address leases safely re-arm concurrent pass-throughs.
+Internal traps carry an owner image, retire without writes on unload, are masked from live reads,
+share sites safely with user breakpoints, and are conditionally restored. Live budget/clock/restore
+counters, a 32-entry deduplicating warning cap, and the capability report make the boundary explicit: direct syscalls,
+`KUSER_SHARED_DATA`, generated/self-modifying timing sites, kernel observers, the one-instruction
+pass-through re-arm window, and instruction-perfect multicore time require the optional Hv
+backend for transparent guarantees. `anti_debug_test` covers policy decisions, pristine restore,
+DR masking, range gates, concurrent re-arm state, and synthetic clocks; event-loop integration is
+Windows solution-build verified.
+
 #### Limitations & notes
 
-- **x86/x64 only.** The live debugger does not support ARM/ARM64/MIPS/PPC/RISC-V
+- **x86/x64 only.** The live debugger does not support A32/Thumb/A64/MIPS/PPC/RISC-V
   targets even though those decode statically; the step decoders are Zydis x64/x86.
-- **IPv4 only** for the connection tables; IPv6 is out of scope.
+- Connection tables cover IPv4 and IPv6 TCP/UDP; visibility still depends on OS access rights.
 - The **call stack is heuristic** (return-address scanning, not unwind-info based) and
   is labelled as such; it can miss or invent frames in optimized/FPO code.
 - Up to **four hardware breakpoints** total (DR0–DR3), the hardware limit.
@@ -1614,9 +1932,19 @@ The header row offers a **goto box** (`##goto`, accepts `0x...` hex or a symbol 
 
 ### Main view: Assembly (full-program listing)
 
-`renderAssembly` is the dispatcher; by default `asmFullProgram_` is true, so `renderAssemblyFull` shows **the entire program** as one scrollable listing. The key trick (`buildFullListing`) is to **linear-sweep every executable section once** and cache only a row index — `std::vector<ListRow>` where each `ListRow` is `{addr, divider}` — rather than holding decoded instructions. Function starts (from `functions_`) emit a `divider` row that renders as a `sub_<addr>:` (or symbol) header (`renderAsmFuncHeader`). The sweep is capped at `kCap = 800000` instructions to stay responsive on huge images; the header shows `"(capped)"` when hit. The listing signature mixes the content hash, function count, arch, and engine, so it rebuilds only when one of those changes; a **Rebuild listing** button forces it.
+`renderAssembly` is the dispatcher; by default `asmFullProgram_` is true, so `renderAssemblyFull` shows the selected image regions as one scrollable listing. `buildFullListing` queues a `K_Listing` job whose worker performs no instruction decoding and has no instruction cap: it returns fixed 4 KiB executable `CodePage` descriptors for code/unknown spans plus region headers, strings, bounded data directives, and explicit truncated-tail rows. Classified executable data islands render as symbol-aware `db`/`dw`/`dd`/`dq` rows with evidence tooltips and split independent lazy `codeRegion` checkpoints, so page lookahead cannot decode across them. Function dividers and unresolved branch/xref `loc_` labels are materialized with each decoded page.
 
-Rendering uses an `ImGuiListClipper` over `listRows_`, re-decoding each *visible* row on the fly with `ctx.disasm->decodeOne` — so memory stays small even at 800k instructions. Undecodable bytes fall back to a synthetic `db 0x..` row. Each instruction row (`renderAsmRow`) has five columns: a **breakpoint gutter** (`*` toggles a SW breakpoint), a **flow gutter** (records geometry for branch arrows), the **address** (prefixed `> ` at RIP, tinted green at RIP / magenta at a HW breakpoint), the **raw bytes**, and the **instruction** (mnemonic color-coded: blue calls, amber branches). The RIP row and the selected/cursor row get a slow sinusoidal pulse (`slowPulse`).
+Rendering uses a 64-bit Fenwick index to map each descriptor's estimated or exact weight into virtual clipper rows. It decodes only pages requested by the visible viewport, goto, cursor stepping, or incremental trace planning, and retains them in a bounded 96-page LRU. The top visible address is restored when exact weights replace estimates. Bounded lookahead and propagated continuation checkpoints prevent variable-width x86/JVM/Thumb/RISC-V instructions that cross 4 KiB boundaries from being decoded twice. Exact predecessor work is capped at 64 KiB; farther random pages paint immediately from a constant-work local estimate, show `~` provisional addresses, and reconcile when exact checkpoints arrive. Provisional rows are excluded from trace and derived function/signature/jump-table authority and cannot publish persistent branch labels automatically. An explicit Breakpoint/Patch action accepts only its selected displayed instruction start as analyst authority (`!`), never the page or a trace seed; full-program and windowed assembly share that policy. Undecodable bytes fall back using the architecture's natural resynchronization width. Each actionable instruction row (`renderAsmRow`) retains the normal breakpoint, flow, address, bytes, syntax, annotation, navigation, and glow interactions.
+
+Trace coverage adds a lower-priority row state. The app toolbar's **Trace** button
+starts or stops the bounded one-shot block plan and **Clear Trace** removes collected
+display state. Discovery walks lazy code-page descriptors at most 1,024 decoded
+instructions per frame, admits only exact decoded instruction starts, reports progress,
+and can be cancelled before planting. Trace start and every planning slice require an
+exact matching x86/x64 path/module/bitness identity; every site uses checked file-to-runtime
+translation and any failed proof cancels before planting. Executed instructions use the semantic green
+`theme::col::good()` treatment only when a stronger RIP/cursor/target state does not
+own the row, and remain visible after Stop until Clear Trace.
 
 **Branch arrows** (`drawAsmArrows`, toggled by "Arrows"/`showJumpArrows_`) are painted into the flow gutter *after* the table using a foreground draw list. Per-row Y centers are collected during render into `asmFlow_`; the renderer assigns each branch to a horizontal **lane** (greedy non-overlap, up to 7 lanes in the 36px gutter), colors backward jumps amber, forward blue, and the cursor's own arrows green, and draws stub triangles for targets that scrolled off-screen.
 
@@ -1640,7 +1968,7 @@ User **comments** (`comments_`, green) render after these. All three are clearly
 
 **Hex** (`renderHex`) is a simple read-only 16-byte-per-row dump (offset, hex, ASCII) starting at the cursor, capped at 64 rows.
 
-**Graph / CFG** (`renderGraph`) builds the cursor function's CFG and lays out blocks in a column-per-depth grid with cubic-Bezier edges (green = taken, grey = fallthrough, blue = jump), a colored legend, the RIP block glowing green, and the cursor block outlined. It is **interactive**: drag empty space to pan, drag a block to move it (offsets stored in `cfgDrag_`, "Reset layout" clears them), and double-click a block to re-root the graph there. Each instruction line is formatted like the listing (`+offset mnem ops -> name ; "string"`).
+**Graph / CFG** (`renderGraph`) builds the cursor function's CFG and lays out blocks in a column-per-depth grid with cubic-Bezier edges (green = taken, grey = fallthrough, blue = jump), a colored legend, the RIP block glowing green, executed trace blocks tinted green, and the cursor block outlined. It is **interactive**: drag empty space to pan, drag a block to move it (offsets stored in `cfgDrag_`, "Reset layout" clears them), and double-click a block to re-root the graph there. Each instruction line is formatted like the listing (`+offset mnem ops -> name ; "string"`).
 
 **Call Graph** (`renderCallGraph`) shows, in three columns, the **callers**, the current function, and the **callees** around the cursor function. Edges come from `buildCallGraph`, which sweeps each function once and records direct `call`s whose target is another known function (cached by content-hash + function count). Clicking any node navigates there.
 
@@ -1650,7 +1978,7 @@ User **comments** (`comments_`, green) render after these. All three are clearly
 
 The listing itself (`renderLiveListing`) reads the on-screen window straight from process memory (`readMemoryMasked`, which masks the debugger's own `0xCC` breakpoint bytes so real instructions show), decodes with `liveDecoder` (a decoder matched to the **debuggee's bitness**, so a 32-bit WOW64 target under an x64 host decodes correctly), and **caches** the decode + address index (`liveIdxOf_`) + divider set. The cache signature folds in the window start, RIP (catches stepping and self-modifying code), `liveGen_` (bumped on any live write/patch/re-analyze/detach), the function count, and the PID — so it is rebuilt only when something actually changed, not every frame (this was a deliberate fix for runaway working-set growth while attached). Dividers come from in-window call targets, analyzed functions (ASLR-shifted), and the containing module's parsed **exports** (`parseExports`).
 
-Extra live-only annotations on the RIP row: **register hints** (`regHints`, e.g. `rax=0x..`), and for a conditional branch a flag-evaluated verdict — `-> will jump` / `-> falls through` (`evalCondBranch`). Branch arrows, hover-token highlighting, string comments (with one pointer-hop dereference for `char*` slots), and user comments all work as in the static view. Keyboard: **Enter** follows the cursor's target, **Backspace** navigates back.
+Extra live-only annotations on the RIP row: **register hints** (`regHints`, e.g. `rax=0x..`), and for a conditional branch a flag-evaluated verdict — `-> will jump` / `-> falls through` (`evalCondBranch`). Branch arrows, hover-token highlighting, string comments (with one pointer-hop dereference for `char*` slots), user comments, and green trace-coverage rows all work as in the static view. Keyboard: **Enter** follows the cursor's target, **Backspace** navigates back.
 
 A **register box** (`renderRegisterBox`, right side, toggle "Regs") shows GP registers (e-names for 32-bit targets), changed values tinted, decoded flags, and a 12-slot stack preview. Every register and stack value is **clickable to follow** and right-click-to-copy, and while paused each is annotated by `describePointer` (does it point at a string? a symbol? a `char*`?) — memoized per stop via a hash of the whole register snapshot so the symbol lookups don't re-run every frame.
 
@@ -1672,7 +2000,27 @@ At the top sits a **Byte Pattern Search** box (hex, no wildcards) with a **Live 
 
 ### Lower sub-tabs
 
-`renderLowerTabs` hosts thirteen tabs: **Breakpoints** (software 0xCC with editable conditions, including a "pending" list for not-yet-armed ones, plus hardware DR0–DR3); **Registers** (full register + 24-slot stack view, double-click to **edit** values into the debuggee while paused, pointer annotations); **Watch** (pinned expressions — registers, `[mem]`, constants — evaluated each stop via the shared `EvalExpression`/`Cond.h` evaluator, persisted in `ctx.project.watches`); **Threads** (list, set-active, follow RIP, freeze/thaw); **Call Stack** (heuristic walk in `computeCallStack` — scans the stack for qwords landing just past a `call`); **Stack** (annotated live dump, RBP slot and frame boundaries highlighted, each value resolved to a symbol/string with a "follow" button); **Functions** (table of analyzed functions + a debuggee **modules** list while attached); **Xrefs**; **Notes** (free-text, persisted); **Results** (byte-search hits); **Patches**; **Imports** (IAT VA / module / function, filterable, right-click → find call sites); and **Hotkeys** (a complete printed cheat-sheet).
+`renderLowerTabs` hosts debugger and analysis panels including **Breakpoints**, **Registers**,
+**Watch**, **Threads**, **Call Stack**, **Stack**, **Functions**, **Xrefs**, **Notes**,
+**Results**, **Patches**, **Imports**, **Resources**, **Exports / Symbols**, **Annotations**,
+**Java**, **PDB**, **Address Inspector**, **Triage**, and **Hotkeys**. Panels whose evidence is not
+available stay explicit and inert rather than inventing data.
+
+The Triage **Authorization Trail** joins the existing string, xref, network, persistence,
+function, and runtime views. It renders the ordered input-to-protected-operation stages, ranked
+predicate fan-out, exact call/return branch consumers, object-root + displacement + width field
+lineages, and proved secondary gates. Selecting evidence navigates to Assembly/Hex and xrefs. Its
+four primary conclusions—locally valid format, server accepted, signature verified, feature
+permitted—remain independent unknown/candidate/supported facts, with explicit completeness and
+negative-search scope. A prominent warning identifies protected operations still behind secondary
+gates when a global predicate reaches only branding or UI paths.
+
+Each selected authorization location projects **static VA, RVA, file offset, and current runtime
+VA** together, with validity retained independently. Runtime is unavailable rather than guessed
+unless the active x86/x64 module identity and range match exactly. Eligible branch-consuming calls
+also expose the identity-bound Break-after-call / AL-EAX-RAX force-and-restore experiment; inert
+static patch advice lists all safety refusals instead of silently proposing a cleanup, cookie,
+non-executable, side-effecting, or transport-only edit.
 
 ### Cross-references
 
@@ -1680,7 +2028,16 @@ Two complementary paths. **Targeted xref search** (`startXrefSearch`, triggered 
 
 ### Navigation & history
 
-`navigateTo` moves the cursor and pushes a `NavEntry{va, live}` onto `navHist_`, dropping any forward branch. Crucially each entry remembers whether it was a **live** (runtime VA) or **static** (file VA) location, so `navBack`/`navForward` restore the correct *view* and never feed a runtime VA into a file-VA view. `gotoStatic` is the entry used by side-panel lists: it records history and, in the live view, shifts the file VA to the runtime VA. History is driven from the toolbar `<`/`>`, **mouse back/forward buttons**, and **Alt+Left/Alt+Right**. Per-instruction keys on the assembly views: **Enter** (follow target), **;** (comment), **N** (rename), **B** (breakpoint), **X** (xrefs), **J/K** (next/prev instruction, Shift = ×16), **P** (patch). Double-click an address or click the `; 0xADDR` target text to follow. Ctrl+G opens the **Goto Symbol** picker (`renderGotoPopup`, fuzzy-filtered over `symbolIndex_`, with a DbgHelp fallback); Ctrl+Shift+F opens the **disassembly text search** (`startTextSearch`, matching mnemonic+operands).
+`navigateTo` moves the cursor and pushes a `NavEntry{va, live}` onto `navHist_`, dropping any forward branch. Crucially each entry remembers whether it was a **live** (runtime VA) or **static** (file VA) location, so `navBack`/`navForward` restore the correct *view* and never feed a runtime VA into a file-VA view. `gotoStatic` is the entry used by side-panel lists: it records history and, in the live view, shifts the file VA to the runtime VA. History is driven from the toolbar `<`/`>`, **mouse back/forward buttons**, and **Alt+Left/Alt+Right**. Per-instruction keys on the assembly views: **Enter** (follow target), **;** (comment), **N** (rename), **B** (breakpoint), **X** (xrefs), **J/K** (next/prev instruction, Shift = ×16), **P** (patch). Double-click an address or click the `; 0xADDR` target text to follow. Ctrl+G opens the focused **Goto Symbol** picker; Ctrl+Shift+F opens disassembly text search.
+
+`Ctrl+K` opens the unified **Investigation** omnibox. Binary View gathers an immutable,
+generation-stamped snapshot in bounded render slices; `InvestigationService` builds/ranks it on
+one joined worker. Commands, exact FILE/LIVE addresses (including zero), functions, strings,
+imports, comments, resources, byte/text hits, xrefs, live modules, and recent queries share a
+typed result model. Superseded generations cannot publish or navigate. The lower **Address
+Inspector** applies the same explicit FILE/LIVE discipline while showing file offset, RVA,
+static VA, runtime module+offset, mapping confidence/evidence, xrefs, classification/type,
+analyst overrides, and ordered overlapping-patch state.
 
 ### Live↔file VA translation under ASLR
 
@@ -1688,26 +2045,66 @@ When attached, the process loads the main module at a base that differs from the
 
 ### Patching (hex + Keystone assembly)
 
-The **Patch popup** (`renderPatchPopup`) supports two modes: **Assembly** (Keystone via `Assemble`, at the target's own bitness — x64, x86, ARM, ARM64 only) with a live byte preview, and **Hex bytes** with a disassembly preview and a "NOP fill" helper. `applyPatchBytes` is the workhorse: it optionally **NOP-pads** a short encoding up to the original instruction length, captures the *exact* original bytes (read from the live process when attached, else the file image) so a revert is precise, records a `PjPatch` keyed by the **file VA** (`patchKeyFor` translates a runtime VA back), writes the bytes into the debuggee when attached *and* into the in-memory image so the static disassembly reflects them, and invalidates all the relevant caches (`listBuilt_`, pseudocode, decompiler, `functionsDirty_`, `liveGen_`). One-click **NOP out** is available on rows and over multi-line selections. The **Patches** tab lists every patch (original vs patched bytes) with per-row **revert**; `File ▸ Save Binary As…` later splices them to disk.
+The **Patch popup** (`renderPatchPopup`) supports two modes: **Assembly** (Keystone via `Assemble` for x64, x86, A32, Thumb, and A64) with a live byte preview, and **Hex bytes** with a disassembly preview and an architecture-correct "NOP fill" helper. `applyPatchBytes` captures pristine original bytes, records an ordered `PjPatch` keyed by file VA, updates live/static memory as applicable, and invalidates the affected analysis/listing caches. One-click **NOP out** is available on rows and over multi-line selections. The **Patches** tab lists every patch with per-row revert; `File ▸ Save Binary As…` later splices them to disk.
+
+Every patch can belong to a stable named experiment set while the one global patch vector remains
+the authoritative later-wins order. The Patches tab creates/renames sets, selects the destination
+for new edits, toggles them through checked pristine-image reconstruction, reassigns or reverts
+members, deletes empty sets, and compares Current/Baseline/Ungrouped/single-set selections without
+mutation. Invalid membership, original-byte disagreement, changed mappings, and conflicting enabled
+overlaps fail closed; a rejected transition publishes no partial image, live write, or project state.
 
 ### Selection & batch actions
 
 The static and live listings support **multi-line selection** (`selVAs_`): plain click = single, Shift+click = range from the anchor, Ctrl+click = toggle one line. When a selected row is right-clicked, a batch menu appears (`asmSelectionMenu` / `liveSelectionMenu`): create a **signature** (`buildSignature`, optionally wildcarding call/jmp displacements so it survives recompilation) routed to the Sig Scanner, copy bytes / C-array / instructions, **NOP out**, **region-patch** (assemble over the whole span), add breakpoints, bookmark, or (live) scan the selected bytes in process memory.
 
-### Analysis export
+### Source export (ASM / C)
 
-`exportAnalysis` (File ▸ Export Analysis) gathers renames, comments, bookmarks, notes, and **decompiles every user-named function** (capped at 300) via `decompileFunctionText`, then renders Markdown + HTML reports (`Report.h`) through the app's save dialog.
+**File ▸ Save ASM…** and **File ▸ Save C…** route to Binary View and open the
+`Save ASM / Save C` modal. File-menu entry defaults to **Whole program**, while also
+showing the analyzed function under the cursor when one exists. The two Functions
+lists add **Save function as ASM… / C…** context actions that open the same modal with
+that exact function preselected. The scope is therefore explicit: whole analyzed image
+or one current function, including a function rooted at VA zero.
+
+C export adds a second choice. **Readable pseudocode** preserves the decompiler's
+display-oriented output and is deliberately *not* promised to compile.
+**Self-contained compilable C** emits portable C11 scaffolding, sanitized symbols,
+external-call stubs, and explicit fallbacks for operations the decompiler cannot model.
+C export is x86/x64-only and remains disabled on other architectures and until background
+function discovery has produced the Functions list. Default names are `<binary-stem>.asm` / `<binary-stem>.c`; function scope appends the function
+name, and readable C appends `_readable` before `.c`.
+
+`startCodeExport` snapshots the discovered/guessed functions, imports, analyst renames
+(the authoritative final name layer), and comments into a `CodeExportRequest`, records
+the current image revision, asks `selectCodeExportPath` for the destination, then queues
+`AppContext::codeExport`. That dedicated one-job worker constructs its **own decoder**;
+it is independent of both `ctx.disasm` and the `AnalysisService` worker. The modal polls
+`CodeExportProgress`, showing the named phase, a byte or function progress bar, the
+current function VA while decompiling, and **Cancel export**. A completed or cancelled
+job reports its final status and byte count in the same modal; cancellation leaves the
+chosen destination unchanged. The service streams to a uniquely named sibling temporary
+file; only a completed export is committed, with an existing destination first moved to a
+short-lived backup so a failed replacement can roll back. Success and cancellation both
+remove their temporary/backup artifacts.
+
+### Analysis-report export
+
+This remains a separate workflow: `exportAnalysis` (File ▸ Export Analysis) gathers
+renames, comments, bookmarks, notes, and **decompiles every user-named function**
+(capped at 300) via `decompileFunctionText`, then renders Markdown + HTML reports
+(`Report.h`) through the app's save dialog.
 
 ### Caching strategy (performance)
 
-Responsiveness is engineered throughout: the full listing caches a **row index** (not decoded instructions) and clipper-renders; the live decode is cached by a change-signature; `funcIndex_`, the xref index, the call graph, the symbol index, pseudocode, and the decompiler are all memoized by content/function signatures; `describePointer` is memoized per stop; side lists are filtered into index vectors and clipper-rendered; and the per-frame `saveProjectState` deep-copies the (potentially huge) comment/name maps only when `projectDirty_` is set. On **detach**, the live caches are released once via the `wasAttached_` edge detector.
+Responsiveness is engineered throughout: the full listing keeps a 64-bit virtual **row index** plus a bounded 96-page decoded LRU and clipper-renders; the live decode is cached by a change-signature; `funcIndex_`, the xref index, the call graph, the symbol index, pseudocode, and the decompiler are all memoized by content/function signatures; `describePointer` is memoized per stop; side lists are filtered into index vectors and clipper-rendered; and the per-frame `saveProjectState` deep-copies the (potentially huge) comment/name maps only when `projectDirty_` is set. On **detach**, the live caches are released once via the `wasAttached_` edge detector.
 
 #### Limitations & notes
 
-- The full listing is **capped at 800k instructions** and is a linear sweep of executable sections — overlapping/obfuscated code may render `db` filler rows rather than the analyst's intended decode.
+- The full listing has **no global instruction cap**. It decodes only requested 4 KiB pages and never linearly sweeps an executable span for display. A far variable-width page may remain visibly provisional when no trusted checkpoint lies within the 64 KiB exact-preparation bound. Breakpoint/Patch can explicitly accept one displayed start, but no page-wide or trace authority is inferred. Overlapping/obfuscated code can still render `db` filler rows rather than the analyst's intended alternate decode.
 - The **call-stack walk** is explicitly heuristic (scans for qwords following a `call`); frames beyond frame 0 are best-effort and the UI says so.
 - Guessed function names, the inferred `guessSignature`, the instruction gloss, and the API-purpose strings are all **heuristic** and labelled as such (amber tint, "guessed name" tooltips, "signature is heuristic" banner).
-- **Keystone** assembly patching covers only x86/x64/ARM/ARM64; other arches can be disassembled (Capstone) but not assembled.
+- **Keystone** assembly patching covers only x86/x64/A32/Thumb/A64; other arches can be disassembled (Capstone) but not assembled.
 - Conditional-branch evaluation, register hints, and the live string/pointer dereferences are **x86/x64 only** — consistent with the Win32 debugger, which never targets other arches.
 - Live string scanning and the various sweeps are **byte-capped** (256 MB strings/value search, 64 MB code search) and **hit-capped** for responsiveness; results may be truncated with a status note.
 - The naive live "Pseudo" line translator (`pseudoLine`/`buildPseudo`) is separate from the structured decompiler used by the Pseudocode views; the structured pipeline is the primary one.
@@ -1734,7 +2131,7 @@ The **left pane** is a three-column table (Name / Arch / Opened) listing the rec
 - Double-click opens it (`ctx.loadBinaryPath(r.path)`, then jump to Binary View; failure stores an `openError_`).
 - Right-click context menu: **Open**, **Copy path** (to the clipboard), **Remove from list** (calls `RemoveRecent(hash)` and refreshes). Timestamps are formatted by a small `whenStr()` helper using `localtime_s`.
 
-The **right pane** shows two detail blocks. *Selected* echoes the highlighted recent's name, path, arch, content hash (printed as `%016llX`), and last-opened time, with an **Open this project** button. *Loaded Binary* describes the currently open binary — path, `formatName()`, image base, entry point (`imageBase + entryPoint`), section count — followed by a *Saved analysis* summary pulled straight from `ctx.project`: counts of comments, renames, bookmarks, breakpoints, and patches. A **Save project now** button calls `ctx.saveProject()`, and a dimmed note reminds the user that the sidecar is auto-saved on close/exit.
+The **right pane** shows two detail blocks. *Selected* echoes the highlighted recent's name, path, arch, content hash (printed as `%016llX`), and last-opened time, with an **Open this project** button. *Loaded Binary* describes the currently open binary — path, `formatName()`, image base, entry point (`imageBase + entryPoint`), section count — followed by a *Saved analysis* summary pulled straight from `ctx.project`: counts of comments, renames, bookmarks, breakpoints, and patches. A **Save project now** button forces a synchronous commit; the normal path is a short debounced autosave plus a verified final commit on close/exit/switch.
 
 **Why this design.** The recents index gives the tool a memory of past targets keyed by *content hash*, not path — so a binary moved or copied still resolves to the same analysis sidecar. The summary block makes the dashboard a quick "what have I done to this file" glance.
 
@@ -1742,17 +2139,16 @@ The **right pane** shows two detail blocks. *Selected* echoes the highlighted re
 
 ### Communications tab
 
-**File:** `src/Tabs/CommunicationsTab.h/.cpp`. Native-process backend plus an AMD-V hypervisor channel.
+**File:** `src/Tabs/CommunicationsTab.h/.cpp`. Native-process backend: processes, modules, and live connections.
 
-This tab is the live-system side of the tool. Its main `render()` splits the area: a 55%-width left child for the process list, and a right child stacking **Modules**, **Connections**, and the **AMD-V Hypervisor** panel.
+This tab is the live-system side of the tool. Its main `render()` splits the area: a 55%-width left child for the process list, and a right child stacking **Modules** above **Connections**.
 
 **Process list (`renderProcesses`).** Enumeration is real, via `ProcessManager::enumerate()` (Toolhelp32). Results are sorted by name for stable ordering. A subtle correctness detail: the selection follows the **PID**, not the row index — on re-enumerate the code records the previously selected PID and re-locates it, so its modules/connections never get listed against the wrong process after a re-sort. A name filter box (`filter_`) narrows the table. Each row shows PID, name, Arch (`is64 ? "x64" : "x86"`, WOW64-aware best-effort), an **Access** column (green "ok" / red "denied" from `ProcessInfo::canOpen`), and an **Attach**/**Detach** action. Attach calls `ctx.debug.attach(pid, err)` (the real Win32 debug API, `DebugActiveProcess`). On success: if no file is loaded, it points `ctx.arch` at the debuggee's bitness and calls `ctx.rebuildDisassembler()` so generic decode paths are correct, then `ctx.openLiveAssemblyView()`. A green "| debugging PID N" badge appears when a session is live.
 
 **Modules (`renderModules`).** For the selected process, lazily fetches `pm_.modules(pid)` (Toolhelp32 module snapshot), caching per PID. Columns: Module / Base / Size (KB). If empty, it tells the user this usually means a bitness or rights mismatch and suggests running as Administrator.
 
-**Connections (`renderConnections` / `refreshConnections`).** Live per-process TCP/UDP endpoints, real, via the IP Helper API. `GetExtendedTcpTable(... TCP_TABLE_OWNER_PID_ALL)` and `GetExtendedUdpTable(... UDP_TABLE_OWNER_PID)` are each called twice — once to size the buffer, once to fill it — then filtered to rows whose `dwOwningPid` matches the selected PID. Addresses are formatted with `inet_ntop` and `ntohs`; TCP state strings come from `tcpStateName()` mapping the `MIB_TCP_STATE_*` enum (LISTEN, ESTABLISHED, TIME_WAIT, …). UDP rows are listed as "listening". **Scope/limitation:** IPv4 only — there is no IPv6 connection table here (consistent with the project's stated out-of-scope list).
+**Connections (`renderConnections`).** Live per-process IPv4+IPv6 TCP/UDP endpoints, real, via the IP Helper API. An owned latest-PID-wins worker queries the four owner-PID tables (`AF_INET`/`AF_INET6` × TCP/UDP) through bounded size/fetch/retry and allocation caps, then filters on `dwOwningPid`; epochs prevent a late result from replacing the newly selected process. One failed table produces an honest partial-refresh warning without suppressing successful rows. `Core/NetworkEndpoint` formats canonical bracketed IPv6 endpoints with numeric scope IDs and IPv4-mapped addresses. The pane separates local/remote, protocol, family, and TCP state, auto-refreshes once per second, and offers IPv4/IPv6/TCP/UDP plus text filters. Whole-table queries and result sorting never run in `render()`.
 
-**AMD-V Hypervisor (`renderHvDbg`).** This panel talks to the SVM kernel driver over `\\.\HvDbg` via `HvDbgClient`. It surfaces connection state, an SCM-driven **Load driver / Unload driver** lifecycle (`HvDbgLoader`, greyed out unless `isElevated()`), a handshake/`ping()` that fills `HVDBG_INFO`, and capability flags (SVM supported, NPT, active, SVM-locked-in-firmware, another hypervisor present), plus **Virtualize all CPUs** / **Devirtualize** actions. Critically, if `ping()` reports an **ABI mismatch** the panel refuses to drive VMRUN IOCTLs and tells the user to rebuild the driver. When the driver isn't loaded the panel degrades gracefully to an informational "not present" state. Per the project spec, **driver packaging, signing, loading, and runtime validation are out of scope** for the normal app target — this panel is the user-mode client surface, not a turnkey hypervisor.
 
 ---
 
@@ -1780,21 +2176,21 @@ The top bar holds a pattern input (defaulting to `48 89 5C 24 ?? 57 48 83 EC 20`
 
 ### Memory Tools tab
 
-**File:** `src/Tabs/MemoryToolsTab.h/.cpp`. A Cheat-Engine-style live-memory toolkit. All four panels operate on the **attached process** (via `Debugger::readMemory/writeMemory/regions`); without an attach they show a "attach a process first" hint.
+**Files:** `src/Tabs/MemoryToolsTab.*`, `src/Core/ProcessMemorySession.*`, `src/Core/MemoryScan.*`, `src/Core/MemoryPointer.*`, and `src/Core/MemoryTable.*`. Memory Tools can reuse the exact active debugger session or open a **passive process-memory session** by PID. Passive open never calls `DebugActiveProcess` or consumes debug events and can retain a read-only session when Windows denies write rights. Both paths bind operations to PID plus session generation; passive identities also retain process creation time to reject PID reuse.
 
-**Value scanner (`renderScanner` / `firstScan` / `nextScan`).** Combo boxes pick a **value type** (`Byte/Word/Dword/Qword/Float/Double`) and a **scan type** (`Exact / Bigger than / Smaller than / Changed / Unchanged / Unknown initial`), with a value box and a **Hex** toggle. `parseNeedle()` turns the text into a little-endian needle (floats/doubles `memcpy`'d; integers `strtoull` in base 10/16).
+**Value scanner.** The typed codec supports signed and unsigned 8/16/32/64-bit integers, `float`, `double`, AOB byte arrays with `??` wildcards, and validated UTF-8/UTF-16LE text with optional terminators. Numeric input supports decimal and raw-width hexadecimal. Predicates are **Exact, Not equal, Greater/Less than value, Between, Changed, Unchanged, Increased, Decreased, Increased by, Decreased by, and Unknown initial**, with optional float tolerance.
 
-- **First Scan** walks committed regions in 1 MB chunks (512 MB byte budget, 2 M result cap). For ordered types it compares each candidate to the entered value; for Changed/Unchanged/Unknown it captures everything (there is no prior value yet, Cheat-Engine style). Each kept hit stores `{address, prevBits}`.
-- **Next Scan** re-reads each stored address and applies `matches()` against the *previous* captured value (or the needle for Exact), keeping survivors. Crucially, integer comparisons are **signed** — the low bytes are sign-extended before widening to `double`, so `-1 < 0` rather than `-1` looking like 4.29e9.
-- **New Scan** clears state.
+- A cancellable first scan selects committed/readable memory by private/image/mapped kind, writable/executable state, explicit address range, alignment, and byte-admission bound.
+- `MemoryScanSnapshot` owns previous bytes per chunk and a compact candidate bitmap. Chunk lookahead preserves cross-boundary values; next scans re-read/refine whole retained chunks instead of making one `ReadProcessMemory` call per candidate.
+- Candidate counts are exact for the admitted readable scope. Results are enumerated by stable ordinal pages, eliminating the old 1,000-row display and 2-million-hit storage truncations without materializing every address.
 
-Results show up to 1000 of `totalFound_`, re-reading live values each frame; right-click adds a result to the address table.
+**Hex viewer/editor and regions.** The live inspector is a 256-byte hex/ASCII window with history, byte selection, copy, byte-array paste/edit, changed-byte highlighting, and pointer-follow actions. The cached searchable region browser shows base/end/size, protection, allocation type, and module, and can route a range into either the viewer or scanner. The debug toolbar and Ctrl+K command **Inspect Live RIP in Memory Tools** carry the current PID/session generation and RIP directly to the inspector.
 
-**Viewer/Editor (`renderViewerEditor`).** A hex+ASCII dump of 8 rows × 16 bytes from a user-entered base address, read live each frame; unreadable bytes render as `--`/`.`.
+**Pointer scan.** A cancellable worker performs deterministic 32- or 64-bit backlink discovery across an admitted region snapshot. Depth, positive offset, result/frontier/read/comparison, and cancellation limits are explicit. Stable module-relative roots and short chains rank first; a result can be resolved against the identity-bound reader or added as a relocatable module-plus-offset pointer record.
 
-**Memory browser (`renderBrowser`).** Lists committed regions from `ctx.debug.regions()` with base, size (KB), and RWX protection flags; clicking a region drops its base into the viewer address.
+**Address table and freeze.** Records support absolute or module-relative bases, pointer offsets, all scanner value types, grouping/description, hexadecimal display, and per-row protection authority. A strict bounded **JSON table** is saved separately from the project sidecar. Loading always clears runtime `enabled` and `freezeActive` flags—even if an untrusted file sets them—so opening a table never starts target reads or writes. Resolution prefers exact normalized module paths and rejects ambiguous basename matches.
 
-**Address table (`renderAddressTable`).** A persistent (in-tab) table of `{active, desc, address, type, value, frozen}` rows. Each frame, **frozen** rows are re-written to the process (`writeMemory`) — the freeze loop. Non-frozen rows display the live value and accept edits (Enter writes through). An **Add Row** box appends a new hex address. Note: this address table lives in the tab instance and is *not* persisted to the project sidecar.
+A dedicated worker applies **Constant, Minimum, or Maximum** freeze policies independently of tab rendering, always against the current process identity. Debugger writes are session-checked and batched. Passive writes capture original bytes, apply and verify the change, restore temporary page protection, and attempt verified rollback after a post-write failure. Normal authority permits only already-writable, non-executable committed data; a row must explicitly allow protection changes for read-only or executable pages, and guard/no-access spans remain denied.
 
 ---
 
@@ -1802,11 +2198,13 @@ Results show up to 1000 of `totalFound_`, re-reading live values each frame; rig
 
 **File:** `src/Tabs/BinaryDiffTab.h/.cpp`. Compare two binaries with synchronized hex panes.
 
-Before a diff exists, `renderLoadZone()` draws a centered "drop zone" — two cards (LEFT / RIGHT) each with a **Load…** button (a `GetOpenFileNameW` dialog into `BinaryFile::load`), plus a **Compute Diff** button enabled only when both are loaded. The block is sized to half the tab width and centered on both axes.
+Before a diff exists, `renderLoadZone()` draws a centered "drop zone" — two cards (LEFT / RIGHT) each with a **Load…** button, plus a **Compute Diff** button enabled once two paths and their stable Win32 identities have been captured. The render thread never loads or parses either binary.
 
-`computeDiff()` walks the byte vectors of both files up to the shorter length, recording mismatching offsets into `diffs_` (`{offset, a, b}`, capped at 5000 stored rows but `totalDiff_` counts all of them, plus the size delta of the tail). After computing, a compact toolbar lets you swap either side or **Recompute** without leaving the view.
+`computeDiff()` enqueues work on a persistent cancellable worker. The job contains only paths and stable Win32 file identities; the worker reloads owned `BinaryFile` objects, verifies identity before and after work, scans bytes once, counts every mismatch, keeps bounded samples, and coalesces navigable change regions. Optional section-aware mode aligns sections by name then RVA. After computing, a compact toolbar lets you swap either side or **Recompute** without leaving the view.
 
-The diff view is two equal bordered panes rendered by `renderPane()`, each a clipper-driven (`ImGuiListClipper`) 16-byte-per-row hex+ASCII dump. A byte is highlighted **red** when it differs from the other file (or lies past the other's end); matching bytes are muted. **Synchronized scrolling:** only the hovered ("master") pane shows a scrollbar and drives `scrollY_`; the follower is positioned with `SetScrollY` to match. Hovering either pane hands it the master role, so scrolling either side keeps both aligned. This is a byte-offset diff (not a structural/section-aware diff); it is most meaningful for builds of the same layout.
+The diff view is two equal bordered panes rendered by `renderPane()`, each a clipper-driven (`ImGuiListClipper`) 16-byte-per-row hex+ASCII dump. A byte is highlighted **red** when it differs from the other file (or lies past the other's end); matching bytes are muted. **Synchronized scrolling:** only the hovered ("master") pane shows a scrollbar and drives `scrollY_`; the follower is positioned with `SetScrollY` to match. Hovering either pane hands it the master role, so scrolling either side keeps both aligned. Flat mode is exact by file offset; section-aware mode is better for changed layouts.
+
+**Semantic mode.** Opting in builds immutable function models on the same worker and matches unique authoritative names first, then relocation-normalized typed-instruction hashes, canonical CFG structure, and already-matched call neighborhoods. The UI separates matched/added/removed functions, shows confidence and concrete evidence, lists instruction edit hunks, and presents a synchronized two-column instruction review. Persisted names, comments, prototypes, and bookmarks become proposals only: every checkbox starts clear, the user must explicitly select and apply each proposal, and application is rejected unless the destination image hash equals both the active binary and project identity.
 
 ---
 
@@ -1824,11 +2222,10 @@ The diff view is two equal bordered panes rendered by `renderPane()`, each a cli
 
 #### Limitations & notes
 
-- **Communications connections are IPv4-only** (no IPv6 table), per the project's out-of-scope list. Module/connection visibility depends on having matching bitness and sufficient rights (often requires Administrator).
-- **The AMD-V hypervisor panel** is the user-mode client surface only; driver packaging, signing, loading, and runtime validation are outside the normal app target, and the panel refuses VMRUN IOCTLs on an ABI mismatch.
-- **Live scans are bounded** for responsiveness: the Sig Scanner caps at 512 MB scanned / 4096 results with chunk overlap to avoid missing straddling matches; the Memory Tools scanner caps at 512 MB / 2 M results and displays at most 1000 rows.
-- **Memory Tools and Binary Diff need their inputs present** — Memory Tools requires an attached process; Binary Diff does a flat byte-offset comparison (not section-aware), so it is most useful for two builds with the same layout.
-- **The Memory Tools address table is per-session** (not written to the project sidecar), unlike comments/bookmarks/breakpoints/patches which are persisted.
+- **Communications connections cover IPv4 and IPv6 TCP/UDP.** Module/connection visibility still depends on having matching bitness and sufficient rights (often requires Administrator); individual table failures are shown as partial refreshes.
+- **Live scans are bounded** for responsiveness: the Sig Scanner caps at 512 MB scanned / 4096 results with chunk overlap. Memory Tools uses configurable byte/work admission bounds, keeps every candidate in the admitted readable chunks, reports the exact count, and pages display rows without a hit cap.
+- **Memory Tools needs a live process, but not a debugger attach.** It can open a passive memory session or reuse the current debugger session. Windows rights, target exit, identity changes, and unreadable regions are surfaced explicitly. Binary Diff needs two file inputs and keeps flat, section-aware, and semantic work cancellable.
+- **Memory tables are durable JSON artifacts, not project-sidecar state.** Loaded rows are deliberately disabled and unfrozen until the analyst enables them for the current target.
 - **Binary Tech `confidence` is a heuristic score**; the detected evidence (imports/sections/patterns) is real, and a clean binary yields an empty list rather than invented capabilities.
 ## 09. Persistence, Projects & Reporting
 
@@ -1838,12 +2235,13 @@ library, the recents index that backs the **Projects** tab, when state is saved
 and reloaded, and the **Export Analysis** report generator (Markdown / HTML). The
 guiding design idea is simple: a binary's content hash is the identity key, so the
 analyst's annotations follow the *bytes*, not the file path — rename a file, move
-it, copy it, and your comments, renames, bookmarks, breakpoints, patches and notes
+it, copy it, and your comments, renames, bookmarks, breakpoints, named patch sets and notes
 come right back. There is no notion of a manually-saved `.dsproj` file the user
 juggles; persistence is implicit and automatic.
 
 Key files: `src/Core/Project.h`, `src/Core/Project.cpp` (state model + sidecar
-I/O + recents), `src/Core/Json.h`, `src/Core/Json.cpp` (the tiny JSON lib),
+I/O + recents), `src/Core/PatchSet.h` and `src/Core/PatchedImage.h` (bounded
+selection, pristine reconstruction, and comparison), `src/Core/Json.h`, `src/Core/Json.cpp` (the tiny JSON lib),
 `src/Core/Report.h`, `src/Core/Report.cpp` (report formatters). Wiring lives in
 `src/App.cpp` (`AppContext::loadProjectForBinary`, `saveProject`,
 `exportAnalysisFile`), `src/Tabs/BinaryViewTab.cpp` (`loadProjectState`,
@@ -1861,6 +2259,9 @@ Identity / metadata:
 - `binaryPath`, `arch` (`"x86"`/`"x64"`/`"ARM"`/`"ARM64"`/…), `engine`
   (`"Zydis"`/`"Capstone"`), `name` (display name, defaults to the file name),
   `status` (defaults to `"analyzed"`), and `lastOpenedUnix` (a Unix timestamp).
+- Raw-layout identity: the exact image base, an explicit-entry bit plus entry VA (including
+  VA 0), and bounded named landmarks/evidence. A raw blob has no header from which these can
+  be reconstructed on a recent-project reopen.
 
 Analysis annotations (the part actually worth persisting):
 - `comments` — `unordered_map<uint64_t,string>`, address → user comment.
@@ -1869,16 +2270,23 @@ Analysis annotations (the part actually worth persisting):
 - `breakpoints` — `vector<uint64_t>` of addresses.
 - `bpConditions` — `unordered_map<uint64_t,string>`, address → condition
   expression, kept 1:1 with `breakpoints`.
-- `patches` — `vector<PjPatch>`, each holding `{address, orig, bytes}` where
-  `orig` and `bytes` are the original and replacement byte vectors.
+- `patches` — `vector<PjPatch>`, each holding `{address, orig, bytes, patchSetId}` where
+  `orig` and `bytes` are the original and replacement byte vectors. Their vector
+  order is application order and is preserved because overlapping patches are later-wins.
+- `patchSets` — presentation records `{id, name, enabled}`. Zero is the implicit
+  backward-compatible **Ungrouped** set; named ids are stable project-local identities rather
+  than vector indices.
+- `functionOverrides` and `dataOverrides` — authoritative analyst decisions for
+  define/undefine, exact function extents, noreturn/convention/prototype/mode, and
+  bounded code/data/string/pointer-table/jump-table spans with optional types.
 - `lastCursor` — the last cursor VA, so reopening returns you where you were.
 - `notes` — free-form text from the Notes tab.
 - `watches` — the watch-panel expressions.
 
 Two helpers shape the save policy. `reset()` clears the struct to defaults
 (called when switching targets), and `hasContent()` returns true only if there is
-real analysis present (any comment, name, bookmark, breakpoint, patch, note,
-watch, or a non-zero `lastCursor`). Crucially, *metadata alone is not "content"* —
+real analysis present (any comment, name, bookmark, breakpoint, patch or patch set, note,
+watch, analyst override, valid cursor, or saved raw mapping). Crucially, ordinary open metadata alone is not "content" —
 a freshly-opened binary with only an auto-stamped open time is considered empty.
 This gate prevents `%APPDATA%` from filling with junk sidecars for binaries the
 user merely glanced at (see save policy below).
@@ -1911,11 +2319,12 @@ project key is stable across patch/revert cycles within a session.
 
 `SerializeProject` / `DeserializeProject` (split out from filesystem I/O so they
 are unit-testable with no disk) convert `ProjectState` to and from a JSON object.
-The serialized document carries `version: 1`, the metadata fields, then arrays for
-`names`, `comments`, `bookmarks`, `breakpoints`, `patches`, and `watches`. Maps
-are emitted as arrays of `{a, v}` (or `{a, label}`, etc.) **sorted by address**,
-so the on-disk output is stable and diff-friendly regardless of `unordered_map`
-iteration order.
+The serialized document carries `version: 4`, the metadata fields, an optional
+`rawMapping` object, annotations, named patch sets, ordered patches, and analyst overrides. Maps
+are sorted by address for stable output, but the patch vector is deliberately
+not sorted because its order defines overlap precedence. Versions 1–3 remain
+readable; legacy patches have no membership field and load into Ungrouped. New saves include an
+explicit hex-string set id for every patch.
 
 The single most important serialization decision: **every address is stored as a
 hex string, not a JSON number.** The reasons:
@@ -1941,9 +2350,14 @@ to drive bad behaviour:
   nibble rather than fabricating a wrong byte.
 - Patches are validated before the file-splicer is ever allowed to trust them:
   `bytes` must be non-empty, `orig` and `bytes` must be the same length, and the
-  size is capped at 1 MiB. A malformed patch entry is skipped, not applied — this
+  size is capped at 1 MiB. Named set ids/names and memberships must be bounded and
+  unique, overlapping records must agree about pristine bytes, and enabled sets may not
+  request conflicting replacement bytes. A malformed version-4 patch or invalid set plan
+  rejects the sidecar rather than publishing a partial selection — this
   matters because saved patches are re-applied to the in-memory image on reopen
   and can be spliced into a written-out binary via **Save Binary As…**.
+- Override counts, text, ranges, duplicates, overflow, and data-span overlap are
+  validated before they can influence analysis; explicit validity fields keep VA 0 legal.
 
 ### The hand-rolled JSON library (`Json.*`)
 
@@ -1972,23 +2386,27 @@ all on top of this library.
 
 Loading (`AppContext::loadProjectForBinary` in `App.cpp`): on opening a binary it
 `reset()`s the project, computes the content hash, and calls `LoadProject(hash)`.
-If a sidecar exists it is restored. On the normal open path it also re-applies the
-*saved* arch/engine so the binary reopens exactly as last analyzed — especially
-valuable for raw blobs and mis-detected images where the header alone picks the
-wrong architecture; on the **Open as Raw…** path (`loadRawPath`) this is skipped
-because the dialog's explicit arch choice must win. It then stamps fresh metadata
-(hash, path, arch, engine, name, `lastOpenedUnix`).
+If a sidecar exists it is restored. On the normal open path, a raw candidate is first
+re-staged at the saved base with the saved explicit entry and named landmarks, then the
+saved arch/engine is applied. This prevents every VA-keyed annotation from shifting on a
+recent raw reopen. Invalid saved raw metadata is ignored safely. On the interactive
+**Open as Raw…** path, the dialog's explicit mapping and architecture win. It then stamps fresh metadata
+(hash, path, arch, engine, name, `lastOpenedUnix`). A bounded firmware rescan recreates
+the evidence report on an ordinary raw reopen without changing the saved mapping.
 
 The Binary View tab then mirrors `ctx.project` into its live editing state via
 `loadProjectState` (comments, names, bookmarks, breakpoints + conditions, notes,
-watches, and `lastCursor` → cursor). If a debugger is already attached, saved
-breakpoints (with conditions) are armed immediately. Saved patches are re-written
-into the in-memory image so the disassembly reflects them across sessions — and
+watches, named patch sets, and `lastCursor` → cursor). If a debugger is already attached, saved
+breakpoints (with conditions) arm only after exact x86/x64 path/module/bitness matching;
+otherwise they remain pending. The enabled patch-set selection is reconstructed from checked
+pristine bytes and written into the in-memory image so the disassembly reflects it across sessions — and
 because the hash was cached from the pristine file, those writes don't change the
 sidecar key.
 
-Saving happens automatically at every natural boundary; the user never has to
-"save the project":
+Mutations mark a project revision dirty. After a short debounce, the App snapshots
+the state and commits it on a background task, keeping serialization and filesystem
+work off the render thread. It also verifies a synchronous final commit at every
+destructive boundary:
 - **Window close / Alt+F4 / Exit** — `App` calls `ctx_.saveProject()` on
   shutdown.
 - **File ▸ Close Binary** — flush, then unload and `reset()`.
@@ -1996,12 +2414,10 @@ Saving happens automatically at every natural boundary; the user never has to
   for the *outgoing* binary before loading the new one.
 - **Projects tab "Save project now"** button — an explicit manual flush.
 
-Each frame, `BinaryViewTab::saveProjectState` cheaply mirrors live tab state back
-into `ctx.project` so the App's flush is always current (no dirty tracking needed
-for small, user-sized state). One performance refinement: the potentially large
-`comments` and `names` maps are only deep-copied when an edit actually changed
-them (`projectDirty_`), since copying thousands of entries every frame was the real
-cost on a heavily-annotated binary.
+Binary View mirrors live state into `ctx.project`, and mutation sites call
+`markProjectDirty()`. In-flight and saved revisions are tracked separately, so an
+edit made during a save remains dirty. Failure remains visible, retains in-memory
+state, and is retried without allowing close/switch to discard the project.
 
 `SaveProject` itself enforces the empty-project policy: if `hasContent()` is
 false it records the open in the recents index but writes **no** sidecar (and
@@ -2027,7 +2443,36 @@ double-click or right-click ▸ **Open** to reopen (which calls
 **Remove from list**. The details pane shows the selected entry's metadata and,
 for the currently loaded binary, a live "Saved analysis" summary (counts of
 comments, renames, bookmarks, breakpoints, patches) plus the **Save project now**
-button and a reminder that it auto-saves on close/exit.
+button and a reminder about debounced autosave and final close/exit commits.
+
+### Save ASM / Save C (source export)
+
+Source export is intentionally separate from the persisted project and the analysis
+report below. **File ▸ Save ASM… / Save C…** exports either every analyzed function/
+executable range or one selected function. ASM preserves resolved names and analyst
+comments. On x86/x64, C has two contracts: `CodeExportCStyle::Readable` keeps the decompiler's
+display pseudo-C, while `CodeExportCStyle::Compilable` produces a self-contained portable
+C11 translation unit with normalized identifiers, declarations/stubs, and explicit
+fallbacks where the lightweight decompiler cannot express an operation faithfully.
+
+`Core/CodeExport` keeps generation independent of ImGui and Win32. The pure
+`GenerateCodeExport(request, decoder, out, cancel, progress)` function streams into an
+arbitrary `std::ostream`; `CodeExportService` wraps it in a dedicated one-job thread and
+opens the path chosen by `AppContext::selectCodeExportPath`. A request snapshots the
+engine/architecture, scope, function table, import/discovered/user name layers, comments,
+source name, destination, and expected image revision. The worker creates its own decoder
+through the injected factory, so a long whole-program export neither touches `ctx.disasm`
+nor occupies the load-time `AnalysisService` worker.
+
+Progress is structured (`Preparing`, `Assembly`, `Decompiling`, `Finalizing`) rather than
+a spinner-only flag: assembly reports bytes, C reports functions and the current function
+VA, and both expose bytes written. `cancel()` is non-blocking for the render thread;
+`cancelAndWaitIdle()` is the stronger lifetime barrier used before loading, closing,
+patching, or reverting the borrowed `BinaryFile`. The source files are write-out artifacts
+only; their paths/options are not stored in the project sidecar and there is no import path.
+The service writes a same-directory temporary file and commits it only after generation and
+flush succeed; an existing destination is protected by a rollback backup during replacement,
+and failure/cancellation cleans the staged artifacts without changing that destination.
 
 ### Export Analysis (Markdown / HTML report)
 
@@ -2073,18 +2518,19 @@ cancelled dialog produces no popup.
   decompiler's structuring limitations.
 - **Reports are export-only.** They are write-out artifacts; there is no import
   path, and they are not part of the persisted project state.
-- **Sidecars are best-effort and tolerant, not transactional.** A truncated/torn
-  write (e.g. crash mid-save) could leave a partial file; loaders fail gracefully
-  (returning the empty defaults) rather than crashing, but there is no atomic
-  rename or backup. Hand-editing a sidecar is possible but validated:
-  malformed patches/breakpoints are dropped, and out-of-range addresses parse to
-  `0`.
+- **Sidecars and recents are crash-recoverable filesystem transactions.** Saves
+  use a same-directory unique temporary file, `FlushFileBuffers`, and atomic
+  replacement while retaining the previous good file as `.bak`; load falls back
+  to it if the primary is corrupt. Failures stay visibly dirty and block a close
+  or target switch from silently discarding in-memory work.
 - **The empty-project policy is intentional.** Opening a binary and doing nothing
   writes no sidecar; only real annotations create one. The first content-bearing
   save is what materializes `<hash>.json`.
 - **Recents are capped at 50** and keyed by hash, so two copies of the same bytes
   collapse to one entry; conversely, an analyzed file that is later modified gets
   a *new* hash and therefore a fresh, separate project.
+- New sidecars use version 4; versions 1–3 remain readable and legacy patches load into
+  the implicit Ungrouped set before the next save records explicit membership.
 - **The JSON lib is minimal by design** — `double`-backed numbers (hence the
   hex-string address convention), no comments, no streaming; it exists solely to
   back persistence without adding a dependency.
@@ -2188,9 +2634,11 @@ The monospace face is what makes the disassembly listing, hex view, and live ass
 Several deliberate choices in `main.cpp` and the theme module define the app's "feel":
 
 - **Fixed browser-style shell.** The workbench's core panel arrangement is app-owned rather than a user dockspace. ImGui platform viewports remain enabled for platform-window/DPI bookkeeping, and `DpiEnableScaleViewports` preserves logical geometry across monitor changes.
-- **Hardware-accelerated.** ImGui draws via `ImGui_ImplDX11` on a real D3D11 device; large lists (the full-program listing capped at ~800k instructions) are clipper-rendered so only visible rows cost anything.
+- **Hardware-accelerated.** ImGui draws via `ImGui_ImplDX11` on a real D3D11 device; large lists are clipper-rendered, and the uncapped full-program listing decodes only requested 4 KiB code pages into a bounded LRU.
 - **Live per-monitor DPI.** The Win32 host is per-monitor aware, ImGui preserves logical viewport geometry, and fonts are re-atlased at the destination monitor's native scale rather than bitmap-stretched.
-- **Theme and density are user preferences.** The **View** submenus update the active palette/density and persist both in a tiny line-based `%APPDATA%\DisasmStudio\prefs.ini`. `loadPrefs()` restores them before `ApplyTheme`; a DPI rebuild reuses these active values rather than overwriting them.
+- **Bounded user preferences.** Theme/density, opt-in symbol settings, and at most 32 encoded
+  Investigation queries live in `%APPDATA%\DisasmStudio\prefs.ini`; authoritative per-binary
+  analysis remains in its atomic sidecar. A DPI rebuild reuses the active visual values.
 - **One source of truth for colour.** Because every status, syntax, and accent colour resolves through `col::*` against `g_pal`, switching themes live recolours debug indicators, instruction tints, selection highlights, and guessed-name amber uniformly — no tab carries its own literals for these.
 
 `ThemeName(id)` provides the human label for the menu (e.g. `SolarizedDark` → "Solarized Dark"), returning "?" for an unknown id.
@@ -2202,54 +2650,6 @@ Several deliberate choices in `main.cpp` and the theme module define the app's "
 - **No custom themes.** The nine palettes are built-in and not user-editable; there is no theme editor, import/export, or per-colour override. Adding a theme means extending `ThemeId`, `PaletteFor`, and `ThemeName`.
 - **Visual prefs only.** The prefs file stores the theme and density; it is separate from binary-analysis sidecars and ImGui's layout file.
 - The `light` flag tunes only scrollbar/alt-row derivations; all other colours come straight from the palette seeds, so a new light theme must pick legible `text`/`accent` seeds itself.
-## 11. Hypervisor (AMD-V/SVM) Backend & Kernel Driver
-
-DisasmStudio ships, alongside its user-mode application, an **experimental hardware-assisted debugging backend** built on **AMD-V (SVM — Secure Virtual Machine)**. The idea is research-grade and entirely optional: where the standard Win32 debugger (Chapter 6) controls a target through the documented OS debug API — which writes `int3` (`0xCC`) breakpoint bytes into the target and is therefore observable by the target itself — a thin hypervisor can in principle observe and control execution from *underneath* the operating system, leaving a much smaller footprint inside the guest. This chapter documents the **structure and purpose** of that subsystem. It is deliberately high-level: per the project spec, **packaging, signing, loading, and runtime validation of the kernel driver are outside the normal application target**, and the entire main application builds, runs, and delivers every feature in this document *without* the driver present.
-
-### Role within the project
-
-The hypervisor backend is a **secondary, opt-in control path** for the debugger, not a replacement for it. Nothing in the static-analysis pipeline (loaders, disassembly, decompiler, function naming, tech-scan, persistence) depends on it, and nothing in the live Win32 debugger requires it. It exists as a forward-looking research avenue: a way to experiment with low-artifact, hardware-assisted introspection of a running system. The Communications tab (Chapter 8) is where the application surfaces a client channel to the driver when one is installed; everywhere else the subsystem is dormant.
-
-### Two halves: user-mode client and kernel-mode driver
-
-The code is split cleanly across the user/kernel boundary, with a single shared ABI header defining the contract between them.
-
-#### User-mode side — `src/Hv/`
-
-- **`HvDbgProtocol.h`** — the **shared ABI**: the device name, the set of control codes (IOCTLs), and the request/response structures that the user-mode client and the kernel driver agree on. Keeping this contract in one header is what lets both sides be compiled independently yet stay byte-compatible. It is the single source of truth for "what messages can be exchanged."
-- **`HvDbgClient.{h,cpp}`** — the **user-mode client**. It opens a handle to the driver's device object (a `\\.\`-style device path), marshals requests into the protocol structures, issues the control calls, and unmarshals the replies into types the rest of the application can use. It is written to **degrade gracefully**: if the driver is not installed or not reachable, the client simply reports "unavailable" and the application carries on with the ordinary Win32 debugger.
-- **`HvDbgLoader.{h,cpp}`** — a **service/driver lifecycle helper** that wraps the Windows Service Control Manager to register, start, stop, and remove the kernel-mode service that hosts the driver. This is the bridge between "a `.sys` file on disk" and "a loaded, talkable device," and it is the piece most affected by the out-of-scope caveat below (loading an unsigned kernel driver requires a specially-configured machine).
-- **`load-driver.ps1`** (repo root) — a developer convenience script for the install/load step during experimentation.
-
-#### Kernel-mode side — `driver/`
-
-The `driver/` directory contains the kernel component as a separate build target (it is *not* part of `DisasmStudio.sln`'s normal app build):
-
-- **`HvDbg.h`** — shared kernel-side definitions (device/IOCTL declarations and internal structures) — the kernel counterpart to the user-mode protocol header.
-- **`HvDbg.c`** — the **driver entry point and device surface**: it creates the device object the user-mode client connects to, registers the dispatch routines, and routes incoming control requests to the appropriate handler. This is the driver's "front door."
-- **`HvSvm.c`** — the **SVM core**: the logic that checks for processor virtualization support, prepares the control structures the CPU's virtualization extensions require, and enters/leaves the hypervisor context. This is where the AMD-V-specific machinery lives.
-- **`HvAsm.asm`** — the small amount of **hand-written assembly glue** that cannot be expressed in C: the low-level entry/exit sequence and register save/restore around the hardware virtualization transitions. Mixing a focused `.asm` translation unit with the C core is standard practice for this class of code, because the transition sequence must control exact register state.
-
-### Why hardware-assisted, and what it buys
-
-The motivation is **fidelity and stealth for analysis**: a target that actively resists debugging can detect software breakpoints, single-step flags, and the presence of the OS debug API. A hypervisor-based observer can, in principle, intercept events without modifying the target's code bytes and without the in-process artifacts the OS debugger leaves behind. For a reverse-engineering workbench whose whole purpose is to understand uncooperative software, this is a natural — if advanced — capability to explore. It is presented here as a **defensive/analysis research feature**, consistent with the rest of the tool's purpose (understanding binaries, not deploying them).
-
-### Boundaries and reality
-
-It is important to be precise about what is and is not delivered:
-
-- The **user-mode client, loader, and protocol** are present and compile as part of the source tree.
-- The **kernel driver sources** are present under `driver/` as a separate target.
-- **Building, signing, loading, and validating** the driver at runtime is **explicitly out of scope** for the normal product. Loading an unsigned kernel driver on modern Windows requires test-signing mode (or a properly signed driver) and Driver Signature Enforcement considerations — environment configuration the application neither performs nor depends on.
-- Consequently, the hypervisor path should be regarded as **experimental and machine-dependent** (it requires an AMD processor with SVM available and enabled, and a host configured to load the driver). The shipped, supported experience is the user-mode workbench plus the Win32 debugger.
-
-#### Limitations & notes
-
-- **Optional and dormant by default.** No documented feature requires the driver; with it absent, the client reports unavailable and the app uses the standard debugger.
-- **Hardware- and host-specific.** Requires AMD-V/SVM-capable hardware and a host configured to load a custom kernel driver; not portable to Intel VT-x as written.
-- **Out-of-scope operationalization.** Driver packaging, signing, loading, and runtime validation are intentionally not part of the app target, per the project spec — so this chapter documents architecture and intent rather than an end-to-end, turnkey capability.
-- **Research framing.** The backend exists to explore low-artifact, hardware-assisted introspection for *analysis* of uncooperative binaries; it is described here at the level of structure and purpose, not as an operational evasion guide.
-- **Single source of truth for the ABI.** Any change to the exchanged messages must be made in the shared protocol header so the user-mode and kernel-mode halves stay compatible.
 ## 12. Build, Testing & Verification
 
 DisasmStudio is a single Visual Studio C++20 project that produces one self-contained executable, paired with a deliberately unusual verification strategy: the parts that *can* be compiled and run without Windows GUI/SDK dependencies are covered by a suite of small, focused off-target unit tests, while the parts that *cannot* (the ImGui / Win32 / Zydis / Capstone-facing code) are review-verified and exercised by building the solution and smoke-running the app. This chapter documents both halves precisely.
@@ -2261,7 +2661,7 @@ DisasmStudio is a single Visual Studio C++20 project that produces one self-cont
 The build is driven by **Visual Studio 2022 / MSBuild**, x64 only. There is a single solution (`DisasmStudio.sln`) and a single project (`DisasmStudio.vcxproj`). Key facts straight from the `.vcxproj`:
 
 - **Configurations:** `Debug|x64` and `Release|x64`. The project is *x64-only* by design — `build.ps1`'s `-Platform` parameter is `[ValidateSet('x64')]`, so any other value is rejected before MSBuild runs.
-- **Toolset / SDK:** `PlatformToolset` is `v145` and `WindowsTargetPlatformVersion` is `10.0` (latest installed Windows 10/11 SDK).
+- **Toolset / SDK:** `PlatformToolset` is `v143` (the Visual Studio 2022 toolset) and `WindowsTargetPlatformVersion` is `10.0` (latest installed Windows 10/11 SDK). The repository overlay binds vcpkg to the active MSBuild instance and its exact `v143` minor via `VCPKG_VISUAL_STUDIO_PATH` and `VCPKG_PLATFORM_TOOLSET_VERSION`, so a newer side-by-side Visual Studio cannot supply ABI-incompatible C++ libraries.
 - **Language standard:** `LanguageStandard` = `stdcpp20` with `ConformanceMode` (`/permissive-`) on. `MultiProcessorCompilation` is enabled for parallel `/MP` builds.
 - **Include path:** `$(ProjectDir)src` is added so headers resolve as `Core/...`, `Disasm/...`, `Tabs/...` etc. — the same include rooting the unit tests rely on (`/I src`).
 - **Preprocessor defines (all configs):** `UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;_CRT_SECURE_NO_WARNINGS`. `NOMINMAX` matters because the codebase uses `std::min`/`std::max` freely; `WIN32_LEAN_AND_MEAN` keeps the Win32 headers (used heavily by `Debugger`, `ProcessManager`, the IP Helper paths) lean. Debug adds `_DEBUG`; Release adds `NDEBUG`.
@@ -2270,7 +2670,7 @@ The build is driven by **Visual Studio 2022 / MSBuild**, x64 only. There is a si
 - **Subsystem:** `Windows` (a GUI app, entry via `wWinMain` in `main.cpp`). An optional first command-line argument opens that target immediately; `CommandLineToArgvW` preserves quoted/Unicode paths.
 - **Resources:** `src\app.rc` (compiled by the resource compiler) embeds `src\app.ico`, giving the window/taskbar/Explorer icon. The icon is regenerated with `gen_app_icon.ps1`.
 
-The full source membership is enumerated in the `.vcxproj` `ItemGroup`s: `main.cpp`, `App.cpp`, the UI helpers (`Ui/Theme`, `Ui/Fonts`), the entire `Core/` set (`BinaryFile`, `ProcessManager`, `FunctionAnalyzer`, `FunctionNamer`, `Debugger`, `SymbolResolver`, `CFG`, `Cond`, `Json`, `Project`, `Decompiler`, `DataFlow`, `TechScan`, `XrefIndex`, `Report`), the `Disasm/` backends (`ZydisDisassembler`, `CapstoneDisassembler`, `DisassemblerFactory`, `Assembler`), every tab in `Tabs/`, and the hypervisor user-mode client `Hv/HvDbgClient` + `Hv/HvDbgLoader`. The kernel driver under `driver/` is *not* part of this project — it is reviewable source only (packaging/signing/loading are out of scope).
+The full source membership is enumerated in the `.vcxproj` `ItemGroup`s: `main.cpp`, `App.cpp`, the UI helpers (`Ui/Theme`, `Ui/Fonts`), the entire `Core/` set (`BinaryFile`, `ProcessManager`, `FunctionAnalyzer`, `FunctionNamer`, `Debugger`, `SymbolResolver`, `CFG`, `Cond`, `Json`, `Project`, `Decompiler`, `DataFlow`, `TechScan`, `XrefIndex`, `Report`), the `Disasm/` backends (`ZydisDisassembler`, `CapstoneDisassembler`, `DisassemblerFactory`, `Assembler`), every tab in `Tabs/`.
 
 #### Dependencies via vcpkg manifest mode
 
@@ -2278,10 +2678,10 @@ Dependencies are declared in `vcpkg.json` (manifest mode), enabled in the projec
 
 - **`imgui`** with features `dx11-binding`, `win32-binding`, and `docking-experimental` — the GUI layer (Dear ImGui), its DirectX 11 renderer backend, its Win32 platform backend, and the docking branch.
 - **`zydis`** — the primary x86/x64 disassembler.
-- **`capstone`** — the multi-architecture disassembler (ARM/ARM64, MIPS/MIPS64, PowerPC/PPC64, RISC-V), routed to automatically for non-x86 images.
-- **`keystone`** — the assembler behind the Patch feature (x86/x64/ARM/ARM64 only; it reports "unsupported" for other arches).
+- **`capstone`** — the multi-architecture disassembler (A32/Thumb/A64, MIPS/MIPS64, PowerPC/PPC64, RISC-V), routed to automatically for non-x86 images.
+- **`keystone`** — the assembler behind the Patch feature (x86/x64/A32/Thumb/A64 only; it reports "unsupported" for other arches).
 
-The first build downloads and compiles all four from source; subsequent builds are incremental because vcpkg caches the built artifacts (in this checkout they already exist under `vcpkg_installed/`). No new vcpkg dependency was added for JSON, the decompiler, or tech-scan — those are hand-rolled on purpose (see §12.4).
+The first build downloads and compiles all four from source; subsequent builds are incremental because vcpkg caches the built artifacts (in this checkout they already exist under `vcpkg_installed/`). The active `VSInstallDir`/`VCToolsVersion`, overlay triplet, selected `v143` marker, and a generated toolchain-identity file participate in manifest-stamp invalidation, so changing the instance, minor, or overlay causes dependency reevaluation. `build.ps1` is the canonical command-line/CI entry point: it restricts `vswhere` to VS 2022, forces one exact `v143` minor through MSBuild and vcpkg, and supports explicit `-VisualStudioPath`/`-VcpkgRoot` values without hardcoded machine paths. Direct vcpkg use has the same VS 2022 discovery fallback. No new vcpkg dependency was added for JSON, the decompiler, or tech-scan — those are hand-rolled on purpose (see §12.4).
 
 #### Static, self-contained single-exe output
 
@@ -2301,9 +2701,10 @@ The project links the Windows system import libraries it needs, declared in `<Ad
 `build.ps1` is a thin, CI-friendly wrapper over MSBuild that needs **no Developer Command Prompt**. Its logic:
 
 - Resolves the solution path relative to the script and errors out if it is missing.
-- Locates MSBuild via **`vswhere.exe`** (`-latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe'`), so it works regardless of the exact VS install path. Missing vswhere or MSBuild yields a clear "install the C++ workload" error.
-- Parameters: `-Configuration` (`Release` default, or `Debug`), `-Platform` (`x64` only), `-Rebuild` (MSBuild `/t:Rebuild`), `-Clean` (`/t:Clean`, no build), and `-Verbosity` (`minimal` default).
-- Invokes `msbuild` with `/m` (parallel), `/nologo`, and the chosen target, then **returns MSBuild's exit code** so it composes in scripts/CI. On success it prints the resolved exe path (`build\x64\Release\DisasmStudio.exe`); on failure it prints `Build FAILED (MSBuild exit code N)`.
+- Selects a complete VS 2022 C++ instance via **`vswhere.exe -version [17.0,18.0)`**, or accepts `-VisualStudioPath`/`VCPKG_VISUAL_STUDIO_PATH` for explicit side-by-side selection. It resolves MSBuild from that same root rather than using a floating `PATH` entry.
+- Reads and validates the selected instance's exact default `v143` minor, passes it as `VCToolsVersion`, and exports the same VS root/minor to vcpkg so dependencies and the app use one compiler ABI.
+- Parameters: `-Configuration` (`Release` default, or `Debug`), `-Platform` (`x64` only), `-VisualStudioPath`, `-VcpkgRoot`, `-Rebuild` (MSBuild `/t:Rebuild`), `-Clean` (`/t:Clean`, no build), and `-Verbosity` (`minimal` default).
+- Invokes MSBuild with `/m` (parallel), `/nologo`, and the chosen target, then **returns MSBuild's exit code** so it composes in scripts/CI. On success it prints the resolved exe path (`build\x64\Release\DisasmStudio.exe`); on failure it prints `Build FAILED (MSBuild exit code N)`.
 
 A practical note from the project's own build workflow: a benign `'pwsh.exe' is not recognized` line can appear from a post-build step — it is harmless, and "Build succeeded" is the authoritative signal.
 
@@ -2314,23 +2715,40 @@ The codebase is split, for verification purposes, into two zones:
 - **Pure-logic Core modules** — no ImGui, no Win32 GUI, and (where possible) no live disassembler. These are unit-tested off-target.
 - **GUI / OS / engine-facing code** — `main.cpp`, `App.cpp`, every `Tabs/*` file, the ImGui rendering, and the parts of the debugger that need a live Win32 debug loop. These cannot be unit-compiled in a plain sandbox, so they are **review-verified** and validated by **building the `.sln` and smoke-running** the exe.
 
-Originally the pure-logic tests were intended to compile with `g++` in a Linux sandbox (as CLAUDE.md still describes). In the actual Windows environment there is no g++/clang, so they are compiled and run with **MSVC `cl`** inside a VS Dev Shell (entered programmatically via `Enter-VsDevShell` from `Microsoft.VisualStudio.DevShell.dll`). Each test file's header comment carries its exact `cl /std:c++20 /EHsc /I src ...` build line listing the minimal set of `.cpp` files it needs, so any single test can be rebuilt and rerun in isolation. All **eleven** `tests/*.cpp` pass (the `FIXES.txt` "10/10" stamp predates the live `wow64_debug_test`, which self-skips when no 32-bit target is available).
+Originally the pure-logic tests were intended to compile with `g++` in a Linux sandbox (as CLAUDE.md still describes). In the actual Windows environment there is no g++/clang, so they are compiled and run with **MSVC `cl`** inside a VS Dev Shell. Each test file's header comment carries its exact `cl /std:c++20 /EHsc /I src ...` build line listing the minimal set of `.cpp` files it needs, so any single test can be rebuilt and rerun in isolation. `tests\run_core_tests.bat` owns the current manifest and can run the full MSVC-compatible set or one named test. It respects explicit `VCPKG_VISUAL_STUDIO_PATH` selection or constrains `vswhere` to a complete VS 2022 C++ instance, so tests cannot drift to a newer side-by-side compiler; the live `wow64_debug_test` self-skips when no 32-bit target is available.
 
 ### 12.3 The off-target unit tests (`tests/`)
 
 Each test is a standalone `main()` using a tiny `CHECK(cond)` macro that counts failures and returns non-zero if any fail, so they are trivially CI-gateable. Several replay canned instruction streams through a `MockDisassembler`/`StubDis` that implements `IDisassembler::decodeOne` from a lookup table — this lets CFG/decompiler/xref logic be exercised without a real decoder. Two tests deliberately *do* link the real Zydis to prove arch-correct decoding.
 
 - **`binaryfile_macho_test.cpp`** — builds a byte-accurate thin 32-bit Mach-O in memory, writes it to a temp file, loads it via `BinaryFile`, and asserts format/machine/bitness, that the single `__text` section parses, and that `vaToOffset`/`offsetToVA` are correct inverses (`0x1000↔0x100`, `0x1050→0x150`). It specifically pins a fixed bug where 32-bit segment fields (`initprot`/`nsects`) were read at the wrong offsets (`lc+48/52` vs `lc+44/48`), which previously yielded zero sections.
+- **`binaryfile_pe_metadata_test.cpp`** — builds a synthetic PE32+ containing TLS callbacks, named/ordinal delay imports, RSDS GUID/age/PDB data, security-relevant load-config fields, and ordinary/chained/indirect x64 unwind records. It also pins truncated structures, impossible payload extents, unbacked pointers, maximal declared directory sizes, and bounded unterminated PDB paths.
+- **`binaryfile_elf_metadata_test.cpp`** — builds synthetic ELF64 shared and ELF32
+  relocatable images containing REL/RELA, PLT/GOT slots, `DT_NEEDED`, GNU version
+  definitions/requirements/index associations, and init/fini arrays. It pins ET_REL
+  synthetic targets, valid VA zero, signed addends, and independent malformed/truncated
+  table reporting.
 - **`decompiler_switch_test.cpp`** — drives `BuildCFG` + `Decompile` over a classic `cmp`/`jbe`/`jmp [table]` switch dispatch using a `JumpTableResolver` callback. Asserts the dispatch block is flagged `isSwitch` with the three resolved `caseTargets` and one successor per case, that *without* a resolver it stays a plain `jmp` (not a switch), and that the decompiler emits real `switch (rax) { case 0: ... break; }` rather than a bare `goto loc_0;`.
 - **`dataflow_decomp_test.cpp`** — the most comprehensive decompiler test (14 scenarios). It validates the data-flow pre-pass (`Core/DataFlow.cpp`) wired into `Decompiler`: copy/constant propagation and dead-assignment elimination (`mov rax,rcx; mov rbx,[rax+8]; mov rax,rbx; ret` → `*(a1 + 8)` with all raw register names gone), argument naming (`rcx→a1`, `rdx→a2`), `xor eax,eax → return 0`, `for`-loop reconstruction from a counting `while`+increment, return-value recovery, `mul`/`div` modeled as `*`/`/`/`%` (not `__asm`), string/IAT resolution through a `dataRefFor` callback (`lea rax,[addr] → return "hello"`, `call [iat] → kernel32.Foo()`), partial-register soundness (`mov al,0` rendered as `LOBYTE(...)`, not a full zero), `movzx` width via `(unsigned __int8)`, alias-aware invalidation of a tracked stack slot, and the **legacy fallback** (`deepDataFlow = false` keeps the raw `rax = rcx;` lift).
 - **`function_namer_test.cpp`** — tests the *pure* part of the heuristic function namer: `ToSnakeIdentifier` (`CreateFileW → create_file`, strips `W`/`A` suffix and leading `_`) and `GuessFromEvidence` over a `FuncEvidence` struct. Covers priority ordering (entry → `start`, thunk → `j_CreateFileW`, ret-only → `nullsub`, ret-zero → `ret_zero`), semantic names from API sets (`read_file`, `write_file`, `inject_code`, `net_send`/`net_recv`, `socket_setup`, `check_debugger`, …), the guard that `SendMessageW` is *not* a network send, single-API thin-wrapper detection (small function only), string-derived identifiers, and the "no evidence → no guess" case. These outputs are explicitly *heuristic* and the namer marks them with a `guessed` flag the UI uses to label them.
+- **`analysis_cache_test.cpp`** — verifies ordered overlapping-patch identity, decoder/schema/override invalidation, effective-backend normalization, typed lookup, and true LRU eviction. `analysis_service_test.cpp` additionally proves worker-level hit/miss behavior and a miss when only the ordered-patch digest changes.
+- **Authorization Trail regression group** — `verification_api_catalog_test.cpp`, `authorization_trail_test.cpp`, `authorization_field_alias_test.cpp`, `authorization_patch_advisor_test.cpp`, and `authorization_experiment_test.cpp` pin exact catalog matching, deterministic fan-out/secondary-gate/conclusion rules, conservative field-root binding, fail-closed patch advice, and PID/session/module/thread/RIP-bound register-only force/restore behavior.
 - **`xref_arch_test.cpp`** — links the **real Zydis** decoder. It confirms `BuildXrefInto`/`FinalizeXrefIndex` recover relative call targets and data references correctly in **both x86 and x64** modes, including the subtle case where identical bytes (`8B 05 ...`) mean RIP-relative in x64 but absolute (`moffs`) in x86 — proving the xref sweep follows the decoder's arch.
 - **`xref_report_test.cpp`** — two pure modules. The `XrefIndex` half (a `StubDis` toy encoding) checks that two callers of one target are recorded **sorted and de-duplicated**, that a data ref resolves to the right source, that unreferenced targets return `nullptr`, that `edgeCount()` is correct, and that `FinalizeXrefIndex` is **idempotent**. The `Report` half checks `RenderReportMarkdown` and `RenderReportHtml` produce the expected structure and — importantly — that `<` is left raw in Markdown but **HTML-escaped** to `&lt;` in HTML output.
-- **`project_roundtrip_test.cpp`** — serializes a fully-populated `ProjectState` (hash, paths, per-project engine/arch, comments, renames, bookmarks, breakpoints + conditions, patches, watches, notes, last cursor) and deserializes it, asserting an exact round-trip. It specifically exercises **64-bit precision** (`hash = 0xDEADBEEFCAFEF00D`, addresses like `0x1400123456`) because the JSON stores addresses as hex strings for exact round-trip; round-trips every `Arch` through `ArchName`/`ArchFromName`; and verifies the `hasContent()` guard (metadata alone is not "content"; a single comment or watch is).
+- **`project_roundtrip_test.cpp` / `patch_set_test.cpp`** — round-trip a fully populated version-4 project including stable named-set ids and per-patch membership, retain version-1–3 compatibility and exact 64-bit strings, and pin bounded selection/overlap validation, pristine composition, and non-mutating Baseline/current/single-set comparisons.
 - **`cond_eval_test.cpp`** — tests the conditional-breakpoint / watch expression evaluator (`Core/Cond.cpp`): `EvalExpression` for single operands (registers, hex/decimal literals, memory derefs `[rax]`, base+disp `[rsp+8]` / `[rsp + 0x8]`, and failures for unknown registers/garbage) and `EvalCondition` for two-operand comparisons (`==`, `!=`, `<`), including empty-string meaning "unconditional → true".
 - **`step_logic_test.cpp`** — the only test the comment still shows building with `g++`, because `Core/StepLogic.h` is pure header-only logic. It pins the debugger's *decision tables* (`ClassifyInsn`, `DecideStepOver`, `DecideStepOut`, `DecideOnBpResume`) and then runs a **synthetic CPU + stack simulator** that drives stepping using *only* those decisions, proving step-out and step-over land on the correct instruction across nested calls and recursion (e.g. step-out unwinds exactly one frame). This is how the live debugger's trickiest behavior is verified without a debuggee.
+- **`trace_coverage_test.cpp`** — drives the pure `TraceCoverage` state machine through de-duplication/capping, generational replacement, arm/hit/stop/clear/reset, stale-callback rejection, deterministic snapshots, and saturated counters without Win32 or a process.
+- **`dll_debug_plan_test.cpp`** — constructs synthetic PE32/PE32+ DLLs and pins DLL/bitness/entry/export validation, callable-export filtering, trusted System32/SysWOW64 and custom-host selection, Microsoft-compatible argv quoting, requested breakpoint RVAs, and exact-path `LOAD_DLL` ASLR retargeting.
+- **`static_unpack_test.cpp`** — builds synthetic PE32/PE32+ packed layouts and validates exact `PACKER_INFO` recovery, bounded LZMA1 and LZMA-alone decoding, stale-plan fallback, manual/stored blocks, hard caps, cancellation, disk reconstruction, raw/mapped artifacts, and background-service result handoff.
+- **`passive_dump_test.cpp`** — pins page fingerprints, entropy/change comparison, coverage-loss rejection, settle/manual/timeout decisions, and on Windows performs a real query/read-only self-snapshot plus PE rebuild. An opt-in launch smoke verifies CREATE_SUSPENDED -> one-process Job -> ResumeThread with no debug flags.
+- **`anti_debug_test.cpp`** — exercises the all-off policy, exact ntdll information-class decisions, invalid-handle gating, PEB/heap normalizers, first-pristine compare-before-restore behavior, DR masking, monotonic QPC/system-time/RDTSC values, saturation, and the explicit user-mode-versus-Hv capability report.
+- **`memory_scan_test.cpp`** — covers strict signed/unsigned integer and float codecs, AOB wildcards, UTF-8/UTF-16LE, every absolute and previous-value predicate, alignment, boundary lookahead, chunk refinement, exact candidate counts, and stable ordinal paging.
+- **`memory_pointer_test.cpp`** — pins deterministic 32/64-bit backlink discovery, depth/offset/alignment/canonical-address/cycle/work bounds, cancellation, de-duplication, and root-to-target pointer-chain resolution.
+- **`memory_table_test.cpp`** — verifies exact-path and unique-name module-relative resolution, ambiguous-module rejection, pointer offsets, constant/minimum/maximum freeze decisions, bounded JSON round-trips, and the invariant that loaded rows are disabled and unfrozen.
+- **`process_memory_session_test.cpp`** — tests pure write-authority decisions and identity matching, then on Windows exercises passive self-open/read/region enumeration plus verified transactional writes without debugger attachment.
 - **`instr_dataref_test.cpp`** — header-only (no `.cpp` deps), tests `instrDataRef()` (`Tabs/DataRef.h`): extracting the static data address an instruction references (absolute `[0x...]`, IAT `call/jmp qword ptr [0x...]`, segment-prefixed `fs:[...]`, Capstone `[rip ± disp]` resolved to absolute) while correctly returning 0 for register-relative memory, stored immediates, bare immediates, and relative branch targets.
-- **`wow64_debug_test.cpp`** — a **live end-to-end** test (links the real Debugger + Zydis). It launches a 32-bit process (`SysWOW64\cmd.exe` by default) under the debugger with break-at-entry, asserts it is detected as 32-bit (`is32`), that EIP/ESP are sub-4 GB, and that a single step advances EIP while staying 32-bit, then terminates the child. It **gracefully SKIPs** (exit 0) if no 32-bit target exists or launch fails, so it is safe in CI. This is the one test that genuinely exercises `Debugger.cpp`'s WOW64 path on Windows.
+- **`wow64_debug_test.cpp`** — a **live end-to-end** test (links the real Debugger + Zydis). It launches a 32-bit process (`SysWOW64\cmd.exe` by default) under the debugger with break-at-entry, asserts it is detected as 32-bit (`is32`), that EIP/ESP are sub-4 GB, exercises the local-loopback Server Watch lifecycle, and then terminates the child. The default local manifest run reports this `LIVE_TEST` as an explicit skip, but GitHub Actions selects it directly with `DS_REQUIRE_LIVE_DEBUG_TESTS=1`; an unavailable target, privilege failure, or fixture skip is therefore a CI failure rather than a silent pass. This exercises `Debugger.cpp`'s WOW64 path without contacting an external server.
 
 Two helper scripts round out the workflow: **`run_namer_test.ps1`** enters a VS Dev Shell and compiles+runs the namer test end-to-end (a template for the `cl`-based recipe), and **`smoke_run.ps1`** launches the built Release exe, waits 5 seconds, and reports whether it stayed alive — the canonical "did the GUI start" check for the code that can't be unit-tested. Tests that link the static Zydis/Capstone libs reference them under the (doubled) path `vcpkg_installed\x64-windows-static\x64-windows-static\{include, lib}`.
 
@@ -2361,12 +2779,9 @@ those non-goals.
 
 ### Source coverage map
 
-Chapter numbers refer to files `01_*.md` … `13_*.md` in this directory. **Chapter 11 —
-"Hypervisor (AMD-V/SVM) Backend & Kernel Driver"** is present and documents the entire
-AMD-V/SVM subsystem at an architectural level: the `src/Hv/*` user-mode protocol/client/loader
-and the `driver/*` kernel source, with the explicit caveat that driver
-packaging/signing/loading/runtime-validation are out of scope (see the non-goals below). The
-Communications tab's AMD-V *panel* (a UI surface) is additionally described in chapter 8.
+Chapter numbers refer to files `01_*.md` … `13_*.md` in this directory. There is no
+chapter 11: the AMD-V (SVM) hypervisor backend, its kernel driver, and the Communications
+tab's user-mode client panel have been removed from the project.
 
 | Source file / dir | Documented in chapter | Notes |
 |---|---|---|
@@ -2386,48 +2801,54 @@ Communications tab's AMD-V *panel* (a UI surface) is additionally described in c
 | `src/Core/CFG.{h,cpp}` | 4 | Basic blocks + edges |
 | `src/Core/XrefIndex.{h,cpp}` | 4 | Cross-reference index |
 | `src/Core/SymbolResolver.{h,cpp}` | 4 | Name resolution / override precedence |
+| `src/Core/Demangle.{h,cpp}` | 4 | Bounded cached MSVC/Itanium/C symbol presentation |
 | `src/Core/TechScan.{h,cpp}` | 4 | Capability / tech detection |
+| `src/Core/AuthorizationTrail.{h,cpp}` | 4 (also 7) | Ranked predicates, stages, secondary gates, independent conclusions |
+| `src/Core/AuthorizationFieldAlias.{h,cpp}` | 4 | Exact interprocedural object-field identity correlation |
+| `src/Core/VerificationApiCatalog.{h,cpp}` | 4 | Exact DLL/symbol signature-verifier contracts |
+| `src/Core/AuthorizationPatchAdvisor.{h,cpp}` | 4 (also 7) | Inert, fail-closed centralized-boolean patch advice |
 | `src/Tabs/DataRef.h` | 4 | `instrDataRef` shared static-ref helper |
 | `src/Core/Decompiler.{h,cpp}` | 5 | Structuring pass → pseudo-C |
 | `src/Core/DataFlow.{h,cpp}` | 5 | Data-flow support for the decompiler |
+| `src/Core/CodeExport.{h,cpp}` | 7 (also 9) | Streaming ASM/C generator + dedicated background export service |
 | `src/Core/Debugger.{h,cpp}` | 6 | Real Win32 debugger |
+| `src/Core/AuthorizationExperiment.{h,cpp}` | 6 (also 7) | Identity-bound register-only return experiment state |
+| `src/Core/TraceCoverage.{h,cpp}` | 6 (also 7) | Bounded/generational one-shot block coverage state |
+| `src/Core/DllDebugPlan.{h,cpp}` | 6 (also 3) | PE-DLL/export validation, host argv planning, LOAD_DLL ASLR retargeting |
 | `src/Core/ProcessManager.{h,cpp}` | 6 | Toolhelp32 process/module enumeration |
+| `src/Core/ProcessMemorySession.{h,cpp}` | 8 | Passive identity-bound memory access and verified write transactions |
+| `src/Core/MemoryScan.{h,cpp}` | 8 | Typed scan predicates, chunk snapshots, bitmap paging |
+| `src/Core/MemoryPointer.{h,cpp}` | 8 | Bounded pointer-chain discovery and resolution |
+| `src/Core/MemoryTable.{h,cpp}` | 8 | Module-relative records, freeze policy, strict JSON codec |
 | `src/Core/StepLogic.h` | 6 | Pure, unit-tested stepping decisions |
 | `src/Core/Cond.{h,cpp}` | 6 | Conditional-breakpoint evaluator |
 | `src/Tabs/BinaryViewTab.{h,cpp}` | 7 | The Binary View centerpiece |
 | `src/Tabs/ProjectsTab.{h,cpp}` | 8 | Recents / project management |
-| `src/Tabs/CommunicationsTab.{h,cpp}` | 8 | Processes, connections, AMD-V panel |
+| `src/Tabs/CommunicationsTab.{h,cpp}` | 8 | Processes, modules, connections, JDWP console |
+| `src/Core/NetworkEndpoint.{h,cpp}` | 8 | Canonical scope-aware IPv4/IPv6 formatting |
 | `src/Tabs/SigScannerTab.{h,cpp}` | 8 | Signature scanner |
-| `src/Tabs/MemoryToolsTab.{h,cpp}` | 8 | Memory scanner/editor/table |
+| `src/Tabs/MemoryToolsTab.{h,cpp}` | 8 | Passive/debugger scanner, hex editor, regions, pointers, JSON table |
 | `src/Tabs/BinaryDiffTab.{h,cpp}` | 8 | Two-binary byte diff |
 | `src/Tabs/BinaryTechTab.{h,cpp}` | 8 | Tech-scan UI |
-| `src/Core/Project.{h,cpp}` | 9 | Per-binary JSON sidecar persistence |
+| `src/Core/Project.{h,cpp}` | 9 | Version-4 per-binary JSON sidecar persistence |
+| `src/Core/PatchSet.h`, `src/Core/PatchedImage.h` | 7 (also 9) | Named-set validation, pristine composition, and comparison |
 | `src/Core/Json.{h,cpp}` | 9 | Hand-rolled JSON |
 | `src/Core/Report.{h,cpp}` | 9 | Report/export generation |
 | `src/Ui/Theme.{h,cpp}` | 10 | Color theme / styling |
 | `src/Ui/Fonts.{h,cpp}` | 10 | Font loading |
-| `src/Hv/HvDbgProtocol.h` | 11 | Shared user/kernel IOCTL + ABI contract |
-| `src/Hv/HvDbgClient.{h,cpp}` | 11 (also 8) | `\\.\HvDbg` user-mode client (Communications panel in ch. 8) |
-| `src/Hv/HvDbgLoader.{h,cpp}` | 11 | SCM-based driver load/unload helper |
-| `driver/HvDbg.h` | 11 | Shared kernel-side definitions |
-| `driver/HvDbg.c` | 11 | Driver entry, device object, IOCTL dispatch |
-| `driver/HvSvm.c` | 11 | SVM core (virtualize/devirtualize) |
-| `driver/HvAsm.asm` | 11 | Asm ↔ C entry/guest-state glue |
-| `load-driver.ps1` | 11 | Developer driver-load script |
 | `DisasmStudio.vcxproj`, `DisasmStudio.sln` | 12 | Project/solution |
 | `vcpkg.json` | 12 | Dependency manifest |
 | `build.ps1` | 12 | Build driver script |
 | `README.md`, `FIXES.txt` | 12 | Docs / audit log |
-| `tests/*.cpp` (11 off-target unit tests) | 12 | All enumerated and described |
+| `tests/*.cpp` (manifested Core and live regression tests) | 12 | Built by `tests\run_core_tests.bat`; key tests enumerated and described |
 
 Auxiliary scripts not in any chapter plan: `tests/smoke_run.ps1` is referenced by
 chapter 12 (a ~5-second GUI liveness check); `tests/run_namer_test.ps1` (the
 function-namer test runner) is **not explicitly named** in any chapter, though the
 test it drives (`function_namer_test.cpp`) is documented in chapter 12. These are minor.
 
-**Verdict:** Every source file in `src/`, `driver/`, `tests/`, and the build/config root is
-covered by a chapter. The AMD-V/SVM subsystem is documented at an architectural level in
-chapter 11 — deliberately *not* at an operational driver-loading level, per the non-goals.
+**Verdict:** Every source file in `src/`, `tests/`, and the build/config root is covered by
+a chapter.
 
 ### Heuristic / best-effort areas
 
@@ -2478,18 +2899,12 @@ reversing any of them.
   scripting, plugin, or headless automation surface.
 - **No FLIRT-style library recognition.** Signature-based identification of statically
   linked library functions (IDA-FLIRT style) is not implemented.
-- **No IPv6 connection tables.** The Communications tab enumerates per-process **IPv4**
-  TCP/UDP endpoints (via the IP Helper API filtered by owning PID). There is no IPv6
-  table walk.
-- **Kernel-driver packaging / signing / loading / runtime validation are outside the
-  normal app target.** The AMD-V (SVM) hypervisor lives as **reviewable source** under
-  `driver/` (`HvDbg.c`, `HvSvm.c`, `HvAsm.asm`, `HvDbg.h`) plus the `\\.\HvDbg`
-  user-mode protocol/client under `src/Hv/`. The shipping `DisasmStudio` solution builds
-  **only the user-mode app** — it does not produce a signed, installable, loaded, or
-  runtime-validated driver package. The VMRUN / #VMEXIT paths in the driver are
-  consequently **review-verified, not runtime-verified** (as the driver source itself
-  notes), and the Communications AMD-V panel is a client surface that refuses VMRUN
-  IOCTLs on an ABI mismatch.
+- **No kernel-mode or hypervisor backend.** DisasmStudio is a pure user-mode
+  application. It does not ship, load, or talk to a kernel driver, and it makes no
+  hardware-assisted (AMD-V/SVM, VT-x) introspection claims. Anything that would require
+  ring-0 or ring-(-1) authority — hiding kernel debug objects, virtualizing
+  KUSER_SHARED_DATA, trapping RDTSC in generated code — is explicitly out of scope, and
+  the anti-debug capability report says so.
 
 ### Roadmap / plausible future enhancements
 
@@ -2504,19 +2919,19 @@ scripting API or contradicts the non-goals above.
   (`CFG.cpp` drops branch-target leaders that land mid-instruction) via
   overlapping-instruction re-decode at unaligned targets — a real feature with
   regression risk to normal-code CFGs, hence deferred but tractable.
-- **Loader breadth.** Additional formats / fat (universal) Mach-O, richer PE metadata
-  (TLS callbacks, exception/unwind data, debug directory / PDB path), and deeper
-  relocation handling — all extensions of `BinaryFile` with no new heavy dependency.
+- **Loader breadth.** Additional formats / fat (universal) Mach-O, deeper PE/ELF
+  relocation and symbol-version handling, and UI presentation of the now-parsed PE TLS,
+  delay-import, CodeView, load-config, and unwind models — all extensions of
+  `BinaryFile` with no new heavy dependency.
 - **Debugger robustness.** Mitigations around the documented edges: re-entrant hits
   during stepped-over calls whose own address holds a software breakpoint, the Step Out
-  500k-instruction safety cap, and callees that rewrite their return address. Possible
-  IPv6 connection enumeration would relax a current non-goal — to be treated as an
-  explicit scope change, not an assumed default.
+  500k-instruction safety cap, and callees that rewrite their return address.
 - **Architecture coverage for assembly.** Keystone currently assembles only
-  x86/x64/ARM/ARM64 (disassembly via Capstone is broader). Extending patch-time
+  x86/x64/A32/Thumb/A64 (disassembly via Capstone is broader). Extending patch-time
   assembly to more arches, where Keystone supports it, would close the disasm/asm gap.
-- **Reporting / export.** Build out `Core/Report` export formats (e.g. richer
-  structured exports of functions/strings/imports/xrefs) for offline review.
+- **Reporting / export.** Save ASM/C already covers whole-program and per-function
+  source export; a future extension can still enrich `Core/Report` with more structured
+  function/string/import/xref formats for offline review.
 - **Performance and persistence.** Continue clipper-driven rendering work for very large
   images and incremental/streamed analysis caching in the project sidecar, keeping the
   "must be fast, GPU-accelerated" constraint central.

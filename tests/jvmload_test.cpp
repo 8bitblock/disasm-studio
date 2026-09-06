@@ -2,8 +2,8 @@
 // jvmload_test.cpp
 // Off-target tests for the BinaryFile JavaClass loader + FunctionAnalyzer's
 // JVM method seeding: 0xCAFEBABE detection, identity VA<->offset mapping,
-// per-method executable sections, entry-point selection (static main), the
-// whole-file backing section, raw fallback for a corrupt pool, and the
+// per-method executable sections without a fabricated process entry, the
+// whole-file backing section, rejection of a corrupt structured class, and the
 // method-table-driven function list (exact names/sizes, no x86 heuristics).
 //
 // Build & run (Windows, from project root, in a VS dev shell):
@@ -48,7 +48,7 @@ int main() {
     CHECK(bf.machine() == MachineArch::JVM);
     CHECK(!bf.is64Bit());
     CHECK(bf.imageBase() == 0);
-    CHECK(bf.entryPoint() == tc.mainCodeOff);              // static main wins
+    CHECK(!bf.hasEntryPoint()); // class files do not declare a process entry
     CHECK(bf.javaClass() && bf.javaClass()->thisClass == "Main");
 
     // ---- sections: one executable per method body + the whole-file backing ----
@@ -109,16 +109,18 @@ int main() {
         CHECK(fa.lastSummary().find("class file") != std::string::npos);
     }
 
-    // ---- corrupt pool: clean Raw fallback, not a crash ---------------------------
+    // ---- corrupt pool: structured rejection, never silent Raw authority ----------
     {
         auto bad = tc.bytes;
         bad[10] = 99;                                      // unknown cp tag
         const std::string tmp2 = "jvmload_test_bad.class";
         CHECK(writeTemp(tmp2, bad));
         BinaryFile b2;
-        CHECK(b2.load(tmp2));                              // still loads...
+        CHECK(!b2.load(tmp2));
         std::remove(tmp2.c_str());
-        CHECK(b2.format() == BinFormat::Raw);              // ...as a raw blob
+        CHECK(!b2.loaded() && b2.format() == BinFormat::Unknown);
+        CHECK(b2.loadError() == BinaryLoadError::MalformedJavaClass &&
+              !b2.loadErrorText().empty());
         CHECK(!b2.javaClass());
     }
 

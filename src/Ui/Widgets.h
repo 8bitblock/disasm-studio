@@ -2,7 +2,7 @@
 //
 // Widgets.h
 // Small shared UI vocabulary (colored/toolbar buttons, search boxes, badges,
-// key-value rows, empty-state hero cards, toast notifications) so the tabs
+// key-value rows, compact empty-state panels, toast notifications) so the tabs
 // stop hand-rolling form rows. All colors are passed in from theme::col::*
 // (or derived from the style) and all pixel metrics scale by theme::UiScale().
 //
@@ -27,6 +27,16 @@ bool ToolbarIconButton(const char* icon, const char* label, const char* tip = nu
 // InputTextWithHint with an embedded magnifier glyph. Returns true when edited.
 // width <= 0 leaves the item width untouched (caller may SetNextItemWidth).
 bool SearchBox(const char* id, const char* hint, char* buf, size_t bufSize, float width = 0.0f);
+
+// Continue a toolbar row only when the next control fits; otherwise retain the
+// normal next-line cursor position. Pass the next control's physical width.
+void SameLineIfFits(float nextWidth);
+
+// Show a conventional delayed tooltip for the most recently submitted item.
+// Delaying routine hints keeps dense tables/toolbars calm while still exposing
+// help on intent. Disabled controls are included by default so they can explain
+// why an action is unavailable.
+void ItemTooltip(const char* text, bool allowWhenDisabled = true);
 
 // Small rounded pill: tinted fill + outline + colored text.
 void Badge(const char* text, const ImVec4& color);
@@ -55,9 +65,9 @@ bool Pill(const char* id, const char* text, const ImVec4* valueCol = nullptr,
 // mono detail ("PAUSED  pid 4312  rip 7FF6..."), right of the state word.
 void StatePill(const char* state, const ImVec4& stateCol, const char* detail = nullptr);
 
-// Wireframe tab strip (wf-tabstrip): full-width 27px strip on the panel-header
-// background with a bottom border; the active tab gets the panel fill plus a
-// 2px accent underline. Returns the (possibly changed) active index.
+// Compact native tab strip with overflow scrolling and a tab-list menu. The
+// caller owns selection; disabled destinations remain visible but unavailable.
+// Returns the (possibly changed) active index.
 // `enabled` (optional, length `count`) grays out and ignores clicks per tab.
 int TabStrip(const char* id, const char* const* labels, int count, int active,
              const bool* enabled = nullptr);
@@ -68,10 +78,8 @@ void StatusDivider();
 // "Key   value" row with a fixed-width muted key column (printf-style value).
 void KeyValueRow(const char* key, const char* fmt, ...);
 
-// Centered hero card for empty views: big glyph (icon font), title, muted
-// subtitle, optional primary action button. Returns true when the button is
-// clicked. Centers within the current content region, so it works both for a
-// whole tab and for a single pane child.
+// Compact flat onboarding panel for empty views: glyph, title, muted subtitle,
+// and optional primary action. Returns true when the action is clicked.
 bool EmptyState(const char* icon, const char* title, const char* subtitle,
                 const char* primaryButtonLabel = nullptr);
 

@@ -180,6 +180,48 @@ CondProgram CompileCondition(const std::string& exprIn) {
     return p;
 }
 
+static bool isBreakpointRegister(const std::string& name) {
+    return name == "rax" || name == "eax" || name == "rbx" || name == "ebx" ||
+           name == "rcx" || name == "ecx" || name == "rdx" || name == "edx" ||
+           name == "rsi" || name == "esi" || name == "rdi" || name == "edi" ||
+           name == "rbp" || name == "ebp" || name == "rsp" || name == "esp" ||
+           name == "rip" || name == "eip" || name == "rflags" || name == "eflags" ||
+           name == "r8"  || name == "r9"  || name == "r10" || name == "r11" ||
+           name == "r12" || name == "r13" || name == "r14" || name == "r15";
+}
+
+static const std::string* unsupportedBreakpointRegister(const CondOperand& operand) {
+    if (operand.kind == CondTerm::Register && !isBreakpointRegister(operand.reg))
+        return &operand.reg;
+    if (operand.kind == CondTerm::Memory && operand.baseIsReg && !isBreakpointRegister(operand.reg))
+        return &operand.reg;
+    return nullptr;
+}
+
+bool ValidateBreakpointCondition(const std::string& expr, std::string* error) {
+    if (error) error->clear();
+    const CondProgram program = CompileCondition(expr);
+    if (!program.valid) {
+        if (error) {
+            *error = "Expected: <operand> <operator> <operand> (for example, rax == 0). "
+                     "Operators are ==, !=, <, <=, >, >= and signed s<, s<=, s>, s>=.";
+        }
+        return false;
+    }
+    if (program.empty) return true;
+
+    const std::string* bad = unsupportedBreakpointRegister(program.lhs);
+    if (!bad) bad = unsupportedBreakpointRegister(program.rhs);
+    if (bad) {
+        if (error) {
+            *error = "Unknown register '" + *bad +
+                     "'. Use an x86/x64 general-purpose register such as rax, eax, rsp, rip, or r8.";
+        }
+        return false;
+    }
+    return true;
+}
+
 bool CompileExpression(const std::string& expr, CondOperand& out) {
     return compileOperand(expr, out);
 }

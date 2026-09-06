@@ -20,7 +20,7 @@ enum class ThemeId {
     Dracula,        // purple/pink dark
     Nord,           // cold blue-gray
     Matrix,         // black + phosphor green
-    Paper,          // warm paper + ink, amber accent (the wireframe look; default)
+    Paper,          // warm paper + ink, amber accent (the wireframe look)
     Count
 };
 
@@ -41,8 +41,9 @@ void  SetUiScale(float scale);
 float UiScale();
 
 // UI density. Only the spacing/padding metrics are scaled by this (on top of the
-// HiDPI UiScale); rounding/borders are unaffected. Comfortable is the roomier
-// default. SetDensity takes effect on the next ApplyTheme().
+// HiDPI UiScale); rounding/borders are unaffected. Compact is the workbench
+// default so code, tables, and result lists expose more rows. SetDensity takes
+// effect on the next ApplyTheme().
 enum class Density { Compact, Comfortable, Spacious };
 void        SetDensity(Density d);
 Density     CurrentDensity();

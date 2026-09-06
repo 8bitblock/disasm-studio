@@ -13,9 +13,14 @@
 #include "imgui_impl_win32.h"
 
 #include <d3d11.h>
+#include <dwmapi.h>
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
+#include <algorithm>
+#include <exception>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <tchar.h>
 #include <utility>
@@ -27,12 +32,31 @@ static IDXGISwapChain*         g_pSwapChain          = nullptr;
 static bool                    g_SwapChainOccluded   = false;
 static UINT                    g_ResizeWidth = 0, g_ResizeHeight = 0;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
+static HWND                    g_MainWindow            = nullptr;
+static ds::App*                g_App                   = nullptr;
+
+// Keep DWM's shadow/system integration aligned with the Midnight shell. The
+// visible title row is rendered by App, but the window retains the ordinary
+// overlapped styles so Windows still owns snap, minimize/maximize and Alt+Space.
+// The attribute is supported by current Windows 10/11 builds; the older value
+// is retained as a best-effort fallback for early Windows 10 runtimes.
+static void ApplyNativeWindowChrome(HWND hwnd) {
+    if (!hwnd) return;
+    BOOL dark = TRUE;
+    constexpr DWORD kImmersiveDarkMode = 20;
+    constexpr DWORD kImmersiveDarkModeLegacy = 19;
+    if (FAILED(::DwmSetWindowAttribute(hwnd, kImmersiveDarkMode,
+                                       &dark, sizeof(dark))))
+        (void)::DwmSetWindowAttribute(hwnd, kImmersiveDarkModeLegacy,
+                                      &dark, sizeof(dark));
+}
 // WndProc and the render loop run on the same UI thread. WM_DPICHANGED stores
 // only the newest requested DPI here; ImGui/font/DX11 work happens later,
 // between frames, after the message queue has drained.
 static constexpr UINT          kDefaultDpi = 96;
 static UINT                    g_AppliedDpi = kDefaultDpi;
 static UINT                    g_PendingDpi = 0;
+static bool                    g_CloseRequested = false;
 // Separate from g_AppliedDpi: a failed B-scale rebuild has already destroyed
 // the prior A-scale texture even though A remains the last successfully applied
 // DPI. Equality is only a safe fast path while these resources are valid.
@@ -40,7 +64,7 @@ static bool                    g_DpiResourcesValid = true;
 
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
-void CreateRenderTarget();
+bool CreateRenderTarget();
 void CleanupRenderTarget();
 bool ApplyPendingDpiChange();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -64,7 +88,7 @@ static std::string Utf8FromWide(const wchar_t* text) {
     return out;
 }
 
-int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+static int RunApplication(HINSTANCE hInstance) {
     std::string startupPath;
     int argc = 0;
     if (wchar_t** argv = ::CommandLineToArgvW(::GetCommandLineW(), &argc)) {
@@ -78,7 +102,8 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     ImGui_ImplWin32_EnableDpiAwareness();
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
-                       hInstance, nullptr, nullptr, nullptr, nullptr,
+                       hInstance, nullptr, nullptr,
+                       (HBRUSH)::GetStockObject(BLACK_BRUSH), nullptr,
                        L"DisasmStudioWnd", nullptr };
     // Application icon (embedded via app.rc): large for alt-tab/taskbar, small
     // for the window caption. Loaded from the multi-resolution app.ico.
@@ -87,13 +112,27 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     wc.hIconSm = (HICON)::LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
                                      ::GetSystemMetrics(SM_CXSMICON),
                                      ::GetSystemMetrics(SM_CYSMICON), LR_SHARED);
-    ::RegisterClassExW(&wc);
+    if (!::RegisterClassExW(&wc)) {
+        ::MessageBoxW(nullptr, L"Could not register the DisasmStudio window class.",
+                      L"DisasmStudio startup failed", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"DisasmStudio",
                                 WS_OVERLAPPEDWINDOW, 100, 100, 1600, 960,
                                 nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) {
+        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        ::MessageBoxW(nullptr, L"Could not create the DisasmStudio window.",
+                      L"DisasmStudio startup failed", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    g_MainWindow = hwnd;
+    ApplyNativeWindowChrome(hwnd);
 
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
+        g_MainWindow = nullptr;
+        ::DestroyWindow(hwnd);
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
@@ -106,19 +145,14 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    // Browser-style single main window, BUT individual panels (side panel, debug
-    // panels, the CFG and pseudocode views) can be "popped out" into their own OS
-    // windows — so enable multi-viewport. The platform-window pump at the bottom of
-    // the render loop is gated on this same flag.
+    // Browser-style single main window. The CFG and pseudocode sub-views can still
+    // be popped into their own OS tool windows, so enable multi-viewport. The fixed
+    // workbench deliberately does not enable ImGui docking.
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     // Let ImGui preserve logical window/layout sizes when viewport DPI changes.
     // Fonts are deliberately not bitmap-scaled by ImGui: the host rebuilds a
     // crisp atlas at the destination monitor's native DPI instead.
     io.ConfigFlags |= ImGuiConfigFlags_DpiEnableScaleViewports;
-    // Docking for the panels INSIDE Binary View (a per-page DockSpace): drag-resize,
-    // re-dock, float as an OS window, or stack as tabs. Combined with ViewportsEnable,
-    // a panel dragged out of the window becomes its own OS viewport for free.
-    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigViewportsNoTaskBarIcon = true;   // popped panels are tools, not separate apps
 
     // Persist the panel layout across sessions in %APPDATA%\DisasmStudio\imgui.ini.
@@ -144,8 +178,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         style.Colors[ImGuiCol_WindowBg].w = 1.0f;
     }
 
-    ImGui_ImplWin32_Init(hwnd);
-    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    if (!ImGui_ImplWin32_Init(hwnd))
+        throw std::runtime_error("Dear ImGui Win32 backend initialization failed");
+    if (!ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext))
+        throw std::runtime_error("Dear ImGui DirectX 11 backend initialization failed");
 
     // DPI scale for the display this window opened on. Fonts are loaded at the
     // scaled pixel size (so glyphs are crisp, not stretched) and the style metrics
@@ -161,6 +197,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // The constructor applies the saved theme and, when supplied, opens the
     // command-line file through AppContext::loadBinaryPath.
     ds::App app(std::move(startupPath));
+    g_App = &app;
 
     bool running = true;
     // Idle throttle: when nothing is animating, block waiting for input instead of
@@ -182,6 +219,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             ::DispatchMessage(&msg);
             if (msg.message == WM_QUIT) running = false;
             gotMsg = true;
+        }
+        if (g_CloseRequested) {
+            g_CloseRequested = false;
+            app.requestExit();
+            framesToRender = 4;
         }
         if (!running) break;
         if (gotMsg) framesToRender = 4;   // keep rendering briefly after any input
@@ -211,7 +253,13 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             g_ResizeWidth = g_ResizeHeight = 0;
             // On device-removed/reset ResizeBuffers fails; don't (re)create an RTV from a
             // dead swapchain — leave it null and let the render guard below skip the frame.
-            if (SUCCEEDED(hr)) CreateRenderTarget();
+            if (FAILED(hr) || !CreateRenderTarget()) {
+                ::MessageBoxW(hwnd,
+                              L"The Direct3D swap chain could not be resized. The graphics device may have been removed or reset.",
+                              L"DisasmStudio graphics error", MB_OK | MB_ICONERROR);
+                running = false;
+                continue;
+            }
         }
 
         ImGui_ImplDX11_NewFrame();
@@ -239,6 +287,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
         HRESULT hr = g_pSwapChain->Present(1, 0); // vsync on
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+        if (FAILED(hr) && hr != DXGI_STATUS_OCCLUDED) {
+            ::MessageBoxW(hwnd,
+                          L"The Direct3D device was removed or reset. DisasmStudio will close cleanly; reopen it to continue.",
+                          L"DisasmStudio graphics error", MB_OK | MB_ICONERROR);
+            running = false;
+        }
 
         // Decide whether to keep rendering: stay at full rate while the app wants
         // animation (background work / debugging) or the user is mid-interaction
@@ -260,9 +314,26 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     ImGui::DestroyContext();
 
     CleanupDeviceD3D();
+    g_App = nullptr;
     ::DestroyWindow(hwnd);
+    g_MainWindow = nullptr;
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return 0;
+}
+
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+    try {
+        return RunApplication(hInstance);
+    } catch (const std::exception& exception) {
+        std::string message = "DisasmStudio encountered an unrecoverable error and must close.\n\n";
+        message += exception.what();
+        ::MessageBoxA(nullptr, message.c_str(), "DisasmStudio fatal error", MB_OK | MB_ICONERROR);
+    } catch (...) {
+        ::MessageBoxW(nullptr,
+                      L"DisasmStudio encountered an unknown unrecoverable error and must close.",
+                      L"DisasmStudio fatal error", MB_OK | MB_ICONERROR);
+    }
+    return 1;
 }
 
 // --- D3D helpers -------------------------------------------------------------
@@ -298,7 +369,10 @@ bool CreateDeviceD3D(HWND hWnd) {
             D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &fl, &g_pd3dDeviceContext);
     }
     if (hr != S_OK) return false;
-    CreateRenderTarget();
+    if (!CreateRenderTarget()) {
+        CleanupDeviceD3D();
+        return false;
+    }
     return true;
 }
 
@@ -309,13 +383,16 @@ void CleanupDeviceD3D() {
     if (g_pd3dDevice)        { g_pd3dDevice->Release();        g_pd3dDevice = nullptr; }
 }
 
-void CreateRenderTarget() {
+bool CreateRenderTarget() {
+    CleanupRenderTarget();
+    if (!g_pSwapChain || !g_pd3dDevice) return false;
     ID3D11Texture2D* back = nullptr;
-    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&back));
-    if (back) {
-        g_pd3dDevice->CreateRenderTargetView(back, nullptr, &g_mainRenderTargetView);
-        back->Release();
-    }
+    HRESULT hr = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&back));
+    if (FAILED(hr) || !back) return false;
+    hr = g_pd3dDevice->CreateRenderTargetView(back, nullptr, &g_mainRenderTargetView);
+    back->Release();
+    if (FAILED(hr)) g_mainRenderTargetView = nullptr;
+    return SUCCEEDED(hr) && g_mainRenderTargetView != nullptr;
 }
 
 void CleanupRenderTarget() {
@@ -383,16 +460,102 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+    switch (msg) {
+        case WM_NCCALCSIZE: {
+            // Retain WS_OVERLAPPEDWINDOW (and therefore native snap/system
+            // semantics), but give the client the former caption/frame area so
+            // App's first band is the one and only visible title/menu row.
+            RECT* client = wParam
+                ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam)->rgrc[0]
+                : reinterpret_cast<RECT*>(lParam);
+            const LONG_PTR style = ::GetWindowLongPtrW(hWnd, GWL_STYLE);
+            if (client && ((style & WS_MAXIMIZE) || ::IsZoomed(hWnd))) {
+                MONITORINFO monitor{sizeof(monitor)};
+                if (::GetMonitorInfoW(
+                        ::MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST),
+                        &monitor))
+                    *client = monitor.rcWork;
+            }
+            return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            // A custom client frame has no native border inset. Constrain a
+            // maximized window to this monitor's work area so it neither hides
+            // the taskbar nor leaves a resize-frame gutter on another display.
+            auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+            MONITORINFO monitor{sizeof(monitor)};
+            if (limits && ::GetMonitorInfoW(
+                    ::MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST),
+                    &monitor)) {
+                limits->ptMaxPosition.x = monitor.rcWork.left - monitor.rcMonitor.left;
+                limits->ptMaxPosition.y = monitor.rcWork.top - monitor.rcMonitor.top;
+                limits->ptMaxSize.x = monitor.rcWork.right - monitor.rcWork.left;
+                limits->ptMaxSize.y = monitor.rcWork.bottom - monitor.rcWork.top;
+
+                // Below this logical size the fixed three-band workbench chrome
+                // stops being useful. Scale the floor with the window DPI, but
+                // never demand more space than the current monitor can provide.
+                UINT dpi = ::GetDpiForWindow(hWnd);
+                if (!dpi) dpi = 96;
+                const LONG preferredMinW = ::MulDiv(760, static_cast<int>(dpi), 96);
+                const LONG preferredMinH = ::MulDiv(520, static_cast<int>(dpi), 96);
+                limits->ptMinTrackSize.x = (std::min)(limits->ptMaxSize.x,
+                                                       preferredMinW);
+                limits->ptMinTrackSize.y = (std::min)(limits->ptMaxSize.y,
+                                                       preferredMinH);
+            }
+            return 0;
+        }
+        case WM_NCHITTEST: {
+            // Recreate only the native resize hit zones. Everything else stays
+            // client input except the deliberately empty menu-to-caption gap,
+            // which App publishes in screen pixels once the row is laid out.
+            const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            RECT window{};
+            if (!::IsZoomed(hWnd) && ::GetWindowRect(hWnd, &window)) {
+                const UINT dpi = ::GetDpiForWindow(hWnd);
+                const int pad = ::GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                const int frameX = ::GetSystemMetricsForDpi(SM_CXFRAME, dpi) + pad;
+                const int frameY = ::GetSystemMetricsForDpi(SM_CYFRAME, dpi) + pad;
+                const bool left = point.x >= window.left &&
+                                  point.x < window.left + frameX;
+                const bool right = point.x < window.right &&
+                                   point.x >= window.right - frameX;
+                const bool top = point.y >= window.top &&
+                                 point.y < window.top + frameY;
+                const bool bottom = point.y < window.bottom &&
+                                    point.y >= window.bottom - frameY;
+                if (top && left) return HTTOPLEFT;
+                if (top && right) return HTTOPRIGHT;
+                if (bottom && left) return HTBOTTOMLEFT;
+                if (bottom && right) return HTBOTTOMRIGHT;
+                if (left) return HTLEFT;
+                if (right) return HTRIGHT;
+                if (top) return HTTOP;
+                if (bottom) return HTBOTTOM;
+            }
+            if (g_App && g_App->mainTitleBarDragHit(point.x, point.y))
+                return HTCAPTION;
+            return HTCLIENT;
+        }
+    }
     if (imguiResult)
         return true;
     switch (msg) {
+        case WM_CLOSE:
+            // Defer close to App so an atomic project-save failure can be shown
+            // and the window can remain open with all in-memory edits intact.
+            g_CloseRequested = true;
+            return 0;
         case WM_SIZE:
             if (wParam == SIZE_MINIMIZED) return 0;
             g_ResizeWidth  = (UINT)LOWORD(lParam);
             g_ResizeHeight = (UINT)HIWORD(lParam);
             return 0;
         case WM_SYSCOMMAND:
-            if ((wParam & 0xfff0) == SC_KEYMENU) return 0; // disable ALT app menu
+            // Suppress the obsolete bare-Alt native menu activation, but keep
+            // Alt+Space so the standard move/size/min/max/close menu remains.
+            if ((wParam & 0xfff0) == SC_KEYMENU && lParam == 0) return 0;
             break;
         case WM_DESTROY:
             ::PostQuitMessage(0);

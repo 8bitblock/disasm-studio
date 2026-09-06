@@ -114,6 +114,61 @@ int main() {
         CHECK(r.size() == 3);
     }
 
+    // ---- worker scan counts all differences despite bounded samples -------
+    {
+        std::vector<uint8_t> a(128, 0), b(128, 1);
+        ByteDiffScanResult scan;
+        CHECK(ScanByteDifferences(a.data(), a.size(), b.data(), b.size(),
+                                  16, /*maxSamples=*/3, /*maxRegions=*/8, scan));
+        CHECK(!scan.cancelled);
+        CHECK(scan.totalDiff == 128);
+        CHECK(scan.samples.size() == 3);
+        CHECK(scan.regions.size() == 1);
+        CHECK(scan.regions[0].start == 0 && scan.regions[0].end == 128);
+    }
+
+    // ---- one-pass scan preserves trailing-length behavior -----------------
+    {
+        std::vector<uint8_t> a(20, 0), b(64, 0);
+        b[2] = 1;
+        ByteDiffScanResult scan;
+        CHECK(ScanByteDifferences(a.data(), a.size(), b.data(), b.size(),
+                                  16, 5000, 50000, scan));
+        CHECK(scan.totalDiff == 45); // one overlap byte + 44 right-only bytes
+        CHECK(scan.samples.size() == 1);
+        CHECK(scan.regions.size() == 2);
+        CHECK(scan.regions[0].start == 2 && scan.regions[0].end == 3);
+        CHECK(scan.regions[1].start == 20 && scan.regions[1].end == 64);
+    }
+
+    // ---- cancellation is checked at a bounded interval --------------------
+    {
+        std::vector<uint8_t> a(200000, 0), b(200000, 1);
+        ByteDiffScanResult scan;
+        int cancelPolls = 0;
+        uint64_t lastProgress = 0;
+        const bool complete = ScanByteDifferences(
+            a.data(), a.size(), b.data(), b.size(), 16, 5000, 50000, scan,
+            [&] { return ++cancelPolls >= 2; },
+            [&](uint64_t current, uint64_t) { lastProgress = current; });
+        CHECK(!complete);
+        CHECK(scan.cancelled);
+        CHECK(cancelPolls == 2);
+        CHECK(lastProgress == 0); // cancelled before the second progress publish
+        CHECK(scan.totalDiff == 65536);
+    }
+
+    // ---- successful scans publish exact completion ------------------------
+    {
+        std::vector<uint8_t> a(70000, 0), b(70000, 0);
+        ByteDiffScanResult scan;
+        uint64_t current = 0, total = 0;
+        CHECK(ScanByteDifferences(
+            a.data(), a.size(), b.data(), b.size(), 16, 5000, 50000, scan, {},
+            [&](uint64_t c, uint64_t t) { current = c; total = t; }));
+        CHECK(current == 70000 && total == 70000);
+    }
+
     if (g_fail == 0) std::printf("ALL DIFFREGIONS TESTS PASSED\n");
     else             std::printf("%d CHECK(S) FAILED\n", g_fail);
     return g_fail ? 1 : 0;

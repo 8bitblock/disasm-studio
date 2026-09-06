@@ -59,6 +59,11 @@ static Instruction callMem(uint64_t va, uint64_t slot) {
     return in;
 }
 
+static Instruction dataRef(uint64_t va, uint64_t target) {
+    char b[64]; std::snprintf(b, sizeof(b), "rcx, [0x%llX]", (unsigned long long)target);
+    return op(va, "lea", b);
+}
+
 static Instruction jumpMem(uint64_t va, uint64_t slot) {
     char b[40]; std::snprintf(b, sizeof(b), "[0x%llX]", (unsigned long long)slot);
     Instruction in = op(va, "jmp", b);
@@ -68,6 +73,12 @@ static Instruction jumpMem(uint64_t va, uint64_t slot) {
 
 static Instruction jumpTo(uint64_t va, uint64_t target) {
     Instruction in = op(va, "jmp");
+    in.isBranch = true; in.branchTarget = target;
+    return in;
+}
+
+static Instruction jumpIf(uint64_t va, const char* mnemonic, uint64_t target) {
+    Instruction in = op(va, mnemonic);
     in.isBranch = true; in.branchTarget = target;
     return in;
 }
@@ -84,7 +95,14 @@ int main() {
     const uint64_t iatOrdinal = base + 0xE10;
     const uint64_t iatRead = base + 0xE20;
     const uint64_t iatSub = base + 0xE30;
+    const uint64_t iatConnectivity = base + 0xE40;
+    const uint64_t iatSend = base + 0xE50;
+    const uint64_t iatCryptCreateHash = base + 0xE60;
+    const uint64_t iatCryptHashData = base + 0xE70;
+    const uint64_t iatCryptGetHashParam = base + 0xE80;
+    const uint64_t iatMemcmp = base + 0xE90;
     const uint64_t stringVA = base + 0xF00;
+    const uint64_t licenseKeyVA = base + 0xF20;
 
     const std::string path = "ds_function_namer_tmp.bin";
     {
@@ -101,10 +119,18 @@ int main() {
         if (va == iatOrdinal) return "KERNEL32.#12";
         if (va == iatRead)    return "KERNEL32.ReadFile";
         if (va == iatSub)     return "odd.sub_100210";
+        if (va == iatConnectivity) return "WININET.InternetGetConnectedState";
+        if (va == iatSend)    return "WS2_32.send";
+        if (va == iatCryptCreateHash) return "ADVAPI32.CryptCreateHash";
+        if (va == iatCryptHashData) return "ADVAPI32.CryptHashData";
+        if (va == iatCryptGetHashParam) return "ADVAPI32.CryptGetHashParam";
+        if (va == iatMemcmp) return "MSVCRT.memcmp";
         return {};
     };
     auto stringRefFor = [&](uint64_t va) -> std::string {
-        return va == stringVA ? "OpenConfig" : std::string();
+        if (va == stringVA) return "OpenConfig";
+        if (va == licenseKeyVA) return "license key";
+        return {};
     };
 
     // An authoritative export is protected even when its real name happens to
@@ -187,6 +213,277 @@ int main() {
         FunctionNamer n;
         auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
         CHECK(r[0].guessed); CHECK_EQ(r[0].name, "OpenConfig");
+    }
+
+    // A thin wrapper that returns the predicate's BOOL directly also qualifies.
+    {
+        const uint64_t direct = base + 0x5F0;
+        dis.bodies[direct] = {
+            callMem(direct, iatConnectivity),
+            ret(direct + 1),
+        };
+        std::vector<NamerInput> f = {
+            { direct, 8, false, "sub_1005F0" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].guessed); CHECK_EQ(r[0].name, "WifiCheck");
+        CHECK(r[0].reason.find("returns InternetGetConnectedState") != std::string::npos);
+    }
+
+    // A strong connectivity predicate must have immediate result-flow evidence:
+    // here its EAX result directly feeds TEST/JNZ. The same shape is vetoed when
+    // the function also performs transport work, which is a network routine rather
+    // than a bounded online-state wrapper.
+    {
+        const uint64_t checked = base + 0x600, transports = base + 0x620;
+        dis.bodies[checked] = {
+            callMem(checked, iatConnectivity),
+            op(checked + 1, "test", "eax, eax"),
+            jumpIf(checked + 2, "jnz", checked + 4),
+            ret(checked + 3),
+            ret(checked + 4),
+        };
+        dis.bodies[transports] = {
+            callMem(transports, iatConnectivity),
+            op(transports + 1, "cmp", "eax, 0"),
+            jumpIf(transports + 2, "je", transports + 5),
+            callMem(transports + 3, iatSend),
+            ret(transports + 4),
+            ret(transports + 5),
+        };
+        std::vector<NamerInput> f = {
+            { checked,    8, false, "sub_100600" },
+            { transports, 8, false, "sub_100620" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].guessed); CHECK_EQ(r[0].name, "WifiCheck");
+        CHECK(r[0].reason.find("InternetGetConnectedState") != std::string::npos);
+        CHECK(r[0].reason.find("connectivity result") != std::string::npos);
+        CHECK(r[1].name != "WifiCheck");
+        CHECK_EQ(r[1].name, "net_send");
+    }
+
+    // TEST establishes several flags, but only a zero/equality Jcc is evidence
+    // that the connectivity BOOL controls a decision. JO observes OF (which TEST
+    // clears), so this shape must remain an ordinary API wrapper rather than a
+    // high-confidence online-state predicate.
+    {
+        const uint64_t overflowBranch = base + 0x650;
+        dis.bodies[overflowBranch] = {
+            callMem(overflowBranch, iatConnectivity),
+            op(overflowBranch + 1, "test", "eax, eax"),
+            jumpIf(overflowBranch + 2, "jo", overflowBranch + 5),
+            op(overflowBranch + 3, "xor", "eax, eax"),
+            ret(overflowBranch + 4),
+            ret(overflowBranch + 5),
+        };
+        std::vector<NamerInput> f = {
+            { overflowBranch, 8, false, "sub_100650" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].guessed);
+        CHECK(r[0].name != "WifiCheck");
+        CHECK_EQ(r[0].name, "internet_get_connected_state");
+    }
+
+    // MSVC commonly normalizes a tested Win32 BOOL with SETNE AL followed by
+    // MOVZX EAX, AL before returning. The full-width MOVZX makes this a valid
+    // predicate result; SETNE alone updates only AL and must not promote the
+    // partially stale EAX value to WifiCheck evidence.
+    {
+        const uint64_t normalized = base + 0x660;
+        const uint64_t partial = base + 0x670;
+        dis.bodies[normalized] = {
+            callMem(normalized, iatConnectivity),
+            op(normalized + 1, "test", "eax, eax"),
+            op(normalized + 2, "setne", "al"),
+            op(normalized + 3, "movzx", "eax, al"),
+            ret(normalized + 4),
+        };
+        dis.bodies[partial] = {
+            callMem(partial, iatConnectivity),
+            op(partial + 1, "test", "eax, eax"),
+            op(partial + 2, "setne", "al"),
+            ret(partial + 3),
+        };
+
+        std::vector<NamerInput> positive = {
+            { normalized, 8, false, "sub_100660" },
+        };
+        FunctionNamer positiveNamer;
+        auto normalizedResult = positiveNamer.name(
+            bin, dis, positive, 0, importNameFor, stringRefFor);
+        CHECK(normalizedResult[0].guessed);
+        CHECK_EQ(normalizedResult[0].name, "WifiCheck");
+        CHECK(normalizedResult[0].reason.find("returns InternetGetConnectedState") !=
+              std::string::npos);
+
+        std::vector<NamerInput> negative = {
+            { partial, 8, false, "sub_100670" },
+        };
+        FunctionNamer negativeNamer;
+        auto partialResult = negativeNamer.name(
+            bin, dis, negative, 0, importNameFor, stringRefFor);
+        CHECK(partialResult[0].guessed);
+        CHECK(partialResult[0].name != "WifiCheck");
+        CHECK_EQ(partialResult[0].name, "internet_get_connected_state");
+    }
+
+    // ARM/AArch64 CB(N)Z combines the accumulator zero test and branch in one
+    // instruction. W0 is the ABI return register, so a strong connectivity call
+    // followed by CBNZ w0 is the same predicate evidence as x86 TEST/JNZ.
+    {
+        const uint64_t armChecked = base + 0x680;
+        Instruction cbnz = jumpIf(armChecked + 1, "cbnz", armChecked + 3);
+        cbnz.operands = "w0, loc_online";
+        cbnz.flow.kind = FlowKind::ConditionalBranch;
+        dis.bodies[armChecked] = {
+            callMem(armChecked, iatConnectivity),
+            cbnz,
+            ret(armChecked + 2),
+            ret(armChecked + 3),
+        };
+        std::vector<NamerInput> f = {
+            { armChecked, 8, false, "sub_100680" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].guessed);
+        CHECK_EQ(r[0].name, "WifiCheck");
+        CHECK(r[0].reason.find("InternetGetConnectedState") != std::string::npos);
+    }
+
+    // Contextual names require two independent kinds of evidence.  This
+    // function references a strong subject phrase and performs a complete
+    // CryptoAPI create/update/final hash pipeline, so the generic hash_data
+    // fallback can be refined honestly to licenseHashing.
+    {
+        const uint64_t hashing = base + 0x700;
+        dis.bodies[hashing] = {
+            dataRef(hashing, licenseKeyVA),
+            callMem(hashing + 1, iatCryptCreateHash),
+            callMem(hashing + 2, iatCryptHashData),
+            callMem(hashing + 3, iatCryptGetHashParam),
+            ret(hashing + 4),
+        };
+        std::vector<NamerInput> f = {
+            { hashing, 16, false, "sub_100700" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].guessed);
+        CHECK_EQ(r[0].name, "licenseHashing");
+        CHECK(r[0].reason.find("license key") != std::string::npos);
+        CHECK(r[0].reason.find("CryptHashData") != std::string::npos);
+    }
+
+    // The same hash pipeline becomes validation only when a comparison result
+    // demonstrably controls an equality decision.  TEST/JNZ is the canonical
+    // x86 shape for consuming memcmp's zero/non-zero result.
+    {
+        const uint64_t validation = base + 0x740;
+        dis.bodies[validation] = {
+            dataRef(validation, licenseKeyVA),
+            callMem(validation + 1, iatCryptCreateHash),
+            callMem(validation + 2, iatCryptHashData),
+            callMem(validation + 3, iatCryptGetHashParam),
+            callMem(validation + 4, iatMemcmp),
+            op(validation + 5, "test", "eax, eax"),
+            jumpIf(validation + 6, "jnz", validation + 8),
+            ret(validation + 7),
+            ret(validation + 8),
+        };
+        std::vector<NamerInput> f = {
+            { validation, 24, false, "sub_100740" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].guessed);
+        CHECK_EQ(r[0].name, "licenseValidation");
+        CHECK(r[0].reason.find("license key") != std::string::npos);
+        CHECK(r[0].reason.find("memcmp") != std::string::npos);
+    }
+
+    // Result-use refinement follows each supported native ABI's return register.
+    // These scripted bodies share the same imported workflow but consume the
+    // comparator on AArch64, MIPS, PowerPC, and RISC-V respectively.
+    {
+        const uint64_t a64 = base + 0x800, mips = base + 0x820;
+        const uint64_t ppc = base + 0x840, riscv = base + 0x860;
+        auto prefix = [&](uint64_t at) {
+            return std::vector<Instruction>{
+                dataRef(at, licenseKeyVA),
+                callMem(at + 1, iatCryptCreateHash),
+                callMem(at + 2, iatCryptHashData),
+                callMem(at + 3, iatCryptGetHashParam),
+                callMem(at + 4, iatMemcmp),
+            };
+        };
+
+        dis.bodies[a64] = prefix(a64);
+        dis.bodies[a64].push_back(op(a64 + 5, "cmp", "w0, #0"));
+        dis.bodies[a64].push_back(op(a64 + 6, "cset", "w0, eq"));
+        dis.bodies[a64].push_back(ret(a64 + 7));
+
+        dis.bodies[mips] = prefix(mips);
+        dis.bodies[mips].push_back(op(mips + 5, "bne", "v0, $zero, loc_bad"));
+        dis.bodies[mips].back().isBranch = true;
+        dis.bodies[mips].push_back(ret(mips + 6));
+
+        dis.bodies[ppc] = prefix(ppc);
+        dis.bodies[ppc].push_back(op(ppc + 5, "cmpwi", "r3, 0"));
+        dis.bodies[ppc].push_back(jumpIf(ppc + 6, "bne", ppc + 8));
+        dis.bodies[ppc].push_back(ret(ppc + 7));
+        dis.bodies[ppc].push_back(ret(ppc + 8));
+
+        dis.bodies[riscv] = prefix(riscv);
+        dis.bodies[riscv].push_back(op(riscv + 5, "bne", "a0, zero, loc_bad"));
+        dis.bodies[riscv].back().isBranch = true;
+        dis.bodies[riscv].push_back(ret(riscv + 6));
+
+        std::vector<NamerInput> f = {
+            { a64,   24, false, "sub_100800" },
+            { mips,  24, false, "sub_100820" },
+            { ppc,   24, false, "sub_100840" },
+            { riscv, 24, false, "sub_100860" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        for (const auto& named : r) {
+            CHECK(named.guessed);
+            CHECK(named.name.rfind("licenseValidation", 0) == 0);
+        }
+    }
+
+    // Evidence is function-local.  A neighboring routine that merely refers
+    // to the licensing phrase must not donate that subject to a generic hash
+    // worker in the same naming batch.
+    {
+        const uint64_t subjectOnly = base + 0x780;
+        const uint64_t hashOnly = base + 0x7A0;
+        dis.bodies[subjectOnly] = {
+            dataRef(subjectOnly, licenseKeyVA),
+            ret(subjectOnly + 1),
+        };
+        dis.bodies[hashOnly] = {
+            callMem(hashOnly, iatCryptCreateHash),
+            callMem(hashOnly + 1, iatCryptHashData),
+            callMem(hashOnly + 2, iatCryptGetHashParam),
+            ret(hashOnly + 3),
+        };
+        std::vector<NamerInput> f = {
+            { subjectOnly, 8, false, "sub_100780" },
+            { hashOnly,   16, false, "sub_1007A0" },
+        };
+        FunctionNamer n;
+        auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        CHECK(r[0].name != "licenseHashing");
+        CHECK(r[0].name != "licenseValidation");
+        CHECK(r[1].guessed);
+        CHECK_EQ(r[1].name, "hash_data");
     }
 
     // ret_zero requires the accumulator still to be zero at RET.  Arbitrary

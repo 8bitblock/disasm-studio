@@ -2,10 +2,9 @@
 //
 // PatchCompiler.h
 // F2 "high-level hot-patch": turn editor source into a position-independent machine-code
-// body that PatchPlacer can land. Three tiers:
+// body that PatchPlacer can land. Two tiers:
 //   * Asm    — always available (Keystone, already linked). The zero-dep MVP.
 //   * C      — vendored libtcc, gated behind DS_HAVE_LIBTCC.
-//   * Python — embedded CPython, gated behind DS_HAVE_PYTHON.
 // When a tier's dep is not compiled in, CompilePatch returns ok=false with a clear
 // diagnostic, so the app builds and the asm tier still works.
 //
@@ -17,7 +16,7 @@
 
 namespace ds {
 
-enum class PatchLang { Asm, C, Python };
+enum class PatchLang { Asm, C };
 
 struct PatchCtx {
     Arch     arch   = Arch::X64;
@@ -31,6 +30,7 @@ struct CompileResult {
 };
 
 const char* PatchLangName(PatchLang l);
+bool PatchLanguageAvailable(PatchLang l);
 
 // Compile `source` in `lang` for `ctx`. Never throws; failures land in diagnostics.
 CompileResult CompilePatch(PatchLang lang, const std::string& source, const PatchCtx& ctx);

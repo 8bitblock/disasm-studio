@@ -5,6 +5,7 @@
 #include "XrefIndex.h"     // FindRefsInBuffer
 
 #include <algorithm>
+#include <exception>
 
 namespace ds {
 
@@ -13,8 +14,26 @@ LiveScanService::LiveScanService(DecoderFactory factory) : factory_(std::move(fa
     unsigned n  = hc > 3 ? hc - 2 : 1;
     if (n > 8) n = 8;
     threads_.reserve(n);
-    for (unsigned i = 0; i < n; ++i) threads_.emplace_back([this] { threadMain(); });
+    try {
+        for (unsigned i = 0; i < n; ++i) threads_.emplace_back([this] { threadMain(); });
+    } catch (...) {
+        // A partially-constructed vector of joinable std::threads would call
+        // std::terminate while unwinding the constructor. Stop and join every
+        // worker that was created before propagating the startup failure.
+        quit_.store(true, std::memory_order_release);
+        cv_.notify_all();
+        for (auto& thread : threads_) if (thread.joinable()) thread.join();
+        throw;
+    }
 }
+
+LiveScanService::LiveScanService(LegacyDecoderFactory factory)
+    : LiveScanService(factory
+        ? DecoderFactory([factory = std::move(factory)](const DecoderConfig& config) {
+              return LegacyDecoderFactoryCanRepresent(config)
+                   ? factory(config.engine, config.arch) : nullptr;
+          })
+        : DecoderFactory{}) {}
 
 LiveScanService::~LiveScanService() {
     {
@@ -47,8 +66,18 @@ uint64_t LiveScanService::requestStrings(std::vector<LiveRange> ranges, MemReade
 uint64_t LiveScanService::requestXref(std::vector<LiveRange> ranges, uint64_t target,
                                       Engine engine, Arch arch, MemReader reader, uint64_t epoch,
                                       size_t hitCap, size_t byteCap) {
+    DecoderConfig decoder;
+    decoder.engine = engine;
+    decoder.arch = arch;
+    return requestXref(std::move(ranges), target, decoder, std::move(reader), epoch,
+                       hitCap, byteCap);
+}
+
+uint64_t LiveScanService::requestXref(std::vector<LiveRange> ranges, uint64_t target,
+                                      const DecoderConfig& decoder, MemReader reader,
+                                      uint64_t epoch, size_t hitCap, size_t byteCap) {
     Job j; j.kind = LiveKind::Xref; j.ranges = std::move(ranges); j.target = target;
-    j.engine = engine; j.arch = arch; j.reader = std::move(reader);
+    j.decoder = decoder; j.reader = std::move(reader);
     j.epoch = epoch; j.hitCap = hitCap; j.byteCap = byteCap;
     return enqueue(std::move(j));
 }
@@ -112,7 +141,43 @@ void LiveScanService::threadMain() {
             pending_.store(true);
         }
 
-        runJob(job);
+        try {
+            runJob(job);
+        } catch (const std::exception& exception) {
+            try {
+                LiveScanResult failure;
+                failure.kind = job.kind;
+                failure.epoch = job.epoch;
+                failure.token = job.token;
+                failure.target = job.target;
+                failure.moduleBase = job.moduleBase;
+                failure.error = std::string("live scan worker failed: ") + exception.what();
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (epoch_.load(std::memory_order_acquire) == job.epoch) {
+                    results_.push_back(std::move(failure));
+                    if (results_.size() > 256) results_.pop_front();
+                }
+            } catch (...) {
+                // Even reporting an allocation failure must not escape a
+                // std::thread entry point and terminate the application.
+            }
+        } catch (...) {
+            try {
+                LiveScanResult failure;
+                failure.kind = job.kind;
+                failure.epoch = job.epoch;
+                failure.token = job.token;
+                failure.target = job.target;
+                failure.moduleBase = job.moduleBase;
+                failure.error = "live scan worker failed: unknown exception";
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (epoch_.load(std::memory_order_acquire) == job.epoch) {
+                    results_.push_back(std::move(failure));
+                    if (results_.size() > 256) results_.pop_front();
+                }
+            } catch (...) {
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -147,11 +212,39 @@ void LiveScanService::runJob(const Job& job) {
     res.kind = job.kind; res.epoch = job.epoch; res.token = job.token;
     res.target = job.target; res.moduleBase = job.moduleBase;
 
+    auto publish = [&](LiveScanResult&& value) {
+        if (superseded()) return;
+        std::lock_guard<std::mutex> lk(mtx_);
+        results_.push_back(std::move(value));
+        if (results_.size() > 256) results_.pop_front();
+    };
+
     std::vector<uint8_t> buf;
     size_t scanned = 0;
 
     std::unique_ptr<IDisassembler> dis;
-    if (job.kind == LiveKind::Xref) dis = factory_ ? factory_(job.engine, job.arch) : nullptr;
+    if (job.kind == LiveKind::Xref) {
+        try {
+            dis = factory_ ? factory_(job.decoder) : nullptr;
+        } catch (const std::exception& exception) {
+            res.error = std::string("live xref decoder initialization failed: ") + exception.what();
+        } catch (...) {
+            res.error = "live xref decoder initialization failed: unknown exception";
+        }
+        if (res.error.empty() && !dis)
+            res.error = "live xref decoder factory returned null";
+        if (res.error.empty() && !dis->ready()) {
+            res.error = "live xref decoder initialization failed";
+            if (!dis->errorMessage().empty()) {
+                res.error += ": ";
+                res.error.append(dis->errorMessage());
+            }
+        }
+        if (!res.error.empty()) {
+            publish(std::move(res));
+            return;
+        }
+    }
 
     for (size_t r = 0; r < job.ranges.size(); ++r) {
         if (superseded()) return;                       // dropped by a newer epoch
@@ -209,10 +302,8 @@ void LiveScanService::runJob(const Job& job) {
                           res.strings.end());
     }
 
-    if (superseded()) return;   // don't deliver a result a detach/reload superseded
-    std::lock_guard<std::mutex> lk(mtx_);
-    results_.push_back(std::move(res));
-    if (results_.size() > 256) results_.pop_front();
+    res.complete = true;
+    publish(std::move(res)); // don't deliver a result a detach/reload superseded
 }
 
 } // namespace ds

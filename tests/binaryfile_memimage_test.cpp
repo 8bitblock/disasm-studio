@@ -12,6 +12,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <utility>
 #include <vector>
 
 using namespace ds;
@@ -77,6 +79,28 @@ int main() {
         CHECK(s.rawOffset == textRVA, "mapped section rawOffset == RVA");
     }
 
+    // A live buffer with an MZ claim is still structured authority. Unknown
+    // machines and malformed headers are rejected instead of silently becoming
+    // a Raw mapping under whatever decoder the caller happened to select.
+    {
+        auto unsupported = img;
+        put16(unsupported, coff, 0x0200); // IA64 is not supported
+        BinaryFile rejected;
+        CHECK(!rejected.loadFromMemory(std::move(unsupported), runtimeBase, "ia64.dll"),
+              "unsupported mapped PE machine rejected");
+        CHECK(!rejected.loaded(), "rejected mapped PE publishes no partial image");
+        CHECK(rejected.loadError() == BinaryLoadError::UnsupportedMachine,
+              "mapped PE reports unsupported-machine failure");
+
+        auto malformed = img;
+        put32(malformed, 0x3C, static_cast<uint32_t>(malformed.size() + 0x100));
+        CHECK(!rejected.loadFromMemory(std::move(malformed), runtimeBase, "bad.dll"),
+              "malformed mapped MZ rejected");
+        CHECK(!rejected.loaded(), "malformed mapped MZ does not fall back Raw");
+        CHECK(rejected.loadError() == BinaryLoadError::MalformedPE,
+              "mapped MZ reports malformed-PE failure");
+    }
+
     // ptrFromVA at the runtime VA returns the mapped section bytes.
     size_t avail = 0;
     const uint8_t* p = bf.ptrFromVA(runtimeBase + textRVA, avail);
@@ -90,6 +114,43 @@ int main() {
     uint64_t off = 0, va = 0;
     CHECK(bf.vaToOffset(runtimeBase + textRVA, off) && off == textRVA, "vaToOffset -> RVA offset");
     CHECK(bf.offsetToVA(textRVA, va) && va == runtimeBase + textRVA, "offsetToVA -> runtime VA");
+
+    // A hostile runtime mapping can place a structurally valid section at the
+    // top of the 64-bit VA space. The pointer remains useful, but its reported
+    // availability must stop at UINT64_MAX instead of inviting bulk decoders to
+    // wrap into low addresses.
+    {
+        const uint64_t nearMaxBase = (std::numeric_limits<uint64_t>::max)() - textRVA - 1;
+        BinaryFile nearMax;
+        CHECK(nearMax.loadFromMemory(img, nearMaxBase, "near-max.dll"),
+              "near-max structured image loads");
+        CHECK(nearMax.hasEntryPoint(), "near-max representable entry remains valid");
+        CHECK(nearMax.entryPointVA() == (std::numeric_limits<uint64_t>::max)() - 1,
+              "near-max entry does not wrap");
+        size_t topAvail = 0;
+        const uint8_t* top = nearMax.ptrFromVA((std::numeric_limits<uint64_t>::max)() - 1,
+                                               topAvail);
+        CHECK(top != nullptr && topAvail == 2, "mapper availability is clamped to VA room");
+        CHECK(nearMax.ptrFromVA((std::numeric_limits<uint64_t>::max)(), topAvail) != nullptr &&
+              topAvail == 1, "UINT64_MAX itself is a one-byte mapped tail");
+        CHECK(nearMax.offsetToVA(textRVA + 1, va) &&
+              va == (std::numeric_limits<uint64_t>::max)(),
+              "last representable mapped offset translates");
+        CHECK(!nearMax.offsetToVA(textRVA + 2, va),
+              "structured offset translation refuses wrapped VA");
+    }
+
+    // If even the declared entry cannot be represented, the loader may retain
+    // the hostile metadata for inspection but must not advertise a wrapped root.
+    {
+        const uint64_t wrappingBase = (std::numeric_limits<uint64_t>::max)() - textRVA + 1;
+        BinaryFile wrapping;
+        CHECK(wrapping.loadFromMemory(img, wrappingBase, "wrapping.dll"),
+              "hostile structured image remains inspectable");
+        CHECK(!wrapping.hasEntryPoint(), "wrapped structured entry is not advertised");
+        CHECK(wrapping.entryPointVA() == 0, "invalid structured entry has safe sentinel");
+        CHECK(!wrapping.offsetToVA(textRVA, va), "wrapped section start does not alias VA zero");
+    }
 
     // A non-PE buffer falls back to a flat blob mapped at base.
     {

@@ -1,5 +1,8 @@
 name: build
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main, master ]
@@ -8,35 +11,220 @@ on:
 
 jobs:
   windows-build:
-    runs-on: windows-latest
+    # DisasmStudio targets Visual Studio 2022; avoid the floating windows-latest
+    # label (which now follows the VS 2026 Windows 2025 image).
+    runs-on: windows-2022
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The VS 2022 image's bundled vcpkg is from 2024 and still points at an
+      # MSYS2 pkgconf archive that has been retired. Pin a current vcpkg
+      # checkout so clean manifest installs remain reproducible on this runner.
+      - name: Checkout pinned vcpkg
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: microsoft/vcpkg
+          ref: abb6dda5cc32914d2e64d7d72b974dc301d1fc8a
+          path: .vcpkg
+          fetch-depth: 1
+
+      - name: Validate Core test manifest
+        shell: pwsh
+        run: tests\validate_test_manifest.ps1
 
       - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
 
-      # The hosted Windows runner ships a vcpkg at $VCPKG_INSTALLATION_ROOT.
-      # Enabling MSBuild integration makes the project's manifest (vcpkg.json)
-      # resolve imgui[dx11/win32/docking], zydis, and capstone automatically.
-      - name: Enable vcpkg MSBuild integration
+      # Bootstrap the pinned checkout rather than the stale copy bundled with
+      # the runner. The explicit VcpkgRoot below also prevents an existing
+      # machine-wide integration from silently selecting a different version.
+      - name: Bootstrap and enable vcpkg MSBuild integration
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install
+          $baseline = (Get-Content -Raw 'vcpkg.json' | ConvertFrom-Json).'builtin-baseline'
+          git -C "$PWD\.vcpkg" fetch --no-tags --depth=1 origin $baseline
+          if ($LASTEXITCODE) { throw "vcpkg baseline fetch failed ($LASTEXITCODE)" }
+          & "$PWD\.vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE) { throw "vcpkg bootstrap failed ($LASTEXITCODE)" }
+          & "$PWD\.vcpkg\vcpkg.exe" integrate install
+          if ($LASTEXITCODE) { throw "vcpkg integration failed ($LASTEXITCODE)" }
 
       - name: Build (Release | x64)
         shell: pwsh
         run: |
-          msbuild DisasmStudio.sln `
-            /m `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:VcpkgEnableManifest=true
+          & .\build.ps1 `
+            -Configuration Release `
+            -Platform x64 `
+            -VcpkgRoot '.vcpkg' `
+            -Verbosity minimal
+          if ($LASTEXITCODE) { throw "Release build failed ($LASTEXITCODE)" }
 
-      - name: Upload executable
-        uses: actions/upload-artifact@v4
+      - name: Run declared Core test suite
+        shell: cmd
+        run: tests\run_core_tests.bat
+
+      - name: Run mandatory live debugger tests
+        shell: pwsh
+        env:
+          DS_REQUIRE_LIVE_DEBUG_TESTS: '1'
+        run: |
+          & tests\run_core_tests.bat x64_debug_test
+          if ($LASTEXITCODE) { throw "x64 debugger integration test failed ($LASTEXITCODE)" }
+          & tests\run_core_tests.bat wow64_debug_test
+          if ($LASTEXITCODE) { throw "WOW64 debugger integration test failed ($LASTEXITCODE)" }
+
+      - name: Smoke launch Release executable
+        shell: pwsh
+        run: tests\smoke_run.ps1
+
+      - name: Assemble release package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $PWD 'package'
+          New-Item -ItemType Directory -Force $package | Out-Null
+
+          $exe = Join-Path $PWD 'build/x64/Release/DisasmStudio.exe'
+          $pdb = Join-Path $PWD 'build/x64/Release/DisasmStudio.pdb'
+          if (!(Test-Path -LiteralPath $exe)) { throw "Missing release executable: $exe" }
+          if (!(Test-Path -LiteralPath $pdb)) { throw "Missing release symbols: $pdb" }
+          Copy-Item -LiteralPath $exe -Destination $package
+          Copy-Item -LiteralPath 'vcpkg.json' -Destination $package
+
+          $manifestVersion = (Get-Content -Raw 'vcpkg.json' | ConvertFrom-Json).version
+          $resourceText = Get-Content -Raw 'src/resource.h'
+          $resourceMatch = [regex]::Match($resourceText, 'DS_VERSION_STRING\s+"([^"]+)"')
+          if (!$resourceMatch.Success) { throw 'DS_VERSION_STRING is missing from src/resource.h' }
+          $productVersion = $resourceMatch.Groups[1].Value
+          $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          $embeddedVersion = $versionInfo.FileVersion
+          $embeddedProductVersion = $versionInfo.ProductVersion
+          if ($embeddedVersion -ne $productVersion) {
+            throw "Embedded file version '$embeddedVersion' does not match src/resource.h '$productVersion'"
+          }
+          if ($embeddedProductVersion -ne $productVersion) {
+            throw "Embedded product version '$embeddedProductVersion' does not match src/resource.h '$productVersion'"
+          }
+          $createdUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          $utf8NoBom = New-Object Text.UTF8Encoding($false)
+          $metadataJson = [ordered]@{
+            name = 'DisasmStudio'
+            manifestVersion = $manifestVersion
+            productVersion = $productVersion
+            embeddedFileVersion = $embeddedVersion
+            embeddedProductVersion = $embeddedProductVersion
+            configuration = 'Release'
+            platform = 'x64'
+            triplet = 'x64-windows-static'
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            ref = $env:GITHUB_REF
+            runId = $env:GITHUB_RUN_ID
+            createdUtc = $createdUtc
+            artifacts = @(
+              [ordered]@{ path = 'DisasmStudio.exe'; sha256 = $exeHash }
+            )
+          } | ConvertTo-Json -Depth 5
+          [IO.File]::WriteAllText((Join-Path $package 'build-metadata.json'), $metadataJson, $utf8NoBom)
+
+          # vcpkg emits a canonical SPDX document for each direct and transitive
+          # package. Bundle those exact build inputs instead of reconstructing
+          # dependency versions from the manifest's unconstrained declarations.
+          $tripletRoot = Join-Path $PWD 'vcpkg_installed/x64-windows-static/x64-windows-static'
+          $dependencyOut = Join-Path $package 'sbom/vcpkg'
+          New-Item -ItemType Directory -Force $dependencyOut | Out-Null
+          $dependencySboms = @()
+          $spdxFiles = @(Get-ChildItem -LiteralPath (Join-Path $tripletRoot 'share') `
+                                      -Filter 'vcpkg.spdx.json' -File -Recurse)
+          if (!$spdxFiles.Count) { throw 'vcpkg produced no dependency SPDX documents' }
+          foreach ($spdx in $spdxFiles) {
+            $dependency = Split-Path (Split-Path $spdx.FullName -Parent) -Leaf
+            $destination = Join-Path $dependencyOut ($dependency + '.spdx.json')
+            Copy-Item -LiteralPath $spdx.FullName -Destination $destination
+            $dependencySboms += [ordered]@{
+              package = $dependency
+              document = "vcpkg/$dependency.spdx.json"
+            }
+          }
+
+          $sha1Values = @(
+            (Get-FileHash -Algorithm SHA1 -LiteralPath $exe).Hash.ToLowerInvariant()
+          )
+          $sha1 = [Security.Cryptography.SHA1]::Create()
+          try {
+            $verificationBytes = [Text.Encoding]::ASCII.GetBytes(($sha1Values -join ''))
+            $verificationCode = ([BitConverter]::ToString($sha1.ComputeHash($verificationBytes))).Replace('-', '').ToLowerInvariant()
+          } finally { $sha1.Dispose() }
+          $documentNamespace = "https://github.com/$($env:GITHUB_REPOSITORY)/sbom/$($env:GITHUB_SHA)"
+          $applicationSbomJson = [ordered]@{
+            spdxVersion = 'SPDX-2.3'
+            dataLicense = 'CC0-1.0'
+            SPDXID = 'SPDXRef-DOCUMENT'
+            name = "DisasmStudio-$productVersion"
+            documentNamespace = $documentNamespace
+            creationInfo = [ordered]@{
+              created = $createdUtc
+              creators = @('Tool: DisasmStudio GitHub Actions packaging')
+            }
+            documentDescribes = @('SPDXRef-Package-DisasmStudio')
+            packages = @([ordered]@{
+              name = 'DisasmStudio'
+              SPDXID = 'SPDXRef-Package-DisasmStudio'
+              versionInfo = $productVersion
+              downloadLocation = 'NOASSERTION'
+              filesAnalyzed = $true
+              packageVerificationCode = [ordered]@{ packageVerificationCodeValue = $verificationCode }
+              licenseConcluded = 'NOASSERTION'
+              licenseDeclared = 'NOASSERTION'
+              copyrightText = 'NOASSERTION'
+            })
+            files = @([ordered]@{
+              fileName = './DisasmStudio.exe'
+              SPDXID = 'SPDXRef-File-DisasmStudio-exe'
+              checksums = @([ordered]@{ algorithm = 'SHA256'; checksumValue = $exeHash })
+              licenseConcluded = 'NOASSERTION'
+              copyrightText = 'NOASSERTION'
+            })
+            relationships = @(
+              [ordered]@{ spdxElementId = 'SPDXRef-Package-DisasmStudio'; relationshipType = 'CONTAINS'; relatedSpdxElement = 'SPDXRef-File-DisasmStudio-exe' }
+            )
+            annotations = @([ordered]@{
+              annotationDate = $createdUtc
+              annotationType = 'OTHER'
+              annotator = 'Tool: DisasmStudio GitHub Actions packaging'
+              comment = "Dependency SPDX documents are indexed separately under sbom/vcpkg ($($dependencySboms.Count) packages)."
+            })
+          } | ConvertTo-Json -Depth 10
+          [IO.File]::WriteAllText((Join-Path $package 'sbom/disasmstudio.spdx.json'), $applicationSbomJson, $utf8NoBom)
+          $sbomIndexJson = [ordered]@{
+            application = 'disasmstudio.spdx.json'
+            dependencies = $dependencySboms
+          } | ConvertTo-Json -Depth 5
+          [IO.File]::WriteAllText((Join-Path $package 'sbom/index.json'), $sbomIndexJson, $utf8NoBom)
+
+          $checksums = Get-ChildItem -LiteralPath $package -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object {
+              $relative = $_.FullName.Substring($package.Length).TrimStart('\', '/').Replace('\', '/')
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+              "$hash *$relative"
+            }
+          $checksums | Set-Content -Encoding ascii (Join-Path $package 'SHA256SUMS.txt')
+
+      - name: Upload release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: DisasmStudio-x64-Release
-          path: build/x64/Release/DisasmStudio.exe
+          path: package
+          if-no-files-found: error
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DisasmStudio-x64-Release-symbols
+          path: build/x64/Release/DisasmStudio.pdb
           if-no-files-found: error

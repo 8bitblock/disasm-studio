@@ -8,9 +8,6 @@
 //              injected bytes only run correctly when 'hot' is self-contained +
 //              position-independent (no external calls / absolute data refs). The UI
 //              warns; a future pass can emit an object file + do proper relocation.
-//   * Python — DS_HAVE_PYTHON: an embedded interpreter runs the snippet, which sets a
-//              `patch = bytes([...])` global of position-independent machine code. Python
-//              SCRIPTS the patch bytes (it does not compile to native).
 //
 #include "PatchCompiler.h"
 #include "../Disasm/Assembler.h"   // ds::Assemble (Keystone)
@@ -20,15 +17,20 @@
 #ifdef DS_HAVE_LIBTCC
 #include <libtcc.h>
 #endif
-#ifdef DS_HAVE_PYTHON
-#include <Python.h>
-#endif
-
 namespace ds {
 
 const char* PatchLangName(PatchLang l) {
-    switch (l) { case PatchLang::Asm: return "asm"; case PatchLang::C: return "c"; case PatchLang::Python: return "python"; }
+    switch (l) { case PatchLang::Asm: return "asm"; case PatchLang::C: return "c"; }
     return "?";
+}
+
+bool PatchLanguageAvailable(PatchLang lang) {
+    if (lang == PatchLang::Asm) return true;
+#ifdef DS_HAVE_LIBTCC
+    return lang == PatchLang::C;
+#else
+    return false;
+#endif
 }
 
 static CompileResult CompileAsm(const std::string& src, const PatchCtx& ctx) {
@@ -77,45 +79,10 @@ static CompileResult CompileC(const std::string& src, const PatchCtx&) {
     return r;
 }
 
-static CompileResult CompilePython(const std::string& src, const PatchCtx&) {
-    CompileResult r;
-#ifdef DS_HAVE_PYTHON
-    if (!Py_IsInitialized()) Py_Initialize();
-    PyObject* main = PyImport_AddModule("__main__");     // borrowed
-    PyObject* dict = PyModule_GetDict(main);             // borrowed
-    PyObject* res = PyRun_String(src.c_str(), Py_file_input, dict, dict);
-    if (!res) {
-        PyObject *t = nullptr, *v = nullptr, *tb = nullptr;
-        PyErr_Fetch(&t, &v, &tb);
-        if (v) { PyObject* sv = PyObject_Str(v); if (sv) { const char* m = PyUnicode_AsUTF8(sv); if (m) r.diagnostics = m; Py_DECREF(sv); } }
-        Py_XDECREF(t); Py_XDECREF(v); Py_XDECREF(tb);
-        PyErr_Clear();
-        return r;
-    }
-    Py_DECREF(res);
-    PyObject* pb = PyDict_GetItemString(dict, "patch");  // borrowed; expect a bytes object
-    if (pb && PyBytes_Check(pb)) {
-        char* buf = nullptr; Py_ssize_t n = 0;
-        if (PyBytes_AsStringAndSize(pb, &buf, &n) == 0 && buf && n > 0) {
-            r.bytes.assign((uint8_t*)buf, (uint8_t*)buf + n);
-            r.ok = true;
-            r.diagnostics = "scripted " + std::to_string((size_t)n) + " bytes from `patch`";
-        } else r.diagnostics = "`patch` was empty";
-    } else {
-        r.diagnostics = "set a global `patch = bytes([...])` of position-independent machine code";
-    }
-#else
-    (void)src;
-    r.diagnostics = "embedded Python requires the python-enabled build (DS_HAVE_PYTHON); use the Asm tier";
-#endif
-    return r;
-}
-
 CompileResult CompilePatch(PatchLang lang, const std::string& source, const PatchCtx& ctx) {
     switch (lang) {
         case PatchLang::Asm:    return CompileAsm(source, ctx);
         case PatchLang::C:      return CompileC(source, ctx);
-        case PatchLang::Python: return CompilePython(source, ctx);
     }
     CompileResult r; r.diagnostics = "unknown patch language"; return r;
 }

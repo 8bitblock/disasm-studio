@@ -3,20 +3,40 @@
 // ApiInfo.h
 // One-line behavioral descriptions for common imported APIs, shared by the
 // listing's inline comments (BinaryViewTab) and the per-function annotation
-// engine (FuncAnnotate). Matched case-insensitively on the function name with
-// any "dll." prefix stripped; A/W/Ex suffixes and Nt/Zw prefixes fall out of
-// the substring matching. Header-only and pure so it unit-tests in isolation.
+// engine (FuncAnnotate). General descriptions remain bounded heuristics, but
+// networking is classified only through the exact DLL-aware catalog: names such
+// as USER32!SendMessageW and KERNEL32!ConnectNamedPipeW are not socket evidence.
 //
+#include "NetworkApiCatalog.h"
+
 #include <cctype>
 #include <string>
+#include <string_view>
 
 namespace ds {
 
 // One-line purpose for a (possibly "dll.func"-qualified) API name. "" when unknown.
 inline std::string ApiPurpose(const std::string& dllDotFunc) {
-    std::string fn = dllDotFunc;
-    size_t dot = fn.find('.');
-    if (dot != std::string::npos) fn = fn.substr(dot + 1);
+    size_t separator = dllDotFunc.rfind('!');
+    if (separator == std::string::npos) separator = dllDotFunc.rfind('.');
+    std::string_view module;
+    std::string_view symbol = dllDotFunc;
+    if (separator != std::string::npos && separator != 0 &&
+        separator + 1 < dllDotFunc.size()) {
+        module = std::string_view(dllDotFunc).substr(0, separator);
+        symbol = std::string_view(dllDotFunc).substr(separator + 1);
+    }
+    if (const auto network = LookupNetworkApi(module, symbol)) {
+        switch (network->family) {
+        case NetworkApiFamily::Winsock: return "network socket I/O";
+        case NetworkApiFamily::DnsApi:  return "resolve a network host name";
+        case NetworkApiFamily::WinHttp:
+        case NetworkApiFamily::WinInet:
+        case NetworkApiFamily::UrlMon:  return "HTTP / internet I/O";
+        }
+    }
+
+    std::string fn(symbol);
     for (char& c : fn) c = (char)std::tolower((unsigned char)c);
     auto has = [&](const char* k) { return fn.find(k) != std::string::npos; };
     if (has("createfile"))        return "open / create a file or device";
@@ -38,8 +58,6 @@ inline std::string ApiPurpose(const std::string& dllDotFunc) {
     if (has("regsetvalue") || has("regcreatekey")) return "write the registry (persistence?)";
     if (has("regopenkey") || has("regqueryvalue")) return "read the registry";
     if (has("createservice"))     return "install a service (persistence)";
-    if (has("wsastartup") || has("socket") || has("connect") || has("send") || has("recv")) return "network socket I/O";
-    if (has("internetopen") || has("internetconnect") || has("httpsendrequest") || has("winhttp") || has("urldownload")) return "HTTP / internet I/O";
     if (has("crypt") || has("bcrypt"))   return "cryptography";
     if (has("messagebox"))        return "show a message box";
     if (has("exitprocess") || has("terminateprocess")) return "terminate the process";

@@ -5,17 +5,18 @@
 #include "../Ui/Widgets.h"
 #include "imgui.h"
 
+#include <algorithm>
 #include <cerrno>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 namespace ds {
 
 namespace {
-// A theme color for each thread state (state bars + verdict tint).
-ImVec4 stateColor(ThreadState s) {
-    switch (s) {
+
+ImVec4 stateColor(ThreadState state) {
+    switch (state) {
         case ThreadState::Running:        return theme::col::good();
         case ThreadState::Waiting:        return theme::col::muted();
         case ThreadState::LockContention: return theme::col::bad();
@@ -30,194 +31,426 @@ bool parsePid(const char* text, uint32_t& pid) {
     if (!text || !*text) return false;
     errno = 0;
     char* end = nullptr;
-    unsigned long long v = std::strtoull(text, &end, 10);
-    if (errno || end == text || *end || v == 0 ||
-        v > (unsigned long long)(std::numeric_limits<uint32_t>::max)())
-        return false;
-    pid = (uint32_t)v;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (errno || end == text || *end || value == 0 ||
+        value > (std::numeric_limits<uint32_t>::max)()) return false;
+    pid = static_cast<uint32_t>(value);
     return true;
 }
-} // namespace
 
-void PrismTab::rebuild() {
-    const uint64_t generation = sampler_.sampleGeneration();
-    rep_ = BuildPrismReport(sampler_.snapshot());
-    builtGeneration_ = generation;
+ImU32 flameColor(const std::string& symbol, bool selected) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : symbol) hash = (hash ^ c) * 16777619u;
+    const ImVec4 palette[] = { theme::col::accent(), theme::col::good(),
+        theme::col::warn(), theme::col::call(), theme::col::branch(), theme::col::jump() };
+    ImVec4 color = palette[hash % IM_ARRAYSIZE(palette)];
+    color.w = selected ? 1.0f : 0.82f;
+    return ImGui::ColorConvertFloat4ToU32(color);
 }
 
-void PrismTab::render(AppContext& ctx) {
-    const float scale = theme::UiScale();
-
-    // ---- Toolbar: PID + Start/Stop ----
-    bool running = sampler_.running();
-    if (running) {
-        if (ui::ToolbarIconButton(DS_ICON_STOP, "Stop", "Stop sampling")) {
-            sampler_.stop();
-            rebuild();
-            running = false;
-        }
-    } else {
-        if (ui::ToolbarIconButton(DS_ICON_PLAY, "Start", "Start sampling the target process")) {
-            uint32_t pid = 0;
-            if (parsePid(pidBuf_, pid)) {
-                shownError_.clear();
-                std::string err;
-                if (!sampler_.start(pid, err))
-                    ui::Toast(ui::ToastKind::Error, "Prism: " + err);
-                else {
-                    ui::Toast(ui::ToastKind::Info, "Prism: sampling pid " + std::to_string(pid));
-                    running = sampler_.running();
-                    lastBuild_ = 0.0;
-                    ctx.wantContinuousRedraw = true;
-                    rebuild();
+// Prefer the static listing only when AppContext can prove that the sampled runtime
+// address belongs to the exact active image. Otherwise navigate to live assembly.
+bool navigateAddress(AppContext& ctx, uint32_t sampledPid,
+                     uint64_t sampledCreationTime, uint64_t runtimeAddress,
+                     const DbgSnapshot& snapshot, bool forceLive = false) {
+    const DebugTargetIdentity target{ snapshot.pid, snapshot.sessionGeneration };
+    if (!runtimeAddress || !snapshot.attached() || snapshot.pid != sampledPid ||
+        !sampledCreationTime ||
+        ctx.debug.processCreationTimeForSession(target) != sampledCreationTime)
+        return false;
+    if (!forceLive && ctx.staticBinary().loaded()) {
+        uint64_t runtimeBase = 0, runtimeSize = 0;
+        if (ctx.debuggerRuntimeImage(snapshot, runtimeBase, runtimeSize) &&
+            runtimeAddress >= runtimeBase && runtimeAddress - runtimeBase < runtimeSize) {
+            const uint64_t delta = runtimeAddress - runtimeBase;
+            if (delta <= (std::numeric_limits<uint64_t>::max)() - ctx.staticBinary().imageBase()) {
+                const uint64_t staticAddress = ctx.staticBinary().imageBase() + delta;
+                size_t available = 0;
+                if (ctx.staticBinary().ptrFromVA(staticAddress, available) && available) {
+                    ctx.gotoAddress(staticAddress);
+                    return true;
                 }
-            } else {
-                ui::Toast(ui::ToastKind::Warn, "Enter a process ID first");
             }
         }
     }
+    ctx.gotoAddressLive(runtimeAddress, target);
+    return true;
+}
+
+void drawQuality(const PrismCollectionQuality& quality) {
+    const ImVec4 color = quality.degraded ? theme::col::warn() : theme::col::good();
+    ImGui::TextColored(color, "%s", PrismCollectorName(quality.collector));
     ImGui::SameLine();
+    if (quality.wow64Target) ImGui::TextDisabled("WOW64 target");
+    else                     ImGui::TextDisabled("native target");
+    if (!quality.summary.empty()) ImGui::TextWrapped("%s", quality.summary.c_str());
+    if (!quality.fallbackReason.empty()) {
+        ImGui::TextColored(theme::col::warn(), "Fallback reason:");
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", quality.fallbackReason.c_str());
+    }
+    if (!quality.warning.empty())
+        ImGui::TextColored(theme::col::warn(), "%s", quality.warning.c_str());
+}
+
+void drawFlameGraph(const PrismReport& report, AppContext& ctx, uint32_t sampledPid,
+                    uint64_t sampledCreationTime, const DbgSnapshot& snapshot,
+                    int& selectedNode) {
+    if (report.flame.size() <= 1) {
+        ImGui::TextDisabled("No stack frames are available for a flame graph.");
+        return;
+    }
+
+    uint16_t maxDepth = 1;
+    for (size_t i = 1; i < report.flame.size(); ++i)
+        maxDepth = std::max(maxDepth, report.flame[i].depth);
+
+    const float scale = theme::UiScale();
+    const float rowHeight = 21.0f * scale;
+    const float graphHeight = std::min(300.0f * scale,
+                                       std::max(90.0f * scale, rowHeight * maxDepth + 4.0f));
+    if (!ImGui::BeginChild("pr_flame", ImVec2(0, graphHeight), ImGuiChildFlags_None,
+                           ImGuiWindowFlags_HorizontalScrollbar)) {
+        ImGui::EndChild();
+        return;
+    }
+
+    const float width = std::max(ImGui::GetContentRegionAvail().x, 600.0f * scale);
+    const float contentHeight = rowHeight * maxDepth + 2.0f;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const bool childHovered = ImGui::IsWindowHovered();
+    int hoveredNode = -1;
+
+    for (size_t i = 1; i < report.flame.size(); ++i) {
+        const PrismFlameNode& node = report.flame[i];
+        if (node.x1 <= node.x0 || node.depth == 0) continue;
+        const float left = origin.x + node.x0 * width;
+        const float right = origin.x + node.x1 * width - 1.0f;
+        const float top = origin.y + static_cast<float>(node.depth - 1) * rowHeight;
+        const float bottom = top + rowHeight - 1.0f;
+        if (right <= left || bottom < ImGui::GetWindowPos().y ||
+            top > ImGui::GetWindowPos().y + ImGui::GetWindowSize().y) continue;
+
+        const bool selected = selectedNode == static_cast<int>(i);
+        draw->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom),
+                            flameColor(node.symbol, selected), 2.0f * scale);
+        draw->AddRect(ImVec2(left, top), ImVec2(right, bottom),
+                      ImGui::GetColorU32(selected ? theme::col::accent() : theme::col::lineSoft()),
+                      2.0f * scale, 0, selected ? 2.0f : 1.0f);
+        const float boxWidth = right - left;
+        if (boxWidth > 34.0f * scale) {
+            const ImVec2 textSize = ImGui::CalcTextSize(node.symbol.c_str());
+            draw->PushClipRect(ImVec2(left + 3.0f, top), ImVec2(right - 2.0f, bottom), true);
+            draw->AddText(ImVec2(left + 4.0f, top + (rowHeight - textSize.y) * 0.5f),
+                          ImGui::GetColorU32(theme::col::windowBg()), node.symbol.c_str());
+            draw->PopClipRect();
+        }
+        if (childHovered && mouse.x >= left && mouse.x < right &&
+            mouse.y >= top && mouse.y < bottom) hoveredNode = static_cast<int>(i);
+    }
+
+    ImGui::Dummy(ImVec2(width, contentHeight));
+    if (hoveredNode > 0) {
+        const PrismFlameNode& node = report.flame[static_cast<size_t>(hoveredNode)];
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(node.symbol.c_str());
+        ImGui::Text("0x%llX  |  %llu samples  |  %llu self",
+                    static_cast<unsigned long long>(node.address),
+                    static_cast<unsigned long long>(node.samples),
+                    static_cast<unsigned long long>(node.selfSamples));
+        ImGui::TextDisabled("Click: exact static image when provable, otherwise live. Shift-click: live.");
+        ImGui::EndTooltip();
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            selectedNode = hoveredNode;
+            if (!navigateAddress(ctx, sampledPid, sampledCreationTime,
+                                 node.address, snapshot,
+                                 ImGui::GetIO().KeyShift))
+                ui::Toast(ui::ToastKind::Info,
+                          "Attach the Win32 debugger to this exact sampled process to navigate runtime addresses.");
+        }
+    }
+    ImGui::EndChild();
+}
+
+void drawVerticalSplitter(const char* id, const ImVec2& localPos,
+                          float height, float thickness, float contentWidth,
+                          float& ratio, float minRatio, float maxRatio) {
+    ImGui::SetCursorPos(localPos);
+    const ImVec2 screenPos = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(thickness, std::max(1.0f, height)));
+    const bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (ImGui::IsItemActive() && contentWidth > 1.0f)
+        ratio += ImGui::GetIO().MouseDelta.x / contentWidth;
+    ratio = std::clamp(ratio, minRatio, maxRatio);
+    const float x = screenPos.x + thickness * 0.5f;
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(x, screenPos.y), ImVec2(x, screenPos.y + height),
+        ImGui::GetColorU32(hot ? theme::col::accent() : theme::col::lineSoft()),
+        hot ? 2.0f : 1.0f);
+}
+
+} // namespace
+
+void PrismTab::render(AppContext& ctx) {
+    const float scale = theme::UiScale();
+    bool running = sampler_.running();
+
+    if (running) {
+        ImGui::BeginDisabled(stopRequested_);
+        if (ui::ToolbarIconButton(DS_ICON_STOP, "Stop", "Cancel Prism collection")) {
+            sampler_.requestStop();
+            stopRequested_ = true;
+        }
+        ImGui::EndDisabled();
+        if (stopRequested_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("stopping...");
+        }
+    } else {
+        stopRequested_ = false;
+        if (ui::ToolbarIconButton(DS_ICON_PLAY, "Start", "Start profiling the target process")) {
+            uint32_t pid = 0;
+            if (!parsePid(pidBuf_, pid)) {
+                ui::Toast(ui::ToastKind::Warn, "Enter a valid process ID first");
+            } else {
+                shownError_.clear();
+                selectedTimeline_ = -1;
+                selectedFlame_ = -1;
+                std::string error;
+                const PrismStartMode mode = static_cast<PrismStartMode>(startMode_);
+                if (!sampler_.start(pid, mode, error))
+                    ui::Toast(ui::ToastKind::Error, "Prism: " + error);
+                else
+                    ui::Toast(ui::ToastKind::Info,
+                              "Prism started for pid " + std::to_string(pid) + " — " +
+                              PrismStartModeName(mode));
+            }
+        }
+    }
+
+    running = sampler_.running();
+    ui::SameLineIfFits(110.0f * scale);
     ImGui::SetNextItemWidth(110.0f * scale);
-    ImGui::InputTextWithHint("##prism_pid", "pid (e.g. 4312)", pidBuf_, sizeof(pidBuf_),
+    ImGui::BeginDisabled(running);
+    ImGui::InputTextWithHint("##prism_pid", "pid", pidBuf_, sizeof(pidBuf_),
                              ImGuiInputTextFlags_CharsDecimal);
-    ImGui::SameLine();
-    ImGui::Checkbox("Auto-refresh", &autoRefresh_);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) rebuild();
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Clear")) { sampler_.clearSamples(); rebuild(); }
-    ImGui::SameLine();
+    const DbgSnapshot targetSnapshot = ctx.debug.snapshot();
+    if (targetSnapshot.attached()) {
+        ui::SameLineIfFits(150.0f * scale);
+        if (ImGui::SmallButton("Use debugger PID"))
+            std::snprintf(pidBuf_, sizeof(pidBuf_), "%u", targetSnapshot.pid);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Select PID %u for the next profile. Start begins collection.", targetSnapshot.pid);
+    }
+    ui::SameLineIfFits(205.0f * scale);
+    ImGui::SetNextItemWidth(205.0f * scale);
+    const char* modes[] = { "Automatic (ETW preferred)", "ETW only", "Suspend-and-walk fallback" };
+    ImGui::Combo("##prism_mode", &startMode_, modes, IM_ARRAYSIZE(modes));
+    ImGui::EndDisabled();
+    ui::SameLineIfFits(55.0f * scale);
+    if (ImGui::SmallButton("Clear")) {
+        sampler_.clearSamples();
+        selectedTimeline_ = -1;
+        selectedFlame_ = -1;
+    }
+    ui::SameLineIfFits(180.0f * scale);
     ImGui::TextDisabled("%zu observations%s", sampler_.sampleCount(),
-                        sampler_.sampleCount() >= PrismSampler::kMaxSamples ? " (rolling window)" : "");
+                        sampler_.sampleCount() >= PrismSampler::kMaxSamples ? " (rolling)" : "");
     ImGui::Separator();
 
-    std::string asyncError = sampler_.lastError();
+    if (running || sampler_.reportGeneration() != sampler_.sampleGeneration())
+        ctx.wantContinuousRedraw = true;
+
+    const std::string asyncError = sampler_.lastError();
     if (!asyncError.empty() && asyncError != shownError_) {
         shownError_ = asyncError;
         ui::Toast(ui::ToastKind::Error, "Prism: " + asyncError);
     }
-
-    // While sampling, keep the UI live and refresh the report on a throttle.
-    if (running) {
-        ctx.wantContinuousRedraw = true;
-        double now = ImGui::GetTime();
-        if (autoRefresh_ && now - lastBuild_ > 0.75) { rebuild(); lastBuild_ = now; }
-    } else if (sampler_.sampleGeneration() != builtGeneration_) {
-        // The target may exit without a Stop click. Publish its final rolling window.
-        rebuild();
+    if (!asyncError.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(theme::col::bad(), "%s", asyncError.c_str());
+        ImGui::PopTextWrapPos();
     }
 
-    if (rep_.totalSamples == 0) {
-        ui::EmptyState(DS_ICON_LIGHTNING, "No samples yet",
-                       "Enter a running process's PID and press Start. Prism suspends each thread briefly, "
-                       "walks its stack, separates thread-state occupancy from cycle-weighted CPU hotspots, "
-                       "and keeps a bounded rolling window. (x64 targets; find PIDs in Communications.)",
+    const std::shared_ptr<const PrismReport> reportPtr = sampler_.report();
+    if (!reportPtr) {
+        ImGui::TextDisabled("Preparing the profiling report...");
+        ctx.wantContinuousRedraw = true;
+        return;
+    }
+    const PrismReport& report = *reportPtr;
+    if (sampler_.pid() != 0) {
+        drawQuality(report.quality);
+        ImGui::Separator();
+    }
+
+    if (report.totalSamples == 0) {
+        ui::EmptyState(DS_ICON_LIGHTNING, running ? "Collecting observations..." : "No samples yet",
+                       running ? "The collector is starting or waiting for activity. Its collection mode and any coverage limits appear above. Stop keeps the collected report."
+                       : "Enter a running process ID and press Start. Prism prefers bounded ETW sampled-profile, "
+                       "image/thread, scheduling/wait, and I/O evidence. If Windows policy blocks ETW, Automatic "
+                       "mode uses the clearly labelled suspend-and-walk fallback (native or WOW64).",
                        nullptr);
         return;
     }
 
-    // ---- Verdict ----
     ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextColored(theme::col::accent(), "%s", rep_.headline.c_str());
-    ImGui::TextWrapped("%s", rep_.verdict.c_str());
+    ImGui::TextColored(theme::col::accent(), "%s", report.headline.c_str());
+    ImGui::TextWrapped("%s", report.verdict.c_str());
     ImGui::PopTextWrapPos();
     ImGui::Separator();
 
-    // ---- Activity over time (one cell per time slice, colored by dominant state) ----
-    if (!rep_.timeline.empty()) {
-        ImGui::TextColored(theme::col::muted(), "ACTIVITY OVER TIME  (%.1fs — dominant state per slice)",
-                           rep_.spanMs / 1000.0f);
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        float w  = ImGui::GetContentRegionAvail().x;
-        float h  = 16.0f * scale;
-        float cw = w / (float)rep_.timeline.size();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        for (size_t i = 0; i < rep_.timeline.size(); ++i) {
-            ImU32 col = ImGui::ColorConvertFloat4ToU32(stateColor(rep_.timeline[i].dominant));
-            ImVec2 a(p0.x + (float)i * cw, p0.y);
-            ImVec2 b(p0.x + (float)(i + 1) * cw - 1.0f, p0.y + h);
-            dl->AddRectFilled(a, b, col);
+    if (!report.timeline.empty()) {
+        ImGui::TextColored(theme::col::muted(), "ACTIVITY TIMELINE  (click a slice to select it)");
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+        const float height = 18.0f * scale;
+        ImGui::InvisibleButton("##prism_timeline", ImVec2(width, height));
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float cellWidth = width / static_cast<float>(report.timeline.size());
+        for (size_t i = 0; i < report.timeline.size(); ++i) {
+            const ImVec2 a(start.x + static_cast<float>(i) * cellWidth, start.y);
+            const ImVec2 b(start.x + static_cast<float>(i + 1) * cellWidth - 1.0f, start.y + height);
+            draw->AddRectFilled(a, b,
+                ImGui::ColorConvertFloat4ToU32(stateColor(report.timeline[i].dominant)));
+            if (selectedTimeline_ == static_cast<int>(i))
+                draw->AddRect(a, b, ImGui::GetColorU32(theme::col::accent()), 0.0f, 0, 2.0f);
         }
-        ImGui::Dummy(ImVec2(w, h));
+        if (ImGui::IsItemHovered()) {
+            int index = static_cast<int>((ImGui::GetMousePos().x - start.x) / cellWidth);
+            index = std::clamp(index, 0, static_cast<int>(report.timeline.size()) - 1);
+            const PrismTimeSlice& slice = report.timeline[static_cast<size_t>(index)];
+            ImGui::SetTooltip("+%.3fs  %d observations  %s",
+                              slice.startMs / 1000.0, slice.samples,
+                              ThreadStateName(slice.dominant));
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) selectedTimeline_ = index;
+        }
+        if (selectedTimeline_ >= 0 && selectedTimeline_ < static_cast<int>(report.timeline.size())) {
+            const PrismTimeSlice& slice = report.timeline[static_cast<size_t>(selectedTimeline_)];
+            ImGui::TextDisabled("Selected +%.3fs: %d observations, dominant %s",
+                                slice.startMs / 1000.0, slice.samples,
+                                ThreadStateName(slice.dominant));
+        }
         ImGui::Separator();
     }
 
-    // ---- Thread-state breakdown (bars) ----
-    ImGui::TextColored(theme::col::muted(), "THREAD-STATE OBSERVATIONS  (not CPU time)");
-    for (const PrismStateStat& st : rep_.states) {
-        ImVec4 c = stateColor(st.state);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
-        char overlay[64];
-        std::snprintf(overlay, sizeof(overlay), "%s  %.0f%%  (%d)", ThreadStateName(st.state), st.pct, st.samples);
-        ImGui::ProgressBar(st.pct / 100.0f, ImVec2(-1, 0), overlay);
+    const DbgSnapshot navigationSnapshot = ctx.debug.snapshot();
+    const uint64_t sampledCreationTime = sampler_.creationTime100ns();
+    const DebugTargetIdentity navigationTarget{
+        navigationSnapshot.pid, navigationSnapshot.sessionGeneration
+    };
+    const bool navigationOwnerExact = navigationSnapshot.attached() &&
+        navigationSnapshot.pid == sampler_.pid() && sampledCreationTime &&
+        ctx.debug.processCreationTimeForSession(navigationTarget) ==
+            sampledCreationTime;
+    if (ImGui::CollapsingHeader("Flame graph", ImGuiTreeNodeFlags_DefaultOpen)) {
+        drawFlameGraph(report, ctx, sampler_.pid(), sampledCreationTime,
+                       navigationSnapshot, selectedFlame_);
+        if (report.flameTruncated)
+            ImGui::TextColored(theme::col::warn(), "Flame graph reached its 4,096-node safety bound.");
+    }
+
+    ImGui::TextColored(theme::col::muted(), "THREAD-STATE OBSERVATIONS  (not CPU utilization)");
+    for (const PrismStateStat& state : report.states) {
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, stateColor(state.state));
+        char overlay[80];
+        std::snprintf(overlay, sizeof(overlay), "%s  %.0f%%  (%d)",
+                      ThreadStateName(state.state), state.pct, state.samples);
+        ImGui::ProgressBar(state.pct / 100.0f, ImVec2(-1, 0), overlay);
         ImGui::PopStyleColor();
     }
     ImGui::Separator();
 
-    // ---- Hot functions | threads + modules | hot paths ----
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float fnW  = avail.x * 0.40f;
-    float midW = avail.x * 0.30f;
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const ImVec2 paneStart = ImGui::GetCursorPos();
+    const float splitter = 6.0f * scale;
+    const float paneContentWidth = std::max(1.0f, available.x - splitter * 2.0f);
+    const float minPane = std::min(170.0f * scale, paneContentWidth * 0.28f);
+    const float minRatio = minPane / paneContentWidth;
+    firstPaneSplit_ = std::clamp(firstPaneSplit_, minRatio,
+                                 std::max(minRatio, secondPaneSplit_ - minRatio));
+    secondPaneSplit_ = std::clamp(secondPaneSplit_, firstPaneSplit_ + minRatio,
+                                  std::max(firstPaneSplit_ + minRatio, 1.0f - minRatio));
+    const float functionWidth = paneContentWidth * firstPaneSplit_;
+    const float middleWidth = paneContentWidth * (secondPaneSplit_ - firstPaneSplit_);
+    const float pathWidth = paneContentWidth - functionWidth - middleWidth;
+    const bool haveCpuWeights = report.totalCpuCycles != 0;
+    const bool canNavigate = navigationOwnerExact;
 
-    ImGui::BeginChild("pr_funcs", ImVec2(fnW, 0), ImGuiChildFlags_Borders);
-    const bool haveCpuWeights = rep_.totalCpuCycles != 0;
-    ImGui::TextColored(theme::col::muted(), haveCpuWeights ? "CPU-WEIGHTED FUNCTIONS" : "SAMPLED LEAF FUNCTIONS");
-    if (ImGui::BeginTable("pr_ftbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf", ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
-        ImGui::TableSetupColumn(haveCpuWeights ? "Incl" : "Stack", ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
+    ImGui::SetCursorPos(paneStart);
+    ImGui::BeginChild("pr_funcs", ImVec2(functionWidth, available.y), ImGuiChildFlags_None);
+    ImGui::TextColored(theme::col::muted(),
+                       haveCpuWeights ? "CPU-WEIGHTED FUNCTIONS" : "SAMPLED LEAF FUNCTIONS");
+    if (ImGui::BeginTable("pr_ftbl", 3,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
+                                ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
+        ImGui::TableSetupColumn(haveCpuWeights ? "Incl" : "Stack",
+                                ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
         ImGui::TableSetupColumn("Function");
         ImGui::TableHeadersRow();
-        DbgSnapshot navSnap = ctx.debug.snapshot();
-        const bool canNavigate = navSnap.attached() && navSnap.pid == sampler_.pid();
-        for (const PrismFuncStat& f : rep_.functions) {
+        for (const PrismFuncStat& function : report.functions) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            const float leafPct = haveCpuWeights ? f.cpuSelfPct : f.selfPct;
-            const float inclPct = haveCpuWeights ? f.cpuInclusivePct : f.inclusivePct;
-            ImVec4 col = leafPct > 20.0f ? theme::col::bad()
-                       : leafPct > 5.0f  ? theme::col::warn() : ImGui::GetStyleColorVec4(ImGuiCol_Text);
-            ImGui::TextColored(col, "%.0f%%", leafPct);
+            const float leafPct = haveCpuWeights ? function.cpuSelfPct : function.selfPct;
+            const float inclusivePct = haveCpuWeights ? function.cpuInclusivePct : function.inclusivePct;
+            const ImVec4 color = leafPct > 20.0f ? theme::col::bad()
+                               : leafPct > 5.0f ? theme::col::warn()
+                                                : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            ImGui::TextColored(color, "%.0f%%", leafPct);
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("%.0f%%", inclPct);
+            ImGui::TextDisabled("%.0f%%", inclusivePct);
             ImGui::TableSetColumnIndex(2);
-            ImGui::PushID((void*)(uintptr_t)f.address);
-            ImGui::BeginDisabled(!canNavigate || !f.address);
-            if (ImGui::Selectable(f.symbol.c_str(), false, ImGuiSelectableFlags_SpanAllColumns) && f.address)
-                ctx.gotoAddressLive(f.address);   // runtime (ASLR) address -> live view
+            ImGui::PushID(reinterpret_cast<void*>(static_cast<uintptr_t>(function.address)));
+            ImGui::BeginDisabled(!canNavigate || !function.address);
+            if (ImGui::Selectable(function.symbol.c_str(), false,
+                                  ImGuiSelectableFlags_SpanAllColumns) && function.address)
+                navigateAddress(ctx, sampler_.pid(), sampledCreationTime,
+                                function.address, navigationSnapshot,
+                                ImGui::GetIO().KeyShift);
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !canNavigate)
-                ImGui::SetTooltip("Attach the Win32 debugger to sampled PID %u to navigate this runtime address.", sampler_.pid());
+                ImGui::SetTooltip(
+                    "Attach the Win32 debugger to the exact sampled process (PID %u) to navigate.",
+                    sampler_.pid());
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
     ImGui::EndChild();
 
-    // Middle column: per-thread breakdown (top) + per-module self-time (bottom).
-    ImGui::SameLine();
-    ImGui::BeginChild("pr_mid", ImVec2(midW, 0), ImGuiChildFlags_Borders);
-    float halfY = ImGui::GetContentRegionAvail().y * 0.5f - 24.0f * scale;
-    if (halfY < 60.0f * scale) halfY = 60.0f * scale;
+    drawVerticalSplitter("##prism_split_functions",
+                         ImVec2(paneStart.x + functionWidth, paneStart.y),
+                         available.y, splitter, paneContentWidth, firstPaneSplit_,
+                         minRatio, std::max(minRatio, secondPaneSplit_ - minRatio));
+    ImGui::SetCursorPos(ImVec2(paneStart.x + functionWidth + splitter, paneStart.y));
+    ImGui::BeginChild("pr_mid", ImVec2(middleWidth, available.y), ImGuiChildFlags_None);
+    float halfHeight = ImGui::GetContentRegionAvail().y * 0.5f - 24.0f * scale;
+    halfHeight = std::max(60.0f * scale, halfHeight);
     ImGui::TextColored(theme::col::muted(), "THREADS");
-    if (ImGui::BeginTable("pr_thr", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, halfY))) {
+    if (ImGui::BeginTable("pr_thr", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, halfHeight))) {
         ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
         ImGui::TableSetupColumn("State");
         ImGui::TableSetupColumn("Obs", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
         ImGui::TableSetupColumn("CPU", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
         ImGui::TableHeadersRow();
-        for (const PrismThreadStat& t : rep_.threads) {
+        for (const PrismThreadStat& thread : report.threads) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            char tl[24]; std::snprintf(tl, sizeof(tl), "%u##thr%u", t.threadId, t.threadId);
-            ImGui::Selectable(tl, false, ImGuiSelectableFlags_SpanAllColumns);
-            if (ImGui::IsItemHovered() && !t.topSymbol.empty()) ImGui::SetTooltip("hottest: %s", t.topSymbol.c_str());
+            ImGui::Text("%u", thread.threadId);
+            if (ImGui::IsItemHovered() && !thread.topSymbol.empty())
+                ImGui::SetTooltip("hottest: %s", thread.topSymbol.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(stateColor(t.dominant), "%s", ThreadStateName(t.dominant));
+            ImGui::TextColored(stateColor(thread.dominant), "%s", ThreadStateName(thread.dominant));
             ImGui::TableSetColumnIndex(2);
-            ImGui::TextDisabled("%.0f", t.dominantPct);
+            ImGui::TextDisabled("%.0f", thread.dominantPct);
             ImGui::TableSetColumnIndex(3);
-            if (haveCpuWeights) ImGui::TextDisabled("%.0f", t.cpuPct);
-            else                ImGui::TextDisabled("--");
+            if (haveCpuWeights) ImGui::TextDisabled("%.0f", thread.cpuPct);
+            else ImGui::TextDisabled("--");
         }
         ImGui::EndTable();
     }
@@ -225,30 +458,41 @@ void PrismTab::render(AppContext& ctx) {
     ImGui::TextColored(theme::col::muted(), "MODULES");
     if (ImGui::BeginTable("pr_mod", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("Module");
-        ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf", ImGuiTableColumnFlags_WidthFixed, 46.0f * scale);
+        ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
+                                ImGuiTableColumnFlags_WidthFixed, 46.0f * scale);
         ImGui::TableHeadersRow();
         int shown = 0;
-        for (const PrismModuleStat& m : rep_.modules) {
+        for (const PrismModuleStat& module : report.modules) {
             if (shown++ >= 20) break;
             ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(m.module.c_str());
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(module.module.c_str());
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("%.0f%%", haveCpuWeights ? m.cpuPct : m.selfPct);
+            ImGui::TextDisabled("%.0f%%", haveCpuWeights ? module.cpuPct : module.selfPct);
         }
         ImGui::EndTable();
     }
     ImGui::EndChild();
 
-    ImGui::SameLine();
-    ImGui::BeginChild("pr_paths", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    ImGui::TextColored(theme::col::muted(), "HOT CALL PATHS  (observation frequency)");
-    for (size_t i = 0; i < rep_.hotPaths.size(); ++i) {
-        const PrismHotPath& hp = rep_.hotPaths[i];
-        char hdr[64]; std::snprintf(hdr, sizeof(hdr), "%.0f%%  (%d samples)###hp%zu", hp.pct, hp.samples, i);
-        if (ImGui::TreeNodeEx(hdr, i == 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+    drawVerticalSplitter("##prism_split_details",
+                         ImVec2(paneStart.x + functionWidth + splitter + middleWidth,
+                                paneStart.y),
+                         available.y, splitter, paneContentWidth, secondPaneSplit_,
+                         firstPaneSplit_ + minRatio,
+                         std::max(firstPaneSplit_ + minRatio, 1.0f - minRatio));
+    ImGui::SetCursorPos(ImVec2(paneStart.x + functionWidth + splitter + middleWidth + splitter,
+                               paneStart.y));
+    ImGui::BeginChild("pr_paths", ImVec2(pathWidth, available.y), ImGuiChildFlags_None);
+    ImGui::TextColored(theme::col::muted(), "HOT CALL PATHS");
+    for (size_t i = 0; i < report.hotPaths.size(); ++i) {
+        const PrismHotPath& path = report.hotPaths[i];
+        char header[72];
+        std::snprintf(header, sizeof(header), "%.0f%%  (%d samples)###hp%zu",
+                      path.pct, path.samples, i);
+        if (ImGui::TreeNodeEx(header, i == 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
             ui::PushMono();
-            for (size_t k = 0; k < hp.frames.size(); ++k)
-                ImGui::Text("%*s%s", (int)(k * 2), "", hp.frames[k].c_str());
+            for (size_t frame = 0; frame < path.frames.size(); ++frame)
+                ImGui::Text("%*s%s", static_cast<int>(frame * 2), "", path.frames[frame].c_str());
             ui::PopMono();
             ImGui::TreePop();
         }

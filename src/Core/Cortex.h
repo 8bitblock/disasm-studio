@@ -38,6 +38,7 @@ struct Capability;   // Core/TechScan.h
 struct AlgoMatch;    // Core/AlgoScan.h
 struct FuncResult;   // Core/AnalysisJobs.h (address, size, name, guessed, reason)
 struct StrResult;    // Core/AnalysisJobs.h (address, text, wide)
+struct CrackmeTriageReport; // Core/CrackmeTriage.h (ranked offline endpoint trails)
 
 // Per-function facts distilled from the annotation engine (Core/FuncAnnotate). Kept
 // as a plain struct so Cortex stays decoupled from FuncAnnotate.h and testable: the
@@ -63,6 +64,7 @@ struct CortexInput {
     const std::vector<FuncResult>*     functions    = nullptr; // discovered + guessed functions
     const std::vector<StrResult>*      strings      = nullptr; // extracted string literals
     const std::vector<CortexFuncInfo>* funcInfo     = nullptr; // per-function annotation facts
+    const CrackmeTriageReport*         crackmeTriage = nullptr; // bounded offline endpoint evidence
 };
 
 // One merged behaviour conclusion (e.g. "Network communication", "Cryptography").
@@ -106,7 +108,8 @@ CortexReport BuildCortexReport(const CortexInput& in);
 
 // Deterministic "chat with the binary": answer `question` from the report + input.
 // Recognises intent by keyword (crypto / network / files / registry / packed /
-// inject / debug / strings / imports / entry / functions / summary) and answers in
+// inject / debug / authorization / remembered startup access / strings / imports /
+// entry / functions / summary) and answers in
 // plain English grounded in the evidence. Always returns something useful (falls
 // back to the verdict + a hint). Case-insensitive.
 std::string AskCortex(const CortexReport& rep, const CortexInput& in,

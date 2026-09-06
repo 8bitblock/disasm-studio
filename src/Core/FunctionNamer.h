@@ -12,6 +12,9 @@
 //   - a recognizable set of imported APIs               -> a semantic verb
 //                                                          (read_file, net_send,
 //                                                           inject_thread, ...)
+//   - strong subject text + a complete operation         -> a contextual intent
+//                                                          (licenseHashing,
+//                                                           configDecryption, ...)
 //   - a single notable API call                         -> <api>_wrapper
 //   - a distinctive identifier-like referenced string   -> that string
 //
@@ -50,13 +53,26 @@ struct GuessedName {
     bool        guessed = false;
 };
 
+// Bounded first-use evidence for one imported API return value.  The collector
+// records only immediate accumulator flows it can prove locally; absence is not
+// proof that a result was ignored.  Keeping the API name lets synthesis decide
+// whether a checked status means comparison, verification, connectivity, etc.
+struct ApiResultUseEvidence {
+    std::string api;
+    bool checked = false;  // feeds an equality/zero branch
+    bool returned = false; // direct/canonically-normalized result reaches RET
+    bool normalizedReturned = false; // SETcc + full-width normalization reaches RET
+};
+
 // Evidence gathered about one function body. Kept deliberately small and free of
 // engine types so the synthesis below is pure and testable.
 struct FuncEvidence {
     int  instrCount = 0;
     int  callCount  = 0;                // direct + indirect calls
     std::vector<std::string> apis;      // bare imported-API names called (in order, de-duped)
+    std::vector<std::string> apiCallSequence; // bounded imported calls in body order (duplicates kept)
     std::vector<std::string> strings;   // referenced string literals (raw text)
+    std::vector<ApiResultUseEvidence> apiResultUses; // ordered, de-duped by exact API key
     bool isThunk      = false;          // body is essentially one jmp to a single target
     std::string thunkApi;               // API a thunk tail-jumps to ("" if its target isn't an API)
     bool selfRecursive = false;
@@ -64,6 +80,11 @@ struct FuncEvidence {
     bool isRawStart   = false;          // analyst-selected base of a raw mapping
     bool retOnly      = false;          // body is just ret / leave;ret / nop*;ret  (no calls)
     bool retZero      = false;          // sets eax/rax=0 then returns, no calls
+    // Strong connectivity predicates are named only when their Boolean result
+    // has an observable predicate-shaped use.  These are deliberately separate
+    // from generic API-set evidence so socket/HTTP workers never become checks.
+    bool connectivityResultChecked  = false; // predicate result feeds an equality/zero branch
+    bool connectivityResultReturned = false; // direct or canonically normalized result reaches RET
 };
 
 // PURE: synthesize a name + reason from evidence. Returns guessed=false (empty

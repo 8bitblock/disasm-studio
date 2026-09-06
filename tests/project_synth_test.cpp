@@ -30,6 +30,11 @@ int main() {
 
     PjHotPatch h{ 0x401100, "c", "int hot(int a){ return a + 1; }" };
     st.hotPatches.push_back(h);
+    // Python hot-patching is no longer executable, but old sidecars must retain the
+    // source verbatim so the UI can expose it as read-only migration evidence. VA 0
+    // is also a legitimate raw-image patch site.
+    PjHotPatch legacy{ 0, "python", "patch = bytes([0x90, 0xC3])" };
+    st.hotPatches.push_back(legacy);
 
     CHECK(st.hasContent());
 
@@ -47,11 +52,16 @@ int main() {
         CHECK(g.z3Equivalent == true);
         CHECK(g.reasoning == s.reasoning);
     }
-    CHECK(got.hotPatches.size() == 1);
-    if (got.hotPatches.size() == 1) {
-        CHECK(got.hotPatches[0].address == 0x401100);
-        CHECK(got.hotPatches[0].lang == "c");
-        CHECK(got.hotPatches[0].source == h.source);
+    CHECK(got.hotPatches.size() == 2);
+    if (got.hotPatches.size() == 2) {
+        const PjHotPatch* loadedC = nullptr;
+        const PjHotPatch* loadedLegacy = nullptr;
+        for (const PjHotPatch& patch : got.hotPatches) {
+            if (patch.lang == "c") loadedC = &patch;
+            if (patch.lang == "python") loadedLegacy = &patch;
+        }
+        CHECK(loadedC && loadedC->address == 0x401100 && loadedC->source == h.source);
+        CHECK(loadedLegacy && loadedLegacy->address == 0 && loadedLegacy->source == legacy.source);
     }
 
     // 64-bit address precision preserved through the hex-string encoding.

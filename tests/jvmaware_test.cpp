@@ -9,6 +9,7 @@
 //   .\jvmaware_test.exe
 //
 #include "Core/JvmAware.h"
+#include "Core/JvmAttach.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -64,6 +65,11 @@ static std::vector<uint8_t> buildExportPE(const std::vector<std::string>& names)
 }
 
 int main() {
+    // A timeout or failed wait is never authority to free the remote stub/data:
+    // the injected thread may still be executing or reading its argument block.
+    CHECK(CanReleaseJvmAttachRemoteMemory(JvmRemoteThreadCompletion::ConfirmedExited));
+    CHECK(!CanReleaseJvmAttachRemoteMemory(JvmRemoteThreadCompletion::MayStillRun));
+
     // ---- module-name table -------------------------------------------------
     CHECK(IsJvmModuleName("jvm.dll"));
     CHECK(IsJvmModuleName("JVM.DLL"));                                  // case-insensitive

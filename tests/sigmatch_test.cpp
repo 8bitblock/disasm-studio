@@ -137,6 +137,30 @@ int main() {
         CHECK(eqVec(ref, got));
     }
 
+    // File scanning admits only mapped starts. Thousands of hits in an
+    // unmapped prefix must not exhaust the result cap before a later section.
+    {
+        std::vector<uint8_t> bytes(9000, 0xAB);
+        const SigPattern pattern = mk({0xAB, 0xAB}, "xx");
+        const auto hits = FindAllMaskedAccepted(bytes.data(), bytes.size(), pattern, 5,
+            [](size_t offset) { return offset >= 8192; });
+        CHECK(eqVec(hits, {8192, 8193, 8194, 8195, 8196}));
+        const auto none = FindAllMaskedAccepted(bytes.data(), bytes.size(), pattern, 5,
+            [](size_t) { return false; });
+        CHECK(none.empty());
+    }
+    // Admission remains exact for overlapping/all-wildcard matches and can
+    // retain address zero. Zero maxHits means all admitted matches.
+    {
+        const std::vector<uint8_t> bytes(12, 0);
+        const SigPattern pattern = mk({0, 0, 0}, "...");
+        const auto hits = FindAllMaskedAccepted(bytes.data(), bytes.size(), pattern, 0,
+            [](size_t offset) { return offset % 3 == 0; });
+        CHECK(eqVec(hits, {0, 3, 6, 9}));
+        CHECK(eqVec(FindAllMaskedAccepted(bytes.data(), bytes.size(), pattern, 3, {}),
+                    FindAllMasked(bytes.data(), bytes.size(), pattern, 3)));
+    }
+
     // ---- Random fuzz: many buffers x many masked patterns ------------------
     {
         std::mt19937 rng(0xC0FFEE);
@@ -157,6 +181,14 @@ int main() {
             }
             char tag[32]; std::snprintf(tag, sizeof(tag), "fuzz-%d", trial);
             crossCheck(tag, buf, p);
+            std::vector<size_t> admitted;
+            for (const size_t offset : naiveAll(buf.data(), buf.size(), p)) {
+                if (offset % 3 == 1) continue;
+                admitted.push_back(offset);
+                if (admitted.size() == 5) break;
+            }
+            CHECK(eqVec(admitted, FindAllMaskedAccepted(buf.data(), buf.size(), p, 5,
+                [](size_t offset) { return offset % 3 != 1; })));
         }
     }
 

@@ -38,21 +38,24 @@ i like 5,3 and 5 begin to add these to disasmstudio project. also working on 11 
   local-model backend you described is a drop-in behind `AskCortex()` / the verdict text —
   Cortex already hands it a structured, grounded fact base. That's the next step for #3.
 
-**#5 Prism — explanatory profiler** ✅ first cut shipped.
+**#5 Prism — explanatory profiler** ✅ Prism 2 shipped.
 - `src/Core/Prism.{h,cpp}` — PURE: symbolized stack samples → self/inclusive hot-function
   table + a thread-state breakdown (running / waiting / lock-contention / allocation / I/O /
   GPU) + hot call paths + a "where the time goes and what to fix" verdict. Unit-tested
   (`tests/prism_test.cpp`).
-- `src/Core/PrismSampler.{h,cpp}` — the Win32 sampler: a background thread that suspends each
-  target-process thread, StackWalk64s it, symbolizes to "module!function", and feeds Prism.
-  x64 targets only for now (WOW64 support is a follow-up).
-- `src/Tabs/PrismTab.cpp` — the "Prism" tab: enter a PID → Start; live state bars, hot
-  functions (click → live view), hot call paths, and the verdict.
+- `src/Core/PrismSampler.{h,cpp}` — a worker-owned ETW collector is preferred (sampled
+  profiles plus image/thread/context-switch/wait/I/O evidence); collection quality, stack/frame
+  coverage, and lost events/buffers stay visible. If Windows policy blocks ETW, Automatic mode
+  records the reason and uses the labelled suspend-and-walk fallback. The fallback walks native
+  x64 and WOW64 contexts. A second worker builds immutable reports off the render thread.
+- `src/Tabs/PrismTab.cpp` — enter a PID → Start; choose Automatic/ETW-only/fallback; inspect
+  the flame graph, selectable timeline, state bars, hot functions/paths, and verdict. Function
+  and flame-node clicks navigate to the exact static image when identity mapping is proven,
+  otherwise to live assembly when the matching debugger target is attached.
 
-**#11 Kernel VM** — left to you (stripped-down VM / simulated kernel-level access), per your note.
-
-Follow-ups: (Cortex) local-LLM backend behind AskCortex, reuse `AppContext::analysis` instead
-of recomputing on Analyze; (Prism) WOW64/32-bit targets, flame graph, symbol server config.
+Follow-ups: (Cortex) local-LLM backend behind AskCortex and reuse `AppContext::analysis` instead
+of recomputing on Analyze. Prism symbol quality can use the opt-in symbol service; ETW remains
+subject to Windows elevation/profile-policy constraints and reports those constraints honestly.
 
 ### Update 2 — deepening pass ✅
 
@@ -67,3 +70,47 @@ of recomputing on Analyze; (Prism) WOW64/32-bit targets, flame graph, symbol ser
   threads/modules column beside the hot functions.
 - Both engines stay pure + unit-tested (cortex_test / prism_test extended); full `DisasmStudio.sln`
   builds clean (0 warnings / 0 errors).
+
+### GameMaker VM debugging — integration and live validation, 2026-09-06
+
+- Added bounded GameMaker archive metadata, dedicated GML decoding, symbolic script breakpoints and named watches, project version 5 persistence, and integrated GML connection/inspection panels.
+- Added an embedded x64 helper and exact-build Nubby runner adapter with interpreter dispatch, entry, and instance lifetime hooks; native debug events remain the pause authority.
+- Fixed helper initialization stack usage; added small-thread-stack and machine-state gate regressions.
+- Added frozen instance registry inspection, canonical numeric writes with stop/revision/lifetime validation, and verified payload restoration in real Nubby tests.
+- Fixed native/GML hook overlap rejection, post-write hook rollback ownership, original page-protection restoration, unreadable-thread rejection, and runtime code binding status.
+- Added visible rejection of invalid claimed GML stops, module-lifetime checks, callback draining, asynchronous unload, and fresh-session reconnect handling.
+- Real Nubby validation has exercised instruction stepping, step over/out, global and instance numeric edit/restore, native breakpoint coexistence, helper unload, and reconnect. Three-restart acceptance, final performance measurements, and the final Release/regression audit remain in progress.
+
+- Verified the same symbolic breakpoint and ItemSfx watch across three real Nubby restarts, with different resolved heap addresses and an unchanged project intent file.
+- Added guarded extended-state saves for all enabled XCR0 components, including AVX-512 registers/opmasks; production-MASM preservation tests and the small-stack initialization regression pass.
+- Fixed frame-local watches to follow the same thread/frame incarnation across stepping while keeping numeric writes bound to the exact current stop.
+- The latest x64 Release application, embedded-helper freshness check, headless GML listing integration, native x64 debugger suite, archive/decoder/runner/inspection/project regressions all pass. A fresh live run with the extended-state helper also passes.
+- Added an opt-in production lifecycle harness for setup failure/cancellation, running/paused/pending-stop disconnect, debugger host disappearance and explicit test-target exit; its execution and the remaining edge-case audit are in progress.
+
+- Passed production lifecycle tests for setup failure/cancellation, running/paused/pending-stop disconnect, and abrupt debugger-host loss while running or paused.
+- Fixed process termination at a held GML stop: revoke pause authority and release the pending event when Windows reports the exit status, allowing EXIT_PROCESS cleanup to finish without target writes.
+- Revalidated native x64 debugging and produced the current self-contained build/gml-verified/DisasmStudio.exe with verified embedded helper bytes.
+- Extended helper frame-state fixtures for recursive frames, loop revisits, multiple-frame unwinding, reused anchors, and unrelated exception propagation.
+
+- Extracted the production hook-write transaction into a bounded testable core and covered partial writes, rollback failure, protection/cache failure, and foreign-byte rejection.
+- Removed allocation from remote write verification so a successful hook write cannot be followed by a throwing readback allocation.
+- Added explicit compiled runner capability records and connection evidence; packed operand-stack values and complex edits remain visibly unavailable.
+- Kept immutable GML snapshots readable during host instance-map inspection and fixed cancellation racing the first native pause publication.
+- Broader live traces proved entry into a named GML callee, return to its original caller, and Step Over across a named GML call. The sampled menu contained no repeated instruction/frame; loop and unwind semantics are covered by deterministic model/helper fixtures, without claiming a live loop was observed.
+
+- Completed the GameMaker requirement audit and documented the exact connection, stepping, variable-edit and persistent-watch workflow in docs/GAMEMAKER_DEBUGGING.md.
+- Fixed Step Out for top-level GML events and complete-chain unwinds; live Nubby testing confirmed it stops at the next verified event after the original frame leaves the active call chain.
+- Passed the final live trace through a real loop, named GML call entry/return, call Step Over and top-level Step Out; the full numeric edit/restore, native coexistence and reconnect harness also passes with the final embedded helper.
+- Added helper shutdown refusal and duplicate-initialization coverage, and verified failed preparation can be cleared and retried without native reattachment. Removed a large automatic temporary from the new test fixture after its stack-overflow regression caught it.
+- Revalidated 15 selected Core/native tests, the headless production GML panel/listing integration, x64 Release build and embedded-helper freshness. Preserved three-restart acceptance and recorded 12 final baseline/idle/armed CPU/cycle samples without claiming a precise slowdown percentage.
+- Delivered build/gml-verified/DisasmStudio.exe and saved hashes, test results and supported limits in build/gamemaker-final-verification.json; the game executable/archive hashes are unchanged and the user's older running application was left open.
+- Added a read-only score inspection utility under build/gml-inspect using the production archive parser/decoder. Verified scr_AddNumber updates PotentialNum from local _Recalculated at bytecode offsets +0x354 through +0x368; no game bytes or debugger behavior were changed.
+
+- Made static cross-reference analysis respect code/data islands, share classification and analyst overrides with Cortex, and validate image/decoder/override/scope identities before adopting cached results.
+- Centralized typed instruction references; prevented false FS/GS static targets and typed-to-text fallbacks while preserving LEA, EIP/RIP, and address-zero behavior.
+- Connected Binary View to bounded document navigation with selected-source return anchors, representation restoration, explicit Hex offsets, and debugger-owner retirement; unified strict goto parsing and one-submission asynchronous symbol navigation.
+- Replaced the References modal with a pinned, filterable Xrefs panel that retains the target and selected source while navigating, with explicit FILE/LIVE coverage and stale-result retirement.
+- Added shared contextual annotation, bookmark, FILE/LIVE handoff, and checked Run to Cursor actions across code views and Ctrl+K; made patch preview, Copy, Apply, padding, and completion outcomes consistent.
+- Added resizable, persistent, DPI-aware Assembly/Live Assembly columns and updated disassembly/workflow documentation; expanded Core and production-object UI regression coverage.
+- Verified the completed workflow upgrade with 16 selected Core test binaries (instruction references, both native decoders, classification planning/service/cache, function analysis/annotations, triage, navigation/address parsing, project round-trips, lazy listing, and source export), plus the production-object headless ImGui suite with zero failures.
+- Confirmed x64 Release build and embedded GameMaker helper verification. Headless UI checks cover 100/150/200% scaling, an 820x560 narrow listing, saved table settings, pinned-reference stale-scope retirement, first-follow history, one-submission symbols, source-bound actions, NOP-padded Copy/Apply, disabled sets, and identity-rejected live mirroring. New UI debugger cases use simulated snapshots and do not attach to a target.

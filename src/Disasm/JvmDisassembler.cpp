@@ -1,4 +1,5 @@
 #include "JvmDisassembler.h"
+#include "../Core/AddressSpan.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -147,6 +148,8 @@ uint32_t JvmDisassembler::bciFor(uint64_t va) const {
 
 bool JvmDisassembler::decodeOne(const uint8_t* data, size_t size,
                                 uint64_t virtualAddress, Instruction& out) {
+    size = ClampAddressableBytes(virtualAddress, size);
+    if (!size) return false;
     return decodeAt(data, size, virtualAddress, bciFor(virtualAddress), out);
 }
 
@@ -155,16 +158,19 @@ std::vector<Instruction> JvmDisassembler::disassemble(const uint8_t* data, size_
                                                       size_t maxInstructions) {
     std::vector<Instruction> out;
     if (!data) return out;
+    size = ClampAddressableBytes(virtualAddress, size);
     size_t off = 0;
     // Without a class context, assume the window starts at a code-array start
     // (true for the per-method sections the JavaClass loader maps), so the
     // switch-padding bci is the offset into the window.
     const bool haveClass = class_ && class_->ok;
     while (off < size && (!maxInstructions || out.size() < maxInstructions)) {
-        const uint64_t va = virtualAddress + off;
+        uint64_t va = 0;
+        if (!CheckedAddressAdd(virtualAddress, static_cast<uint64_t>(off), va)) break;
         const uint32_t bci = haveClass ? bciFor(va) : (uint32_t)off;
         Instruction in;
-        if (!decodeAt(data + off, size - off, va, bci, in)) {
+        if (!decodeAt(data + off, size - off, va, bci, in) ||
+            !in.length || in.length > size - off) {
             // Undecodable byte: emit a `db`-style row and resync one byte on,
             // mirroring the x86 backends' behaviour.
             in = Instruction{};
@@ -194,6 +200,8 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
 
     char buf[96];
     size_t len = 1;
+    int32_t switchDefaultOffset = 0;
+    bool switchDefaultOffsetValid = false;
     const JvmClassFile* cf = (class_ && class_->ok) ? class_.get() : nullptr;
 
     // Resolve a constant-pool operand: "#n" text + readable comment, and for
@@ -248,7 +256,10 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
         case KCP2: {
             if (n < 3) return false;
             len = 3;
-            cpOperand(rdU2(d + 1), op >= 0xB6 && op <= 0xB8);  // invokevirtual/special/static
+            // Only invokespecial/invokestatic have statically selected methods.
+            // invokevirtual remains dynamically dispatched even when its CP
+            // Methodref names a method in this class.
+            cpOperand(rdU2(d + 1), op == 0xB7 || op == 0xB8);
             break;
         }
         case KIINC: {
@@ -263,9 +274,7 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
             if (n < 1 + w) return false;
             len = 1 + w;
             const int32_t rel = (w == 2) ? rdS2(d + 1) : rdS4(d + 1);
-            const int64_t tgt = (int64_t)va + rel;
-            if (tgt < 0) return false;
-            out.branchTarget = (uint64_t)tgt;
+            if (!CheckedAddressAddSigned(va, rel, out.branchTarget)) return false;
             out.branchTargetValid = true;
             std::snprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)out.branchTarget);
             out.operands = buf;
@@ -311,16 +320,27 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
             const uint64_t count = (uint64_t)high - (uint64_t)low + 1;
             if (count > (n - 1 - pad - 12) / 4) return false;  // table must fit the buffer
             len = 1 + pad + 12 + (size_t)count * 4;
-            out.branchTarget = va + def;
+            if (!CheckedAddressAddSigned(va, def, out.branchTarget)) return false;
             out.branchTargetValid = true;
+            switchDefaultOffset = def;
+            switchDefaultOffsetValid = true;
+            out.switchInfo.defaultTarget = out.branchTarget;
+            out.switchInfo.defaultTargetValid = true;
             std::snprintf(buf, sizeof(buf), "%d..%d, default=0x%llX",
                           low, high, (unsigned long long)out.branchTarget);
             out.operands = buf;
             out.extraTargets.reserve((size_t)count);
+            out.switchInfo.cases.reserve((size_t)count);
             std::string cases;
             for (uint64_t k = 0; k < count; ++k) {
-                const uint64_t t = va + rdS4(q + 12 + k * 4);
+                uint64_t t = 0;
+                if (!CheckedAddressAddSigned(va, rdS4(q + 12 + k * 4), t)) return false;
                 out.extraTargets.push_back(t);
+                SwitchCase switchCase;
+                switchCase.value = static_cast<int64_t>(low) + static_cast<int64_t>(k);
+                switchCase.target = t;
+                switchCase.targetValid = true;
+                out.switchInfo.cases.push_back(switchCase);
                 if (k < 4) {
                     std::snprintf(buf, sizeof(buf), "%s%lld -> 0x%llX",
                                   cases.empty() ? "" : ", ",
@@ -340,17 +360,31 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
             if (npairs < 0) return false;
             if ((uint64_t)npairs > (n - 1 - pad - 8) / 8) return false;
             len = 1 + pad + 8 + (size_t)npairs * 8;
-            out.branchTarget = va + def;
+            if (!CheckedAddressAddSigned(va, def, out.branchTarget)) return false;
             out.branchTargetValid = true;
+            switchDefaultOffset = def;
+            switchDefaultOffsetValid = true;
+            out.switchInfo.defaultTarget = out.branchTarget;
+            out.switchInfo.defaultTargetValid = true;
             std::snprintf(buf, sizeof(buf), "%d pairs, default=0x%llX",
                           npairs, (unsigned long long)out.branchTarget);
             out.operands = buf;
             out.extraTargets.reserve((size_t)npairs);
+            out.switchInfo.cases.reserve((size_t)npairs);
             std::string cases;
+            int32_t previousMatch = 0;
             for (int32_t k = 0; k < npairs; ++k) {
                 const int32_t match = rdS4(q + 8 + (size_t)k * 8);
-                const uint64_t t = va + rdS4(q + 12 + (size_t)k * 8);
+                if (k && match <= previousMatch) return false; // JVMS: sorted, unique keys
+                previousMatch = match;
+                uint64_t t = 0;
+                if (!CheckedAddressAddSigned(va, rdS4(q + 12 + (size_t)k * 8), t)) return false;
                 out.extraTargets.push_back(t);
+                SwitchCase switchCase;
+                switchCase.value = match;
+                switchCase.target = t;
+                switchCase.targetValid = true;
+                out.switchInfo.cases.push_back(switchCase);
                 if (k < 4) {
                     std::snprintf(buf, sizeof(buf), "%s%d -> 0x%llX",
                                   cases.empty() ? "" : ", ", match, (unsigned long long)t);
@@ -389,21 +423,95 @@ bool JvmDisassembler::decodeAt(const uint8_t* d, size_t n, uint64_t va, uint32_t
 
     // Control-flow classification (CFG / FunctionAnalyzer / navigation):
     //   invoke*           -> call (falls through; local target when resolvable)
-    //   *return / athrow  -> return-like terminator (no fallthrough)
+    //   *return           -> method return
+    //   athrow            -> exceptional terminator (not a method return)
     //   goto/goto_w, switches -> unconditional transfers
     //   if* / jsr         -> conditional-style (fallthrough edge kept; jsr's
     //                        subroutine returns to the next instruction)
-    //   ret (0xa9)        -> indirect terminator (jsr return)
+    //   jsr/ret           -> legacy intra-method subroutine transfer
     if (op >= 0xB6 && op <= 0xBA) {                             // invokevirtual..invokedynamic
         out.isCall = out.isBranch = true;
-    } else if ((op >= 0xAC && op <= 0xB1) || op == 0xBF) {      // ireturn..return, athrow
+    } else if (op >= 0xAC && op <= 0xB1) {                      // ireturn..return
         out.isRet = out.isBranch = true;
-    } else if (op == 0xA9 || (op == 0xC4 && d[1] == 0xA9)) {    // ret / wide ret
-        out.isRet = out.isBranch = true;
+    } else if (op == 0xBF || op == 0xA9 ||
+               (op == 0xC4 && d[1] == 0xA9)) {                 // athrow / ret / wide ret
+        out.isBranch = true;
     } else if ((op >= 0x99 && op <= 0xA8) || op == 0xC6 || op == 0xC7 ||
                op == 0xC8 || op == 0xC9 || op == 0xAA || op == 0xAB) {
         out.isBranch = true;                                    // ifs, goto(_w), jsr(_w), switches
     }
+
+    // Decoder-native semantics. JVM has an operand stack/local slots rather
+    // than architectural registers, so register sets intentionally remain
+    // empty; encoded indices/offsets are still exposed as typed immediates.
+    auto addImmediate = [&](uint64_t value, uint16_t width, bool isSigned,
+                            bool pcRelative) {
+        TypedOperand typed;
+        typed.kind = OperandKind::Immediate;
+        typed.access = OperandAccess::Read;
+        typed.widthBits = width;
+        typed.immediate = value;
+        typed.immediateSigned = isSigned;
+        typed.pcRelative = pcRelative;
+        out.typedOperands.push_back(std::move(typed));
+    };
+    switch (info.kind) {
+        case KU1: case KCP1: case KNEWARR:
+            addImmediate(d[1], 8, false, false);
+            break;
+        case KS1:
+            addImmediate(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(d[1]))),
+                         8, true, false);
+            break;
+        case KS2:
+            addImmediate(static_cast<uint64_t>(static_cast<int64_t>(rdS2(d + 1))),
+                         16, true, false);
+            break;
+        case KCP2: case KIFACE: case KIDYN: case KMULTI:
+            addImmediate(rdU2(d + 1), 16, false, false);
+            break;
+        case KIINC:
+            addImmediate(d[1], 8, false, false);
+            addImmediate(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(d[2]))),
+                         8, true, false);
+            break;
+        case KBR2:
+            addImmediate(static_cast<uint64_t>(static_cast<int64_t>(rdS2(d + 1))),
+                         16, true, true);
+            break;
+        case KBR4:
+            addImmediate(static_cast<uint64_t>(static_cast<int64_t>(rdS4(d + 1))),
+                         32, true, true);
+            break;
+        case KTBL: case KLKP:
+            if (switchDefaultOffsetValid)
+                addImmediate(static_cast<uint64_t>(static_cast<int64_t>(switchDefaultOffset)),
+                             32, true, true);
+            break;
+        default:
+            break;
+    }
+
+    if (op == 0xB7 || op == 0xB8)
+        out.flow.kind = FlowKind::DirectCall;
+    else if (op == 0xB6 || op == 0xB9 || op == 0xBA)
+        out.flow.kind = FlowKind::IndirectCall;
+    else if (op >= 0xAC && op <= 0xB1)
+        out.flow.kind = FlowKind::Return;
+    else if (op == 0xBF)
+        out.flow.kind = FlowKind::IndirectBranch;
+    else if (op == 0xAA || op == 0xAB)
+        out.flow.kind = FlowKind::Switch;
+    else if (op == 0xA7 || op == 0xC8)
+        out.flow.kind = FlowKind::UnconditionalBranch;
+    else if (op == 0xA8 || op == 0xC9)
+        out.flow.kind = FlowKind::SubroutineCall;
+    else if (op == 0xA9 || (op == 0xC4 && d[1] == 0xA9))
+        out.flow.kind = FlowKind::SubroutineReturn;
+    else if ((op >= 0x99 && op <= 0xA6) || op == 0xC6 || op == 0xC7)
+        out.flow.kind = FlowKind::ConditionalBranch;
+    out.flow.directTarget = out.branchTarget;
+    out.flow.directTargetValid = out.branchTargetValid;
     return true;
 }
 

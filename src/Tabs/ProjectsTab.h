@@ -1,6 +1,7 @@
 #pragma once
 #include "ITab.h"
 #include "../Core/Project.h"
+#include <string>
 #include <vector>
 
 namespace ds {
@@ -16,9 +17,13 @@ private:
     void refresh();
 
     std::vector<RecentEntry> recents_;
-    bool     loaded_       = false;
-    int      selected_     = -1;
-    uint64_t lastSeenHash_ = ~0ull;   // re-read the index when the active project changes
+    bool     loaded_              = false;
+    bool     selectedHashValid_   = false;
+    bool     lastSeenBinaryLoaded_ = false;
+    uint64_t selectedHash_        = 0;
+    float    listWidth_           = 0.0f; // retained master/detail splitter width
+    uint64_t lastSeenHash_        = ~0ull; // re-read the index when the active project changes
+    char     filter_[256]         = {};
     std::string openError_;
 };
 

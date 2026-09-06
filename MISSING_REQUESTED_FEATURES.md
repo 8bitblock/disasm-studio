@@ -1,129 +1,59 @@
 # Requested Features Not Fully Present
 
-Last updated: 2026-07-12
+Last updated: 2026-08-30
 Audit baseline: `b8724e7` (then updated to account for completed work in this tree)
 
 This file contains only requested features that are absent or not implemented to the described level. `Missing` means no working implementation was found. `Partial` means related functionality exists, but one or more material parts of the requested feature do not.
 
 The findings come from the current source and tests, not from names in documentation alone.
 
+Recently completed: **automatic crackme network triage plus an explicit guided live-observation handoff** now ships. `Core/NetworkApiCatalog` uses exact DLL+API matching for Winsock, DNS, WinHTTP, WinINet, and URLMon, preventing names such as `USER32!SendMessageW` and `KERNEL32!ConnectNamedPipe` from becoming network evidence. `Core/CrackmeTriage` scans bounded ASCII/UTF-16 file bytes, including unmapped/overlay content, then combines endpoints, routes, semantic artifacts, import/xref ownership, typed calls, and a depth-2 call graph into ranked **Endpoint -> Connect -> Request -> Reply -> Decision** trails. The load-time `AnalysisService` caches the immutable report; Binary View exposes Start Here / Network Trail / Strings / Functions / Runtime under **Triage**; Ctrl+K gains typed Network Trail results with independent VA/file-offset navigation; Binary Tech hands network capabilities into the trail; and Cortex ranks report-backed endpoint answers. **Automatic static triage does not run this target or contact detected endpoints.** Communications' opt-in **Server Watch** can then record bounded typed debugger observations for supported x64/WOW64 DNS/Winsock/WinHTTP/WinINet/URLMon paths, with explicit start/stop, coverage, payload, caller navigation, and file logging. Routed watches retain the originating document/image identity and cannot start against an unrelated attachment unless the analyst explicitly leaves that guard. The pure catalog/triage, false-positive consumers, ranked Cortex answers, file-offset investigation records, cache invalidation/adoption, and focused consumers are covered by the declared Core tests.
+
+Recently completed: the **PE resource browser** (a former Missing item) now ships. A bounded resource-directory parser (`BinaryFile::parseResources`, PE data directory [2]) builds a Type -> Name -> Language model (`BinaryFile::resources()` / `resourceDirRVA()` / `resourceDirSize()`), and a new **Resources** lower tab presents the tree with decoded previews (manifest/HTML text, `RT_VERSION` version info, `RT_STRING` string tables), a hex fallback for binary payloads, resource-to-Hex navigation, verbatim save, and reconstructed **.bmp** / **.ico** export. Decoders live in `Core/ResourceDecode.*` and are unit-tested (`resourcedecode_test`); the parser is unit-tested (`binaryfile_resources_test`). Only inline on-canvas image rasterization remains deferred (now tracked under Partial).
+
+Recently completed: the complete **Save ASM / Save C export workflow** now ships. File-menu actions and function-list context actions export either every executable section / analyzed function or one exact function. ASM is a streamed, named, commented listing for every active decoder with no UI-listing instruction cap. On x86/x64, C offers the decompiler's readable output or a sanitized, self-contained compilable C11 translation unit with portable types/helpers and local fallbacks for unresolved external behavior; C actions are explicitly disabled on other architectures. `Core/CodeExport.*` contains the ImGui/Win32-free generator and a dedicated independent-decoder worker; the Binary View provides options, phase/current/total/bytes-written progress, status-bar progress, completion reporting, and cancellation. Output is staged to a sibling temporary file and replaces the destination only after successful completion. The pure generator, scope behavior, both C styles (including invoking a C compiler), worker result handoff, genuine in-flight cancellation, and temp-file cleanup are covered by `code_export_test`.
+
+Recently completed: the full **firmware sniffing and boot-entry recovery** workflow now ships. `Core/FirmwareSniffer.*` performs bounded, evidence-scored detection of legacy BIOS images, UEFI firmware volumes (`_FVH` with bounded header/block-map/checksum validation), legacy and EFI PCI option ROMs (`55 AA` + `PCIR`), and Intel Flash Descriptors with bounded BIOS-region recovery. It recommends top-of-4-GiB or conventional C0000h mappings only when corroborated, resolves bounded rel8/rel16/rel32/far-immediate boot-jump chains, reports code versus structural landmarks, and selects x86-16/x86/x64 when the evidence supports it. **Open as Raw** presents the evidence, preselects the detected base/entry/architecture, keeps base and entry editable, validates the final mapping atomically, and seeds/names reset/boot/firmware-image roots. `Arch::X86_16` is decoded as real mode by both Zydis and Capstone; the Capstone manifest explicitly builds every advertised architecture. The pure detector, malformed/truncated inputs, mapping overflow, jump recovery, entry/landmark integration, architecture persistence, and both real x86-16 decoders are tested.
+
+Recently completed: **optional PE sections and the PE header in the linear listing** now ship. A **Sections** side-panel tab exposes independent Load and Fold controls for the modeled PE header and every loader section. Executable sections default visible; `.rsrc`, `.data`, `.rdata`, `.reloc`, `.pdata`, and other data sections default hidden/folded, then render clipped 16-byte `db`/ASCII rows with exact string navigation and explicit cap markers when enabled. Region dividers can also fold in place in the Assembly listing. Visibility prevents hidden executable sections from being decoded into the listing, every rebuild remains on the background analysis worker, and immutable layout generations reject stale results. State persists by stable `(section RVA, section name)` keys plus separate PE-header state. Planning, worker handoff, stale-layout rejection, and JSON round-trip behavior are covered by `listing_layout_test`, `analysis_service_test`, and `project_roundtrip_test`.
+
+Recently completed: the **multi-million-instruction, on-screen-only linear listing** now ships. `K_Listing` performs no instruction sweep and has no instruction cap: it emits fixed 4 KiB executable `CodePage` descriptors plus the existing region/header/data/string rows. Binary View maps their estimated/exact 64-bit row weights through a pure Fenwick index, decodes only visible or explicitly requested pages, retains a bounded 96-page LRU, preserves the top address while exact weights replace estimates, and resolves goto/J/K on demand. Variable-width x86/JVM/Thumb/compressed-RISC-V streams use bounded lookahead and propagated exact continuation checkpoints. A far random jump never scans from the section front: x86 uses a <=15-byte, <=120-call local estimate, Thumb/RISC-V use halfword-aligned <=4-byte candidates, and a far JVM page uses a provisional page-front decode. All paint immediately with `~` addresses. Exact background preparation is capped at 64 KiB and reconciles cached rows only when a trusted section/function/predecessor checkpoint lies within that bound; otherwise the page intentionally remains provisional. Provisional rows cannot authorize trace/breakpoint/patch/function/signature/jump-table actions or persistent branch labels. Trace walks lazy page spans in bounded per-frame batches and plants only instruction starts proven by exact decoded pages. The toolbar reports mapped code MiB/pages rather than a capped instruction count; `listing_virtual_index_test`, `listing_layout_test`, and `analysis_service_test` cover millions of virtual rows, UINT64_MAX containment, Thumb/x86 boundary straddles, constant-work far access, provisional-to-exact reconciliation, trace-site proof, cancellation, and the zero-decoder-call listing worker contract.
+
+Recently completed: **ELF section-table symbols and loader metadata are integrated**. The bounded ELF32/ELF64 section-table loader parses `.dynsym`/`.symtab` through linked string tables, including kind, binding, visibility, size, `SHN_XINDEX`, defined/undefined state, and provenance. Defined symbols populate **Exports / Symbols**; undefined symbols populate **Imports**; function/IFUNC symbols seed analysis. `ET_REL` allocated sections receive checked, aligned, non-overlapping synthetic VAs. The same pass now retains class-aware REL/RELA tables with symbols/types/signed addends and validated mapped targets, conventional PLT/GOT sections and conservatively associated slots, ordered `DT_NEEDED` dependencies, bounded GNU VERDEF/VERNEED/VERSYM associations (also exposed on normalized imports/exports), and direct/array init/fini entries. Every table separates valid/complete/truncated state, every address has explicit validity so VA zero remains real, and row/string/traversal work is capped. `elf_symbols_test` and `binaryfile_elf_metadata_test` cover ELF32/64, ET_REL synthetic targets, versions, linkage, initializers, malformed geometry, hostile offset chains, partial tables, and zero addresses. Only sectionless `PT_DYNAMIC` recovery remains separate loader work.
+
+Recently completed: the **ARM / Thumb / AArch64 raw-firmware workflow** now ships end to end. `Arch::THUMB` is a first-class persisted architecture routed through Capstone `CS_MODE_THUMB` and Keystone Thumb mode; Open as Raw and both architecture selectors expose A32, Thumb/Thumb-2, and A64. A32/Thumb mappings must fit the 32-bit architectural address space, including later selector changes. The bounded firmware probe scores coherent architecture-specific call/frame/return motifs and only suggests a mode when the evidence clears conservative strength and separation thresholds, leaving mapping, entry, and architecture editable. Function discovery recognizes A32, Thumb, A64, and PACIASP prologues, canonicalizes Thumb low-bit targets, consumes ELF symbol sizes, excludes bounded referenced literal-pool spans from roots/call following, and applies hard candidate/byte budgets with worker cancellation. Thumb `TBB`/`TBH` tables are recovered with a nearby `CMP` bound and overflow-checked PC-relative target math. Assembly patches and NOP fill use ISA-correct A32, Thumb, and A64 encodings; invalid-decode recovery preserves each ISA's two- or four-byte alignment. Raw sidecar v2 restores the exact base, explicit entry (including VA 0), architecture, and named landmarks before VA-keyed annotations, safely ignores an invalid mapping, and recreates the bounded firmware evidence report on reopen. Changing architecture/backend invalidates every decode-derived cache and launches one epoch-consistent reanalysis. The GUI and Core reject the static image's x86-only decompilation, synthesis, trace/debug mutations, DLL launch, and adaptive-unpack actions for non-x86 or nonmatching images. Static breakpoints remain pending and static patches remain file-only unless an exact path/module/bitness match permits checked file-to-runtime translation; an independently attached x86/x64 target can still use its own Live Assembly view. Firmware, analyzer, architecture persistence, NOP/padding, table-branch math, lazy Thumb boundary handling, and real Capstone Thumb decoding are regression-tested. Mixed A32/Thumb interworking remains intentionally conservative: an even-address `BLX` mode switch is reported and not followed through the wrong fixed decoder.
+
+Recently completed: the **execution trace / coverage workflow** now ships. Starting Trace from a paused debug session incrementally plans the analyzed basic-block starts and plants a bounded set of up to 65,536 invisible, one-shot software breakpoints. Planning/planting progress is visible and cancellable; Stop removes outstanding trace breakpoints without discarding collected hits, **Clear Trace** removes the coverage data, and generation checks prevent stale work from re-arming a cancelled trace. A trace breakpoint restores its pristine byte, records the block/instruction hit, retires itself, and continues without stealing a stop from a user breakpoint, temporary step/run breakpoint, or other higher-priority debugger action at the same address. Executed code is highlighted green in the static assembly listing, Live Assembly, and CFG, and the thread-safe pure state machine is covered by `trace_coverage_test`.
+
+Recently completed: the **Debug-a-DLL workflow** now ships. PE DLLs are identified from the COFF characteristics and are no longer passed directly to `CreateProcessW`; **Debug DLL...** first validates the image, enumerates only callable non-forwarded code exports, and lets the analyst choose the export, arguments, and DllMain/export stops. The default host is a trusted, bitness-matched Windows `rundll32.exe` (`System32` for a native 64-bit DLL or `SysWOW64` for a 32-bit DLL on 64-bit Windows), while the custom-host path validates host bitness and builds Windows-correct quoted arguments from typed DLL/export/user-argument fields. Breakpoints remain RVAs until the target's `LOAD_DLL_DEBUG_EVENT`, then are planted at the actual ASLR base; when one lands, the loaded module is copied into the normal live-module analysis path so Binary View analyzes the DLL rather than the host. Pure image inspection, host/argument planning, malformed-input rejection, and LOAD_DLL retargeting are covered by `dll_debug_plan_test`.
+
+Recently completed: the **adaptive generic unpacker** now ships as a live-debug workflow under **Debug -> Adaptive Unpack**. It is deliberately stronger than a one-click process dumper: `Core/UnpackEngine.*` fuses bounded, timestamped stack-return (ESP/RSP), write-to-execute / newly-executable-page, entropy-settle, run-free, control-transfer, and manual evidence into deduplicated OEP candidates with explicit scores, confidence, and evidence. The sampler uses breakpoint-masked, region-aware process reads, remembers changed pages, can pause automatically on high-confidence evidence, and produces a bounded VM-like dispatcher/hot-RIP/back-edge/exception-handler trace report. New launches can be placed in a disclosed one-process Windows Job with kill-on-close containment (child/lifetime containment, not filesystem or network virtualization). `Core/PeUnpack.*` transactionally converts the captured mapped PE32/PE32+ image back to aligned disk layout, cleans section metadata, updates the OEP and executable owner section, restores intact ILT->IAT thunks or rebuilds observed imports into a new `.dsimp` section by matching exact loaded-module exports, normalizes HIGHLOW/DIR64 ASLR relocations when safe (runtime-base fallback otherwise), repairs or clears invalid security-cookie / Guard CF load-config pointers, clears stale bound-import/security/checksum data, and always retains a raw failure artifact plus a detailed reconstruction/OEP/entropy/VM report. The saved result can be loaded directly into the normal analyzer. Deterministic engine and PE32+ reconstruction tests are `unpack_engine_test` and `pe_unpack_test`; the Windows debugger/UI integration is solution-build verified.
+
+Recently completed: **static packed-PE recovery** now ships under **Debug -> Static Packed-PE Recovery**. `Core/StaticUnpack.*` validates a disk PE, maps it with finite bounds, recovers the VMProtect-style `PACKER_INFO` `{SrcRVA,DstRVA}` table by requiring its ordered destinations to match every virtual-only non-BSS section, resolves the shared five-byte LZMA1 properties record, and derives a finite compressed-source extent for every block. Its dependency-free LZMA1 decoder enforces input, exact output, dictionary, probability-model, candidate, block-count, allocation, and cancellation limits. Automatic mode tries that high-confidence plan first and independently validates bounded LZMA-alone containers as a fallback; either strategy can be forced, while explicit finite manual block plans remain available in Core. Successful blocks are written into a mapped image and passed through the shared transactional PE reconstructor. The path-backed background service opens and owns its input off the render thread, verifies its exact size/hash before decoding, publishes progress, supports cancellation, and retains reconstructed disk, decompressed mapped, and raw failure artifacts plus per-block confidence/evidence and a full report; the UI requires in-memory patches to be saved and reopened first. OEP provenance is first-class: a validated manual OEP (resolved against a nested PE's own preferred base) or an original header entry proven to lie inside a completed recovered executable destination block is trusted; a plausible executable section name or even a structurally valid nested PE is not sufficient, so the modal and filename mark those reconstructed PEs analysis-only with an unverified OEP. Parser recovery, adversarial bounds, LZMA decoding, fallback selection, cancellation, reconstruction, OEP trust, source-identity/path-worker handoff, and exception containment are covered by `static_unpack_test`.
+
+Recently completed: the **non-invasive process dumper** now ships from the Communications process list and **Debug -> Passive Process Dump**. Existing processes are opened for query/read only unless the analyst explicitly requests a short final `NtSuspendProcess` window; the pipeline never calls `DebugActiveProcess`, injects code, patches bytes, or writes target memory. It captures the exact main-module mapping page-by-page with validity/protection provenance, hashes readable pages, measures bounded Shannon entropy, and supports immediate, manual, or stable-change/entropy timing. A fresh launch accepts safely requoted arguments and an explicit working directory, uses no debug flags, and is created suspended, assigned to a mandatory one-process kill-on-close Job, then resumed only after containment succeeds. Final reconstruction refuses missing required pages, but may backfill unreadable discardable pages from disk only after strict image/layout identity checks; the pristine remote capture remains separate and import-slot evidence never uses backfilled bytes. When final suspension is available, the module list and remote export tables are snapshotted before resume, then the already captured IAT/data is matched locally for coherent exact-export imports; unsuspended observation is reported best-effort. A 2 GiB aggregate peak estimate admits or rejects capture/reconstruction before image-sized allocations, the worker contains repeated allocation failures, and duplicate mapped/raw images are suppressed. OEP provenance is explicit: the original header entry is always analysis-only, while runnable output requires an analyst OEP validated against an exactly captured executable page and zero disk-backfilled pages. A validated OEP remains labelled as such when backfill downgrades the overall artifact to analysis-only. Progress, cancellation, raw fallback, reports, explicit contained-process termination, honest filenames/save labels, and load-back are integrated. Pure settle/memory/OEP/artifact policy plus a real read-only self-snapshot/rebuild and opt-in contained-launch smoke are covered by `passive_dump_test`.
+
+Recently completed: the opt-in **Hide Debugger / anti-anti-debug layer** now ships as a session-atomic policy configured before attach/launch. Every switch defaults off. It reversibly normalizes PEB debug fields and only OS-heap-list-proven, region-bounded legacy NT-heap debug bits while preserving ordinary policy bits, records the first pristine value, and restores on detach only if the target has not changed the concealed value. Target-local entry traps are resolved through bounded exports from the exact canonical System32/SysWOW64 `ntdll.dll` of matching bitness, then admitted only on executable `MEM_IMAGE` pages owned by that mapping. They mediate selected `NtQueryInformationProcess`, `NtQuerySystemInformation`, `NtQuery/SetInformationThread`, invalid `NtClose`, `NtGet/SetContextThread`, `NtQueryPerformanceCounter`, and `NtQuerySystemTime` calls with exact native buffer rules and proven self-process/same-process handles; WOW64 synthesized returns use the correct stdcall cleanup, while CET shadow-stack/IP validation disables synthetic-return hooks. Debug-register reads are masked, target DR writes are omitted, and DisasmStudio-owned hardware breakpoints are re-applied. RDTSC/RDTSCP discovery recursively follows decode-valid control flow only from the PE entry, fully validated x64 unwind roots, and trusted ntdll exports—never byte-resynchronizing through arbitrary executable data—and is bounded to 50,000 instructions per image and 250,000 per session. Production QPC/frequency, FILETIME, TSC, and processor identity seed one correlated virtual timeline; actual resumed-run intervals advance it, while debugger/user-paused time is excluded. Per-thread/same-address re-arm leases handle concurrent pass-throughs. Internal traps carry owner-image ranges, retire without writes on unload, are masked from debugger reads, coexist with user breakpoints, and are conditionally restored. Live coverage/budget/restore counters and a 32-entry deduplicating warning cap are visible in the modal. The capability report explicitly separates this user-mode coverage from guarantees that need the existing Hv backend: direct syscalls, `KUSER_SHARED_DATA`, generated/self-modifying timing sites, kernel observers, the one-instruction pass-through window, and instruction-perfect multicore time are not claimed. Pure policy, native buffer rules, warning bounds, pristine-state, DR masking, correlated clock behavior, range gates, and concurrent re-arm state are covered by `anti_debug_test`; Debugger integration is Windows-build verified.
+
+Recently completed: **C++ demangling throughout** now ships through the shared bounded `Core/Demangle` layer. Microsoft names use the OS DbgHelp undecorator under the process-global `DbgHelpMutex`; an in-tree Itanium ABI parser covers GCC/Clang/ELF functions, nested/template/substituted types, operators, constructors/destructors, qualifiers, literals, special names, and clone/version suffixes; x86 C calling-convention decoration is normalized too. Hostile symbols fail closed under input/output/depth/component caps, and a bounded thread-safe cache serves both the worker and render threads. Compact qualified labels flow through function discovery, listing/xrefs, decompilation, source export, PDB/live-export resolution, and Cortex annotations. Imports, Exports/Symbols, and Debug DLL show full readable signatures, filter on both spellings, and expose the exact raw linker name by tooltip/copy; raw names remain authoritative for invocation, forwarding, scanning, import reconstruction, and reverse lookup. `demangle_test` covers both ABIs, malformed input, and concurrent caching.
+
+Recently completed: **IPv6 TCP/UDP connection enumeration** now ships in both live network surfaces. The selected-process Communications pane independently polls owner-PID TCP/UDP tables for `AF_INET` and `AF_INET6`, retains successful families after a partial table failure, bounds size/retry/allocation work, sorts rows, and exposes local/remote endpoint, protocol, family, and state columns with one-second auto-refresh plus IPv4/IPv6/TCP/UDP/text filters. The existing system-wide history/ESTATS monitor now shares scope-aware formatting. `Core/NetworkEndpoint` emits canonical compressed IPv6, IPv4-mapped addresses, bracketed endpoints, and numeric scope IDs so link-local interfaces remain distinguishable; `network_endpoint_test` covers compression, ties, mapped addresses, scopes, and endpoints.
+
+Recently completed: **recursive whole-image code/data classification** now ships as a bounded background analysis pass. `Core/CodeDataClassifier.*` starts at authoritative functions and recursively follows decoder-confirmed control flow without byte-resynchronizing through undecodable gaps. It combines reached instructions with referenced strings and literals, ARM/Thumb/A64 literal references, absolute/RVA/relative jump tables, aligned code-pointer/vtable arrays, relocation-backed callback pointers, CET `endbr32`/`endbr64` landing pads, and ISA-aware padding. Strong indirect entries are fed back into `FunctionAnalyzer` for one bounded fixed-point rerun, recovering functions that have no export, direct call, symbol, unwind record, or recognizable prologue. The result is a confidence/evidence-bearing partition of every mapped executable byte into code, string, literal pool, jump table, pointer table, padding, data, or deliberately **unknown** spans; explicit instruction/block/table/scan/allocation caps and cancellation keep hostile files finite. Binary View uses that immutable, image-revision-tagged map to split lazy code regions at data islands, preventing variable-width decode checkpoints from crossing them, and renders non-code spans inline as clipped `db`/`dw`/`dd`/`dq` rows with semantic colors, ASCII, resolved pointer symbols, click navigation, and evidence tooltips. Stale maps are rejected after patches/reloads, worker-owned decoders preserve render-thread isolation, and `codedata_classifier_test`, `listing_layout_test`, and `analysis_service_test` cover partition completeness, indirect-only recovery, strings/literals/tables/padding/unknown honesty, typed directives, region splitting, stale-safe delivery, and zero-decode listing construction.
+
 ## Missing
 
-### 1. Firmware sniffing and boot-entry recovery
-
-There is no BIOS/UEFI/PCI option-ROM detector, reset-vector mapping, 16-bit real-mode decoder, boot-jump resolver, Intel Flash Descriptor or `_FVH` corroboration, editable detected entry point, or firmware-landmark seeding/naming.
-
-Evidence:
-
-- `Arch` has no x86-16 mode: `src/Disasm/IDisassembler.h:36`.
-- the raw-load popup in `src/App.cpp` accepts only a base plus x86/x64/ARM/ARM64.
-- `BinaryFile::loadRaw` in `src/Core/BinaryFile.cpp` always sets `entryRVA_ = 0`.
-- source searches found no reset-vector, option-ROM, `_FVH`, or flash-descriptor implementation.
-
-### 2. Optional PE sections and header in the linear listing
-
-There is no Sections panel, PE-header row source, per-section "load into listing" toggle, folding of `.rsrc`/`.data`/`.rdata`/`.reloc`/`.pdata`, or project-persisted section visibility. Executable sections are always swept; non-executable sections contribute only recognized string rows.
-
-Evidence: the Binary View's static-list construction in `src/Tabs/BinaryViewTab.cpp`, `src/Core/AnalysisJobs.cpp:307-342`, and the absence of section-visibility state in `src/Core/Project.h:47-73`.
-
-### 3. PE resource browser
-
-There is no resource-directory model/parser, type/name/language tree, manifest/version/string-table decoding, bitmap/icon preview, raw-resource save, or resource-to-address navigation.
-
-Evidence: `BinaryFile::parsePE` does not consume resource directory index 2, and no Resources tab or resource-browser implementation exists.
-
-### 4. Save ASM / Save C export workflow
-
-There is no whole-program or per-function `.asm`/`.c` export, readable-versus-compilable C choice, self-contained compilable-C preamble, background export job, or export progress UI.
-
-The existing feature is a different Markdown/HTML analysis report and does not satisfy this request. Evidence: `AppContext::exportAnalysisFile` and the report workflow in `src/Tabs/BinaryViewTab.cpp`.
-
-### 5. Execution trace / coverage
-
-There is no trace toggle, executed-block/instruction store, one-shot basic-block breakpoint planting, green execution coverage, background planting/removal, or Clear Trace command.
-
-Evidence: the debugger command set has no trace operation (`src/Core/Debugger.h:256`), `App::renderDebugToolbar` has no trace controls, and source searches found no execution-coverage implementation.
-
-### 6. Debug-a-DLL workflow
-
-There is no DLL host dialog, bitness-matched `rundll32.exe` or custom-host launch, argument/export picker, DllMain/export breakpoint, or retargeting to the loaded DLL.
-
-Currently every PE is treated as directly launchable and is passed to `CreateProcessW`, including DLLs: the launch path in `src/App.h`, `src/Core/Debugger.cpp:95-110`, and `src/Core/Debugger.cpp:1100-1108`.
-
-### 7. Generic unpacker
-
-There is no Unpack action/dialog; OEP discovery; ESP/NX/manual/run-free strategy; process-image dump; IAT reconstruction; section cleanup; entry/cookie/CFG/relocation repair; sandbox; failure dump; timed entropy probes; or VM-loop/handler trace report.
-
-Only detection fragments exist: packer section-name rules in `src/Core/TechScan.cpp:106-136` and generic entropy findings in `src/Core/RuntimeScan.cpp:341-387`.
-
-### 8. Static VMProtect output unpack
-
-There is no `PACKER_INFO` parser, block-descriptor recovery, LZMA decoder, static decompression/reconstruction strategy, automatic strategy selection, or decompressed-image handoff.
-
-VMProtect is currently recognized only through section-name detection such as `.vmp0`/`.vmp1`: `src/Core/TechScan.cpp:108-111`.
-
-### 9. Non-invasive process dump
-
-There is no passive Dump Process action, read-only snapshot-to-clean-PE pipeline, IAT rebuild, optional `NtSuspendProcess`, launch-and-watch mode, settle detector, or entropy-based auto-timing.
-
-The existing `AppContext::loadLiveModule` path requires an invasive debugger session and only loads copied bytes into the analyzer. `ProcessManager::attach` uses `DebugActiveProcess`: `src/Core/ProcessManager.cpp:71-89`.
-
-### 10. Anti-anti-debug / Hide Debugger layer
-
-There is no PEB/heap normalization, concealment hooks for the requested ntdll calls, invalid-handle handling, debug-register masking/preservation, synthetic clock, or RDTSC/RDTSCP interception/emulation.
-
-Current anti-debug support detects and annotates suspicious imports/instructions only: `src/Core/TechScan.cpp:48-50` and `src/Core/FuncAnnotate.cpp:962-1003`.
+No fully missing requested feature remains in this audit. The remaining gaps are partial implementations below.
 
 ## Partial
 
-### 11. ELF symbols are not integrated into Exports or function analysis
+### 1. Graph interaction and synchronization — completed
 
-The completed Exports side panel now provides a full bounded PE export-address-table view, including aliases, ordinal-only entries, forwarders, and code/data targets. ELF `.dynsym` and `.symtab` entries are still skipped rather than exposed as exports/imports or used as analysis symbols.
+The CFG canvas now provides cursor-anchored Ctrl+wheel zoom, Fit graph, 100%, Center selection, unrestricted pan, and block-header dragging. Instruction rows use the same transformed geometry for drawing and exact-address picking: a click updates the shared FILE cursor, double-click opens that instruction in Assembly, and incoming cursor changes reveal an off-screen selected instruction. References and address copy are available from the context menu. Popped-out FILE graph selections retain FILE identity even when Live Assembly is active. Switch routes use dashed edges and diamond arrowheads. Cards, instructions, and ordinary edges use semantic theme colors and DPI-aware dimensions; off-screen cards/text are culled. Call Graph now uses clipped, resizable caller/callee tables with counts and empty states.
 
-Evidence: `src/Core/BinaryFile.cpp` skips non-loaded ELF symbol/string-table sections during section modeling, and `BinaryFile::exports()` is populated by the PE export-directory parser only.
+The existing bounded CFG analysis and its incomplete-result labels remain unchanged. Layout is still a simple automatic arrangement with manual offsets, and graph cards do not yet include prototype/argument annotations (see item 6). The view is a graph of decoded static evidence, not a guarantee of complete function ownership or recovered indirect targets. Evidence: `BinaryViewTab::renderGraph`, `renderCallGraph`, `Ui/GraphViewport.h`, and `graph_viewport_test` (zoom anchoring/clamps, fit after negative block offsets, and instruction hit testing through pan/zoom/DPI).
 
-### 12. ARM / Thumb / AArch64 raw-firmware workflow
-
-A32 and A64 Capstone decoding exist, but these requested parts do not:
-
-- Thumb/Thumb-2 architecture selection or `CS_MODE_THUMB`;
-- byte-frequency ARM-versus-Thumb sniffing and dialog preselection;
-- an editable entry point for raw images;
-- ARM prologue discovery and code-versus-literal-pool classification;
-- ARM table-branch resolution;
-- explicit disabling of x86-only decompiler/debugger/export actions for ARM images.
-
-Evidence: `src/Disasm/IDisassembler.h:36`, `src/Disasm/CapstoneDisassembler.cpp:94-112`, the raw-load popup in `src/App.cpp`, and the x86-only prologue gate in `FunctionAnalyzer::prologueScan`. Pseudocode/Decompiler remain enabled for all loaded architectures in the Binary View's main-view selector.
-
-### 13. Multi-million-instruction, on-screen-only linear listing
-
-ImGui clipper rendering, visible-row decode caching, syntax coloring, string/API comments, and a branch-arrow gutter exist. The requested scale/virtualization model does not:
-
-- the background indexer first decodes every executable byte to build row addresses;
-- a hard 800,000-instruction cap omits the rest of larger images;
-- unresolved intra-function targets are not consistently materialized as persistent `loc_` listing labels.
-
-Evidence: `src/Core/AnalysisJobs.cpp:281-342`, the cap at `src/Core/AnalysisService.cpp:233-245`, and the visible-row clipping/cache path in `BinaryViewTab::renderAssembly`.
-
-### 14. Recursive code/data classification
-
-Function discovery does use the entry, PE exports, x64 `.pdata`, direct calls, and limited x86 prologues. It does not build the requested code map or classify executable-section padding, jump tables, literals, and embedded strings as data.
-
-Missing pieces include data code-pointer/vtable/callback seeds, `endbr64`-aware gap scanning, indirect-only function recovery from those seeds, ARM literal-pool separation, and `db`/`dd`/`dq` rendering for non-code spans inside executable sections. The current listing linearly disassembles all executable bytes.
-
-Evidence: `FunctionAnalyzer::analyze`, the Binary View's static-list construction, and `src/Core/AnalysisJobs.cpp:307-342`.
-
-### 15. Graph interaction and synchronization
-
-Block cards, colored ordinary edges, pan, block dragging, cursor/RIP block highlighting, and re-rooting exist. The requested graph still lacks:
-
-- Ctrl+wheel zoom and fit-to-view;
-- per-instruction hit targets and exact instruction-to-instruction two-way sync;
-- a distinct switch-case edge style.
-
-One invisible hit target currently covers each whole block and double-click selects the block start; instruction text is draw-list text. Evidence: the block hit-target, dragging, and edge-rendering paths in `BinaryViewTab::renderGraph`.
-
-### 16. Multi-level IL decompiler
+### 2. Multi-level IL decompiler
 
 The current lazy background decompiler, LRU, structured pseudo-C/Python output, data-flow improvements, goto fallback, and source navigation are real. There are no separate Low IL, Medium IL, or High IL artifacts/views and no Low/Medium/High/Pseudo-C selector; both decompiler views consume the same final structured result.
 
@@ -131,23 +61,23 @@ Source synchronization on the deep path is block-granular rather than exact-inst
 
 Evidence: the Pseudocode/Decompiler selectors, shared-result description, and click handling in `src/Tabs/BinaryViewTab.cpp`, plus mapping granularity at `src/Core/Decompiler.h:77-80`.
 
-### 17. Whole-address-space Hex view
+### 3. Whole-address-space Hex view
 
 The Hex editor is virtualized and editable, with selection/copy, goto-file-offset, and patch highlighting. It covers `binary.bytes()` (file-backed bytes), not the whole mapped virtual address space, so virtual-only/BSS tails and sparse address gaps cannot be displayed.
 
 Evidence: `BinaryViewTab::renderHex`, which derives its extent from `binary.bytes()`.
 
-### 18. Jump-table recovery
+### 4. Jump-table recovery
 
-CFG switch edges and a basic resolver exist, but the resolver only handles a scaled memory-form `jmp [...]`, extracts a hex literal, and reads absolute 4/8-byte pointers until an invalid target.
+CFG switch edges, a basic x86 scaled-memory resolver, and bounded Thumb `TBB`/`TBH` recovery exist. Thumb recovery uses a nearby `CMP` bound, ISA-correct PC alignment, and checked entry/target arithmetic. The global code/data classifier also recognizes bounded absolute/RVA and relative/RVA code-target runs referenced by indirect branches, follows their targets, and renders the covered storage as typed jump-table data.
 
-It does not use a preceding `cmp` bound, recover MSVC/GCC relative/RVA tables, handle `mov [table]; add; jmp reg`, or emit the requested `; switch (N cases)` listing annotation.
+The interactive CFG resolver still does not use a preceding `cmp` bound, share the classifier's relative/RVA results, handle `mov [table]; add; jmp reg`, or emit the requested `; switch (N cases)` annotation on the dispatch instruction. A32 and A64 table-branch forms are not recovered.
 
 Evidence: `BinaryViewTab::resolveJumpTable` and `src/Core/CFG.cpp:114-121`.
 
-### 19. Patching workflow
+### 5. Patching workflow
 
-Assembly/raw-hex patching, NOP fill/padding, the in-memory overlay, manual revert, Hex integration, and Save Binary As exist. These requested parts do not:
+Assembly/raw-hex patching, ISA-correct x86/A32/Thumb/A64 NOP fill and padding, the in-memory overlay, manual revert, Hex integration, and Save Binary As exist. These requested parts do not:
 
 - Ctrl+Z or a stepwise patch undo history;
 - enforcement that a replacement stays within whole selected instructions (a longer encoding may overwrite following bytes after only a warning);
@@ -155,7 +85,7 @@ Assembly/raw-hex patching, NOP fill/padding, the in-memory overlay, manual rever
 
 Edits instead mark functions dirty and rebuild all code-derived indexes in the background. Evidence: the patch/apply flows and manual-revert path in `src/Tabs/BinaryViewTab.cpp`.
 
-### 20. Windows API prototype and symbolic-argument awareness
+### 6. Windows API prototype and symbolic-argument awareness
 
 The app has a one-line API-purpose map and limited best-effort argument sniffing. It does not have the requested prototype database, parameter names/types, x64 stack-argument recovery at `[rsp+0x20+...]`, or symbolic decoding for access masks, share modes, `PAGE_*`, `MEM_*`, creation dispositions, and file flags/attributes.
 
@@ -163,21 +93,15 @@ Graph cards also do not show the requested prototype/argument annotations.
 
 Evidence: `src/Core/ApiInfo.h`, backward scans in `src/Core/FuncAnnotate.cpp:635-687`, the explicit "no callee prototypes" limitation in `src/Core/Decompiler.h:65-74`, and the assembly/graph annotation formatting in `src/Tabs/BinaryViewTab.cpp`.
 
-### 21. C++ demangling throughout
+### 7. Manual `.dsproj` projects
 
-DbgHelp is configured with `SYMOPT_UNDNAME`, which can provide some MSVC/PDB undecoration. There is no built-in Itanium demangler or shared demangling pass, and parsed PE import/export names are displayed/copied raw rather than demangled consistently across functions, imports, exports, and labels.
+Automatic hash-keyed JSON sidecars and a recents index persist real annotations and the new PE-header/section listing choices. The requested Save Project/Open Project `.dsproj` workflow, versioned user-chosen project file, binary reference/load options, and broader current-view state are absent.
 
-Evidence: `src/Core/SymbolResolver.cpp:29-41`, `FunctionAnalyzer::collectExports`, and the raw-name rendering in the Exports/Imports views.
-
-### 22. Manual `.dsproj` projects
-
-Automatic hash-keyed JSON sidecars and a recents index persist real annotations. The requested Save Project/Open Project `.dsproj` workflow, versioned user-chosen project file, binary reference/load options, section choices, and broader current-view state are absent.
-
-Raw recents are especially incomplete: reopening uses normal `loadBinaryPath`, so the originally chosen raw base is not restored; only saved architecture/engine can be reapplied.
+Hash-keyed raw sidecars now do restore the exact base, explicit entry (including VA 0), architecture, and named landmarks before VA-keyed annotations. This closes the former raw-recents identity gap, but it is still automatic sidecar persistence rather than the requested user-chosen `.dsproj` workflow.
 
 Evidence: `src/Core/Project.cpp:294-396`, `src/Core/Project.h:47-73`, and `AppContext::loadBinaryPath` / `loadRawPath`.
 
-### 23. Full requested live-debugger surface
+### 8. Full requested live-debugger surface
 
 The core Win32 debugger, launch/attach, live memory disassembly, stepping, run-to-cursor, SW/HW breakpoints, registers/stack/call stack/modules, detach cleanup, and WOW64 path exist. The requested version still lacks:
 
@@ -190,3 +114,15 @@ The core Win32 debugger, launch/attach, live memory disassembly, stepping, run-t
 - a general bottom Memory Dump pane (the general viewer is in the separate Memory Tools tab).
 
 Evidence: `src/Core/ProcessManager.h:12-19`, command set at `src/Core/Debugger.h:256`, shortcuts in `App::renderDebugToolbar`, condition grammar at `src/Core/Cond.h:4-13`, register handling at `src/Core/Debugger.cpp:947-958`, hit policy at `src/Core/Debugger.cpp:1305-1315`, and `BinaryViewTab::renderLowerTabs`.
+
+### 9. Inline image rendering in the resource browser
+
+The Resources tab (the completed PE resource browser) decodes bitmap/icon metadata (dimensions, bit depth, PNG-versus-DIB) and reconstructs standalone `.bmp`/`.ico` files for save, but it does not yet rasterize a resource onto the canvas — image preview is "save then open" rather than an in-panel thumbnail. Adding on-canvas rendering needs a DX11 texture upload/lifetime path reachable from the tab (the app currently creates GPU textures only for the ImGui font atlas).
+
+Evidence: the image branch of `BinaryViewTab::buildResourcePreview` builds metadata plus `ReconstructBmp`/`ReconstructIcon` bytes but no texture, and there is no per-resource `ID3D11ShaderResourceView` cache.
+
+### 10. Crackme trail proof and observation coverage
+
+The new workflow is deliberately evidence-ranked rather than a claim of full behavioral proof. Static co-location, xrefs, typed calls, and a bounded depth-2 call neighborhood can miss dynamically decoded endpoints, reflection/dynamic dispatch, deeper call chains, or argument transformations; a displayed trail does not prove that a server was contacted or that its reply controls the final branch. File-only and overlay artifacts remain navigable evidence but may have no mapped VA.
+
+Server Watch is an explicit debugger observation aid, not containment or a network sandbox. It covers the catalogued user-mode DNS/Winsock/WinHTTP/WinINet/URLMon paths exposed by the debuggee, retains bounded payload excerpts, and reports unavailable/skipped probes and dropped data. Direct syscalls, custom transports, dynamically resolved/generated stubs, kernel traffic, and custom TLS can evade semantic capture; encrypted payloads stay opaque, and overlapped/asynchronous completion is labelled partial. The user must arrange any desired VM, firewall, DNS sinkhole, or server isolation separately.

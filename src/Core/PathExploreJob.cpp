@@ -43,11 +43,14 @@ public:
         if (b.succ.size() == 1) {
             bi.kind    = b.isUncond ? BranchInfo::Jump : BranchInfo::Fallthrough;
             bi.targetA = cfg_.blocks[b.succ[0]].start;
+            bi.targetAValid = true;
             return bi;
         }
         bi.kind    = BranchInfo::CondBranch;
         bi.targetA = cfg_.blocks[b.succ[0]].start;
         bi.targetB = cfg_.blocks[b.succ[1]].start;
+        bi.targetAValid = true;
+        bi.targetBValid = true;
         bi.pred    = Var(blockVA, 1);   // distinct per block -> Explore forks both edges
         return bi;
     }
@@ -63,13 +66,18 @@ private:
 } // namespace
 
 PathTree PathExploreJob(const BinaryFile& bin, IDisassembler& dis, Arch /*arch*/, uint64_t rootVA,
-                        const ExploreConfig& cfg) {
+                        const ExploreConfig& cfg,
+                        const NoreturnCallResolver& isNoreturnCall) {
     PathTree empty;
     size_t avail = 0;
     const uint8_t* p = bin.ptrFromVA(rootVA, avail);
     if (!p || avail == 0) return empty;
 
-    ControlFlowGraph g = BuildCFG(p, avail, rootVA, dis, 2000);
+    ControlFlowGraph g = BuildCFG(
+        p, avail, rootVA, dis, 2000, {}, isNoreturnCall,
+        [&bin](const Instruction& instruction, uint64_t& target) {
+            return bin.resolveInstructionTarget(instruction, target);
+        });
     if (g.blocks.empty()) return empty;
 
     CfgSymCfg sc(std::move(g));

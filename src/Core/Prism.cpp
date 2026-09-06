@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <functional>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -14,6 +16,8 @@ constexpr int    kTopFramesForClass = 4;    // how deep to look when classifying
 constexpr size_t kHotPathDepth      = 12;   // frames retained per hot-path key
 constexpr size_t kMaxHotPaths       = 12;
 constexpr size_t kMaxFuncRows       = 200;
+constexpr size_t kMaxFlameNodes     = 4096;
+constexpr size_t kMaxFlameDepth     = 64;
 
 std::string lower(std::string s) {
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
@@ -102,6 +106,63 @@ std::string leafModule(const std::string& sym) {
 
 } // namespace
 
+const char* PrismCollectorName(PrismCollectorKind kind) {
+    return kind == PrismCollectorKind::Etw
+         ? "ETW sampled profile (preferred)"
+         : "Suspend-and-walk fallback";
+}
+
+void AccumulatePrismTraceEvent(PrismCollectionQuality& q,
+                               PrismTraceEventKind kind,
+                               uint32_t frameCount,
+                               uint32_t resolvedFrameCount) {
+    switch (kind) {
+        case PrismTraceEventKind::SampledProfile:
+            ++q.sampledEvents;
+            if (frameCount > 1) ++q.samplesWithStacks;
+            q.totalFrames += frameCount;
+            q.resolvedFrames += std::min(frameCount, resolvedFrameCount);
+            break;
+        case PrismTraceEventKind::Image:         ++q.imageEvents; break;
+        case PrismTraceEventKind::Thread:        ++q.threadEvents; break;
+        case PrismTraceEventKind::ContextSwitch: ++q.contextSwitchEvents; break;
+        case PrismTraceEventKind::Wait:          ++q.waitEvents; break;
+        case PrismTraceEventKind::IO:            ++q.ioEvents; break;
+    }
+}
+
+PrismCollectionQuality FinalizePrismQuality(PrismCollectionQuality q) {
+    q.stackCoveragePct = q.sampledEvents
+        ? (float)((double)q.samplesWithStacks * 100.0 / (double)q.sampledEvents) : 0.0f;
+    q.frameResolutionPct = q.totalFrames
+        ? (float)((double)q.resolvedFrames * 100.0 / (double)q.totalFrames) : 0.0f;
+
+    // Do not call a just-started session degraded before the first profile event.
+    // Once samples exist, missing configured stacks or zero delivered stacks is
+    // concrete quality evidence. Setup failures still carry their explicit warning.
+    q.degraded = q.lostEvents != 0 || q.lostBuffers != 0 ||
+                 (q.collector == PrismCollectorKind::Etw && q.sampledEvents != 0 &&
+                  (!q.stackTracingConfigured || q.samplesWithStacks == 0));
+
+    char text[384];
+    if (q.collector == PrismCollectorKind::Etw) {
+        std::snprintf(text, sizeof(text),
+            "ETW: %llu profile samples, %.0f%% with stacks, %.0f%% frames resolved; "
+            "%llu context switches, %llu waits, %llu I/O events; %llu events / %llu buffers lost%s",
+            (unsigned long long)q.sampledEvents, q.stackCoveragePct, q.frameResolutionPct,
+            (unsigned long long)q.contextSwitchEvents, (unsigned long long)q.waitEvents,
+            (unsigned long long)q.ioEvents, (unsigned long long)q.lostEvents,
+            (unsigned long long)q.lostBuffers, q.degraded ? " (degraded)" : "");
+    } else {
+        std::snprintf(text, sizeof(text),
+            "Fallback: %llu thread observations, %.0f%% with multi-frame stacks, %.0f%% frames resolved%s",
+            (unsigned long long)q.sampledEvents, q.stackCoveragePct, q.frameResolutionPct,
+            q.wow64Target ? "; WOW64 context walking enabled" : "");
+    }
+    q.summary = text;
+    return q;
+}
+
 const char* ThreadStateName(ThreadState s) {
     switch (s) {
         case ThreadState::Running:        return "Running / executing";
@@ -156,8 +217,11 @@ std::string pctStr(float p) {
 
 } // namespace
 
-PrismReport BuildPrismReport(const std::vector<PrismSample>& samples) {
+PrismReport BuildPrismReport(const std::vector<PrismSample>& samples,
+                             PrismCollectionQuality quality,
+                             std::stop_token stop) {
     PrismReport rep;
+    rep.quality = FinalizePrismQuality(std::move(quality));
     rep.totalSamples = (int)samples.size();
     if (samples.empty()) {
         rep.headline = "No samples collected.";
@@ -171,6 +235,13 @@ PrismReport BuildPrismReport(const std::vector<PrismSample>& samples) {
     std::unordered_set<uint32_t> threads;
     std::unordered_map<std::string, PrismHotPath> paths;
     std::unordered_map<int, int> stateCount;   // ThreadState -> samples
+
+    // Flame tree is built root-to-leaf while samples arrive leaf-first. The
+    // parent+symbol lookup keeps recursion and repeated call paths distinct.
+    rep.flame.push_back({ 0, 0, "(all samples)", 0, 0, 0, 0, 0, 0.0f, 1.0f });
+    std::vector<std::vector<uint32_t>> flameChildren(1);
+    std::unordered_map<std::string, uint32_t> flameIndex;
+    flameIndex.reserve(std::min<size_t>(samples.size() * 2, kMaxFlameNodes * 2));
 
     // Per-thread / per-module / over-time accumulators.
     struct ThreadAcc {
@@ -198,6 +269,7 @@ PrismReport BuildPrismReport(const std::vector<PrismSample>& samples) {
     bool     anyTime = false;
 
     for (const PrismSample& s : samples) {
+        if (stop.stop_requested()) { rep.cancelled = true; return rep; }
         rep.totalCpuCycles += s.cpuCycles;
         threads.insert(s.threadId);
         ThreadState ts = ClassifySample(s.frames);   // Unknown for empty frames
@@ -216,6 +288,47 @@ PrismReport BuildPrismReport(const std::vector<PrismSample>& samples) {
 
         if (s.frames.empty()) continue;
         const PrismFrame& leaf = s.frames.front();
+
+        rep.flame[0].samples++;
+        rep.flame[0].cycles += s.cpuCycles;
+        uint32_t flameParent = 0;
+        const size_t flameDepth = std::min(s.frames.size(), kMaxFlameDepth);
+        for (size_t rev = 0; rev < flameDepth; ++rev) {
+            const size_t frameIndex = flameDepth - 1 - rev;
+            const PrismFrame& frame = s.frames[frameIndex];
+            std::string key = std::to_string(flameParent);
+            key.push_back('\0');
+            key += frame.symbol;
+            auto found = flameIndex.find(key);
+            uint32_t nodeIndex = 0;
+            if (found == flameIndex.end()) {
+                if (rep.flame.size() >= kMaxFlameNodes) {
+                    rep.flameTruncated = true;
+                    break;
+                }
+                nodeIndex = (uint32_t)rep.flame.size();
+                PrismFlameNode node;
+                node.parent = flameParent;
+                node.depth = (uint16_t)(rev + 1);
+                node.symbol = frame.symbol;
+                node.address = frame.address;
+                rep.flame.push_back(std::move(node));
+                flameChildren.emplace_back();
+                flameChildren[flameParent].push_back(nodeIndex);
+                flameIndex.emplace(std::move(key), nodeIndex);
+            } else {
+                nodeIndex = found->second;
+                if (!rep.flame[nodeIndex].address) rep.flame[nodeIndex].address = frame.address;
+            }
+            PrismFlameNode& node = rep.flame[nodeIndex];
+            ++node.samples;
+            node.cycles += s.cpuCycles;
+            if (frameIndex == 0) {
+                ++node.selfSamples;
+                node.selfCycles += s.cpuCycles;
+            }
+            flameParent = nodeIndex;
+        }
 
         // self: leaf frame.
         {
@@ -259,11 +372,16 @@ PrismReport BuildPrismReport(const std::vector<PrismSample>& samples) {
         }
     }
     rep.threadCount = (int)threads.size();
-    if (anyTime) rep.spanMs = maxMs - minMs;
+    if (anyTime) {
+        rep.firstTimestampMs = minMs;
+        rep.lastTimestampMs = maxMs;
+        rep.spanMs = maxMs - minMs;
+    }
     const double invCycles = rep.totalCpuCycles
                            ? 100.0 / (double)rep.totalCpuCycles : 0.0;
 
     for (auto& kv : funcs) {
+        if (stop.stop_requested()) { rep.cancelled = true; return rep; }
         PrismFuncStat fs = kv.second;
         fs.selfPct      = fs.self * inv;
         fs.inclusivePct = fs.inclusive * inv;
@@ -298,8 +416,48 @@ PrismReport BuildPrismReport(const std::vector<PrismSample>& samples) {
               [](const PrismHotPath& a, const PrismHotPath& b) { return a.samples > b.samples; });
     if (rep.hotPaths.size() > kMaxHotPaths) rep.hotPaths.resize(kMaxHotPaths);
 
+    // Calculate stable normalized spans in the worker. Prefer cycle weights for
+    // ETW/profile data, falling back to sample counts. Children are sorted so a
+    // refresh with the same data produces the same graph.
+    for (auto& children : flameChildren) {
+        std::sort(children.begin(), children.end(), [&](uint32_t a, uint32_t b) {
+            const PrismFlameNode& na = rep.flame[a];
+            const PrismFlameNode& nb = rep.flame[b];
+            const uint64_t wa = rep.totalCpuCycles ? na.cycles : na.samples;
+            const uint64_t wb = rep.totalCpuCycles ? nb.cycles : nb.samples;
+            if (wa != wb) return wa > wb;
+            return na.symbol < nb.symbol;
+        });
+    }
+    std::function<void(uint32_t)> placeChildren = [&](uint32_t parent) {
+        if (stop.stop_requested()) return;
+        const auto& children = flameChildren[parent];
+        if (children.empty()) return;
+        uint64_t total = 0;
+        for (uint32_t child : children)
+            total += rep.totalCpuCycles ? rep.flame[child].cycles : rep.flame[child].samples;
+        if (!total) return;
+        const float left = rep.flame[parent].x0;
+        const float width = rep.flame[parent].x1 - left;
+        uint64_t prefix = 0;
+        for (size_t i = 0; i < children.size(); ++i) {
+            const uint32_t child = children[i];
+            PrismFlameNode& n = rep.flame[child];
+            const uint64_t weight = rep.totalCpuCycles ? n.cycles : n.samples;
+            n.x0 = left + width * (float)((double)prefix / (double)total);
+            prefix += weight;
+            n.x1 = i + 1 == children.size()
+                 ? left + width
+                 : left + width * (float)((double)prefix / (double)total);
+            placeChildren(child);
+        }
+    };
+    placeChildren(0);
+    if (stop.stop_requested()) { rep.cancelled = true; return rep; }
+
     // ---- Per-thread breakdown ----
     for (auto& kv : threadAcc) {
+        if (stop.stop_requested()) { rep.cancelled = true; return rep; }
         const ThreadAcc& ta = kv.second;
         PrismThreadStat t;
         t.threadId = kv.first;

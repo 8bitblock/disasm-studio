@@ -1,7 +1,9 @@
 #include "GameContext.h"
+#include "NetworkApiCatalog.h"
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -68,6 +70,30 @@ bool endsWithAny(const std::string& s, std::initializer_list<const char*> suffix
     return false;
 }
 
+bool hasExactNetworkApi(const std::string& text) {
+    size_t at = 0;
+    while (at < text.size()) {
+        while (at < text.size() &&
+               !(std::isalnum(static_cast<unsigned char>(text[at])) || text[at] == '_'))
+            ++at;
+        const size_t begin = at;
+        while (at < text.size()) {
+            const unsigned char c = static_cast<unsigned char>(text[at]);
+            if (!(std::isalnum(c) || c == '_' || c == '.' || c == '!' || c == '@')) break;
+            ++at;
+        }
+        if (begin == at) continue;
+        const std::string token = text.substr(begin, at - begin);
+        size_t separator = token.find_last_of('!');
+        if (separator == std::string::npos) separator = token.find_last_of('.');
+        if (separator == std::string::npos || separator == 0 || separator + 1 >= token.size())
+            continue;
+        if (LookupNetworkApi(token.substr(0, separator), token.substr(separator + 1)))
+            return true;
+    }
+    return false;
+}
+
 GameStringFinding classifyString(const StrResult& r) {
     GameStringFinding out;
     out.address = r.address;
@@ -128,6 +154,7 @@ void addFunction(std::vector<GameFunctionFinding>& out, uint64_t va, const std::
 
 void classifyFunction(const FuncResult& f, std::vector<GameFunctionFinding>& out) {
     const std::string hay = lower(f.name + " " + f.reason);
+    const std::string name = lower(f.name);
     auto add = [&](GameFunctionKind k, float conf, const char* why) {
         addFunction(out, f.address, f.name, k, conf, why);
     };
@@ -143,8 +170,12 @@ void classifyFunction(const FuncResult& f, std::vector<GameFunctionFinding>& out
         add(GameFunctionKind::ResourceLoad, 0.70f, "function name/evidence suggests loading assets or files");
     if (any(hay, { "audio", "sound", "music", "wave", "ogg" }))
         add(GameFunctionKind::Audio, 0.68f, "function name/evidence suggests audio");
-    if (any(hay, { "net_", "network", "socket", "send", "recv", "connect", "http" }))
-        add(GameFunctionKind::Network, 0.72f, "function name/evidence suggests networking");
+    const bool exactNetworkApi = hasExactNetworkApi(f.name) || hasExactNetworkApi(f.reason);
+    if (exactNetworkApi ||
+        any(name, { "net_", "network", "socket", "http_", "httpclient", "websocket" }))
+        add(GameFunctionKind::Network, exactNetworkApi ? 0.82f : 0.72f,
+            exactNetworkApi ? "exact DLL-aware networking API evidence"
+                            : "function name suggests networking");
     if (any(hay, { "vtable", "virtual", "this-pointer", "thiscall" }))
         add(GameFunctionKind::VtableVirtual, 0.64f, "function evidence suggests object dispatch");
     if (any(hay, { "jni", "native", "load_library", "loadlibrary", "lwjgl", "jvm" }))
@@ -161,7 +192,8 @@ void classifyFunction(const FuncResult& f, std::vector<GameFunctionFinding>& out
         add(GameFunctionKind::ConfigSave, 0.66f, "function name/evidence suggests config/save/replay handling");
 }
 
-Finding makeHint(const char* title, float conf, std::string detail, std::string evidence, uint64_t va = 0) {
+Finding makeHint(const char* title, float conf, std::string detail, std::string evidence,
+                 std::optional<uint64_t> va = std::nullopt) {
     Finding f;
     f.analyzer = "GameContext";
     f.title = title;
@@ -171,10 +203,10 @@ Finding makeHint(const char* title, float conf, std::string detail, std::string 
     if (!evidence.empty()) {
         FindingEvidence ev;
         ev.what = std::move(evidence);
-        ev.va = va;
+        if (va) { ev.va = *va; ev.vaValid = true; }
         f.evidence.push_back(std::move(ev));
     }
-    f.address = va;
+    if (va) { f.address = *va; f.addressValid = true; }
     return f;
 }
 
@@ -218,17 +250,27 @@ GameContextReport BuildGameContext(const GameContextInput& in) {
     for (const AlgoMatch& a : in.algorithms) {
         if (!(a.category == "crypto" || a.category == "hash" ||
               a.category == "checksum" || a.category == "encoding")) continue;
+        bool emittedFunction = false;
         if (a.referencedBy.empty()) {
             out.crackmeHints.push_back(makeHint("Algorithm constants", a.confidence,
-                a.name, "recognized constants or alphabets present in the image", a.address));
+                a.name, "recognized constants or alphabets present in the image",
+                a.addressValid ? std::optional<uint64_t>(a.address) : std::nullopt));
             continue;
         }
         for (const AlgoXref& xr : a.referencedBy) {
             std::string ev = "references " + a.name + " (" + a.category + ")";
+            if (!xr.funcAddressValid) continue;
+            emittedFunction = true;
             addFunction(out.functions, xr.funcAddress, xr.funcName, GameFunctionKind::Encoding,
                         std::max(0.55f, a.confidence * 0.85f), ev);
             out.crackmeHints.push_back(makeHint("Algorithm-backed routine", a.confidence,
                 xr.funcName.empty() ? a.name : xr.funcName, ev, xr.funcAddress));
+        }
+        if (!emittedFunction) {
+            out.crackmeHints.push_back(makeHint(
+                "Algorithm constants", a.confidence, a.name,
+                "recognized constants or alphabets are present, but their instruction reference(s) could not be assigned to a function",
+                a.addressValid ? std::optional<uint64_t>(a.address) : std::nullopt));
         }
     }
 

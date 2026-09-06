@@ -8,8 +8,7 @@
 //       deep-mode for-loop reconstruction erases the hoisted step line);
 //   (3) legacy mode tags statement lines with their INSTRUCTION address and
 //       return lines with the ret's address;
-//   (4) deep mode tags statement lines with their BLOCK start (DataFlow merges
-//       statements, so block granularity is the contract);
+//   (4) deep mode preserves exact instruction origins through propagation/DCE;
 //   (5) the synthetic function header / braces carry VA 0.
 //
 // Build & run (Windows, from project root, in a VS dev shell):
@@ -25,6 +24,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace ds;
@@ -121,6 +121,7 @@ int main() {
             std::vector<std::string> L = splitLines(r.text);
             CHECK(!L.empty());
             CHECK(r.lineVA.size() == L.size());
+            CHECK(r.lineOrigins.size() == L.size());
             // (5) header + opening brace are synthetic
             CHECK(r.lineVA[0] == 0);                       // "__int64 sub_1000(...)"
             CHECK(lineWith(L, "{") >= 0);
@@ -130,9 +131,13 @@ int main() {
             int rLine = lineWith(L, "return");
             CHECK(sLine >= 0 && rLine >= 0);
             if (deep) {
-                // (4) deep: block-start granularity (single block at 0x1000)
-                if (sLine >= 0) CHECK(r.lineVA[(size_t)sLine] == 0x1000);
-                (void)movB;
+                // Deep propagation/DCE must retain the exact instruction which
+                // emitted each surviving statement, not merely its block start.
+                if (sLine >= 0) {
+                    CHECK(r.lineVA[(size_t)sLine] == movB);
+                    CHECK(r.lineOrigins[(size_t)sLine].granularity ==
+                          SourceOriginGranularity::Instruction);
+                }
             } else {
                 // (3) legacy: exact instruction addresses
                 if (sLine >= 0) CHECK(r.lineVA[(size_t)sLine] == movB);
@@ -150,9 +155,9 @@ int main() {
         Asm a;
         a.op(2, "cmp", "ecx, 0");
         uint64_t jeAddr = a.cur; a.cur += 2;       // reserve the je slot
-        a.op(7, "mov", "dword ptr [rdx], 0x11"); a.ret();
+        uint64_t thenStore = a.op(7, "mov", "dword ptr [rdx], 0x11"); a.ret();
         uint64_t elseB = a.cur;
-        a.op(7, "mov", "dword ptr [rdx], 0x22"); a.ret();
+        uint64_t elseStore = a.op(7, "mov", "dword ptr [rdx], 0x22"); a.ret();
         a.ins.push_back(mk(jeAddr, 2, "je", "", true, false, elseB));
         ControlFlowGraph g = buildG(a.ins);
 
@@ -166,12 +171,19 @@ int main() {
             CHECK(ifLine >= 0);
             // The if's terminator is the je (last insn of the entry block).
             if (ifLine >= 0) CHECK(r.lineVA[(size_t)ifLine] == jeAddr);
-            // Both arms' stores tagged within their blocks (exact insn in legacy,
-            // block start in deep — either way nonzero and inside the function).
-            for (const char* k : { "0x11", "0x22" }) {
+            // Both arms' stores retain their exact instruction origins in both
+            // lifters, including after deep propagation and structuring.
+            const std::pair<const char*, uint64_t> stores[] = {
+                { "0x11", thenStore }, { "0x22", elseStore }
+            };
+            for (const auto& [k, expectedVA] : stores) {
                 int s = lineWith(L, k);
                 CHECK(s >= 0);
-                if (s >= 0) { CHECK(r.lineVA[(size_t)s] >= 0x1000); CHECK(r.lineVA[(size_t)s] < a.cur); }
+                if (s >= 0) {
+                    CHECK(r.lineVA[(size_t)s] == expectedVA);
+                    CHECK(r.lineOrigins[(size_t)s].granularity ==
+                          SourceOriginGranularity::Instruction);
+                }
             }
         }
     }
@@ -208,6 +220,105 @@ int main() {
         CHECK(r.text == "// no code\n");
         CHECK(r.lineVA.size() == 1 && r.lineVA[0] == 0);
         CHECK(Decompile(empty, {}) == r.text);
+    }
+
+    // VA zero is a real source location, not the synthetic-line sentinel. The
+    // validity-bearing origin survives both C emission and the Python transform.
+    {
+        MockDisassembler dis;
+        dis.at[0] = mk(0, 1, "mov", "rax, 1");
+        dis.at[1] = mk(1, 1, "ret", "", true, true, 0);
+        std::vector<uint8_t> bytes(2);
+        ControlFlowGraph g = BuildCFG(bytes.data(), bytes.size(), 0, dis, 20);
+        DecompileOptions opt; opt.deepDataFlow = false;
+        opt.target = { Arch::X64, DecompileABI::Auto };
+        DecompResult r = DecompileWithMap(g, opt);
+        std::vector<std::string> lines = splitLines(r.text);
+        CHECK(r.lineOrigins.size() == lines.size());
+        int movLine = lineWith(lines, "rax = 1");
+        CHECK(movLine >= 0);
+        if (movLine >= 0) {
+            CHECK(r.lineVA[(size_t)movLine] == 0);
+            CHECK(r.lineOrigins[(size_t)movLine].valid);
+            CHECK(r.lineOrigins[(size_t)movLine].va == 0);
+            CHECK(r.lineOrigins[(size_t)movLine].granularity == SourceOriginGranularity::Instruction);
+        }
+        CHECK(!r.lineOrigins.empty() && !r.lineOrigins[0].valid &&
+              r.lineOrigins[0].granularity == SourceOriginGranularity::Synthetic); // header is synthetic
+        DecompResult py = DecompileToPython(r);
+        CHECK(py.lineOrigins.size() == splitLines(py.text).size());
+        bool sawRealZero = false;
+        for (const SourceOrigin& origin : py.lineOrigins)
+            sawRealZero |= origin.valid && origin.va == 0 &&
+                           origin.granularity == SourceOriginGranularity::Instruction;
+        CHECK(sawRealZero);
+    }
+
+    // Instruction/decode budgets publish incompleteness instead of silently
+    // making the partial graph look authoritative.
+    {
+        MockDisassembler dis;
+        dis.at[0x4000] = mk(0x4000, 1, "nop", "");
+        dis.at[0x4001] = mk(0x4001, 1, "ret", "", true, true, 0);
+        std::vector<uint8_t> bytes(2);
+        ControlFlowGraph g = BuildCFG(bytes.data(), bytes.size(), 0x4000, dis, 1);
+        CHECK(!g.complete);
+        CHECK(!g.incompleteReason.empty());
+        CHECK(g.decodedInstructions == 1 && g.decodedBytes == 1);
+        DecompResult r = DecompileWithMap(g);
+        CHECK(!r.complete && r.incompleteReason == g.incompleteReason);
+        CHECK(!r.diagnostics.empty() &&
+              r.diagnostics[0].kind == DecompileDiagnosticKind::InstructionLimit);
+
+        MockDisassembler stopped;
+        stopped.at[0x4100] = mk(0x4100, 1, "nop", "");
+        ControlFlowGraph partial = BuildCFG(bytes.data(), bytes.size(), 0x4100, stopped, 20);
+        DecompResult decodeFailure = DecompileWithMap(partial);
+        CHECK(!decodeFailure.diagnostics.empty() &&
+              decodeFailure.diagnostics[0].kind == DecompileDiagnosticKind::DecodeFailure);
+    }
+
+    // Noncontiguous chunks link only through explicit targets. Even physically
+    // adjacent chunks do not gain an invented fallthrough edge.
+    {
+        MockDisassembler dis;
+        dis.at[0x5000] = mk(0x5000, 1, "jmp", "0x7000", true, false, 0x7000);
+        dis.at[0x7000] = mk(0x7000, 1, "mov", "eax, 7");
+        dis.at[0x7001] = mk(0x7001, 1, "ret", "", true, true, 0);
+        uint8_t a[1] = {}, b[2] = {};
+        std::vector<CFGCodeChunk> chunks = { { a, sizeof(a), 0x5000 }, { b, sizeof(b), 0x7000 } };
+        ControlFlowGraph g = BuildCFG(chunks, dis, 20);
+        CHECK(g.complete);
+        CHECK(g.blocks.size() >= 2 && g.blocks[0].succ.size() == 1);
+        DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Auto };
+        DecompResult r = DecompileWithMap(chunks, dis, opt, 20);
+        CHECK(r.text.find("7") != std::string::npos);
+
+        MockDisassembler adjacent;
+        adjacent.at[0x8000] = mk(0x8000, 1, "nop", "");
+        adjacent.at[0x8001] = mk(0x8001, 1, "ret", "", true, true, 0);
+        uint8_t c[1] = {}, d[1] = {};
+        ControlFlowGraph noFall = BuildCFG(std::vector<CFGCodeChunk>{
+            { c, sizeof(c), 0x8000 }, { d, sizeof(d), 0x8001 } }, adjacent, 20);
+        const BasicBlock* first = nullptr;
+        for (const BasicBlock& block : noFall.blocks) if (block.start == 0x8000) first = &block;
+        CHECK(first && first->succ.empty());
+
+        // The first supplied chunk is the logical entry even when a cold chunk
+        // has a numerically lower address.
+        MockDisassembler reordered;
+        reordered.at[0x7000] = mk(0x7000, 1, "ret", "", true, true, 0);
+        reordered.at[0x1000] = mk(0x1000, 1, "ret", "", true, true, 0);
+        ControlFlowGraph entryFirst = BuildCFG(std::vector<CFGCodeChunk>{
+            { d, sizeof(d), 0x7000 }, { c, sizeof(c), 0x1000 } }, reordered, 20);
+        CHECK(!entryFirst.blocks.empty() && entryFirst.blocks[0].start == 0x7000);
+
+        adjacent.at[0x8000] = mk(0x8000, 1, "jmp", "0x9000", true, false, 0x9000);
+        ControlFlowGraph missing = BuildCFG(std::vector<CFGCodeChunk>{ { c, sizeof(c), 0x8000 } }, adjacent, 20);
+        CHECK(!missing.complete && !missing.incompleteReason.empty());
+        DecompResult missingResult = DecompileWithMap(missing);
+        CHECK(!missingResult.diagnostics.empty() &&
+              missingResult.diagnostics[0].kind == DecompileDiagnosticKind::MissingChunk);
     }
 
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }

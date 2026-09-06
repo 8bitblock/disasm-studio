@@ -170,6 +170,18 @@ int main() {
         CHECK(bf2.clrDirRVA() == 0 && bf2.clrDirSize() == 0);
         auto r2 = ScanRuntimes(bf2, kNoJava);
         CHECK(r2.findings.empty());
+
+        // A nonzero directory entry alone is not .NET authority: the mapped
+        // payload must contain a bounded COR20 header with a valid cb field.
+        auto malformed = buildPE32();
+        setDir(malformed, 14, 0x1010, 0x48);
+        BinaryFile malformedBf;
+        CHECK(loadBytes(malformedBf, malformed, "rs_clr_malformed.bin"));
+        auto malformedReport = ScanRuntimes(malformedBf, kNoJava);
+        CHECK(malformedReport.findings.size() == 1);
+        CHECK(malformedReport.findings[0].title == "Malformed CLR directory");
+        CHECK(malformedReport.findings[0].category == "malformed");
+        CHECK(!malformedReport.wrapperLikely);
     }
 
     // ---- 2. mscoree.dll!_CorExeMain import, no directory -> 0.9 ----

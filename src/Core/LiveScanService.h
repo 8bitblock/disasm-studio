@@ -35,6 +35,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -57,6 +58,8 @@ struct LiveScanResult {
     std::vector<uint64_t>  hits;      // Xref (instruction addresses)
     std::vector<uint8_t>   image;     // ReadImage (the module's mapped bytes)
     bool truncated = false;           // hit a cap (strings/hits/bytes)
+    bool complete = false;            // false means error describes a failed job
+    std::string error;
 };
 
 // Lightweight progress for the status-bar bar (lock-free atomic reads).
@@ -69,9 +72,13 @@ struct LiveProgress {
 
 class LiveScanService {
 public:
-    using DecoderFactory = std::function<std::unique_ptr<IDisassembler>(Engine, Arch)>;
+    using DecoderFactory =
+        std::function<std::unique_ptr<IDisassembler>(const DecoderConfig&)>;
+    using LegacyDecoderFactory =
+        std::function<std::unique_ptr<IDisassembler>(Engine, Arch)>;
 
     explicit LiveScanService(DecoderFactory factory);
+    explicit LiveScanService(LegacyDecoderFactory factory);
     ~LiveScanService();
 
     LiveScanService(const LiveScanService&)            = delete;
@@ -87,6 +94,9 @@ public:
                             size_t byteCap = 256ull * 1024 * 1024);
     uint64_t requestXref(std::vector<LiveRange> ranges, uint64_t target, Engine engine, Arch arch,
                          MemReader reader, uint64_t epoch,
+                         size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024);
+    uint64_t requestXref(std::vector<LiveRange> ranges, uint64_t target,
+                         const DecoderConfig& decoder, MemReader reader, uint64_t epoch,
                          size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024);
     uint64_t requestReadImage(uint64_t base, uint64_t size, uint64_t moduleBase,
                               MemReader reader, uint64_t epoch);
@@ -113,8 +123,7 @@ private:
         std::vector<LiveRange> ranges;
         uint64_t  target = 0;
         uint64_t  moduleBase = 0;
-        Engine    engine = Engine::Zydis;
-        Arch      arch   = Arch::X64;
+        DecoderConfig decoder;
         size_t    strCap = kDefaultStringScanCap;
         size_t    hitCap = 3000;
         size_t    byteCap = 256ull * 1024 * 1024;

@@ -1,15 +1,19 @@
 #pragma once
 #include "ITab.h"
+#include "ConnectionsTab.h"
 #include "../Core/JdwpClient.h"
 #include "../Core/JvmAttach.h"
 #include "../Core/JvmClass.h"
 #include "../Core/ProcessManager.h"
 #include "../Disasm/IDisassembler.h"
-#include "../Hv/HvDbgClient.h"
-#include "../Hv/HvDbgLoader.h"
-#include "../Hv/HvDbgProtocol.h"
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -21,20 +25,42 @@ namespace ds {
 // Java debug (JDWP) console for bytecode-level JVM debugging.
 class CommunicationsTab final : public ITab {
 public:
+    CommunicationsTab();
+    ~CommunicationsTab() override;
+
     const char* name() const override { return "Communications"; }
     void render(AppContext& ctx) override;
 
 private:
+    void refreshProcesses();
     void renderProcesses(AppContext& ctx);
     void renderModules();
-    void renderConnections();
-    void renderHvDbg();                       // AMD-V (SVM) hypervisor channel: \\.\HvDbg
+    void renderConnections(AppContext& ctx);
     void renderJdwp(AppContext& ctx);         // Java debug (JDWP) console
+    void renderGameMaker(AppContext& ctx);
     void loadJdwpMethod(AppContext& ctx, uint64_t classID, uint64_t methodID,
                         const std::string& label);
-    void refreshConnections(uint32_t pid);   // live per-process TCP/UDP endpoints
 
-    struct Conn { std::string endpoint; std::string type; std::string state; };
+    struct Conn {
+        std::string local;
+        std::string remote;
+        std::string protocol; // TCP / UDP
+        std::string family;   // IPv4 / IPv6
+        std::string state;
+        bool        ipv6 = false;
+    };
+
+    struct ConnJob { uint64_t epoch = 0; uint32_t pid = 0; };
+    struct ConnResult {
+        uint64_t epoch = 0;
+        uint32_t pid = 0;
+        std::vector<Conn> connections;
+        std::string status;
+    };
+    static ConnResult collectConnections(const ConnJob& job);
+    void requestConnectionRefresh(uint32_t pid);
+    void pumpConnectionRefresh();
+    void connectionWorkerLoop(std::stop_token stop);
 
     ProcessManager           pm_;
     std::vector<ProcessInfo> procs_;
@@ -46,21 +72,35 @@ private:
 
     std::vector<Conn>        conns_;          // live per-process connections
     uint32_t                 connsForPid_ = 0;
+    uint32_t                 connsRequestedPid_ = 0;
+    std::string              connStatus_;     // empty on a complete 4-table refresh
+    double                   connNextRefresh_ = 0.0;
+    bool                     connAutoRefresh_ = true;
+    bool                     connShowV4_ = true;
+    bool                     connShowV6_ = true;
+    bool                     connShowTcp_ = true;
+    bool                     connShowUdp_ = true;
+    char                     connFilter_[96] = "";
     char filter_[64] = "";
 
-    // AMD-V (SVM) hypervisor backend (\\.\HvDbg).
-    HvDbgClient              hv_;
-    HvDbgLoader              hvLoader_;          // SCM-driven load/unload of HvDbg.sys
-    HVDBG_INFO               hvInfo_{};
-    bool                     hvHave_  = false;   // hvInfo_ is populated from a live query
-    bool                     hvAbiMismatch_ = false; // driver ABI != client ABI (ping() warned)
-    std::string              hvStatus_;
-    // Cached driver state + elevation: querying the SCM (state) and the process token
-    // (isElevated) every frame was wasteful. state refreshes on first use and after a
-    // load/unload; elevation never changes within a process, so query it exactly once.
-    HvDbgLoader::State       hvState_      = HvDbgLoader::State::Unknown;
-    bool                     hvStateValid_ = false;
-    int                      hvElevated_   = -1;   // -1 = unknown, else cached isElevated()
+    // Communications is the single home for process attach, system-wide network
+    // activity, and JVM/JDWP work.  Keeping these as internal workspaces matches
+    // the fixed nine-section shell and avoids spending permanent top-level
+    // navigation on a second communications surface.
+    int                      workspaceView_ = 0; // 0 native, 1 network, 2 Java/JDWP, 3 GameMaker
+    std::string              gmlStatus_;
+    ConnectionsTab           systemConnections_;
+
+    // IP Helper table enumeration can allocate/touch tens of MiB and is never
+    // allowed to execute from render(). The worker owns each query/result;
+    // epochs reject a response for a process the user has already left.
+    std::mutex               connWorkerMutex_;
+    std::condition_variable  connWorkerCv_;
+    std::optional<ConnJob>   pendingConnJob_;
+    std::optional<ConnResult> readyConnResult_;
+    std::atomic<uint64_t>    desiredConnEpoch_{0};
+    std::atomic<bool>        connRefreshRunning_{false};
+    std::jthread             connWorker_;
 
     // ---- Java debug (JDWP) console state ----
     char        jdwpHost_[64]        = "127.0.0.1";
@@ -75,6 +115,7 @@ private:
                                                     // (so an EXE-launcher's Java main logic can be
                                                     // breakpointed before it runs on)
     char        jdwpClassFilter_[64] = "";
+    char        jdwpProcessFilter_[96] = "";
     uint64_t    jdwpSelClass_  = 0;                // selected class typeID
     std::string jdwpSelClassName_;
     std::vector<JdwpMethodRow> jdwpMethods_;       // methods of the selected class

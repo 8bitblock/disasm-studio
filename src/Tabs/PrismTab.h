@@ -3,6 +3,8 @@
 #include "../Core/Prism.h"
 #include "../Core/PrismSampler.h"
 
+#include <memory>
+
 namespace ds {
 
 // Prism: the explanatory profiler (additions.md idea #5). Samples a running process,
@@ -15,15 +17,19 @@ public:
     void render(AppContext& ctx) override;
 
 private:
-    void rebuild();   // aggregate the sampler's snapshot into rep_
-
     PrismSampler sampler_;
-    PrismReport  rep_;
     char         pidBuf_[16] = "";
-    double       lastBuild_  = 0.0;   // ImGui::GetTime() of the last rebuild (throttle)
-    bool         autoRefresh_ = true;
     std::string  shownError_;
-    uint64_t     builtGeneration_ = 0;
+    int          startMode_ = 0;
+    int          selectedTimeline_ = -1;
+    int          selectedFlame_ = -1;
+    bool         stopRequested_ = false;
+
+    // Retained ratios for the draggable functions | details | paths panes.
+    // Boundaries are expressed against the available content width so the
+    // layout remains stable across window and DPI changes.
+    float        firstPaneSplit_ = 0.40f;
+    float        secondPaneSplit_ = 0.70f;
 };
 
 } // namespace ds

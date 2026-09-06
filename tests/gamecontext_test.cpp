@@ -24,6 +24,13 @@ static bool hasFuncKind(const GameContextReport& r, GameFunctionKind k) {
     return false;
 }
 
+static bool hasFuncKindAt(const GameContextReport& r, uint64_t address,
+                          GameFunctionKind kind) {
+    for (const auto& f : r.functions)
+        if (f.address == address && f.kind == kind) return true;
+    return false;
+}
+
 static bool hasHint(const GameContextReport& r, const std::string& needle) {
     for (const auto& h : r.crackmeHints)
         if (h.title.find(needle) != std::string::npos || h.detail.find(needle) != std::string::npos)
@@ -43,6 +50,10 @@ int main() {
     in.functions.push_back({ 0x2100, 32, "render_frame", false, "" });
     in.functions.push_back({ 0x2200, 32, "read_user_input", true, "reads user input" });
     in.functions.push_back({ 0x2300, 32, "check_license", true, "string compare controls branch" });
+    in.functions.push_back({ 0x2400, 32, "send_ui_message", true, "calls USER32!SendMessageW" });
+    in.functions.push_back({ 0x2500, 32, "connect_pipe", true, "calls KERNEL32!ConnectNamedPipeW" });
+    in.functions.push_back({ 0x2600, 32, "socket_wrapper", true,
+                             "calls WS2_32!connect and WS2_32!send" });
 
     Finding rt;
     rt.analyzer = "RuntimeScan";
@@ -62,7 +73,8 @@ int main() {
     a.category = "checksum";
     a.confidence = 0.80f;
     a.address = 0x3000;
-    a.referencedBy.push_back({ 0x2300, "check_license", 0x2310 });
+    a.addressValid = true;
+    a.referencedBy.push_back({ 0x2300, "check_license", 0x2310, true, true });
     in.algorithms.push_back(a);
 
     GameContextReport r = BuildGameContext(in);
@@ -76,6 +88,9 @@ int main() {
     CHECK(hasFuncKind(r, GameFunctionKind::Input));
     CHECK(hasFuncKind(r, GameFunctionKind::Validation));
     CHECK(hasFuncKind(r, GameFunctionKind::Encoding));
+    CHECK(!hasFuncKindAt(r, 0x2400, GameFunctionKind::Network));
+    CHECK(!hasFuncKindAt(r, 0x2500, GameFunctionKind::Network));
+    CHECK(hasFuncKindAt(r, 0x2600, GameFunctionKind::Network));
     CHECK(r.runtimeBoundaries.size() == 1 && r.runtimeBoundaries[0].title == "Unity engine");
     CHECK(hasHint(r, "Runtime handoff"));
     CHECK(hasHint(r, "Wrong password"));

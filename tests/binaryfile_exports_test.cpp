@@ -235,6 +235,7 @@ int main() {
         BinaryFile bin;
         CHECK(loadBytes(bin, buildPE32Exports(), "exports_complete.bin"));
         CHECK(bin.format() == BinFormat::PE32);
+        CHECK(bin.isDll() && (bin.fileCharacteristics() & 0x2000u));
         const auto& ex = bin.exports();
         CHECK(ex.size() == 5);                     // four ordinals, one extra alias row
 

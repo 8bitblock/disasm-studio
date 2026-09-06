@@ -105,6 +105,32 @@ int main() {
         CHECK(s.executable);
     }
 
+    // Normal structured loading has an explicit admission policy and a
+    // cancellation hook. Neither failure may leave a partially authoritative
+    // image behind.
+    {
+        BinaryLoadOptions limited;
+        limited.maxBytes = bytes.size() - 1;
+        BinaryFile rejected;
+        CHECK(!rejected.load(tmp, limited));
+        CHECK(rejected.loadError() == BinaryLoadError::FileTooLarge);
+        CHECK(!rejected.loaded());
+
+        BinaryLoadOptions cancelled;
+        cancelled.cancelled = [] { return true; };
+        BinaryFile stopped;
+        CHECK(!stopped.load(tmp, cancelled));
+        CHECK(stopped.loadError() == BinaryLoadError::Cancelled);
+        CHECK(!stopped.loaded());
+
+        BinaryFile rawRejected;
+        CHECK(!rawRejected.loadRaw(tmp, 0, limited));
+        CHECK(rawRejected.loadError() == BinaryLoadError::FileTooLarge);
+        BinaryFile rawStopped;
+        CHECK(!rawStopped.loadRaw(tmp, 0, cancelled));
+        CHECK(rawStopped.loadError() == BinaryLoadError::Cancelled);
+    }
+
     const uint64_t base = 0x400000;
     uint64_t off = 0, va = 0; size_t avail = 0;
 
@@ -129,6 +155,45 @@ int main() {
     //     it as an RVA and mapped 0x1000 straight onto the .text section. ---
     CHECK(!bf.vaToOffset(0x1000, off));
     CHECK(bf.ptrFromVA(0x1000, avail) == nullptr);
+
+    // A structured data-only image has no code root. firstCodeSection must not
+    // silently return sections.front() and authorize data as instructions/CFG.
+    {
+        auto dataOnlyBytes = buildPE32();
+        constexpr size_t sec = 0x98 + 0xE0;
+        put32(dataOnlyBytes, 0x98 + 16, 0);         // no PE entry
+        putstr(dataOnlyBytes, sec, ".data", 8);
+        put32(dataOnlyBytes, sec + 36, 0x40000040u); // initialized data | read
+        const std::string dataOnlyTmp = "pe32_data_only.bin";
+        {
+            std::ofstream f(dataOnlyTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(dataOnlyBytes.data()),
+                    static_cast<std::streamsize>(dataOnlyBytes.size()));
+        }
+        BinaryFile dataOnly;
+        CHECK(dataOnly.load(dataOnlyTmp));
+        CHECK(!dataOnly.hasEntryPoint());
+        CHECK(dataOnly.firstCodeSection() == nullptr);
+        std::remove(dataOnlyTmp.c_str());
+    }
+
+    // PE's THUMB and ARMNT machine values both select the dedicated fixed
+    // Thumb/Thumb-2 decoder mode; they must not collapse into A32 ARM.
+    for (const uint16_t machine : {uint16_t{0x01C2}, uint16_t{0x01C4}}) {
+        auto thumbBytes = buildPE32();
+        put16(thumbBytes, 0x84, machine);
+        const std::string thumbTmp = machine == 0x01C2 ? "pe32_thumb_machine.bin"
+                                                       : "pe32_armnt_machine.bin";
+        {
+            std::ofstream f(thumbTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(thumbBytes.data()),
+                    static_cast<std::streamsize>(thumbBytes.size()));
+        }
+        BinaryFile thumb;
+        CHECK(thumb.load(thumbTmp));
+        CHECK(thumb.format() == BinFormat::PE32 && thumb.machine() == MachineArch::THUMB);
+        std::remove(thumbTmp.c_str());
+    }
 
     // A hostile SizeOfHeaders must not overlap the first section's raw bytes.
     // Otherwise RVA 0x500 aliases file offset 0x500 as a fake header while the
@@ -173,6 +238,118 @@ int main() {
         std::remove(zeroRawTmp.c_str());
     }
 
+    // File-backed translation is symmetric. A zero VirtualSize uses the raw
+    // extent, while raw file-alignment padding beyond a non-zero VirtualSize is
+    // deliberately not assigned a VA.
+    {
+        constexpr size_t sec = 0x98 + 0xE0;
+        auto zeroVirtualSize = buildPE32();
+        put32(zeroVirtualSize, sec + 8, 0);
+        const std::string zeroVirtualTmp = "pe32_zero_virtual_size.bin";
+        {
+            std::ofstream f(zeroVirtualTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(zeroVirtualSize.data()),
+                    static_cast<std::streamsize>(zeroVirtualSize.size()));
+        }
+        BinaryFile zeroVirtual;
+        CHECK(zeroVirtual.load(zeroVirtualTmp));
+        CHECK(zeroVirtual.offsetToVA(0x5FF, va) && va == base + 0x11FF);
+        CHECK(zeroVirtual.vaToOffset(va, off) && off == 0x5FF);
+        CHECK(zeroVirtual.ptrFromVA(va, avail) != nullptr && avail == 1);
+        std::remove(zeroVirtualTmp.c_str());
+
+        auto paddedRaw = buildPE32();
+        put32(paddedRaw, sec + 8, 0x10);
+        const std::string paddedTmp = "pe32_raw_alignment_padding.bin";
+        {
+            std::ofstream f(paddedTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(paddedRaw.data()),
+                    static_cast<std::streamsize>(paddedRaw.size()));
+        }
+        BinaryFile padded;
+        CHECK(padded.load(paddedTmp));
+        CHECK(padded.offsetToVA(0x40F, va) && va == base + 0x100F);
+        CHECK(padded.vaToOffset(va, off) && off == 0x40F);
+        CHECK(!padded.offsetToVA(0x410, va));
+        CHECK(!padded.vaToOffset(base + 0x1010, off));
+        CHECK(padded.ptrFromVA(base + 0x1010, avail) == nullptr);
+        std::remove(paddedTmp.c_str());
+    }
+
+    // A section header may overstate SizeOfRawData. Neither direction may map
+    // the declared tail past physical EOF, even though it is within VirtualSize.
+    {
+        constexpr size_t sec = 0x98 + 0xE0;
+        auto truncatedRaw = buildPE32();
+        put32(truncatedRaw, sec + 16, 0x400); // only 0x200 bytes exist at 0x400
+        const std::string truncatedTmp = "pe32_truncated_raw_section.bin";
+        {
+            std::ofstream f(truncatedTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(truncatedRaw.data()),
+                    static_cast<std::streamsize>(truncatedRaw.size()));
+        }
+        BinaryFile truncated;
+        CHECK(truncated.load(truncatedTmp));
+        CHECK(!truncated.offsetToVA(0x600, va));
+        CHECK(!truncated.vaToOffset(base + 0x1200, off));
+        CHECK(truncated.ptrFromVA(base + 0x1200, avail) == nullptr);
+        std::remove(truncatedTmp.c_str());
+    }
+
+    // writeImage is all-or-nothing. Starting on the last raw byte and crossing
+    // into zero-filled virtual padding must not mutate even the valid prefix.
+    {
+        const uint8_t beforeLast = bf.bytes()[0x5FF];
+        const uint8_t beforeNext = bf.bytes().size() > 0x600 ? bf.bytes()[0x600] : 0;
+        const uint8_t replacement[2] = { 0xCC, 0xCD };
+        const uint64_t revision = bf.imageRevision();
+        CHECK(bf.writeImage(base + 0x11FF, replacement, sizeof(replacement)) == 0);
+        CHECK(bf.imageRevision() == revision);
+        CHECK(bf.bytes()[0x5FF] == beforeLast);
+        if (bf.bytes().size() > 0x600) CHECK(bf.bytes()[0x600] == beforeNext);
+
+        CHECK(bf.writeImage(base + 0x11FE, replacement, sizeof(replacement)) == 2);
+        CHECK(bf.imageRevision() == revision + 1);
+        CHECK(bf.bytes()[0x5FE] == 0xCC && bf.bytes()[0x5FF] == 0xCD);
+    }
+
+    // Even when virtual sections touch, a single patch may not jump across a
+    // noncontiguous raw-file layout. canWriteImage is the read-only authority
+    // used by UI preflight and writeImage enforces the identical rule.
+    {
+        constexpr size_t coff = 0x84;
+        constexpr size_t first = 0x98 + 0xE0;
+        constexpr size_t second = first + 40;
+        auto split = buildPE32();
+        put16(split, coff + 2, 2);
+        put32(split, first + 8, 1);
+        put32(split, first + 16, 1);
+        putstr(split, second, ".next", 8);
+        put32(split, second + 8, 1);
+        put32(split, second + 12, 0x1001); // virtually adjacent
+        put32(split, second + 16, 1);
+        put32(split, second + 20, 0x500);  // but not file-contiguous
+        put32(split, second + 36, 0x60000020u);
+        const std::string splitTmp = "pe32_split_write_mapping.bin";
+        {
+            std::ofstream f(splitTmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(split.data()),
+                    static_cast<std::streamsize>(split.size()));
+        }
+        BinaryFile splitBinary;
+        CHECK(splitBinary.load(splitTmp));
+        const uint8_t originalFirst = splitBinary.bytes()[0x400];
+        const uint8_t originalSecond = splitBinary.bytes()[0x500];
+        const uint8_t replacement[2] = { 0xA1, 0xA2 };
+        CHECK(!splitBinary.canWriteImage(base + 0x1000, 2));
+        CHECK(splitBinary.writeImage(base + 0x1000, replacement, 2) == 0);
+        CHECK(splitBinary.bytes()[0x400] == originalFirst &&
+              splitBinary.bytes()[0x500] == originalSecond);
+        CHECK(splitBinary.canWriteImage(base + 0x1000, 1));
+        CHECK(!splitBinary.canWriteImage(base + 0x1000, 0));
+        std::remove(splitTmp.c_str());
+    }
+
     // Public paths are UTF-8. On Windows the old narrow std::ifstream(path)
     // interpreted these bytes through the ANSI codepage, so a command-line or
     // file-dialog target with a non-ASCII name could not be opened.
@@ -191,6 +368,79 @@ int main() {
     CHECK(pathFromUtf8(utf8Raw.path()).is_absolute());
     CHECK(utf8Raw.imageBase() == 0x12340000);
     std::filesystem::remove(pathFromUtf8(utf8Tmp));
+
+    // A structured MZ/PE claim never silently becomes Raw. Unsupported machine
+    // types and truncated declared section tables are rejected atomically; the
+    // analyst can still make the same bytes authoritative via explicit Raw.
+    {
+        auto unsupported = buildPE32();
+        put16(unsupported, 0x84, 0x0200); // IMAGE_FILE_MACHINE_IA64: no decoder
+        const std::string path = "pe32_unsupported_machine.bin";
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(unsupported.data()),
+                    static_cast<std::streamsize>(unsupported.size()));
+        }
+        BinaryFile rejected;
+        CHECK(!rejected.load(path));
+        CHECK(!rejected.loaded() && rejected.format() == BinFormat::Unknown);
+        CHECK(rejected.loadError() == BinaryLoadError::UnsupportedMachine &&
+              !rejected.loadErrorText().empty());
+        BinaryFile explicitRaw;
+        CHECK(explicitRaw.loadRaw(path, 0x9000));
+        CHECK(explicitRaw.format() == BinFormat::Raw && explicitRaw.imageBase() == 0x9000);
+        std::remove(path.c_str());
+    }
+    {
+        auto truncatedTable = buildPE32();
+        constexpr size_t coff = 0x84;
+        constexpr size_t firstSection = 0x98 + 0xE0;
+        put16(truncatedTable, coff + 2, 2); // second declared header is incomplete
+        truncatedTable.resize(firstSection + 40 + 39);
+        const std::string path = "pe32_truncated_section_table.bin";
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(truncatedTable.data()),
+                    static_cast<std::streamsize>(truncatedTable.size()));
+        }
+        BinaryFile rejected;
+        CHECK(!rejected.load(path));
+        CHECK(!rejected.loaded() && rejected.sections().empty());
+        CHECK(rejected.loadError() == BinaryLoadError::MalformedPE);
+        std::remove(path.c_str());
+    }
+    {
+        auto contradictory = buildPE32();
+        put16(contradictory, 0x84, 0x8664); // AMD64 machine with a PE32 optional header
+        const std::string path = "pe32_contradictory_machine_width.bin";
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(contradictory.data()),
+                    static_cast<std::streamsize>(contradictory.size()));
+        }
+        BinaryFile rejected;
+        CHECK(!rejected.load(path));
+        CHECK(rejected.loadError() == BinaryLoadError::MalformedPE);
+        CHECK(!rejected.loaded() && rejected.machine() == MachineArch::Unknown);
+        std::remove(path.c_str());
+    }
+    {
+        std::vector<uint8_t> malformedMz(0x80, 0);
+        malformedMz[0] = 'M'; malformedMz[1] = 'Z';
+        put32(malformedMz, 0x3C, 0x1000); // PE header beyond EOF
+        const std::string path = "malformed_mz_requires_raw.bin";
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(malformedMz.data()),
+                    static_cast<std::streamsize>(malformedMz.size()));
+        }
+        BinaryFile normal;
+        CHECK(!normal.load(path));
+        CHECK(normal.loadError() == BinaryLoadError::MalformedPE);
+        BinaryFile raw;
+        CHECK(raw.loadRaw(path, 0) && raw.format() == BinFormat::Raw);
+        std::remove(path.c_str());
+    }
 
     std::remove(tmp.c_str());
 

@@ -7,6 +7,7 @@
 // strings by the Project layer to avoid float precision loss.
 //
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -60,6 +61,18 @@ struct Value {
 std::string Dump(const Value& v, bool pretty = true);
 
 // Parse text into `out`. Returns false on syntax error (out left untouched).
+// Limits are enforced while tokens/nodes are being constructed, not after the
+// complete tree has already amplified a small input into a large allocation.
+struct JsonParseLimits {
+    size_t maxDepth             = 200;
+    size_t maxNodes             = 1'000'000;
+    size_t maxStringBytes       = 64u * 1024u * 1024u; // decoded keys + values
+    size_t maxContainerEntries  = 131'072;             // per array/object
+    size_t maxStringTokenBytes  = 1u * 1024u * 1024u;  // encoded or decoded single string
+    size_t maxNumberTokenBytes  = 128;
+};
+
 bool Parse(const std::string& text, Value& out);
+bool Parse(const std::string& text, Value& out, const JsonParseLimits& limits);
 
 } // namespace ds::json

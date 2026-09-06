@@ -1,11 +1,12 @@
 #include "FunctionNamer.h"
 #include "BinaryFile.h"
 #include "../Disasm/IDisassembler.h"
-#include "../Tabs/DataRef.h"   // instrDataRef/instrImmRef: referenced data addresses
+#include "InstructionReference.h"   // instrDataRef/instrImmRef: referenced data addresses
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <initializer_list>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -68,16 +69,37 @@ std::string nameKey(const std::string& s) {
     return k;
 }
 
+// Remove the import-pointer and x86 calling-convention decorations while
+// retaining the API's useful display case.  Real PE/PDB spellings include
+// combinations such as __imp__Foo@8, @Foo@8, and __imp_@Foo@8.
+std::string undecoratedImportName(const std::string& full) {
+    std::string n = bareApi(full);
+    if (size_t bang = n.rfind('!'); bang != std::string::npos) n.erase(0, bang + 1);
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        while (!n.empty() && n.front() == '_') { n.erase(n.begin()); changed = true; }
+        if (nameKey(n).rfind("imp_", 0) == 0) { n.erase(0, 4); changed = true; }
+    }
+    if (!n.empty() && n.front() == '@') n.erase(n.begin()); // leading fastcall decoration
+    while (!n.empty() && n.front() == '_') n.erase(n.begin());
+
+    if (size_t at = n.rfind('@'); at != std::string::npos && at > 0 && at + 1 < n.size()) {
+        bool byteCount = true;
+        for (size_t i = at + 1; i < n.size(); ++i)
+            if (!std::isdigit(static_cast<unsigned char>(n[i]))) { byteCount = false; break; }
+        if (byteCount) n.resize(at);
+    }
+    if (n.empty() || n.front() == '#' || norm(n).rfind("ordinal", 0) == 0) return {};
+    return n;
+}
+
 // Strip import-pointer and stdcall decoration without changing the API's useful
 // display case.  Used for j_<API> thunk names.
 std::string thunkIdentifier(const std::string& full) {
-    std::string n = bareApi(full);
+    std::string n = undecoratedImportName(full);
     if (n.empty() || n[0] == '?') return {};             // MSVC-mangled tail: no safe short name
-    size_t lead = 0; while (lead < n.size() && n[lead] == '_') ++lead;
-    n.erase(0, lead);
-    std::string low = nameKey(n);
-    if (low.rfind("imp_", 0) == 0) n.erase(0, 4);       // __imp_CreateFileW
-    if (size_t at = n.find('@'); at != std::string::npos) n.resize(at); // _foo@8
 
     std::string out;
     for (char c : n) {
@@ -98,6 +120,545 @@ std::string joinApis(const std::vector<std::string>& v) {
         r += a;
     }
     return r;
+}
+
+// Decoration-insensitive but otherwise exact API key.  Substring matching is
+// intentionally forbidden here: ConnectNamedPipe and SendMessage are not
+// network availability/transport evidence.  PE import spellings may include a
+// DLL qualifier, __imp_, stdcall @N decoration, or an A/W suffix.
+std::string compactApiKey(const std::string& full) {
+    const std::string n = undecoratedImportName(full);
+
+    std::string key;
+    key.reserve(n.size());
+    for (char c : n)
+        if (std::isalnum((unsigned char)c))
+            key.push_back((char)std::tolower((unsigned char)c));
+    return key;
+}
+
+bool exactApiOrAnsiWideVariant(const std::string& key, const char* base) {
+    const std::string b = base;
+    return key == b || key == b + "a" || key == b + "w";
+}
+
+bool isConnectivityPredicateApi(const std::string& api) {
+    const std::string key = compactApiKey(api);
+    return exactApiOrAnsiWideVariant(key, "internetgetconnectedstate") ||
+           exactApiOrAnsiWideVariant(key, "internetgetconnectedstateex") ||
+           exactApiOrAnsiWideVariant(key, "internetcheckconnection") ||
+           exactApiOrAnsiWideVariant(key, "isnetworkalive") ||
+           exactApiOrAnsiWideVariant(key, "isdestinationreachable");
+}
+
+// Any real resolution/session/transport/payload work makes the enclosing
+// function broader than a connectivity predicate.  Keep this an exact catalog
+// local to FunctionNamer rather than reintroducing the old substring hazards.
+bool isTransportOrPayloadApi(const std::string& api) {
+    const std::string key = compactApiKey(api);
+    static constexpr const char* kNetworkWork[] = {
+        "socket", "wsasocket", "wsastartup", "wsacleanup", "connect",
+        "connectex", "wsaconnect", "bind", "listen", "accept", "acceptex",
+        "closesocket", "send", "sendto", "wsasend", "wsasendto",
+        "transmitfile", "recv", "recvfrom", "wsarecv", "wsarecvfrom",
+        "getaddrinfo", "getaddrinfoex", "gethostbyname", "gethostbyaddr",
+        "getnameinfo", "dnsquery", "internetattemptconnect", "internetopen",
+        "internetconnect", "internetopenurl", "httpopenrequest",
+        "httpsendrequest", "httpsendrequestex", "internetwritefile",
+        "httpendrequest", "internetreadfile", "internetreadfileex",
+        "httpqueryinfo", "internetclosehandle", "winhttpopen",
+        "winhttpconnect", "winhttpopenrequest", "winhttpsendrequest",
+        "winhttpwritedata", "winhttpreceiveresponse", "winhttpreaddata",
+        "winhttpqueryheaders", "winhttpclosehandle", "urldownloadtofile",
+    };
+    for (const char* candidate : kNetworkWork)
+        if (exactApiOrAnsiWideVariant(key, candidate)) return true;
+    return false;
+}
+
+std::string connectivityPredicateIn(const std::vector<std::string>& apis) {
+    for (const std::string& api : apis) {
+        if (!isConnectivityPredicateApi(api)) continue;
+        if (std::string display = thunkIdentifier(api); !display.empty()) return display;
+        return bareApi(api);
+    }
+    return {};
+}
+
+bool hasTransportOrPayloadApi(const std::vector<std::string>& apis) {
+    for (const std::string& api : apis)
+        if (isTransportOrPayloadApi(api)) return true;
+    return false;
+}
+
+bool hasOnlyConnectivityPredicateApis(const std::vector<std::string>& apis) {
+    return !apis.empty() &&
+           std::all_of(apis.begin(), apis.end(), isConnectivityPredicateApi);
+}
+
+// Contextual names deliberately require two independent signals: a strong
+// subject phrase from this function and an exact, complete operation shape.
+// This keeps generic helpers generic while allowing useful analyst-facing names
+// such as licenseHashing and configDecryption when the evidence really agrees.
+enum class SemanticSubject {
+    None,
+    License,
+    Serial,
+    Password,
+    Credential,
+    Config,
+    Payload,
+    Token,
+    Integrity,
+};
+
+struct SubjectEvidence {
+    SemanticSubject subject = SemanticSubject::None;
+    std::string cue;
+    bool ambiguous = false;
+    bool encryptionCue = false;
+    bool compressionCue = false;
+};
+
+std::string lowerText(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text)
+        out.push_back((char)std::tolower((unsigned char)c));
+    return out;
+}
+
+// Lowercase, collapse punctuation/whitespace, and pad with spaces so phrase
+// lookup is word-bounded ("sublicense" never matches "license").
+std::string normalizedWords(const std::string& text) {
+    std::string out = " ";
+    bool spaced = true;
+    for (char c : text) {
+        const unsigned char u = (unsigned char)c;
+        if (std::isalnum(u)) {
+            out.push_back((char)std::tolower(u));
+            spaced = false;
+        } else if (!spaced) {
+            out.push_back(' ');
+            spaced = true;
+        }
+    }
+    if (!spaced) out.push_back(' ');
+    return out;
+}
+
+bool containsPhrase(const std::string& words, const char* phrase) {
+    return words.find(std::string(" ") + phrase + " ") != std::string::npos;
+}
+
+const char* firstPhrase(const std::string& words,
+                        std::initializer_list<const char*> phrases) {
+    for (const char* phrase : phrases)
+        if (containsPhrase(words, phrase)) return phrase;
+    return nullptr;
+}
+
+bool containsBoundedExtension(const std::string& lower, const char* extension) {
+    const size_t length = std::char_traits<char>::length(extension);
+    for (size_t pos = lower.find(extension); pos != std::string::npos;
+         pos = lower.find(extension, pos + 1)) {
+        const size_t end = pos + length;
+        if (end == lower.size()) return true;
+        const unsigned char next = (unsigned char)lower[end];
+        if (!std::isalnum(next) && next != '_' && next != '.') return true;
+    }
+    return false;
+}
+
+SubjectEvidence contextualSubject(const std::vector<std::string>& strings) {
+    SubjectEvidence result;
+    auto add = [&](SemanticSubject subject, const char* cue) {
+        if (!cue || result.ambiguous) return;
+        if (result.subject == SemanticSubject::None) {
+            result.subject = subject;
+            result.cue = cue;
+        } else if (result.subject != subject) {
+            result.ambiguous = true;
+            result.subject = SemanticSubject::None;
+            result.cue.clear();
+        }
+    };
+
+    for (const std::string& text : strings) {
+        const std::string words = normalizedWords(text);
+        const std::string lower = lowerText(text);
+        if (firstPhrase(words, {"encrypted", "encrypt", "encryption",
+                                "decrypt", "decryption"}))
+            result.encryptionCue = true;
+        if (firstPhrase(words, {"compressed", "decompress", "decompression",
+                                "packed data", "archive data"}))
+            result.compressionCue = true;
+
+        // Legal boilerplate is not product-key evidence.  Skip only license
+        // cues in this string so an unrelated strong subject can still count.
+        const bool legalLicenseText = firstPhrase(words, {
+            "license agreement", "licence agreement", "software license",
+            "software licence", "third party license", "third party licence",
+            "licensed under", "licenced under", "open source license",
+        }) != nullptr;
+        if (!legalLicenseText) {
+            add(SemanticSubject::License, firstPhrase(words, {
+                "license key", "licence key", "product key", "activation key",
+                "activation code", "registration key", "registration code",
+                "invalid license", "invalid licence", "expired license",
+                "expired licence", "license expired", "licence expired",
+                "valid license", "valid licence", "validate license",
+                "validate licence", "license validation", "licence validation",
+                "license hash", "licence hash", "license digest", "licence digest",
+            }));
+        }
+
+        const bool deviceSerial = firstPhrase(words, {
+            "device serial", "hardware serial", "volume serial", "drive serial",
+            "disk serial", "serial port",
+        }) != nullptr;
+        if (!deviceSerial) {
+            add(SemanticSubject::Serial, firstPhrase(words, {
+                "serial number", "serial key", "serial code", "enter serial",
+                "invalid serial", "valid serial", "validate serial",
+                "serial validation", "serial hash", "serial digest",
+            }));
+        }
+
+        add(SemanticSubject::Password, firstPhrase(words, {
+            "password", "passwd", "passcode", "password hash", "password digest",
+        }));
+        add(SemanticSubject::Credential, firstPhrase(words, {
+            "user credential", "login credential", "stored credential",
+            "credential hash", "credential digest",
+        }));
+        add(SemanticSubject::Config, firstPhrase(words, {
+            "config", "configuration", "encrypted config", "encrypted configuration",
+            "application settings", "user settings", "preferences file",
+        }));
+        if (containsBoundedExtension(lower, ".ini") ||
+            containsBoundedExtension(lower, ".cfg") ||
+            lower.find("config.json") != std::string::npos)
+            add(SemanticSubject::Config, "configuration file");
+
+        add(SemanticSubject::Payload, firstPhrase(words, {
+            "payload", "compressed payload", "encrypted payload",
+            "compressed data", "archive data", "packed data",
+        }));
+        add(SemanticSubject::Token, firstPhrase(words, {
+            "access token", "auth token", "authentication token", "session token",
+            "refresh token", "bearer token", "api token", "csrf token",
+        }));
+        add(SemanticSubject::Integrity, firstPhrase(words, {
+            "integrity check", "integrity verification", "digital signature",
+            "file signature", "trusted publisher", "certificate chain",
+            "signature verification",
+        }));
+    }
+    return result;
+}
+
+const char* subjectStem(SemanticSubject subject) {
+    switch (subject) {
+    case SemanticSubject::License:    return "license";
+    case SemanticSubject::Serial:     return "serial";
+    case SemanticSubject::Password:   return "password";
+    case SemanticSubject::Credential: return "credential";
+    case SemanticSubject::Config:     return "config";
+    case SemanticSubject::Payload:    return "payload";
+    case SemanticSubject::Token:      return "token";
+    case SemanticSubject::Integrity:  return "integrity";
+    default:                          return "";
+    }
+}
+
+bool keyIs(const std::string& key, std::initializer_list<const char*> candidates) {
+    for (const char* candidate : candidates)
+        if (key == candidate) return true;
+    return false;
+}
+
+template <typename Predicate>
+std::string firstApiMatching(const std::vector<std::string>& apis, Predicate predicate) {
+    for (const std::string& api : apis)
+        if (predicate(compactApiKey(api)))
+            return undecoratedImportName(api);
+    return {};
+}
+
+bool hasApiKey(const std::vector<std::string>& apis, const char* wanted) {
+    return !firstApiMatching(apis, [&](const std::string& key) {
+        return key == wanted;
+    }).empty();
+}
+
+struct HashWorkflowEvidence {
+    bool complete = false;
+    std::string detail;
+};
+
+bool orderedApiStages(
+    const std::vector<std::string>& calls,
+    std::initializer_list<std::initializer_list<const char*>> stages) {
+    size_t next = 0;
+    for (const auto& stage : stages) {
+        bool found = false;
+        while (next < calls.size()) {
+            const std::string key = compactApiKey(calls[next++]);
+            if (keyIs(key, stage)) { found = true; break; }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+HashWorkflowEvidence hashWorkflow(const std::vector<std::string>& apis,
+                                  const std::vector<std::string>& calls) {
+    auto any = [&](std::initializer_list<const char*> keys) {
+        for (const char* key : keys)
+            if (hasApiKey(apis, key)) return true;
+        return false;
+    };
+
+    if (orderedApiStages(calls, {
+            {"cryptcreatehash"}, {"crypthashdata"}, {"cryptgethashparam"}}))
+        return {true, "complete CryptoAPI hash pipeline (CryptCreateHash, CryptHashData, CryptGetHashParam)"};
+    if (orderedApiStages(calls, {
+            {"bcryptcreatehash"}, {"bcrypthashdata"}, {"bcryptfinishhash"}}))
+        return {true, "complete CNG hash pipeline (BCryptCreateHash, BCryptHashData, BCryptFinishHash)"};
+    if (hasApiKey(apis, "bcrypthash"))
+        return {true, "one-shot BCryptHash operation"};
+
+    if (orderedApiStages(calls, {
+            {"evpdigestinit", "evpdigestinitex"},
+            {"evpdigestupdate"},
+            {"evpdigestfinal", "evpdigestfinalex"}}))
+        return {true, "complete EVP digest pipeline"};
+
+    struct LowLevelHash {
+        const char* init;
+        const char* update;
+        const char* final;
+        const char* label;
+    };
+    static constexpr LowLevelHash kLowLevel[] = {
+        {"sha1init", "sha1update", "sha1final", "complete SHA-1 hash pipeline"},
+        {"sha256init", "sha256update", "sha256final", "complete SHA-256 hash pipeline"},
+        {"sha512init", "sha512update", "sha512final", "complete SHA-512 hash pipeline"},
+        {"md5init", "md5update", "md5final", "complete MD5 hash pipeline"},
+        {"ccsha1init", "ccsha1update", "ccsha1final", "complete CommonCrypto SHA-1 pipeline"},
+        {"ccsha256init", "ccsha256update", "ccsha256final", "complete CommonCrypto SHA-256 pipeline"},
+        {"ccsha512init", "ccsha512update", "ccsha512final", "complete CommonCrypto SHA-512 pipeline"},
+        {"ccmd5init", "ccmd5update", "ccmd5final", "complete CommonCrypto MD5 pipeline"},
+        {"cryptogenerichashinit", "cryptogenerichashupdate", "cryptogenerichashfinal",
+         "complete libsodium generic-hash pipeline"},
+    };
+    for (const auto& workflow : kLowLevel)
+        if (orderedApiStages(calls, {
+                {workflow.init}, {workflow.update}, {workflow.final}}))
+            return {true, workflow.label};
+
+    if (any({"sha1", "sha256", "sha512", "md5", "ccsha1", "ccsha256",
+             "ccsha512", "ccmd5", "cryptogenerichash"}))
+        return {true, "one-shot cryptographic hash operation"};
+    return {};
+}
+
+bool isComparatorApiKey(const std::string& key) {
+    return keyIs(key, {
+        "memcmp", "strcmp", "strncmp", "wcscmp", "wcsncmp", "stricmp",
+        "wcsicmp", "lstrcmp", "lstrcmpa", "lstrcmpw", "lstrcmpi",
+        "lstrcmpia", "lstrcmpiw", "cryptomemcmp", "sodiummemcmp",
+    });
+}
+
+bool isCryptographicVerifierApiKey(const std::string& key) {
+    return keyIs(key, {
+        "cryptverifysignature", "cryptverifysignaturea", "cryptverifysignaturew",
+        "bcryptverifysignature", "ncryptverifysignature", "evpdigestverifyfinal",
+        "rsaverify", "ecdsaverify",
+    });
+}
+
+bool isTrustVerifierApiKey(const std::string& key) {
+    return key == "winverifytrust";
+}
+
+template <typename Predicate>
+std::string resultDecisionApi(const FuncEvidence& e, Predicate predicate,
+                              bool acceptDirectReturn) {
+    for (const auto& use : e.apiResultUses) {
+        if (!predicate(compactApiKey(use.api))) continue;
+        if (use.checked || use.normalizedReturned ||
+            (acceptDirectReturn && use.returned))
+            return undecoratedImportName(use.api);
+    }
+    return {};
+}
+
+struct OperationWorkflowEvidence {
+    bool complete = false;
+    std::string detail;
+};
+
+OperationWorkflowEvidence decryptWorkflow(const std::vector<std::string>& apis,
+                                          const std::vector<std::string>& calls) {
+    const std::string oneShot = firstApiMatching(apis, [](const std::string& key) {
+        return keyIs(key, {
+            "cryptdecrypt", "bcryptdecrypt", "ncryptdecrypt", "aesdecrypt",
+            "cryptunprotectdata", "cryptosecretboxopeneasy",
+        });
+    });
+    if (!oneShot.empty()) return {true, "calls exact decryption API " + oneShot};
+    if (orderedApiStages(calls, {
+            {"evpdecryptinit", "evpdecryptinitex"},
+            {"evpdecryptupdate"},
+            {"evpdecryptfinal", "evpdecryptfinalex"}}))
+        return {true, "complete EVP decryption pipeline"};
+    return {};
+}
+
+OperationWorkflowEvidence encryptWorkflow(const std::vector<std::string>& apis,
+                                          const std::vector<std::string>& calls) {
+    const std::string oneShot = firstApiMatching(apis, [](const std::string& key) {
+        return keyIs(key, {
+            "cryptencrypt", "bcryptencrypt", "ncryptencrypt", "aesencrypt",
+            "cryptprotectdata", "cryptosecretboxeasy",
+        });
+    });
+    if (!oneShot.empty()) return {true, "calls exact encryption API " + oneShot};
+    if (orderedApiStages(calls, {
+            {"evpencryptinit", "evpencryptinitex"},
+            {"evpencryptupdate"},
+            {"evpencryptfinal", "evpencryptfinalex"}}))
+        return {true, "complete EVP encryption pipeline"};
+    return {};
+}
+
+bool isDecompressApiKey(const std::string& key) {
+    return keyIs(key, {
+        "rtldecompressbuffer", "rtldecompressbufferex", "decompress", "uncompress",
+        "uncompress2", "inflate", "lz4decompress", "lz4decompresssafe",
+        "zstddecompress", "zstddecompressdc", "zstddecompressstream",
+    });
+}
+
+bool isRandomGenerationApiKey(const std::string& key) {
+    return keyIs(key, {
+        "bcryptgenrandom", "cryptgenrandom", "randbytes", "randprivbytes",
+        "secrandomcopybytes", "randombytesbuf",
+    });
+}
+
+bool isContextualVetoApi(const std::string& api) {
+    if (isTransportOrPayloadApi(api)) return true;
+    const std::string key = compactApiKey(api);
+    return keyIs(key, {
+        "createprocess", "createprocessa", "createprocessw", "shellexecute",
+        "shellexecutea", "shellexecutew", "winexec", "system",
+        "writeprocessmemory", "readprocessmemory", "virtualallocex",
+        "createremotethread", "ntcreatethreadex", "queueuserapc",
+    });
+}
+
+bool hasContextualVetoApi(const std::vector<std::string>& apis) {
+    return std::any_of(apis.begin(), apis.end(), isContextualVetoApi);
+}
+
+bool supportsValidation(SemanticSubject subject) {
+    return subject == SemanticSubject::License ||
+           subject == SemanticSubject::Serial ||
+           subject == SemanticSubject::Password ||
+           subject == SemanticSubject::Credential ||
+           subject == SemanticSubject::Token;
+}
+
+bool supportsHashing(SemanticSubject subject) {
+    return supportsValidation(subject) || subject == SemanticSubject::Integrity;
+}
+
+GuessedName contextualSemanticGuess(const FuncEvidence& e) {
+    GuessedName guess;
+    const SubjectEvidence subject = contextualSubject(e.strings);
+    constexpr int kMaxContextInstructions = 128;
+    constexpr int kMaxContextCalls = 12;
+    if (subject.ambiguous || subject.subject == SemanticSubject::None ||
+        e.instrCount <= 0 || e.callCount <= 0 ||
+        e.instrCount > kMaxContextInstructions || e.callCount > kMaxContextCalls ||
+        hasContextualVetoApi(e.apis))
+        return guess;
+
+    const std::vector<std::string>& calls = e.apiCallSequence.empty()
+        ? e.apis : e.apiCallSequence;
+    const HashWorkflowEvidence hash = hashWorkflow(e.apis, calls);
+    const std::string comparison = resultDecisionApi(
+        e, isComparatorApiKey, /*acceptDirectReturn*/false);
+    std::string verifier = resultDecisionApi(
+        e, isCryptographicVerifierApiKey, /*acceptDirectReturn*/true);
+    if (verifier.empty() && subject.subject == SemanticSubject::Integrity)
+        verifier = resultDecisionApi(e, isTrustVerifierApiKey, /*acceptDirectReturn*/true);
+
+    const OperationWorkflowEvidence decrypt = decryptWorkflow(e.apis, calls);
+    const OperationWorkflowEvidence encrypt = encryptWorkflow(e.apis, calls);
+    const std::string decompress = firstApiMatching(e.apis, isDecompressApiKey);
+    const std::string generate = firstApiMatching(e.apis, isRandomGenerationApiKey);
+    const bool randomSupportsHash = hash.complete && !generate.empty() &&
+        (subject.subject == SemanticSubject::License ||
+         subject.subject == SemanticSubject::Serial ||
+         subject.subject == SemanticSubject::Password ||
+         subject.subject == SemanticSubject::Credential);
+    const int transformKinds = (hash.complete ? 1 : 0) + (decrypt.complete ? 1 : 0) +
+                               (encrypt.complete ? 1 : 0) + (!decompress.empty() ? 1 : 0) +
+                               ((!generate.empty() && !randomSupportsHash) ? 1 : 0);
+
+    const std::string prefix = std::string("context \"") + subject.cue + "\" + ";
+    auto set = [&](const char* suffix, std::string operationReason) {
+        guess.name = std::string(subjectStem(subject.subject)) + suffix;
+        guess.reason = prefix + std::move(operationReason);
+        guess.guessed = true;
+    };
+
+    // A checked comparator/verifier is result-content evidence.  Checking the
+    // status from CryptHashData is intentionally not: that only proves whether
+    // the hashing API succeeded, never whether a license or password matched.
+    if ((!comparison.empty() || !verifier.empty()) &&
+        (supportsValidation(subject.subject) || subject.subject == SemanticSubject::Integrity) &&
+        !decrypt.complete && !encrypt.complete && decompress.empty() &&
+        (generate.empty() || randomSupportsHash)) {
+        std::string detail;
+        if (!comparison.empty())
+            detail = "checked comparison result from " + comparison;
+        else
+            detail = "checked/returned verification result from " + verifier;
+        if (hash.complete) detail += " after " + hash.detail;
+        set(subject.subject == SemanticSubject::Integrity ? "Verification" : "Validation",
+            std::move(detail));
+        return guess;
+    }
+
+    // Narrow operation names require one unambiguous transform/generator kind.
+    if (transformKinds != 1) return guess;
+    if (hash.complete && supportsHashing(subject.subject)) {
+        set("Hashing", hash.detail);
+    } else if (decrypt.complete && subject.encryptionCue &&
+               (subject.subject == SemanticSubject::Config ||
+                subject.subject == SemanticSubject::Payload ||
+                subject.subject == SemanticSubject::Token)) {
+        set("Decryption", decrypt.detail);
+    } else if (encrypt.complete && subject.encryptionCue &&
+               (subject.subject == SemanticSubject::Config ||
+                subject.subject == SemanticSubject::Payload ||
+                subject.subject == SemanticSubject::Token)) {
+        set("Encryption", encrypt.detail);
+    } else if (!decompress.empty() &&
+               subject.compressionCue &&
+               (subject.subject == SemanticSubject::Payload ||
+                subject.subject == SemanticSubject::Config)) {
+        set("Decompression", "calls exact decompression API " + decompress);
+    } else if (!generate.empty() && subject.subject == SemanticSubject::Token) {
+        set("Generation", "calls exact random-generation API " + generate);
+    }
+    return guess;
 }
 
 // The semantic-classification table: map a function's set of called APIs to a
@@ -272,11 +833,155 @@ bool isFrameNoise(const Instruction& in, bool sawRet) {
 }
 
 bool zeroLiteral(std::string s) {
+    while (!s.empty() && (s.front() == '#' || s.front() == '$')) s.erase(s.begin());
     if (s.size() >= 2 && s[0] == '0' && s[1] == 'x') s.erase(0, 2);
     if (!s.empty() && s.back() == 'h') s.pop_back();
     if (s.empty()) return false;
     for (char c : s) if (c != '0') return false;
     return true;
+}
+
+bool isConditionalBranch(const Instruction& in) {
+    if (in.flow.kind != FlowKind::None)
+        return in.flow.kind == FlowKind::ConditionalBranch;
+    if (!in.isBranch || in.isCall || in.isRet) return false;
+    const std::string m = nameKey(in.mnemonic);
+    if (m.size() >= 2 && m[0] == 'j' && m != "jmp" && m != "jmpf") return true;
+    return m == "beq" || m == "bne" || m == "b.eq" || m == "b.ne" ||
+           m == "cbz" || m == "cbnz";
+}
+
+// Only equality/inequality branches consume the Boolean zero test. TEST also
+// clears CF/OF and computes parity/sign, so accepting JC/JO/JP would turn a
+// constant or unrelated flag decision into false online-state evidence.
+bool isZeroEqualityBranch(const Instruction& in) {
+    if (!isConditionalBranch(in)) return false;
+    const std::string m = nameKey(in.mnemonic);
+    return m == "je" || m == "jz" || m == "jne" || m == "jnz" ||
+           m == "beq" || m == "bne" || m == "b.eq" || m == "b.ne";
+}
+
+std::vector<std::string> compactOperands(const Instruction& in) {
+    std::vector<std::string> result;
+    const std::string text = compactLower(in.operands);
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        result.push_back(text.substr(start, comma == std::string::npos
+            ? std::string::npos : comma - start));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return result;
+}
+
+bool isAbiAccumulator(const std::string& value) {
+    return value == "eax" || value == "rax" || value == "al" ||
+           value == "r0" || value == "w0" || value == "x0" ||
+           value == "v0" || value == "$v0" || value == "$2" ||
+           value == "r3" || value == "a0" || value == "x10";
+}
+
+bool isDirectBranchAccumulator(const std::string& value) {
+    return value == "v0" || value == "$v0" || value == "$2" ||
+           value == "a0" || value == "x10";
+}
+
+bool isNamedZeroRegister(const std::string& value) {
+    return value == "zero" || value == "$zero";
+}
+
+bool branchTestsAccumulatorForZero(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    const auto operands = compactOperands(in);
+    if ((m == "cbz" || m == "cbnz") && !operands.empty())
+        return operands[0] == "r0" || operands[0] == "w0" || operands[0] == "x0";
+    // MIPS and RISC-V encode the zero comparison in BEQ/BNE itself.
+    if ((m == "beq" || m == "bne") && operands.size() >= 2)
+        return (isDirectBranchAccumulator(operands[0]) && isNamedZeroRegister(operands[1])) ||
+               (isNamedZeroRegister(operands[0]) && isDirectBranchAccumulator(operands[1]));
+    return false;
+}
+
+// Canonical zero comparisons for the supported native ABIs. Restricting this to
+// the ABI return register avoids mistaking an unrelated branch for result flow.
+bool testsAccumulatorForZero(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    const auto operands = compactOperands(in);
+    if (operands.size() < 2) return false;
+    if (m == "test") return isAbiAccumulator(operands[0]) && operands[0] == operands[1];
+    if (m == "cmp")
+        return (isAbiAccumulator(operands[0]) && zeroLiteral(operands[1])) ||
+               (zeroLiteral(operands[0]) && isAbiAccumulator(operands[1]));
+    // PowerPC optionally prefixes the comparison with a CR field operand.
+    if (m == "cmpwi" || m == "cmplwi" || m == "cmpdi" || m == "cmpldi") {
+        const std::string& value = operands[operands.size() - 2];
+        const std::string& zero = operands.back();
+        return value == "r3" && zeroLiteral(zero);
+    }
+    return false;
+}
+
+// BOOL normalization is an x86-specific full-accumulator pattern.  Do not let
+// a low-byte TEST feed it: SETcc writes only AL, and returning that partial EAX
+// without the following MOVZX is not a valid normalized Win32 BOOL result.
+bool testsFullX86AccumulatorForZero(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    const std::string o = compactLower(in.operands);
+    const size_t comma = o.find(',');
+    if (comma == std::string::npos) return false;
+    const std::string a = o.substr(0, comma);
+    const std::string b = o.substr(comma + 1);
+    auto accumulator = [](const std::string& value) {
+        return value == "eax" || value == "rax";
+    };
+    if (m == "test") return accumulator(a) && a == b;
+    if (m == "cmp")
+        return (accumulator(a) && zeroLiteral(b)) ||
+               (zeroLiteral(a) && accumulator(b));
+    return false;
+}
+
+bool setsZeroEqualityIntoAl(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    if (m != "sete" && m != "setz" && m != "setne" && m != "setnz") return false;
+    return compactLower(in.operands) == "al";
+}
+
+bool zeroExtendsAlIntoEax(const Instruction& in) {
+    return nameKey(in.mnemonic) == "movzx" && compactLower(in.operands) == "eax,al";
+}
+
+bool setsZeroEqualityIntoAarch64Accumulator(const Instruction& in) {
+    if (nameKey(in.mnemonic) != "cset") return false;
+    const auto operands = compactOperands(in);
+    if (operands.size() != 2 || (operands[0] != "w0" && operands[0] != "x0"))
+        return false;
+    return operands[1] == "eq" || operands[1] == "ne";
+}
+
+bool normalizesAccumulatorDirectly(const Instruction& in) {
+    const std::string m = nameKey(in.mnemonic);
+    if (m != "seqz" && m != "snez") return false;
+    const auto operands = compactOperands(in);
+    return operands.size() == 2 && isDirectBranchAccumulator(operands[0]) &&
+           operands[0] == operands[1];
+}
+
+// A direct BOOL-return wrapper commonly tears down its ABI frame between the
+// imported call and RET.  These operations leave EAX intact; no other work is
+// allowed in the direct-return pattern.
+bool isReturnValueTransparentFrameOp(const Instruction& in) {
+    if (isFrameNoise(in, false)) return true;
+    const std::string m = nameKey(in.mnemonic);
+    const std::string o = compactLower(in.operands);
+    const size_t comma = o.find(',');
+    const std::string dst = o.substr(0, comma);
+    if (m == "add" && (dst == "rsp" || dst == "esp")) return true;
+    if (m == "mov" && (o == "rsp,rbp" || o == "esp,ebp")) return true;
+    if (m == "pop" && o != "rax" && o != "eax" && o != "ax" &&
+        o != "al" && o != "ah") return true;
+    return m == "lea" && (dst == "rsp" || dst == "esp");
 }
 
 bool zeroesAccumulator(const Instruction& in) {
@@ -311,13 +1016,8 @@ bool writesAccumulator(const Instruction& in) {
 } // namespace
 
 std::string ToSnakeIdentifier(const std::string& api) {
-    std::string a = bareApi(api);
+    std::string a = undecoratedImportName(api);
     if (a.empty() || a[0] == '?') return {};
-    size_t i = 0; while (i < a.size() && a[i] == '_') ++i;
-    a.erase(0, i);
-    std::string low = nameKey(a);
-    if (low.rfind("imp_", 0) == 0) a.erase(0, 4);      // __imp_Foo -> Foo
-    if (size_t at = a.find('@'); at != std::string::npos) a.resize(at);
     // Drop a trailing ANSI/Wide variant suffix ("CreateFileW" -> "CreateFile").
     if (a.size() >= 2 && (a.back() == 'A' || a.back() == 'W') &&
         std::islower((unsigned char)a[a.size() - 2]))
@@ -367,8 +1067,39 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
     if (e.retOnly && e.callCount == 0) { set("nullsub", "empty stub (returns immediately)"); return g; }
     if (e.retZero && e.callCount == 0) { set("ret_zero", "returns 0"); return g; }
 
-    // 4) Semantic name from the set of imported APIs it calls.
+    // 4) Subject + operation synthesis.  This is more specific than the generic
+    // API-set verbs below, but it is allowed only when two independent evidence
+    // kinds agree and the function remains within conservative complexity bounds.
+    if (GuessedName contextual = contextualSemanticGuess(e); contextual.guessed)
+        return contextual;
+
+    // 5) A dedicated connectivity predicate whose Boolean result is itself
+    // checked/returned.  The API alone is insufficient: it may be one small
+    // part of a larger worker.  A dedicated check may combine multiple exact
+    // connectivity predicates, but any other imported behavior is a veto.
     if (!e.apis.empty()) {
+        const std::string connectivityApi = connectivityPredicateIn(e.apis);
+        const bool predicateUse = e.connectivityResultChecked ||
+                                  e.connectivityResultReturned;
+        constexpr int kMaxConnectivityInstructions = 96;
+        constexpr int kMaxConnectivityCalls = 4;
+        if (!connectivityApi.empty() && predicateUse &&
+            e.instrCount > 0 && e.callCount > 0 &&
+            e.instrCount <= kMaxConnectivityInstructions &&
+            e.callCount <= kMaxConnectivityCalls &&
+            hasOnlyConnectivityPredicateApis(e.apis) &&
+            !hasTransportOrPayloadApi(e.apis)) {
+            std::string reason;
+            if (e.connectivityResultChecked)
+                reason = "branches on " + connectivityApi + " connectivity result";
+            else
+                reason = "returns " + connectivityApi + " connectivity result directly";
+            reason += "; no non-predicate API calls observed";
+            set("WifiCheck", std::move(reason));
+            return g;
+        }
+
+        // 6) Semantic name from the set of imported APIs it calls.
         std::string s = semanticName(e.apis);
         if (!s.empty()) {
             std::string r = "calls " + joinApis(e.apis);
@@ -376,7 +1107,7 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
             set(std::move(s), std::move(r));
             return g;
         }
-        // 5) Thin wrapper around exactly one notable API.
+        // 7) Thin wrapper around exactly one notable API.
         if (e.apis.size() == 1 && e.callCount <= 2 && e.instrCount <= 24) {
             if (std::string name = ToSnakeIdentifier(e.apis[0]); !name.empty()) {
                 set(std::move(name), "wrapper around " + e.apis[0]);
@@ -385,7 +1116,7 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
         }
     }
 
-    // 6) A distinctive identifier-like referenced string (embedded symbol name).
+    // 8) A distinctive identifier-like referenced string (embedded symbol name).
     if (std::string id = identifierString(e.strings); !id.empty()) {
         set(id, "references \"" + id + "\"");
         return g;
@@ -424,8 +1155,9 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         std::string nm;
         if (HasBranchTarget(in) && importNameFor) nm = importNameFor(in.branchTarget);
         if (nm.empty()) {
-            uint64_t mem = instrDataRef(in);                     // call/jmp [iat]
-            if (mem && importNameFor) nm = importNameFor(mem);
+            uint64_t mem = 0;
+            if (TryGetInstrDataRef(in, mem) && importNameFor)    // call/jmp [iat]
+                nm = importNameFor(mem);
         }
         return nm;
     };
@@ -501,21 +1233,67 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         int meaningful = 0;     // instrs that aren't padding/frame noise
         int retCount = 0;
         bool accKnownZero = false, allReturnsZero = true, hasControlBranch = false;
+        // Track the first local use of any imported API's accumulator result.
+        // The old connectivity-only state could prove WifiCheck but could not
+        // tell a checked memcmp from a checked CryptHashData status.
+        std::string resultAccumulatorApi;
+        std::string resultCompareApi;
+        std::string resultX86CompareApi;
+        std::string resultSetccAlApi;
+        std::string resultNormalizedAccumulatorApi;
+        auto clearResultFlow = [&] {
+            resultAccumulatorApi.clear();
+            resultCompareApi.clear();
+            resultX86CompareApi.clear();
+            resultSetccAlApi.clear();
+            resultNormalizedAccumulatorApi.clear();
+        };
+        auto recordResultUse = [&](const std::string& api, bool checked,
+                                   bool returned, bool normalizedReturned) {
+            const std::string key = compactApiKey(api);
+            if (key.empty()) return;
+            auto it = std::find_if(e.apiResultUses.begin(), e.apiResultUses.end(),
+                [&](const ApiResultUseEvidence& existing) {
+                    return compactApiKey(existing.api) == key;
+                });
+            if (it == e.apiResultUses.end()) {
+                if (e.apiResultUses.size() >= 32) return;
+                e.apiResultUses.push_back({api, checked, returned, normalizedReturned});
+            } else {
+                it->checked = it->checked || checked;
+                it->returned = it->returned || returned;
+                it->normalizedReturned = it->normalizedReturned || normalizedReturned;
+            }
+            if (isConnectivityPredicateApi(api)) {
+                e.connectivityResultChecked = e.connectivityResultChecked || checked;
+                e.connectivityResultReturned = e.connectivityResultReturned || returned;
+            }
+        };
         std::unordered_set<std::string> apiSeen, strSeen;
         for (const auto& in : insns) {
             ++e.instrCount;
             bool noise = isFrameNoise(in, retCount != 0);
             if (!noise) ++meaningful;
-            if (in.isRet) {
+            const bool instructionCall = InstructionIsCall(in);
+            const bool instructionReturn = InstructionIsReturn(in);
+            if (instructionReturn) {
+                if (!resultNormalizedAccumulatorApi.empty())
+                    recordResultUse(resultNormalizedAccumulatorApi, false, true, true);
+                else if (!resultAccumulatorApi.empty())
+                    recordResultUse(resultAccumulatorApi, false, true, false);
+                clearResultFlow();
                 ++retCount;
                 allReturnsZero = allReturnsZero && accKnownZero;
                 continue;
             }
-            if (in.isBranch && !in.isCall) hasControlBranch = true;
+            if ((in.isBranch && !instructionCall) ||
+                (in.flow.kind != FlowKind::None && InstructionEndsBlock(in)))
+                hasControlBranch = true;
 
-            if (in.isCall) {
+            if (instructionCall) {
                 ++e.callCount;
                 accKnownZero = false;                                // x86 calls return through eax/rax
+                clearResultFlow();
                 std::string nm = resolveTargetApi(in);
                 if (nm.empty() && HasBranchTarget(in)) {             // call to another local fn?
                     if (in.branchTarget == f.address) e.selfRecursive = true;
@@ -523,13 +1301,71 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                         nm = it->second.api;                          // call to a thunk -> its API
                 }
                 std::string bare = bareApi(nm);
-                if (!bare.empty() && !isNoiseApi(bare) && apiSeen.insert(norm(bare)).second)
-                    e.apis.push_back(bare);
+                if (!bare.empty() && !isNoiseApi(bare)) {
+                    resultAccumulatorApi = bare;
+                    if (e.apiCallSequence.size() < 64) e.apiCallSequence.push_back(bare);
+                    if (apiSeen.insert(norm(bare)).second) e.apis.push_back(bare);
+                }
             } else {
+                if (isConditionalBranch(in)) {
+                    if (!resultCompareApi.empty() && isZeroEqualityBranch(in))
+                        recordResultUse(resultCompareApi, true, false, false);
+                    else if (!resultAccumulatorApi.empty() && branchTestsAccumulatorForZero(in))
+                        recordResultUse(resultAccumulatorApi, true, false, false);
+                    // A linear scan cannot safely follow the accumulator through
+                    // both successors.  The decision evidence above is enough.
+                    clearResultFlow();
+                } else if (!resultAccumulatorApi.empty() &&
+                           normalizesAccumulatorDirectly(in)) {
+                    const std::string source = resultAccumulatorApi;
+                    clearResultFlow();
+                    resultAccumulatorApi = source;
+                    resultNormalizedAccumulatorApi = source;
+                } else if (!resultAccumulatorApi.empty() && testsAccumulatorForZero(in)) {
+                    resultCompareApi = resultAccumulatorApi;
+                    resultX86CompareApi = testsFullX86AccumulatorForZero(in)
+                        ? resultAccumulatorApi : std::string();
+                    resultSetccAlApi.clear();
+                    resultNormalizedAccumulatorApi.clear();
+                } else if (!resultCompareApi.empty() &&
+                           setsZeroEqualityIntoAarch64Accumulator(in)) {
+                    const std::string source = resultCompareApi;
+                    clearResultFlow();
+                    resultAccumulatorApi = source;
+                    resultNormalizedAccumulatorApi = source;
+                } else if (!resultX86CompareApi.empty() && setsZeroEqualityIntoAl(in)) {
+                    // SETE/SETNE consumes the immediately preceding zero-test
+                    // flags, but AL is only a partial architectural return. Wait
+                    // for the canonical MOVZX before granting return evidence.
+                    resultAccumulatorApi.clear();
+                    resultCompareApi.clear();
+                    resultSetccAlApi = resultX86CompareApi;
+                    resultX86CompareApi.clear();
+                    resultNormalizedAccumulatorApi.clear();
+                } else if (!resultSetccAlApi.empty() && zeroExtendsAlIntoEax(in)) {
+                    resultAccumulatorApi = resultSetccAlApi;
+                    resultCompareApi.clear();
+                    resultX86CompareApi.clear();
+                    resultNormalizedAccumulatorApi = resultSetccAlApi;
+                    resultSetccAlApi.clear();
+                } else if (isReturnValueTransparentFrameOp(in)) {
+                    // Preserve EAX across ABI teardown. Only true frame-noise
+                    // instructions may also sit between TEST/CMP and its Jcc;
+                    // ADD rsp/esp changes flags and therefore breaks that pair.
+                    if (!noise) {
+                        resultCompareApi.clear();
+                        resultX86CompareApi.clear();
+                        resultSetccAlApi.clear();
+                    }
+                } else {
+                    clearResultFlow();
+                }
+
                 // String reference?
-                uint64_t d = instrDataRef(in);
-                if (!d) d = instrImmRef(in);                         // x86-32 mov/push offset string
-                if (d && stringRefFor) {
+                uint64_t d = 0;
+                bool hasDataRef = TryGetInstrDataRef(in, d);
+                if (!hasDataRef) hasDataRef = TryGetInstrImmRef(in, d); // x86-32 offset string, VA 0 valid
+                if (hasDataRef && stringRefFor) {
                     std::string s = stringRefFor(d);
                     if (!s.empty() && e.strings.size() < 32 && strSeen.insert(s).second)
                         e.strings.push_back(s);

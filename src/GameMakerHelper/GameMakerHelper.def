@@ -1,0 +1,9 @@
+LIBRARY GameMakerHelper
+EXPORTS
+    DsGmlInitialize
+    DsGmlShutdown
+    DsGmlDispatchGate
+    DsGmlEntryGate
+    DsGmlInstanceConstructorGate
+    DsGmlInstanceDestructorGate
+    gDsGmlActiveGates DATA

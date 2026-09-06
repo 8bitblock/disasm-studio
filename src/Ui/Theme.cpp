@@ -29,13 +29,18 @@ static Palette PaletteFor(ThemeId id) {
     switch (id) {
         default:
         case ThemeId::Midnight:
-            p.bg0=V(0.082f,0.090f,0.110f); p.bg1=V(0.110f,0.120f,0.145f);
-            p.bg2=V(0.145f,0.158f,0.190f); p.bg3=V(0.180f,0.196f,0.235f);
-            p.child=V(0.095f,0.103f,0.125f); p.popup=V(0.075f,0.082f,0.100f,0.98f); p.menubar=V(0.105f,0.114f,0.138f);
-            p.text=V(0.90f,0.91f,0.93f); p.muted=V(0.55f,0.58f,0.64f); p.border=V(0.24f,0.26f,0.30f,0.60f);
-            p.accent=V(0.26f,0.59f,0.98f); p.good=V(0.40f,0.85f,0.50f); p.warn=V(0.95f,0.74f,0.35f);
-            p.bad=V(0.93f,0.45f,0.45f); p.call=V(0.45f,0.72f,1.00f); p.branch=V(0.95f,0.78f,0.42f);
-            p.jump=V(0.72f,0.52f,0.98f);
+            // DisasmStudio Midnight: near-black navy canvas, subtly lifted
+            // graphite panels, crisp blue-gray dividers, and one cyan-blue
+            // interaction accent.  The restrained surface contrast keeps dense
+            // disassembly and data tables readable without looking like a stack
+            // of unrelated cards.
+            p.bg0=V(0.024f,0.047f,0.066f); p.bg1=V(0.041f,0.078f,0.106f);
+            p.bg2=V(0.063f,0.129f,0.176f); p.bg3=V(0.082f,0.184f,0.255f);
+            p.child=V(0.029f,0.059f,0.082f); p.popup=V(0.020f,0.041f,0.058f,0.985f); p.menubar=V(0.027f,0.055f,0.075f);
+            p.text=V(0.855f,0.894f,0.925f); p.muted=V(0.500f,0.570f,0.630f); p.border=V(0.122f,0.196f,0.251f);
+            p.accent=V(0.055f,0.553f,0.890f); p.good=V(0.302f,0.773f,0.420f); p.warn=V(0.945f,0.690f,0.251f);
+            p.bad=V(0.965f,0.294f,0.263f); p.call=V(0.235f,0.671f,0.973f); p.branch=V(0.945f,0.735f,0.345f);
+            p.jump=V(0.690f,0.455f,0.941f);
             break;
         case ThemeId::Slate:
             p.bg0=V(0.110f,0.118f,0.128f); p.bg1=V(0.150f,0.160f,0.172f);
@@ -120,16 +125,16 @@ static Palette PaletteFor(ThemeId id) {
 
 // Current theme + its resolved palette. Initialized to the default so the col::*
 // helpers are valid even before ApplyTheme() is first called.
-static ThemeId g_theme   = ThemeId::Paper;
-static Palette g_pal     = PaletteFor(ThemeId::Paper);
+static ThemeId g_theme   = ThemeId::Midnight;
+static Palette g_pal     = PaletteFor(ThemeId::Midnight);
 static float   g_scale   = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
-static Density g_density = Density::Comfortable;   // roomier default
+static Density g_density = Density::Compact;       // dense RE-workbench default
 
 // Spacing/padding multiplier for the current density (applied on top of HiDPI k).
-// Comfortable = 1.0 is the new baseline; Compact is the old tighter look.
+// Comfortable = 1.0 is the baseline; Compact is intentionally information-dense.
 static float densityFactor() {
     switch (g_density) {
-        case Density::Compact:  return 0.88f;
+        case Density::Compact:  return 0.82f;
         case Density::Spacious: return 1.18f;
         default:                return 1.0f;
     }
@@ -142,29 +147,32 @@ static void applyMetrics() {
     // Borders are rasterized as lines, so keep their physical thickness on an
     // integer pixel even at fractional Windows DPI scales (125%, 150%, ...).
     const float linePx = std::max(1.0f, std::round(k));
-    const float separatorPx = std::max(1.0f, std::round(2.0f * k));
-    s.WindowRounding    = 6.0f * k;
-    s.ChildRounding     = 6.0f * k;
-    s.FrameRounding     = 5.0f * k;
-    s.PopupRounding     = 5.0f * k;
-    s.ScrollbarRounding = 9.0f * k;
-    s.GrabRounding      = 4.0f * k;
-    s.TabRounding       = 6.0f * k;
+    const float separatorPx = linePx;
+    // Workbench surfaces are contiguous IDE panes, not floating cards.  Keep
+    // rounding for dialogs/popups, but make child panels and tabs share crisp
+    // square edges like the approved desktop concept.
+    s.WindowRounding    = 4.0f * k;
+    s.ChildRounding     = 0.0f;
+    s.FrameRounding     = 2.0f * k;
+    s.PopupRounding     = 4.0f * k;
+    s.ScrollbarRounding = 2.0f * k;
+    s.GrabRounding      = 2.0f * k;
+    s.TabRounding       = 0.0f;
 
     s.WindowBorderSize  = linePx;
     s.ChildBorderSize   = linePx;
-    s.FrameBorderSize   = 0.0f;
+    s.FrameBorderSize   = linePx;
     s.TabBorderSize     = 0.0f;
     s.PopupBorderSize   = linePx;
 
-    s.WindowPadding     = ImVec2(12 * d, 12 * d);
-    s.FramePadding      = ImVec2(10 * d, 6 * d);
-    s.CellPadding       = ImVec2(8 * d, 5 * d);
-    s.ItemSpacing       = ImVec2(10 * d, 8 * d);
-    s.ItemInnerSpacing  = ImVec2(8 * d, 6 * d);
-    s.IndentSpacing     = 20.0f * d;
-    s.ScrollbarSize     = 14.0f * d;
-    s.GrabMinSize       = 12.0f * d;
+    s.WindowPadding     = ImVec2(7.0f * d, 6.0f * d);
+    s.FramePadding      = ImVec2(7.0f * d, 3.0f * d);
+    s.CellPadding       = ImVec2(7.0f * d, 2.0f * d);
+    s.ItemSpacing       = ImVec2(7.0f * d, 4.0f * d);
+    s.ItemInnerSpacing  = ImVec2(5.0f * d, 3.0f * d);
+    s.IndentSpacing     = 16.0f * d;
+    s.ScrollbarSize     = 11.0f * d;
+    s.GrabMinSize       = 9.0f * d;
 
     s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
@@ -174,7 +182,9 @@ static void applyMetrics() {
 static void applyColors(const Palette& p) {
     ImVec4* c = ImGui::GetStyle().Colors;
     const ImVec4 acc    = p.accent;
-    const ImVec4 accDim = ImVec4(acc.x, acc.y, acc.z, 0.40f);
+    const ImVec4 accDim = ImVec4(acc.x, acc.y, acc.z, 0.34f);
+    const ImVec4 accSoft = mix(p.bg1, acc, 0.22f);
+    const ImVec4 rowAlt = mix(p.child, p.bg1, 0.34f);
 
     c[ImGuiCol_Text]                  = p.text;
     c[ImGuiCol_TextDisabled]          = p.muted;
@@ -197,31 +207,38 @@ static void applyColors(const Palette& p) {
     c[ImGuiCol_CheckMark]             = acc;
     c[ImGuiCol_SliderGrab]            = acc;
     c[ImGuiCol_SliderGrabActive]      = acc;
-    c[ImGuiCol_Button]                = mix(p.bg1, acc, 0.14f);
-    c[ImGuiCol_ButtonHovered]         = mix(p.bg1, acc, 0.50f);
-    c[ImGuiCol_ButtonActive]          = acc;
-    c[ImGuiCol_Header]                = mix(p.bg1, acc, 0.22f);
-    c[ImGuiCol_HeaderHovered]         = mix(p.bg1, acc, 0.50f);
-    c[ImGuiCol_HeaderActive]          = accDim;
+    c[ImGuiCol_Button]                = mix(p.bg1, p.bg2, 0.38f);
+    c[ImGuiCol_ButtonHovered]         = mix(p.bg1, acc, 0.42f);
+    c[ImGuiCol_ButtonActive]          = mix(p.bg1, acc, 0.68f);
+    c[ImGuiCol_Header]                = accSoft;
+    c[ImGuiCol_HeaderHovered]         = mix(p.bg1, acc, 0.42f);
+    c[ImGuiCol_HeaderActive]          = mix(p.bg1, acc, 0.58f);
     c[ImGuiCol_Separator]             = p.border;
     c[ImGuiCol_SeparatorHovered]      = accDim;
     c[ImGuiCol_SeparatorActive]       = acc;
     c[ImGuiCol_ResizeGrip]            = mix(p.bg2, p.bg0, 0.30f);
     c[ImGuiCol_ResizeGripHovered]     = accDim;
     c[ImGuiCol_ResizeGripActive]      = acc;
-    c[ImGuiCol_Tab]                   = mix(p.bg0, p.bg1, 0.60f);
-    c[ImGuiCol_TabHovered]            = mix(p.bg1, acc, 0.50f);
-    c[ImGuiCol_TabActive]             = mix(p.bg1, acc, 0.30f);
+    c[ImGuiCol_Tab]                   = mix(p.bg0, p.bg1, 0.58f);
+    c[ImGuiCol_TabHovered]            = mix(p.bg1, acc, 0.38f);
+    c[ImGuiCol_TabActive]             = mix(p.bg1, acc, 0.24f);
     c[ImGuiCol_TabUnfocused]          = p.bg0;
-    c[ImGuiCol_TabUnfocusedActive]    = mix(p.bg1, acc, 0.14f);
-    c[ImGuiCol_TableHeaderBg]         = mix(p.bg1, p.bg2, 0.50f);
+    c[ImGuiCol_TabUnfocusedActive]    = mix(p.bg1, acc, 0.12f);
+    c[ImGuiCol_TableHeaderBg]         = mix(p.bg1, p.bg2, 0.34f);
     c[ImGuiCol_TableBorderStrong]     = p.border;
-    c[ImGuiCol_TableBorderLight]      = mix(p.border, p.bg1, 0.50f);
+    c[ImGuiCol_TableBorderLight]      = mix(p.border, p.bg1, 0.38f);
     c[ImGuiCol_TableRowBg]            = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]         = p.light ? ImVec4(0, 0, 0, 0.030f) : ImVec4(1, 1, 1, 0.025f);
+    c[ImGuiCol_TableRowBgAlt]         = p.light ? ImVec4(0, 0, 0, 0.030f) : rowAlt;
     c[ImGuiCol_TextSelectedBg]        = accDim;
     c[ImGuiCol_DragDropTarget]        = p.warn;
     c[ImGuiCol_NavHighlight]          = acc;
+    c[ImGuiCol_PlotLines]             = p.call;
+    c[ImGuiCol_PlotLinesHovered]      = p.warn;
+    c[ImGuiCol_PlotHistogram]         = p.accent;
+    c[ImGuiCol_PlotHistogramHovered]  = p.warn;
+    c[ImGuiCol_NavWindowingHighlight] = p.text;
+    c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.0f, 0.0f, 0.0f, p.light ? 0.12f : 0.32f);
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.0f, 0.0f, 0.0f, p.light ? 0.18f : 0.54f);
 }
 
 } // namespace

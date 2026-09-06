@@ -3,6 +3,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
+#include <stdexcept>
+#include <unordered_set>
 
 namespace ds::json {
 
@@ -107,8 +110,10 @@ namespace {
 struct Parser {
     const char* p;
     const char* end;
-    int depth = 0;                          // current container nesting
-    static constexpr int kMaxDepth = 200;   // reject pathologically deep input
+    const JsonParseLimits& limits;
+    size_t depth = 0;                       // current container nesting
+    size_t nodes = 0;                       // scalar + container values
+    size_t stringBytes = 0;                 // decoded keys and string values
 
     void skipWs() {
         while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p;
@@ -117,10 +122,17 @@ struct Parser {
     bool parseValue(Value& out) {
         skipWs();
         if (p >= end) return false;
-        if (depth >= kMaxDepth) return false;   // too deeply nested -> reject, don't overflow the stack
+        if (nodes >= limits.maxNodes) return false;
+        ++nodes;
         switch (*p) {
-            case '{': { ++depth; bool ok = parseObject(out); --depth; return ok; }
-            case '[': { ++depth; bool ok = parseArray(out);  --depth; return ok; }
+            case '{': {
+                if (depth >= limits.maxDepth) return false;
+                ++depth; bool ok = parseObject(out); --depth; return ok;
+            }
+            case '[': {
+                if (depth >= limits.maxDepth) return false;
+                ++depth; bool ok = parseArray(out); --depth; return ok;
+            }
             case '"': { std::string s; if (!parseString(s)) return false; out = Value::Str(std::move(s)); return true; }
             case 't': return lit("true",  4) && (out = Value::Bool(true),  true);
             case 'f': return lit("false", 5) && (out = Value::Bool(false), true);
@@ -137,14 +149,42 @@ struct Parser {
 
     bool parseNumber(Value& out) {
         const char* s = p;
-        if (p < end && (*p == '-' || *p == '+')) ++p;
-        bool any = false;
-        while (p < end && ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' || *p == 'E' || *p == '+' || *p == '-')) { ++p; any = true; }
-        if (!any) return false;
+        auto take = [&]() {
+            if (static_cast<size_t>(p - s) >= limits.maxNumberTokenBytes) return false;
+            ++p;
+            return true;
+        };
+        // RFC 8259 number grammar. In particular, leading '+', leading '.',
+        // leading zeroes, a bare decimal point, and incomplete exponents are
+        // malformed rather than values to be permissively repaired by strtod.
+        if (p < end && *p == '-' && !take()) return false;
+        if (p >= end) return false;
+        if (*p == '0') {
+            if (!take()) return false;
+            if (p < end && *p >= '0' && *p <= '9') return false;
+        } else if (*p >= '1' && *p <= '9') {
+            do { if (!take()) return false; }
+            while (p < end && *p >= '0' && *p <= '9');
+        } else {
+            return false;
+        }
+        if (p < end && *p == '.') {
+            if (!take() || p >= end || *p < '0' || *p > '9') return false;
+            do { if (!take()) return false; }
+            while (p < end && *p >= '0' && *p <= '9');
+        }
+        if (p < end && (*p == 'e' || *p == 'E')) {
+            if (!take()) return false;
+            if (p < end && (*p == '+' || *p == '-'))
+                if (!take()) return false;
+            if (p >= end || *p < '0' || *p > '9') return false;
+            do { if (!take()) return false; }
+            while (p < end && *p >= '0' && *p <= '9');
+        }
         std::string tok(s, p);
         char* e = nullptr;
         double d = std::strtod(tok.c_str(), &e);
-        if (e != tok.c_str() + tok.size()) return false;  // junk/malformed token ("1e", ".", "--5")
+        if (e != tok.c_str() + tok.size() || !std::isfinite(d)) return false;
         out = Value::Num(d);
         return true;
     }
@@ -152,21 +192,27 @@ struct Parser {
     bool parseString(std::string& out) {
         if (p >= end || *p != '"') return false;
         ++p;
+        const char* tokenStart = p;
         while (p < end) {
+            if (static_cast<size_t>(p - tokenStart) >= limits.maxStringTokenBytes &&
+                *p != '"')
+                return false;
             char c = *p++;
-            if (c == '"') return true;
+            if (c == '"')
+                return static_cast<size_t>((p - 1) - tokenStart) <= limits.maxStringTokenBytes &&
+                       out.size() <= limits.maxStringTokenBytes;
             if (c == '\\') {
                 if (p >= end) return false;
                 char e = *p++;
                 switch (e) {
-                    case '"':  out += '"';  break;
-                    case '\\': out += '\\'; break;
-                    case '/':  out += '/';  break;
-                    case 'n':  out += '\n'; break;
-                    case 't':  out += '\t'; break;
-                    case 'r':  out += '\r'; break;
-                    case 'b':  out += '\b'; break;
-                    case 'f':  out += '\f'; break;
+                    case '"':  if (!appendByte(out, '"')) return false;  break;
+                    case '\\': if (!appendByte(out, '\\')) return false; break;
+                    case '/':  if (!appendByte(out, '/')) return false;  break;
+                    case 'n':  if (!appendByte(out, '\n')) return false; break;
+                    case 't':  if (!appendByte(out, '\t')) return false; break;
+                    case 'r':  if (!appendByte(out, '\r')) return false; break;
+                    case 'b':  if (!appendByte(out, '\b')) return false; break;
+                    case 'f':  if (!appendByte(out, '\f')) return false; break;
                     case 'u': {
                         if (end - p < 4) return false;
                         unsigned cp = 0;
@@ -194,19 +240,50 @@ struct Parser {
                             cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
                         }
                         // Encode the code point as UTF-8.
-                        if (cp < 0x80) out += (char)cp;
-                        else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
-                        else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
-                        else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+                        if (!appendCodePoint(out, cp)) return false;
                         break;
                     }
                     default: return false;
                 }
             } else {
-                out += c;
+                // RFC 8259 requires U+0000..U+001F to be escaped.
+                if (static_cast<unsigned char>(c) < 0x20 || !appendByte(out, c)) return false;
             }
         }
         return false; // unterminated
+    }
+
+    bool appendByte(std::string& out, char value) {
+        if (stringBytes >= limits.maxStringBytes || out.size() >= limits.maxStringTokenBytes)
+            return false;
+        out.push_back(value);
+        ++stringBytes;
+        return true;
+    }
+
+    bool appendCodePoint(std::string& out, unsigned cp) {
+        char encoded[4]{};
+        size_t count = 0;
+        if (cp < 0x80) encoded[count++] = static_cast<char>(cp);
+        else if (cp < 0x800) {
+            encoded[count++] = static_cast<char>(0xC0 | (cp >> 6));
+            encoded[count++] = static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            encoded[count++] = static_cast<char>(0xE0 | (cp >> 12));
+            encoded[count++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            encoded[count++] = static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            encoded[count++] = static_cast<char>(0xF0 | (cp >> 18));
+            encoded[count++] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            encoded[count++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            encoded[count++] = static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        if (count > limits.maxStringBytes || stringBytes > limits.maxStringBytes - count ||
+            count > limits.maxStringTokenBytes || out.size() > limits.maxStringTokenBytes - count)
+            return false;
+        out.append(encoded, count);
+        stringBytes += count;
+        return true;
     }
 
     bool parseArray(Value& out) {
@@ -215,6 +292,7 @@ struct Parser {
         skipWs();
         if (p < end && *p == ']') { ++p; return true; }
         while (true) {
+            if (out.arr.size() >= limits.maxContainerEntries) return false;
             Value v;
             if (!parseValue(v)) return false;
             out.arr.push_back(std::move(v));
@@ -229,12 +307,22 @@ struct Parser {
     bool parseObject(Value& out) {
         ++p; // {
         out = Value::Obj();
+        // RFC 8259 permits parsers to choose how duplicate names are exposed,
+        // but accepting them is unsafe for authoritative sidecars: a producer
+        // and consumer can otherwise disagree about whether the first or last
+        // value wins.  Check decoded names (so "a" and "\u0061" collide) at
+        // every object depth.  The parser's per-container and cumulative
+        // string budgets bound this auxiliary set, while hashing avoids the
+        // quadratic scan that a hostile maximum-sized object would trigger.
+        std::unordered_set<std::string> keys;
         skipWs();
         if (p < end && *p == '}') { ++p; return true; }
         while (true) {
+            if (out.obj.size() >= limits.maxContainerEntries) return false;
             skipWs();
             std::string key;
             if (!parseString(key)) return false;
+            if (!keys.emplace(key).second) return false;
             skipWs();
             if (p >= end || *p != ':') return false;
             ++p;
@@ -252,13 +340,28 @@ struct Parser {
 } // namespace
 
 bool Parse(const std::string& text, Value& out) {
-    Parser ps{ text.c_str(), text.c_str() + text.size() };
-    Value v;
-    if (!ps.parseValue(v)) return false;
-    ps.skipWs();
-    if (ps.p != ps.end) return false; // trailing garbage
-    out = std::move(v);
-    return true;
+    static const JsonParseLimits defaults{};
+    return Parse(text, out, defaults);
+}
+
+bool Parse(const std::string& text, Value& out, const JsonParseLimits& limits) {
+    if (!limits.maxDepth || !limits.maxNodes || !limits.maxStringBytes ||
+        !limits.maxContainerEntries || !limits.maxStringTokenBytes ||
+        !limits.maxNumberTokenBytes)
+        return false;
+    try {
+        Parser ps{ text.c_str(), text.c_str() + text.size(), limits };
+        Value v;
+        if (!ps.parseValue(v)) return false;
+        ps.skipWs();
+        if (ps.p != ps.end) return false; // trailing garbage
+        out = std::move(v);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    } catch (const std::length_error&) {
+        return false;
+    }
 }
 
 } // namespace ds::json

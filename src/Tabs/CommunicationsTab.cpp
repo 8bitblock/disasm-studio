@@ -4,6 +4,8 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include "../Core/JvmAttach.h"
+#include "../Core/NetworkEndpoint.h"
+#include "../Core/GameMakerArchive.h"
 #include "../Disasm/JvmDisassembler.h"
 #include "../Ui/Icons.h"
 #include "../Ui/Theme.h"
@@ -11,16 +13,31 @@
 #include "imgui.h"
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <new>
+#include <utility>
 
 namespace ds {
 
-static void fmtEndpoint(unsigned long addr, unsigned long port, char* out, size_t n) {
-    struct in_addr a; a.S_un.S_addr = (ULONG)addr;
-    char ip[INET_ADDRSTRLEN] = {0};
-    inet_ntop(AF_INET, &a, ip, sizeof(ip));
-    std::snprintf(out, n, "%s:%u", ip, (unsigned)ntohs((u_short)port));
+CommunicationsTab::CommunicationsTab() {
+    connWorker_ = std::jthread([this](std::stop_token stop) {
+        connectionWorkerLoop(stop);
+    });
+}
+
+CommunicationsTab::~CommunicationsTab() {
+    desiredConnEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(connWorkerMutex_);
+        pendingConnJob_.reset();
+        readyConnResult_.reset();
+    }
+    connWorker_.request_stop();
+    connWorkerCv_.notify_all();
+    if (connWorker_.joinable()) connWorker_.join();
 }
 
 static const char* tcpStateName(unsigned long s) {
@@ -41,98 +58,278 @@ static const char* tcpStateName(unsigned long s) {
     }
 }
 
-// Enumerate the IPv4 TCP/UDP endpoints owned by `pid` (IP Helper API).
-void CommunicationsTab::refreshConnections(uint32_t pid) {
-    conns_.clear();
-    connsForPid_ = pid;
-    if (!pid) return;
-
-    // Size-then-fetch with a bounded retry: the table can grow between the size
-    // query and the fetch, in which case the fetch returns ERROR_INSUFFICIENT_BUFFER
-    // with `sz` updated — retry with the larger buffer instead of silently dropping.
-    std::vector<uint8_t> buf;
-    DWORD sz = 0;
-    GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    for (int attempt = 0; sz && attempt < 3; ++attempt) {
-        buf.assign(sz, 0);
-        DWORD rc = GetExtendedTcpTable(buf.data(), &sz, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-        if (rc == NO_ERROR) {
-            auto* t = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
-            for (DWORD i = 0; i < t->dwNumEntries; ++i) {
-                const auto& r = t->table[i];
-                if (r.dwOwningPid != pid) continue;
-                char ls[64], rs[64];
-                fmtEndpoint(r.dwLocalAddr, r.dwLocalPort, ls, sizeof(ls));
-                fmtEndpoint(r.dwRemoteAddr, r.dwRemotePort, rs, sizeof(rs));
-                conns_.push_back({ std::string(ls) + "  ->  " + rs, "TCP", tcpStateName(r.dwState) });
-            }
-            break;
-        }
-        if (rc != ERROR_INSUFFICIENT_BUFFER) break;   // sz was updated; loop reallocates
+template <typename Fetch>
+static DWORD fetchIpTableBounded(Fetch&& fetch, std::vector<uint8_t>& buffer) {
+    constexpr DWORD kMaxTableBytes = 64u * 1024u * 1024u;
+    DWORD size = 0;
+    DWORD rc = fetch(nullptr, &size);
+    if (rc == NO_ERROR && !size) { buffer.clear(); return NO_ERROR; }
+    if (rc != ERROR_INSUFFICIENT_BUFFER && rc != NO_ERROR) return rc;
+    for (int attempt = 0; size && attempt < 3; ++attempt) {
+        if (size > kMaxTableBytes) return ERROR_NOT_ENOUGH_MEMORY;
+        try { buffer.assign(size, 0); }
+        catch (const std::bad_alloc&) { return ERROR_NOT_ENOUGH_MEMORY; }
+        rc = fetch(buffer.data(), &size);
+        if (rc == NO_ERROR) return NO_ERROR;
+        if (rc != ERROR_INSUFFICIENT_BUFFER) return rc;
     }
-    sz = 0;
-    GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-    for (int attempt = 0; sz && attempt < 3; ++attempt) {
-        buf.assign(sz, 0);
-        DWORD rc = GetExtendedUdpTable(buf.data(), &sz, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-        if (rc == NO_ERROR) {
-            auto* u = reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(buf.data());
-            for (DWORD i = 0; i < u->dwNumEntries; ++i) {
-                const auto& r = u->table[i];
-                if (r.dwOwningPid != pid) continue;
-                char ls[64];
-                fmtEndpoint(r.dwLocalAddr, r.dwLocalPort, ls, sizeof(ls));
-                conns_.push_back({ ls, "UDP", "listening" });
-            }
-            break;
+    return rc == NO_ERROR ? ERROR_INSUFFICIENT_BUFFER : rc;
+}
+
+template <typename Table, typename Row>
+static size_t boundedTableRows(const std::vector<uint8_t>& buffer, const Table* table) {
+    constexpr size_t header = offsetof(Table, table);
+    if (!table || buffer.size() < header) return 0;
+    return std::min<size_t>(table->dwNumEntries, (buffer.size() - header) / sizeof(Row));
+}
+
+// Enumerate IPv4 + IPv6 TCP/UDP endpoints owned by `job.pid` (IP Helper API).
+// This function is worker-only: it owns every allocation and publishes one
+// immutable result back to the render thread.
+CommunicationsTab::ConnResult
+CommunicationsTab::collectConnections(const ConnJob& job) {
+    ConnResult result;
+    result.epoch = job.epoch;
+    result.pid = job.pid;
+    if (!job.pid) return result;
+
+    // Each of the four tables uses a bounded size/fetch/retry path. A table can
+    // grow between calls; successful families remain visible if another fails.
+    std::vector<uint8_t> buf;
+    auto failure = [&](const char* table, DWORD error) {
+        if (!result.status.empty()) result.status += "; ";
+        result.status += table;
+        result.status += " error ";
+        result.status += std::to_string(error);
+    };
+    auto addTcp = [&](std::string local, std::string remote, DWORD state, bool ipv6) {
+        if (state == MIB_TCP_STATE_LISTEN) remote = "*";
+        result.connections.push_back({std::move(local), std::move(remote), "TCP",
+                                      ipv6 ? "IPv6" : "IPv4", tcpStateName(state), ipv6});
+    };
+    auto addUdp = [&](std::string local, bool ipv6) {
+        result.connections.push_back({std::move(local), "*", "UDP",
+                                      ipv6 ? "IPv6" : "IPv4", "LISTEN", ipv6});
+    };
+
+    DWORD rc = fetchIpTableBounded([&](void* data, DWORD* size) {
+        return GetExtendedTcpTable(data, size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+    }, buf);
+    if (rc == NO_ERROR) {
+        const auto* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(buf.data());
+        const size_t rows = boundedTableRows<MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID>(buf, table);
+        for (size_t i = 0; i < rows; ++i) {
+            const auto& row = table->table[i];
+            if (row.dwOwningPid != job.pid) continue;
+            addTcp(FormatIpv4Endpoint(reinterpret_cast<const uint8_t*>(&row.dwLocalAddr),
+                                      (uint16_t)ntohs((u_short)row.dwLocalPort)),
+                   FormatIpv4Endpoint(reinterpret_cast<const uint8_t*>(&row.dwRemoteAddr),
+                                      (uint16_t)ntohs((u_short)row.dwRemotePort)),
+                   row.dwState, false);
         }
-        if (rc != ERROR_INSUFFICIENT_BUFFER) break;   // sz was updated; loop reallocates
+    } else failure("TCP/IPv4", rc);
+
+    rc = fetchIpTableBounded([&](void* data, DWORD* size) {
+        return GetExtendedTcpTable(data, size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
+    }, buf);
+    if (rc == NO_ERROR) {
+        const auto* table = reinterpret_cast<const MIB_TCP6TABLE_OWNER_PID*>(buf.data());
+        const size_t rows = boundedTableRows<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(buf, table);
+        for (size_t i = 0; i < rows; ++i) {
+            const auto& row = table->table[i];
+            if (row.dwOwningPid != job.pid) continue;
+            addTcp(FormatIpv6Endpoint(row.ucLocalAddr, (uint16_t)ntohs((u_short)row.dwLocalPort),
+                                      row.dwLocalScopeId),
+                   FormatIpv6Endpoint(row.ucRemoteAddr, (uint16_t)ntohs((u_short)row.dwRemotePort),
+                                      row.dwRemoteScopeId),
+                   row.dwState, true);
+        }
+    } else failure("TCP/IPv6", rc);
+
+    rc = fetchIpTableBounded([&](void* data, DWORD* size) {
+        return GetExtendedUdpTable(data, size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+    }, buf);
+    if (rc == NO_ERROR) {
+        const auto* table = reinterpret_cast<const MIB_UDPTABLE_OWNER_PID*>(buf.data());
+        const size_t rows = boundedTableRows<MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID>(buf, table);
+        for (size_t i = 0; i < rows; ++i) {
+            const auto& row = table->table[i];
+            if (row.dwOwningPid != job.pid) continue;
+            addUdp(FormatIpv4Endpoint(reinterpret_cast<const uint8_t*>(&row.dwLocalAddr),
+                                      (uint16_t)ntohs((u_short)row.dwLocalPort)), false);
+        }
+    } else failure("UDP/IPv4", rc);
+
+    rc = fetchIpTableBounded([&](void* data, DWORD* size) {
+        return GetExtendedUdpTable(data, size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
+    }, buf);
+    if (rc == NO_ERROR) {
+        const auto* table = reinterpret_cast<const MIB_UDP6TABLE_OWNER_PID*>(buf.data());
+        const size_t rows = boundedTableRows<MIB_UDP6TABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID>(buf, table);
+        for (size_t i = 0; i < rows; ++i) {
+            const auto& row = table->table[i];
+            if (row.dwOwningPid != job.pid) continue;
+            addUdp(FormatIpv6Endpoint(row.ucLocalAddr, (uint16_t)ntohs((u_short)row.dwLocalPort),
+                                      row.dwLocalScopeId), true);
+        }
+    } else failure("UDP/IPv6", rc);
+
+    std::sort(result.connections.begin(), result.connections.end(),
+              [](const Conn& a, const Conn& b) {
+        if (a.protocol != b.protocol) return a.protocol < b.protocol;
+        if (a.ipv6 != b.ipv6) return a.ipv6 < b.ipv6;
+        if (a.local != b.local) return a.local < b.local;
+        if (a.remote != b.remote) return a.remote < b.remote;
+        return a.state < b.state;
+    });
+    return result;
+}
+
+void CommunicationsTab::requestConnectionRefresh(uint32_t pid) {
+    const uint64_t epoch = desiredConnEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    connsRequestedPid_ = pid;
+    if (!pid) {
+        std::lock_guard lock(connWorkerMutex_);
+        pendingConnJob_.reset();
+        readyConnResult_.reset();
+        conns_.clear();
+        connStatus_.clear();
+        connsForPid_ = 0;
+        connRefreshRunning_.store(false, std::memory_order_release);
+        return;
+    }
+    {
+        std::lock_guard lock(connWorkerMutex_);
+        pendingConnJob_ = ConnJob{epoch, pid}; // latest selected process wins
+        readyConnResult_.reset();
+        connRefreshRunning_.store(true, std::memory_order_release);
+    }
+    connWorkerCv_.notify_one();
+}
+
+void CommunicationsTab::pumpConnectionRefresh() {
+    std::optional<ConnResult> ready;
+    {
+        std::lock_guard lock(connWorkerMutex_);
+        if (readyConnResult_) {
+            ready = std::move(readyConnResult_);
+            readyConnResult_.reset();
+        }
+    }
+    if (!ready || ready->epoch != desiredConnEpoch_.load(std::memory_order_acquire) ||
+        ready->pid != connsRequestedPid_)
+        return;
+    conns_ = std::move(ready->connections);
+    connStatus_ = std::move(ready->status);
+    connsForPid_ = ready->pid;
+    connRefreshRunning_.store(false, std::memory_order_release);
+}
+
+void CommunicationsTab::connectionWorkerLoop(std::stop_token stop) {
+    for (;;) {
+        ConnJob job;
+        {
+            std::unique_lock lock(connWorkerMutex_);
+            connWorkerCv_.wait(lock, [&] {
+                return stop.stop_requested() || pendingConnJob_.has_value();
+            });
+            if (stop.stop_requested()) return;
+            job = *pendingConnJob_;
+            pendingConnJob_.reset();
+        }
+
+        ConnResult result;
+        try {
+            result = collectConnections(job);
+        } catch (const std::exception& error) {
+            result.epoch = job.epoch;
+            result.pid = job.pid;
+            result.status = std::string("connection refresh failed: ") + error.what();
+        } catch (...) {
+            result.epoch = job.epoch;
+            result.pid = job.pid;
+            result.status = "connection refresh failed: unknown worker error";
+        }
+        if (stop.stop_requested() ||
+            desiredConnEpoch_.load(std::memory_order_acquire) != job.epoch)
+            continue;
+        {
+            std::lock_guard lock(connWorkerMutex_);
+            if (desiredConnEpoch_.load(std::memory_order_acquire) != job.epoch)
+                continue;
+            readyConnResult_ = std::move(result);
+        }
     }
 }
 
+void CommunicationsTab::refreshProcesses() {
+    // The selection follows the PID, not the row index: re-enumerating + re-sorting
+    // must not move module/connection actions to a different process.
+    const uint32_t prevPid = (selProc_ >= 0 && selProc_ < (int)procs_.size()) ? procs_[selProc_].pid : 0;
+    procs_ = pm_.enumerate();
+    enumerated_ = true;
+    std::sort(procs_.begin(), procs_.end(),
+              [](const ProcessInfo& a, const ProcessInfo& b) {
+                  const int byName = _stricmp(a.name.c_str(), b.name.c_str());
+                  return byName == 0 ? a.pid < b.pid : byName < 0;
+              });
+    selProc_ = -1;
+    if (prevPid)
+        for (int i = 0; i < (int)procs_.size(); ++i)
+            if (procs_[i].pid == prevPid) { selProc_ = i; break; }
+    // A refreshed process may have loaded new modules or initialized its VM.
+    modsForPid_ = 0;
+    jdwpInjectPid_ = 0;
+}
+
 void CommunicationsTab::renderProcesses(AppContext& ctx) {
+    const float scale = theme::UiScale();
     ImGui::SeparatorText("Native Processes");
-    if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh", "Re-enumerate running processes") || !enumerated_) {
-        // The selection follows the PID, not the row index: re-enumerating + re-sorting
-        // would otherwise leave selProc_ pointing at a different process, so its
-        // modules/connections would be listed for the wrong PID.
-        uint32_t prevPid = (selProc_ >= 0 && selProc_ < (int)procs_.size()) ? procs_[selProc_].pid : 0;
-        procs_ = pm_.enumerate();
-        enumerated_ = true;
-        // Stable, readable ordering by name.
-        std::sort(procs_.begin(), procs_.end(),
-                  [](const ProcessInfo& a, const ProcessInfo& b){ return a.name < b.name; });
-        selProc_ = -1;
-        if (prevPid)
-            for (int i = 0; i < (int)procs_.size(); ++i)
-                if (procs_[i].pid == prevPid) { selProc_ = i; break; }
-    }
-    ImGui::SameLine();
-    ui::SearchBox("##pfilter", "filter by name...", filter_, sizeof(filter_), 220.0f * theme::UiScale());
+    if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh", "Re-enumerate running processes") || !enumerated_)
+        refreshProcesses();
     ImGui::SameLine();
     ImGui::TextDisabled("%d process(es)", (int)procs_.size());
 
     DbgSnapshot snap = ctx.debug.snapshot();
     if (snap.attached()) {
-        ImGui::SameLine();
+        ui::SameLineIfFits(160.0f * scale);
         char b[40]; std::snprintf(b, sizeof(b), "debugging PID %u", snap.pid);
         ui::Badge(b, theme::col::good());
     }
-    if (!status_.empty()) ImGui::TextDisabled("%s", status_.c_str());
+    ui::SearchBox("##pfilter", "process name or PID...", filter_, sizeof(filter_), -1.0f);
+    if (!status_.empty()) ImGui::TextWrapped("%s", status_.c_str());
+
+    std::string needle = filter_;
+    for (char& c : needle) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::vector<int> visible;
+    for (int i = 0; i < static_cast<int>(procs_.size()); ++i) {
+        std::string haystack = procs_[i].name + " " + std::to_string(procs_[i].pid);
+        for (char& c : haystack) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (needle.empty() || haystack.find(needle) != std::string::npos) visible.push_back(i);
+    }
+    if (visible.empty()) {
+        ImGui::TextDisabled(procs_.empty() ? "No processes found. Refresh to try again."
+                                          : "No processes match this name or PID.");
+        return;
+    }
 
     // Fill the remaining height so the list only scrolls when truly overflowing.
     if (ImGui::BeginTable("procs", 5,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
-        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 60 * scale);
         ImGui::TableSetupColumn("Process");
-        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 50);
-        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 70);
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 40 * scale);
+        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 55 * scale);
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 110 * scale);
         ImGui::TableHeadersRow();
-        for (int i = 0; i < (int)procs_.size(); ++i) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visible.size()));
+        while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const int i = visible[row];
             auto& p = procs_[i];
-            if (filter_[0] && p.name.find(filter_) == std::string::npos) continue;
             ImGui::TableNextRow();
             ImGui::PushID(i);
             ImGui::TableSetColumnIndex(0); ImGui::Text("%u", p.pid);
@@ -142,7 +339,7 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
                 selProc_ = i;
             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(p.is64 ? "x64" : "x86");
             ImGui::TableSetColumnIndex(3);
-            ImGui::TextColored(p.canOpen ? ImVec4(0.6f,0.8f,0.6f,1) : ImVec4(0.8f,0.5f,0.5f,1),
+            ImGui::TextColored(p.canOpen ? theme::col::good() : theme::col::bad(),
                                "%s", p.canOpen ? "ok" : "denied");
             ImGui::TableSetColumnIndex(4);
             bool isAttached = snap.attached() && snap.pid == p.pid;
@@ -153,12 +350,13 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
                 if (ctx.debug.attach(p.pid, err)) {
                     status_ = "debugging " + p.name + " (PID " + std::to_string(p.pid) + ")";
                     // No file backs this session: point the engine/arch at the debuggee's
-                    // bitness so generic ctx.disasm / ctx.arch fallbacks decode correctly.
+                    // bitness so the active static-document decoder/arch fallbacks decode correctly.
                     // (When a file IS loaded its arch is authoritative for the static view,
                     // and live paths use liveDecoder(snap.is32) — so don't touch it then.)
-                    if (!ctx.binary.loaded()) {
-                        ctx.arch = ctx.debug.snapshot().is32 ? Arch::X86 : Arch::X64;
-                        ctx.rebuildDisassembler();
+                    if (!ctx.staticBinary().loaded()) {
+                        ctx.setStaticDecoderConfiguration(
+                            ctx.staticEngine(),
+                            ctx.debug.snapshot().is32 ? Arch::X86 : Arch::X64);
                     }
                     ctx.openLiveAssemblyView();
                 } else {
@@ -166,7 +364,23 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
                     ui::Toast(ui::ToastKind::Error, "Attach failed: " + err);
                 }
             }
+            ImGui::SameLine();
+            // A live DisasmStudio session owns software/temp/trace/concealment
+            // int3 bytes in this process. Passive RPM cannot distinguish those
+            // from target code, so refuse a supposedly clean passive dump until
+            // the session is detached and every pristine byte is restored.
+            ImGui::BeginDisabled(!p.canOpen || isAttached);
+            if (ImGui::SmallButton("Dump")) {
+                ctx.requestedPassiveDumpPid = p.pid;
+                ctx.requestedPassiveDump = true;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(isAttached
+                    ? "Detach first so debugger-owned breakpoint bytes are restored before passive capture."
+                    : "Open a read-only snapshot workflow; this does not attach a debugger or inject code.");
             ImGui::PopID();
+        }
         }
         ImGui::EndTable();
     }
@@ -179,15 +393,21 @@ void CommunicationsTab::renderModules() {
         return;
     }
     uint32_t pid = procs_[selProc_].pid;
+    if (ImGui::SmallButton("Refresh modules")) modsForPid_ = 0;
     if (pid != modsForPid_) { mods_ = pm_.modules(pid); modsForPid_ = pid; }
 
-    ImGui::Text("%s (PID %u) - %d module(s)", procs_[selProc_].name.c_str(), pid, (int)mods_.size());
+    ImGui::TextWrapped("%s (PID %u) - %d module(s)", procs_[selProc_].name.c_str(), pid, (int)mods_.size());
+    if (mods_.empty()) {
+        ImGui::TextWrapped("No readable module list. The process may have exited or denied access; refresh after it initializes.");
+        return;
+    }
     if (ImGui::BeginTable("mods", 3,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-            ImVec2(0, ImGui::GetContentRegionAvail().y * 0.6f))) {
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Module");
-        ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, 150);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, 150 * theme::UiScale());
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90 * theme::UiScale());
         ImGui::TableHeadersRow();
         for (auto& m : mods_) {
             ImGui::TableNextRow();
@@ -197,165 +417,113 @@ void CommunicationsTab::renderModules() {
         }
         ImGui::EndTable();
     }
-    if (mods_.empty())
-        ImGui::TextDisabled("No modules (need matching bitness / rights; try as Administrator).");
 }
 
-void CommunicationsTab::renderConnections() {
+void CommunicationsTab::renderConnections(AppContext& ctx) {
+    const float scale = theme::UiScale();
     ImGui::SeparatorText("Connections (selected process)");
+    pumpConnectionRefresh();
     uint32_t pid = (selProc_ >= 0 && selProc_ < (int)procs_.size()) ? procs_[selProc_].pid : 0;
     if (!pid) {
-        // Small hero (no button) bounded to this section's slot, so the HvDbg
-        // panel below keeps its place; the process list to the left is the action.
+        if (connsRequestedPid_) requestConnectionRefresh(0);
+        // Small hero (no button) bounded to this section's slot, so the panel
+        // keeps its place; the process list to the left is the action.
         ImGui::BeginChild("conn_none", ImVec2(0, ImGui::GetContentRegionAvail().y * 0.55f));
         ui::EmptyState(DS_ICON_NETWORK, "No process selected",
                        "Select a process to list its live TCP/UDP connections.");
         ImGui::EndChild();
         return;
     }
-    if (pid != connsForPid_) refreshConnections(pid);
-    ImGui::Text("%s (PID %u) - %d endpoint(s)", procs_[selProc_].name.c_str(), pid, (int)conns_.size());
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh##conn")) refreshConnections(pid);
+    const double now = ImGui::GetTime();
+    if (pid != connsRequestedPid_) {
+        conns_.clear();
+        connStatus_.clear();
+        connsForPid_ = 0;
+        requestConnectionRefresh(pid);
+        connNextRefresh_ = now + 1.0;
+    }
+    const bool refreshing = connRefreshRunning_.load(std::memory_order_acquire);
+    if (connAutoRefresh_) {
+        ctx.wantContinuousRedraw = true;
+        if (!refreshing && now >= connNextRefresh_) {
+            requestConnectionRefresh(pid);
+            connNextRefresh_ = now + 1.0;
+        }
+    }
+    if (refreshing) ctx.wantContinuousRedraw = true;
 
-    if (ImGui::BeginTable("conns", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, ImGui::GetContentRegionAvail().y * 0.8f))) {
-        ImGui::TableSetupColumn("Endpoint");
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 60);
-        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 110);
+    auto visible = [&](const Conn& c) {
+        if (c.ipv6 ? !connShowV6_ : !connShowV4_) return false;
+        if (c.protocol == "TCP" ? !connShowTcp_ : !connShowUdp_) return false;
+        if (!connFilter_[0]) return true;
+        auto contains = [&](const std::string& value) {
+            return std::search(value.begin(), value.end(), connFilter_,
+                               connFilter_ + std::strlen(connFilter_),
+                [](char a, char b) {
+                    return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+                }) != value.end();
+        };
+        return contains(c.local) || contains(c.remote) || contains(c.protocol) ||
+               contains(c.family) || contains(c.state);
+    };
+    size_t shown = 0;
+    for (const Conn& c : conns_) if (visible(c)) ++shown;
+
+    ImGui::TextWrapped("%s (PID %u) - %zu/%zu endpoint(s)", procs_[selProc_].name.c_str(),
+                pid, shown, conns_.size());
+    if (ImGui::SmallButton("Refresh##conn")) {
+        requestConnectionRefresh(pid);
+        connNextRefresh_ = now + 1.0;
+    }
+    ui::SameLineIfFits(70.0f * scale); ImGui::Checkbox("Auto##conn", &connAutoRefresh_);
+    ui::SameLineIfFits(65.0f * scale); ImGui::Checkbox("IPv4", &connShowV4_);
+    ui::SameLineIfFits(65.0f * scale); ImGui::Checkbox("IPv6", &connShowV6_);
+    ui::SameLineIfFits(60.0f * scale); ImGui::Checkbox("TCP", &connShowTcp_);
+    ui::SameLineIfFits(60.0f * scale); ImGui::Checkbox("UDP", &connShowUdp_);
+    ui::SearchBox("##connfilter", "filter endpoint / state...", connFilter_, sizeof(connFilter_),
+                  -1.0f);
+    if (connRefreshRunning_.load(std::memory_order_acquire)) {
+        ImGui::TextDisabled("Refreshing\xE2\x80\xA6");
+    }
+    if (!connStatus_.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(theme::col::warn(), "Partial refresh: %s", connStatus_.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    if (conns_.empty()) {
+        if (!refreshing)
+            ImGui::TextWrapped("No active IPv4/IPv6 TCP/UDP endpoints were reported for this process.");
+        return;
+    }
+    if (!shown) {
+        ImGui::TextWrapped("No endpoints match the current family, protocol, or text filters.");
+        return;
+    }
+
+    if (ImGui::BeginTable("conns", 5,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                          ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Local endpoint");
+        ImGui::TableSetupColumn("Remote endpoint");
+        ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed, 52 * scale);
+        ImGui::TableSetupColumn("Family", ImGuiTableColumnFlags_WidthFixed, 52 * scale);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 104 * scale);
         ImGui::TableHeadersRow();
-        for (auto& c : conns_) {
+        for (const Conn& c : conns_) {
+            if (!visible(c)) continue;
             ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(c.endpoint.c_str());
-            ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.type.c_str());
-            ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", c.state.c_str());
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(c.local.c_str());
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(c.remote.c_str());
+            ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", c.protocol.c_str());
+            ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", c.family.c_str());
+            ImGui::TableSetColumnIndex(4);
+            if (c.state == "ESTABLISHED") ImGui::TextColored(theme::col::good(), "%s", c.state.c_str());
+            else ImGui::TextDisabled("%s", c.state.c_str());
         }
         ImGui::EndTable();
     }
-    if (conns_.empty()) ImGui::TextDisabled("No active IPv4 TCP/UDP endpoints for this process.");
-}
-
-
-// AMD-V (SVM) hypervisor debugging channel. The kernel driver (driver/HvDbg.sys)
-// creates \\.\HvDbg; here we open it, handshake, and surface its state. When the
-// driver isn't loaded this degrades to an informational "not present" panel.
-void CommunicationsTab::renderHvDbg() {
-    ImGui::SeparatorText("AMD-V Hypervisor (\\\\.\\HvDbg)");
-
-    const bool connected = hv_.connected();
-    ImVec4 dot = connected ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f) : ImVec4(0.65f, 0.65f, 0.65f, 1.0f);
-    ImGui::TextColored(dot, connected ? "[connected]" : "[not connected]");
-    ImGui::SameLine();
-    if (ImGui::SmallButton(connected ? "Reconnect" : "Connect")) {
-        hv_.disconnect();
-        hvHave_ = false; hvAbiMismatch_ = false;
-        if (hv_.connect() && hv_.ping(hvInfo_)) {
-            hvHave_ = true;
-            // ping() returns true even on an ABI mismatch, leaving the warning in
-            // lastError(); surface it rather than reporting a clean handshake.
-            hvAbiMismatch_ = !hv_.lastError().empty();
-            hvStatus_ = hvAbiMismatch_ ? hv_.lastError() : "Handshake OK.";
-        } else hvStatus_ = hv_.lastError();
-    }
-    if (connected) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Refresh##hv")) {
-            if (hv_.getState(hvInfo_)) { hvHave_ = true; hvStatus_ = "State refreshed."; }
-            else hvStatus_ = hv_.lastError();
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Disconnect")) { hv_.disconnect(); hvHave_ = false; hvAbiMismatch_ = false; hvStatus_ = "Disconnected."; }
-    }
-
-    // Driver lifecycle (SCM): register + start HvDbg.sys so \\.\HvDbg exists, or
-    // stop + deregister it. Requires elevation; greys out when not admin.
-    {
-        if (!hvStateValid_) { hvState_ = hvLoader_.state(); hvStateValid_ = true; }  // SCM query: cached, refreshed on action
-        const HvDbgLoader::State ls = hvState_;
-        const bool installed = (ls != HvDbgLoader::State::NotInstalled && ls != HvDbgLoader::State::Unknown);
-        const char* lbl = ls == HvDbgLoader::State::Running     ? "[driver running]"
-                        : ls == HvDbgLoader::State::Stopped     ? "[driver installed]"
-                        : ls == HvDbgLoader::State::NotInstalled? "[driver not loaded]"
-                                                                : "[driver state unknown]";
-        ImVec4 lc = ls == HvDbgLoader::State::Running ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f)
-                                                      : ImVec4(0.70f, 0.70f, 0.50f, 1.0f);
-        ImGui::TextColored(lc, "%s", lbl);
-        ImGui::SameLine();
-
-        if (hvElevated_ < 0) hvElevated_ = HvDbgLoader::isElevated() ? 1 : 0;  // never changes for this process
-        const bool elevated = hvElevated_ != 0;
-        if (!elevated) ImGui::BeginDisabled();
-        if (!installed) {
-            if (ImGui::SmallButton("Load driver")) {
-                hvStateValid_ = false;   // re-query the SCM state after the attempt
-                if (hvLoader_.load()) {
-                    hvStatus_ = "HvDbg.sys loaded - click Connect to attach.";
-                    if (hv_.connect() && hv_.ping(hvInfo_)) {
-                        hvHave_ = true;
-                        hvAbiMismatch_ = !hv_.lastError().empty();
-                        if (hvAbiMismatch_) hvStatus_ = hv_.lastError(); // rebuild-driver warning wins
-                    }
-                } else hvStatus_ = hvLoader_.lastError();
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Register + start HvDbg.sys (next to the exe) via the SCM.");
-        } else {
-            if (ImGui::SmallButton("Unload driver")) {
-                hvStateValid_ = false;   // re-query the SCM state after the attempt
-                hv_.disconnect(); hvHave_ = false; hvAbiMismatch_ = false;
-                hvStatus_ = hvLoader_.unload() ? "HvDbg.sys stopped and deregistered."
-                                               : hvLoader_.lastError();
-            }
-        }
-        if (!elevated) {
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("(run as Administrator to load/unload)");
-        }
-    }
-
-    if (hvHave_) {
-        const HVDBG_INFO& i = hvInfo_;
-        ImGui::Text("Driver v%u.%u  |  ABI %u  |  CPU %.16s",
-                    (i.driverVersion >> 16) & 0xFFFF, i.driverVersion & 0xFFFF, i.abiVersion, i.vendor);
-        auto cap = [](bool on, const char* yes, const char* no) {
-            ImGui::SameLine(); ImGui::TextColored(on ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f)
-                                                     : ImVec4(0.70f, 0.55f, 0.45f, 1.0f), "%s", on ? yes : no);
-        };
-        ImGui::TextUnformatted("SVM:");          cap(i.flags & HVDBG_FLAG_SVM_SUPPORTED, "supported", "unsupported");
-        ImGui::SameLine(); ImGui::TextUnformatted(" NPT:"); cap(i.flags & HVDBG_FLAG_NPT_SUPPORTED, "yes", "no");
-        ImGui::SameLine(); ImGui::TextUnformatted(" Active:"); cap(i.flags & HVDBG_FLAG_ACTIVE, "yes", "no");
-        if (i.flags & HVDBG_FLAG_SVM_LOCKED_OFF)
-            ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.4f, 1.0f), "SVM is disabled+locked in firmware - enable SVM in BIOS.");
-        if (i.flags & HVDBG_FLAG_HV_PRESENT)
-            ImGui::TextColored(ImVec4(0.85f, 0.7f, 0.4f, 1.0f), "Another hypervisor is present (Hyper-V/HVCI may own SVM).");
-        ImGui::Text("Virtualized %u / %u CPU(s)   |   #VMEXIT serviced: %llu",
-                    i.virtualizedCount, i.cpuCount, (unsigned long long)i.vmexitCount);
-
-        const bool active = (i.flags & HVDBG_FLAG_ACTIVE) != 0;
-        if (hvAbiMismatch_) {
-            // The HVDBG_INFO wire layout is what abiVersion guards; don't drive
-            // machine-wide VMRUN IOCTLs against a driver whose ABI we don't match.
-            ImGui::TextColored(ImVec4(0.85f, 0.5f, 0.4f, 1.0f),
-                               "ABI mismatch - rebuild the driver before virtualizing.");
-        } else if (!active) {
-            if (ImGui::Button("Virtualize all CPUs")) {
-                if (hv_.virtualize() && hv_.getState(hvInfo_)) hvStatus_ = "VMRUN active.";
-                else hvStatus_ = hv_.lastError();
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Enables EFER.SVME and runs VMRUN on every logical CPU (kernel driver).");
-        } else {
-            if (ImGui::Button("Devirtualize")) {
-                if (hv_.devirtualize() && hv_.getState(hvInfo_)) hvStatus_ = "Hypervisor torn down.";
-                else hvStatus_ = hv_.lastError();
-            }
-        }
-    } else {
-        ImGui::TextDisabled("The \\\\.\\HvDbg channel is served by the AMD-V (SVM) driver in driver/.");
-        ImGui::TextDisabled("Click \"Load driver\" (admin + signed/test-signing) then Connect to attach.");
-    }
-    if (!hvStatus_.empty()) ImGui::TextColored(ImVec4(0.6f, 0.7f, 0.85f, 1.0f), "%s", hvStatus_.c_str());
 }
 
 // ---------------------------------------------------------- Java debug (JDWP) --
@@ -383,6 +551,12 @@ void CommunicationsTab::loadJdwpMethod(AppContext& ctx, uint64_t classID, uint64
                                        const std::string& label) {
     std::vector<uint8_t> bc;
     if (!ctx.jdwp.bytecodesOf(classID, methodID, bc) || bc.empty()) {
+        // Never leave breakpoint actions pointing at a previous method when a
+        // newly selected native/abstract method cannot supply bytecode.
+        jdwpInsns_.clear();
+        jdwpInsnsClass_ = classID;
+        jdwpInsnsMethod_ = methodID;
+        jdwpInsnsLabel_ = label;
         jdwpStatus_ = "bytecode fetch failed (abstract/native method, or the VM denies canGetBytecodes)";
         return;
     }
@@ -411,6 +585,7 @@ void CommunicationsTab::loadJdwpMethod(AppContext& ctx, uint64_t classID, uint64
 void CommunicationsTab::renderJdwp(AppContext& ctx) {
     const float scale = theme::UiScale();
     JdwpSnapshot snap = ctx.jdwp.snapshot();
+    if (!snap.attached()) ctx.jdwpTargetPid = 0;
 
     const char* st = "detached";
     if (snap.state == JdwpState::Running)   st = "running";
@@ -419,7 +594,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     char hdr[192];
     std::snprintf(hdr, sizeof(hdr), "Java debug (JDWP) \xE2\x80\x94 %s%s%s###jdwp_hdr",
                   st, snap.vmName.empty() ? "" : ", ", snap.vmName.c_str());
-    if (!ImGui::CollapsingHeader(hdr, snap.attached() ? ImGuiTreeNodeFlags_DefaultOpen : 0))
+    if (!ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen))
         return;
 
     // Housekeeping shared by both attach paths: clear stale per-session UI state.
@@ -429,6 +604,11 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         jdwpMethods_.clear();
         jdwpInsns_.clear();
         jdwpCp_.reset();
+        jdwpSelClassName_.clear();
+        jdwpInsnsLabel_.clear();
+        jdwpClassesRef_.reset();
+        jdwpFiltered_.clear();
+        jdwpScrollToStop_ = false;
         jdwpSeenStopClass_ = jdwpSeenStopMethod_ = 0;
         jdwpSeenStopBci_ = ~0ull;
     };
@@ -437,8 +617,34 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         jdwpPort_ = jdwpPort_ < 1 ? 1 : jdwpPort_ > 65535 ? 65535 : jdwpPort_;
 
         // --- Primary path: inject the JDWP agent into a RUNNING JVM (no -agentlib
-        //     prelaunch flag). Operates on the process selected in the list below. ---
+        //     prelaunch flag). Selection is local to the Java workspace. ---
         ImGui::SeparatorText("Attach to a running Java process");
+        if (!enumerated_) refreshProcesses();
+        if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh processes", "Refresh running processes and re-check the selected JVM"))
+            refreshProcesses();
+        const std::string processPreview = selProc_ >= 0 && selProc_ < static_cast<int>(procs_.size())
+            ? procs_[selProc_].name + " (PID " + std::to_string(procs_[selProc_].pid) + ")"
+            : "Select a Java process...";
+        ImGui::SetNextItemWidth((std::min)(500.0f * scale, ImGui::GetContentRegionAvail().x));
+        if (ImGui::BeginCombo("##jdwp_process", processPreview.c_str())) {
+            ui::SearchBox("##jdwp_process_filter", "process name or PID...",
+                          jdwpProcessFilter_, sizeof(jdwpProcessFilter_), -1.0f);
+            std::string needle = jdwpProcessFilter_;
+            for (char& c : needle) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            size_t shown = 0;
+            for (int i = 0; i < static_cast<int>(procs_.size()); ++i) {
+                const std::string label = procs_[i].name + " (PID " + std::to_string(procs_[i].pid) + ")";
+                std::string haystack = label;
+                for (char& c : haystack) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (!needle.empty() && haystack.find(needle) == std::string::npos) continue;
+                ++shown;
+                ImGui::PushID(i);
+                if (ImGui::Selectable(label.c_str(), selProc_ == i)) selProc_ = i;
+                ImGui::PopID();
+            }
+            if (!shown) ImGui::TextDisabled("No processes match this name or PID.");
+            ImGui::EndCombo();
+        }
         uint32_t selPid = (selProc_ >= 0 && selProc_ < (int)procs_.size()) ? procs_[selProc_].pid : 0;
         const std::string selName = selPid ? procs_[selProc_].name : std::string();
         if (selPid != jdwpInjectPid_) {           // re-inspect the VM on selection change
@@ -454,10 +660,10 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         }
         const JvmInfo& ji = jdwpInjectInfo_;
         if (!selPid) {
-            ImGui::TextDisabled("Select a process in the list below, then attach here. No JVM debug flags needed.");
+            ImGui::TextWrapped("Choose a process above to detect its JVM and enable attachment. No JVM debug flags are needed for supported HotSpot x64 targets.");
         } else {
             ImGui::Text("Selected: %s (PID %u)", selName.c_str(), selPid);
-            ImGui::SameLine();
+            ui::SameLineIfFits(125.0f * scale);
             if (ji.flavor == JvmFlavor::HotSpot)
                 ui::Badge(ji.is64 ? "HotSpot x64" : "HotSpot x86", theme::col::good());
             else if (ji.flavor == JvmFlavor::OpenJ9)
@@ -470,17 +676,14 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
             ImGui::BeginDisabled(!canInject);
             if (ImGui::Button("Attach (inject JDWP)##jdwpinject")) {
                 JvmAttachResult ar = LoadJdwpAgent(selPid, (uint16_t)jdwpPort_);
-                // The button is gated to a HotSpot x64 target, so the agent may be
-                // listening for several reasons: it just loaded (ok), the request was
-                // accepted but unconfirmed (enqueued), or it was "already loaded" from
-                // a prior attempt (refused now, but still bound). So always TRY the
-                // socket; the connect is the real proof. Show the VM's reason if not.
-                std::string err, lastErr;
-                bool connected = false;
-                for (int tries = 0; tries < 8 && !connected; ++tries) {
-                    if (ctx.jdwp.attach("127.0.0.1", (uint16_t)jdwpPort_, err)) connected = true;
-                    else { lastErr = err; ::Sleep(300); }   // agent may need a moment to bind
-                }
+                // A refused or unconfirmed load does not prove that a listener
+                // on this port belongs to the selected PID. Only a confirmed
+                // load permits automatic connection and PID attribution. One
+                // bounded connection attempt also avoids stacking eight 15s RPC
+                // waits on the render thread.
+                std::string err;
+                const bool connected = ar.ok && ctx.jdwp.attach(
+                    "127.0.0.1", (uint16_t)jdwpPort_, err);
                 if (connected) {
                     onAttached();
                     ctx.jdwpTargetPid = selPid;   // scope the Connections "attached only" view
@@ -488,21 +691,29 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
                     // breakpointed before it runs on. The agent stays suspend=n (no frozen
                     // orphan if the connect had failed); one Resume releases this cleanly.
                     if (jdwpSuspendOnAttach_) ctx.jdwp.suspendAll();
+                    const bool nowSuspended = ctx.jdwp.snapshot().state == JdwpState::Suspended;
                     ui::Toast(ui::ToastKind::Success,
                               std::string("Attached to JVM PID ") + std::to_string(selPid) +
-                              (jdwpSuspendOnAttach_ ? " (suspended)" : ""));
+                              (nowSuspended ? " (suspended)" : " (running)"));
                 } else {
-                    jdwpStatus_ = (ar.ok ? std::string("agent loaded") : ar.error) +
-                                  "  \xE2\x80\x94 connect failed: " + lastErr;
+                    ctx.jdwpTargetPid = 0;
+                    jdwpStatus_ = ar.ok
+                        ? "The agent loaded, but the connection failed: " + err
+                        : ar.enqueued
+                            ? "The VM accepted the agent load request, but did not confirm that the agent started."
+                            : "The agent was not loaded: " + ar.error;
+                    jdwpStatus_ += "\nVerify the agent's host and port, then use Connect below to try a listening agent.";
                     if (!ar.agentOutput.empty()) jdwpStatus_ += "\nVM said: " + ar.agentOutput;
-                    ui::Toast(ui::ToastKind::Error, "JVM attach failed (details in the Java debug panel)");
+                    ui::Toast(ar.enqueued && !ar.ok ? ui::ToastKind::Warn : ui::ToastKind::Error,
+                              "JVM attachment is incomplete; details appear in the Java debug panel.");
                 }
             }
             ImGui::EndDisabled();
-            ImGui::SameLine();
+            ui::SameLineIfFits(120.0f * scale);
             ImGui::SetNextItemWidth(80.0f * scale);
             ImGui::InputInt("port##jdwpinj", &jdwpPort_, 0, 0);
-            ImGui::SameLine();
+            jdwpPort_ = (std::clamp)(jdwpPort_, 1, 65535);
+            ui::SameLineIfFits(170.0f * scale);
             ImGui::Checkbox("Suspend on attach##jdwpsusp", &jdwpSuspendOnAttach_);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Freeze every Java thread the instant we connect, so you can set\n"
@@ -512,7 +723,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
             if (ji.flavor == JvmFlavor::OpenJ9)
                 ImGui::TextColored(theme::col::warn(), "OpenJ9 uses a different attach protocol \xE2\x80\x94 launch with -agentlib:jdwp and use the host:port connect below.");
             else if (ji.flavor == JvmFlavor::HotSpot && !ji.is64)
-                ImGui::TextColored(theme::col::warn(), "32-bit JVM: injection needs a 64-bit target (debug it natively via Attach in the list).");
+                ImGui::TextWrapped("32-bit JVM: launch it with -agentlib:jdwp and connect below for bytecode debugging, or use Processes & Attach for native debugging.");
             else if (ji.flavor == JvmFlavor::None)
                 ImGui::TextDisabled("This process has no jvm.dll loaded. Pick a java/javaw process (or one embedding a JVM).");
             else
@@ -523,10 +734,10 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         //     (remote target, or a VM launched with -agentlib:jdwp). ---
         ImGui::SeparatorText("Or connect to a listening JDWP agent");
         ImGui::SetNextItemWidth(150.0f * scale);
-        ImGui::InputText("##jdwphost", jdwpHost_, sizeof(jdwpHost_));
+        ImGui::InputTextWithHint("##jdwphost", "host", jdwpHost_, sizeof(jdwpHost_));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90.0f * scale);
-        ImGui::InputInt("##jdwpport", &jdwpPort_, 0, 0);
+        ImGui::InputInt("Port##jdwpport", &jdwpPort_, 0, 0);
         jdwpPort_ = jdwpPort_ < 1 ? 1 : jdwpPort_ > 65535 ? 65535 : jdwpPort_;
         ImGui::SameLine();
         if (ImGui::Button("Connect##jdwp")) {
@@ -536,9 +747,14 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
                 if (jdwpSuspendOnAttach_) ctx.jdwp.suspendAll();
             } else jdwpStatus_ = err;
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("host:port of a VM started with -agentlib:jdwp=...,server=y,address=*:%d", jdwpPort_);
-        if (!jdwpStatus_.empty()) ImGui::TextColored(theme::col::bad(), "%s", jdwpStatus_.c_str());
+        ImGui::TextWrapped("Host and port of a VM started with -agentlib:jdwp=...,server=y,address=*:%d", jdwpPort_);
+        if (!jdwpStatus_.empty()) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextColored(theme::col::bad(), "%s", jdwpStatus_.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        if (snap.state == JdwpState::Dead)
+            ImGui::TextWrapped("Last session: %s", snap.lastEvent.c_str());
         return;
     }
 
@@ -547,27 +763,30 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     if (suspended) {
         if (ImGui::Button("Resume##jdwp")) ctx.jdwp.resumeAll();
         ImGui::SameLine();
+        ImGui::BeginDisabled(!snap.stopThread || !snap.stopLoc.classID);
         if (ImGui::Button("Step Into##jdwp")) ctx.jdwp.stepInto();
         ImGui::SameLine();
         if (ImGui::Button("Step Over##jdwp")) ctx.jdwp.stepOver();
         ImGui::SameLine();
         if (ImGui::Button("Step Out##jdwp")) ctx.jdwp.stepOut();
+        ImGui::EndDisabled();
     } else {
         if (ImGui::Button("Suspend##jdwp")) ctx.jdwp.suspendAll();
     }
-    ImGui::SameLine();
+    ui::SameLineIfFits(150.0f * scale);
     if (ImGui::Button("Refresh classes##jdwp")) ctx.jdwp.refreshClasses();
-    ImGui::SameLine();
+    ui::SameLineIfFits(80.0f * scale);
     if (ImGui::Button("Detach##jdwp")) {
         ctx.jdwp.detach();
         ctx.jdwpTargetPid = 0;
         return;
     }
-    ImGui::SameLine();
+    ImGui::PushTextWrapPos();
     ImGui::TextDisabled("%s%s%s \xC2\xB7 %s", snap.vmName.c_str(),
                         snap.vmVersion.empty() ? "" : " ",
                         snap.vmVersion.c_str(), snap.lastEvent.c_str());
     if (!jdwpStatus_.empty()) ImGui::TextColored(theme::col::bad(), "%s", jdwpStatus_.c_str());
+    ImGui::PopTextWrapPos();
 
     // ---- auto-follow a fresh stop (breakpoint hit / step landed) -------------
     if (suspended && snap.stopLoc.classID &&
@@ -586,7 +805,8 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     }
 
     // ---- three-column console -------------------------------------------------
-    ImGui::BeginChild("jdwp_body", ImVec2(0, 380.0f * scale), ImGuiChildFlags_Borders);
+    ImGui::BeginChild("jdwp_body", ImVec2(0, (std::max)(380.0f * scale,
+        ImGui::GetContentRegionAvail().y)), ImGuiChildFlags_Borders);
     const float colW = ImGui::GetContentRegionAvail().x;
 
     // -- column 1: threads / breakpoints / session log --
@@ -665,6 +885,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
                 if (ImGui::Selectable(c.name.c_str(), c.typeID == jdwpSelClass_)) {
                     jdwpSelClass_     = c.typeID;
                     jdwpSelClassName_ = c.name;
+                    jdwpMethods_.clear();
                     if (!ctx.jdwp.methodsOf(c.typeID, jdwpMethods_))
                         jdwpStatus_ = "method list fetch failed";
                 }
@@ -737,11 +958,12 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
                     if (b.loc.classID == jdwpInsnsClass_ && b.loc.methodID == jdwpInsnsMethod_ &&
                         b.loc.index == in.address) { hasBp = true; break; }
 
+                const std::string instruction = InstructionText(in);
                 char line[512];
-                std::snprintf(line, sizeof(line), "%c%5llu:  %-14s %-24s%s%s",
+                std::snprintf(line, sizeof(line), "%c%5llu:  %-39s%s%s",
                               isStopRow ? '>' : hasBp ? '*' : ' ',
                               (unsigned long long)in.address,
-                              in.mnemonic.c_str(), in.operands.c_str(),
+                              instruction.c_str(),
                               in.comment.empty() ? "" : "  ; ",
                               in.comment.c_str());
                 if (isStopRow)    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::good());
@@ -782,23 +1004,139 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     ImGui::EndChild();   // jdwp_body
 }
 
+void CommunicationsTab::renderGameMaker(AppContext& ctx) {
+    const auto archive=ctx.staticBinary().gameMakerArchive();
+    const auto session=ctx.debug.gameMakerSnapshot();
+    const auto fallback=ctx.frameDebugSnapshot?DbgSnapshot{}:ctx.debug.snapshot();
+    const auto& native=ctx.frameDebugSnapshot?*ctx.frameDebugSnapshot:fallback;
+    const bool matching=native.attached() && DebugTargetIdentityMatches(session.target,{native.pid,native.sessionGeneration});
+    const bool paused=matching && native.state==DbgState::Paused && session.state==GameMakerSessionState::Paused && session.stop && session.stop->identity.tid==native.activeTid;
+    ImGui::TextColored(theme::col::accent(),"GameMaker / GML instruction debugger");
+    ImGui::TextWrapped("Open the game's data.win as a document, attach its running process in Processes & Attach, then start GML debugging here.");
+    ImGui::Text("Native target: %s",native.attached()?std::to_string(native.pid).c_str():"not attached");
+    if(archive)ImGui::Text("Archive: %s (%zu code entries)",archive->gameName.c_str(),archive->code.size());
+    else ImGui::TextDisabled("The active document is not a GameMaker archive.");
+    const bool canStart=native.attached() && archive && archive->ok && archive->bytecodeSupported &&
+        session.state==GameMakerSessionState::Disconnected;
+    ImGui::BeginDisabled(!canStart);
+    if(ImGui::Button("Start GML debugging")){
+        gmlStatus_.clear();
+        if(ctx.debug.connectGameMaker(archive,ctx.staticBinary().path(),ctx.staticBinary().contentHash(),ctx.staticProject().gmlBreakpoints,gmlStatus_))ctx.gmlExecutionMode=true;
+    }
+    ImGui::EndDisabled();ImGui::SameLine();
+    ImGui::BeginDisabled(session.state==GameMakerSessionState::Disconnected || session.state==GameMakerSessionState::Inert);
+    if(ImGui::Button("Stop GML debugging"))ctx.debug.disconnectGameMaker();
+    ImGui::EndDisabled();
+    ImGui::TextWrapped("The built-in helper verifies the runner and archive, then observes GML instruction boundaries. Game files are unchanged.");
+    ImGui::Separator();
+    if(!session.runnerName.empty())ImGui::Text("Runner: %s",session.runnerName.c_str());
+    if(!session.status.empty())ImGui::TextWrapped("%s",session.status.c_str());
+    ImGui::Text("Breakpoints: %u requested / %u bound",session.requestedBreakpoints,session.boundBreakpoints);
+    if(session.capabilities.runtimeVerified){
+        ImGui::TextDisabled("Verified adapter: instruction stops, call-aware steps, frames and numeric storage");
+        ImGui::TextDisabled("Packed operand-stack values and complex-value edits are unavailable in this adapter.");
+    }
+    ImGui::Text("Instruction stops: %s",session.instructionStopsVerified?"verified":"not yet verified");
+    if(session.mappingRetained){
+        if(session.ready() || session.state==GameMakerSessionState::Initializing || session.state==GameMakerSessionState::Installing)
+            ImGui::TextDisabled("The verified helper is loaded for this connection.");
+        else if(session.state==GameMakerSessionState::Inert)ImGui::TextDisabled("The disabled helper mapping remains until the target exits.");
+        else if(session.state==GameMakerSessionState::Disabling)ImGui::TextDisabled("Waiting for callback draining and helper unload.");
+        else ImGui::TextDisabled("The helper mapping is retained; review the connection error before continuing.");
+    }
+    if(!session.error.empty())ImGui::TextColored(theme::col::warn(),"%s",session.error.c_str());
+    if(!gmlStatus_.empty())ImGui::TextColored(theme::col::warn(),"%s",gmlStatus_.c_str());
+    auto command=[&](GmlControlCommand c){gmlStatus_.clear();ctx.debug.gameMakerCommand(c,paused?session.stop->identity:GmlPauseIdentity{},gmlStatus_);};
+    ImGui::BeginDisabled(!matching || !session.ready() || (!paused && native.state!=DbgState::Running));
+    if(ImGui::Button(paused?"Continue GML":"Pause GML"))command(paused?GmlControlCommand::Continue:GmlControlCommand::Pause);
+    ImGui::EndDisabled();ImGui::SameLine();
+    ImGui::BeginDisabled(!paused);
+    if(ImGui::Button("Step Into GML"))command(GmlControlCommand::StepInto);ImGui::SameLine();
+    if(ImGui::Button("Step Over GML"))command(GmlControlCommand::StepOver);ImGui::SameLine();
+    if(ImGui::Button("Step Out GML"))command(GmlControlCommand::StepOut);
+    ImGui::EndDisabled();
+    if(native.state==DbgState::Paused && matching && !paused)ImGui::TextDisabled("This is a native pause. GML frame and numeric-edit authority are unavailable.");
+    ImGui::Checkbox("Use GML execution controls in the toolbar",&ctx.gmlExecutionMode);
+    ImGui::Checkbox("Follow GML stops in Binary View",&ctx.gmlAutoFollow);
+    if(paused && session.archive && session.stop->location.codeIndex<session.archive->code.size()){
+        const auto& code=session.archive->code[session.stop->location.codeIndex];
+        ImGui::Text("Stopped in %s + %u",code.name.c_str(),session.stop->location.byteOffset);
+        const bool sameArchive=archive && ctx.staticBinary().contentHash()==session.archiveHash;
+        ImGui::BeginDisabled(!sameArchive);
+        if(ImGui::Button("Show GML instruction"))ctx.gotoAddress(code.bytecodeOffset+session.stop->location.byteOffset);
+        ImGui::EndDisabled();
+        if(!sameArchive)ImGui::TextDisabled("Activate the connected archive document to navigate this stop.");
+    }
+}
+
 void CommunicationsTab::render(AppContext& ctx) {
-    // Java debug (JDWP) console: full-width, collapsible, above the native panes.
-    // (System-wide connection monitoring with history lives in the Connections tab.)
-    renderJdwp(ctx);
-    ImGui::Spacing();
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    ImGui::BeginChild("c_proc", ImVec2(avail.x * 0.55f - 4, 0), ImGuiChildFlags_Borders);
-    renderProcesses(ctx);
-    ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("c_right", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    renderModules();
-    ImGui::Spacing();
-    renderConnections();
-    ImGui::Spacing();
-    renderHvDbg();
-    ImGui::EndChild();
+    const float scale = theme::UiScale();
+    static const char* views[] = {
+        "Processes & Attach", "Network Monitor", "Java / JDWP", "GameMaker / GML"
+    };
+
+    if (ctx.requestedLiveObservation) {
+        ctx.requestedLiveObservation = false;
+        workspaceView_ = 1;
+        systemConnections_.requestLiveObservation(
+            ctx.requestedLiveObservationDocument,
+            ctx.requestedLiveObservationImageGeneration);
+    }
+
+    // A real workspace switcher, rather than three large tools stacked into one
+    // scrolling page.  Each mode receives the full content viewport and keeps its
+    // retained state while the user moves between them.
+    if(ctx.requestedGameMakerConnection){ctx.requestedGameMakerConnection=false;workspaceView_=3;}
+    workspaceView_ = ui::TabStrip("##communications_views", views, 4,
+                                   workspaceView_);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(7.0f * scale, 6.0f * scale));
+
+    if (workspaceView_ == 1) {
+        ImGui::BeginChild("##communications_network", ImVec2(0, 0),
+                          ImGuiChildFlags_None);
+        systemConnections_.render(ctx);
+        ImGui::EndChild();
+    } else if(workspaceView_==3){
+        ImGui::BeginChild("##communications_gamemaker",ImVec2(0,0),ImGuiChildFlags_None);
+        renderGameMaker(ctx);ImGui::EndChild();
+    } else if (workspaceView_ == 2) {
+        ImGui::BeginChild("##communications_java", ImVec2(0, 0),
+                          ImGuiChildFlags_None);
+        renderJdwp(ctx);
+        ImGui::EndChild();
+    } else {
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float divider = 5.0f * scale;
+        float processW = (std::max)(280.0f * scale, avail.x * 0.43f);
+        if (processW > avail.x - 300.0f * scale)
+            processW = (std::max)(180.0f * scale, avail.x * 0.50f);
+
+        ImGui::BeginChild("c_proc", ImVec2(processW, 0),
+                          ImGuiChildFlags_Borders);
+        renderProcesses(ctx);
+        ImGui::EndChild();
+        ImGui::SameLine(0.0f, divider);
+        ImGui::BeginChild("c_right", ImVec2(0, 0),
+                          ImGuiChildFlags_Borders);
+        if (ImGui::BeginTabBar("##process_details")) {
+            if (ImGui::BeginTabItem("Modules")) {
+                renderModules();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Connections")) {
+                renderConnections(ctx);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::EndChild();
+    }
+
+    ImGui::PopStyleVar(3);
 }
 
 } // namespace ds

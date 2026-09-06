@@ -5,11 +5,14 @@
 //
 // Compile + run (MSVC dev shell), from the repo root:
 //   cl /nologo /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS /I src ^
-//      tests\module_registry_test.cpp src\Core\BinaryFile.cpp
+//      tests\module_registry_test.cpp src\Core\ModuleRegistry.cpp src\Core\BinaryFile.cpp
 //
 #include "Core/ModuleRegistry.h"
+#include "Core/AnalysisService.h"
 
 #include <cstdio>
+#include <memory>
+#include <utility>
 
 using namespace ds;
 
@@ -41,11 +44,70 @@ int main() {
     CHECK(reg.containing(0x7FF800001000ull) == ntdll, "containing VA inside ntdll");
     CHECK(reg.containing(0x10) == nullptr, "containing VA outside all modules");
 
-    // analyzed()/contains helpers.
+    // analyzed()/contains helpers. Partial pass results are not a complete cache.
     CHECK(!exe->analyzed(), "module not analyzed before cache populated");
     exe->cache.funcsValid = true;
-    CHECK(exe->analyzed(), "module analyzed once funcsValid");
+    CHECK(!exe->analyzed(), "partial function result is not reported as complete analysis");
+    exe->analysisComplete = true;
+    CHECK(exe->analyzed(), "module analyzed once the terminal pass is adopted");
     CHECK(exe->contains(0x140000000ull) && !exe->contains(0x140020000ull), "contains bounds [base, base+size)");
+    LoadedModule wrapping;
+    wrapping.base = UINT64_MAX - 0x10;
+    wrapping.size = 0x20;
+    CHECK(wrapping.contains(UINT64_MAX), "contains does not overflow at top of VA space");
+
+    // App-global AnalysisService results route only to the exact base + epoch.
+    ntdll->analyzing = true;
+    ntdll->analysisEpoch = 7;
+    AnalysisResult strings;
+    strings.moduleBase = ntdll->base;
+    strings.epoch = 7;
+    strings.kinds = K_Funcs | K_Strings | K_Listing | K_Xref;
+    strings.stringsValid = true;
+    strings.strings.push_back({ntdll->base + 0x100, "hello", false});
+    CHECK(reg.applyAnalysisResult(std::move(strings)) == ModuleAnalysisRoute::Applied,
+          "incremental module result applied");
+    CHECK(ntdll->cache.stringsValid && ntdll->analyzing && !ntdll->analyzed(),
+          "incremental result stays pending until terminal xref");
+
+    AnalysisResult stale;
+    stale.moduleBase = ntdll->base;
+    stale.epoch = 6;
+    stale.funcsValid = true;
+    CHECK(reg.applyAnalysisResult(std::move(stale)) == ModuleAnalysisRoute::Ignored,
+          "stale module epoch rejected");
+    CHECK(!ntdll->cache.funcsValid, "stale result did not mutate cache");
+
+    AnalysisResult terminal;
+    terminal.moduleBase = ntdll->base;
+    terminal.epoch = 7;
+    terminal.kinds = K_Funcs | K_Strings | K_Listing | K_Xref;
+    terminal.xref = std::make_shared<XrefIndex>();
+    CHECK(reg.applyAnalysisResult(std::move(terminal)) == ModuleAnalysisRoute::Completed,
+          "xref terminal result completes module analysis");
+    CHECK(ntdll->analyzed() && !ntdll->analyzing && ntdll->cache.xref,
+          "terminal result publishes a complete cache");
+
+    ntdll->analyzing = true;
+    ntdll->analysisComplete = false;
+    ntdll->analysisEpoch = 8;
+    AnalysisResult failure;
+    failure.moduleBase = ntdll->base;
+    failure.epoch = 8;
+    failure.failureValid = true;
+    failure.failure = "decoder failed";
+    CHECK(reg.applyAnalysisResult(std::move(failure)) == ModuleAnalysisRoute::Failed,
+          "structured module failure routed");
+    CHECK(!ntdll->analyzing && !ntdll->analyzed() &&
+          ntdll->analysisError == "decoder failed",
+          "structured failure is retained and retryable");
+
+    AnalysisResult unknown;
+    unknown.moduleBase = 0x12340000;
+    unknown.epoch = 8;
+    unknown.failureValid = true;
+    CHECK(reg.applyAnalysisResult(std::move(unknown)) == ModuleAnalysisRoute::Ignored,
+          "result for unloaded module ignored");
 
     // Active tracking + removal index fix-ups.
     reg.setActiveByBase(0x7FF810000000ull);   // kernel32 at index 2

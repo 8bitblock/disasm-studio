@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -57,8 +58,58 @@ static bool loadBlob(BinaryFile& bf, const std::vector<uint8_t>& bytes, uint64_t
     return ok;
 }
 
+static void put16(std::vector<uint8_t>& b, size_t off, uint16_t value) {
+    std::memcpy(b.data() + off, &value, sizeof(value));
+}
+static void put32(std::vector<uint8_t>& b, size_t off, uint32_t value) {
+    std::memcpy(b.data() + off, &value, sizeof(value));
+}
+
+// One all-executable PE section whose raw offset differs from its RVA, followed
+// by an overlay. This pins structured FILE-offset versus VA authority.
+static std::vector<uint8_t> buildAllExecPe() {
+    std::vector<uint8_t> bytes(0x700, 0);
+    bytes[0] = 'M'; bytes[1] = 'Z'; put32(bytes, 0x3c, 0x80);
+    put32(bytes, 0x80, 0x00004550);
+    const size_t coff = 0x84, opt = coff + 20, sec = opt + 0xe0;
+    put16(bytes, coff, 0x014c); put16(bytes, coff + 2, 1);
+    put16(bytes, coff + 16, 0xe0); put16(bytes, coff + 18, 0x0102);
+    put16(bytes, opt, 0x10b); put32(bytes, opt + 16, 0);
+    put32(bytes, opt + 28, 0x400000); put32(bytes, opt + 32, 0x1000);
+    put32(bytes, opt + 36, 0x200); put32(bytes, opt + 56, 0x2000);
+    put32(bytes, opt + 60, 0x400); put32(bytes, opt + 92, 16);
+    std::memcpy(bytes.data() + sec, ".text", 5);
+    put32(bytes, sec + 8, 0x200); put32(bytes, sec + 12, 0x1000);
+    put32(bytes, sec + 16, 0x200); put32(bytes, sec + 20, 0x400);
+    put32(bytes, sec + 36, 0x60000020u);
+    std::memcpy(bytes.data() + 0x420, kB64Std, 64); // mapped: VA 0x401020
+    std::memcpy(bytes.data() + 0x620, kB64Std, 64); // overlay: no VA
+    return bytes;
+}
+
+static bool loadStructured(BinaryFile& bf, const std::vector<uint8_t>& bytes) {
+    char tmp[L_tmpnam_s]; if (tmpnam_s(tmp, sizeof(tmp)) != 0) return false;
+    const std::string path(tmp);
+    { std::ofstream f(path, std::ios::binary); f.write((const char*)bytes.data(), (std::streamsize)bytes.size()); }
+    const bool ok = bf.load(path);
+    std::remove(path.c_str());
+    return ok;
+}
+
 int main() {
     const uint64_t base = 0x400000;
+
+    // Primary evidence at VA zero is valid and must not be confused with no hit.
+    {
+        std::vector<uint8_t> blob;
+        for (int i = 0; i < 64; ++i) blob.push_back((uint8_t)kB64Std[i]);
+        BinaryFile bf;
+        CHECK(loadBlob(bf, blob, 0));
+        const std::vector<AlgoMatch> matches = ScanAlgorithms(bf);
+        const AlgoMatch* match = find(matches, "Base64 (standard alphabet)");
+        CHECK(match != nullptr);
+        if (match) CHECK(match->addressValid && match->address == 0);
+    }
 
     // ---- 1) Constant detection + extent mapping ----------------------------------
     {
@@ -175,7 +226,24 @@ int main() {
         CHECK(find(ms2, "Base64 (standard alphabet)") == nullptr);
     }
 
-    // ---- 5) Clean blob: none of the headline signatures present ------------------
+    // ---- 5) Structured all-executable image: mapped section VAs only --------------
+    {
+        BinaryFile bf;
+        CHECK(loadStructured(bf, buildAllExecPe()));
+        const auto matches = ScanAlgorithms(bf);
+        size_t standardCount = 0;
+        const AlgoMatch* standard = nullptr;
+        for (const AlgoMatch& match : matches) {
+            if (match.name != "Base64 (standard alphabet)") continue;
+            ++standardCount;
+            standard = &match;
+        }
+        CHECK(standardCount == 1);
+        if (standard)
+            CHECK(standard->addressValid && standard->address == 0x401020);
+    }
+
+    // ---- 6) Clean blob: none of the headline signatures present ------------------
     {
         std::vector<uint8_t> blob(512);
         for (size_t i = 0; i < blob.size(); ++i) blob[i] = (uint8_t)(i ^ 0x5A);

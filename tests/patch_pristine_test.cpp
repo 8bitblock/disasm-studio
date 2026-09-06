@@ -60,6 +60,18 @@ static void revert(Image& img, std::vector<PjPatch>& V, uint64_t va) {
 int main() {
     const std::vector<uint8_t> pristine = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
 
+    // The UI must never retain a valid prefix from malformed raw patch text.
+    {
+        std::vector<uint8_t> parsed{ 0xFF };
+        CHECK(ParseCompletePatchHex("90 0f\tA5", parsed));
+        CHECK(parsed == (std::vector<uint8_t>{ 0x90, 0x0F, 0xA5 }));
+        CHECK(!ParseCompletePatchHex("90 GG", parsed) && parsed.empty());
+        CHECK(!ParseCompletePatchHex("90 A", parsed) && parsed.empty());
+        CHECK(!ParseCompletePatchHex("909", parsed) && parsed.empty());
+        CHECK(!ParseCompletePatchHex("9 0", parsed) && parsed.empty());
+        CHECK(!ParseCompletePatchHex("   ", parsed) && parsed.empty());
+    }
+
     // ---- overlap on the right: P1 @0x1000 [3], P2 @0x1001 [3] ---------------
     {
         Image img{ 0x1000, pristine };

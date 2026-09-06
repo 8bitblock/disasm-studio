@@ -11,17 +11,19 @@
 // UI posts requests and reads a mutex-guarded snapshot.
 //
 // Threading contract:
-//   - attach()/detach() and every public request run on the caller (UI) thread;
-//     RPCs block on the reply with a short timeout (localhost JDWP is sub-ms).
-//   - the reader thread pumps incoming packets, parks replies for waiting
-//     callers, and handles events (stop bookkeeping + follow-up RPCs through
-//     its own nested pump, never through the caller-side wait path).
+//   - one connection thread exclusively owns the SOCKET for its complete
+//     lifetime: resolution/connect/handshake, send/recv, shutdown, and close.
+//   - attach()/detach() and every public RPC submit bounded commands and wait
+//     only on command completion; caller/UI threads never perform socket I/O.
+//   - event-triggered follow-up RPCs execute directly on the connection thread
+//     through a nested pump, avoiding a command-queue self-deadlock.
 // All wire encode/decode lives in Core/Jdwp.{h,cpp} (pure, unit-tested);
 // this file is the socket + session-state shell (review-verified, Winsock).
 //
 #include "Jdwp.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -89,8 +91,10 @@ public:
     JdwpClient(const JdwpClient&) = delete;
     JdwpClient& operator=(const JdwpClient&) = delete;
 
-    // Connect + handshake + IDSizes/Version + AllClasses, then start the
-    // reader thread. Synchronous (3 s connect timeout); false + err on failure.
+    // Starts the connection thread and asks it to connect, handshake, and
+    // bootstrap IDSizes/Version/classes/threads. The public API remains
+    // synchronous for compatibility, but the wait is bounded and the caller
+    // never touches Winsock or the socket.
     bool attach(const std::string& host, uint16_t port, std::string& err);
     void detach();                          // best-effort VM_Dispose + close + join
 
@@ -107,7 +111,7 @@ public:
     bool setBreakpoint(const JdwpLocation& loc, const std::string& label, std::string& err);
     void clearBreakpoint(int32_t requestID);
 
-    // Browsing (blocking RPCs on the caller thread, short timeout).
+    // Browsing (bounded waits for connection-thread RPC commands).
     void refreshClasses();
     bool methodsOf(uint64_t typeID, std::vector<JdwpMethodRow>& out);
     bool bytecodesOf(uint64_t typeID, uint64_t methodID, std::vector<uint8_t>& out);
@@ -115,38 +119,95 @@ public:
     bool lineTableOf(uint64_t typeID, uint64_t methodID,
                      std::vector<std::pair<uint64_t, uint32_t>>& out);
 
+#if defined(DS_JDWP_TEST_HOOKS)
+    // Deterministically exercises the connection-thread exception boundary.
+    // This declaration and its storage do not exist in production builds.
+    void injectReaderFailureForTest();
+#endif
+
 private:
     // ---- RPC plumbing ----
-    uint32_t sendCommand(uint8_t set, uint8_t cmd, const std::vector<uint8_t>& payload);
-    // Caller-side RPC: send + wait for the reader thread to park the reply.
+    using Deadline = std::chrono::steady_clock::time_point;
+    struct Command {
+        enum class Kind { Connect, Request, Disconnect } kind = Kind::Request;
+        std::string host;
+        uint16_t port = 0;
+        uint8_t set = 0, cmd = 0;
+        std::vector<uint8_t> payload;
+        Deadline deadline{};
+        std::atomic<bool> cancelled{false};
+
+        std::mutex doneMtx;
+        std::condition_variable doneCv;
+        bool done = false;
+        bool ok = false;
+        std::string error;
+        JdwpPacket reply;
+    };
+
+    bool submitAndWait(const std::shared_ptr<Command>& command,
+                       JdwpPacket* reply = nullptr, std::string* error = nullptr);
+    bool enqueue(const std::shared_ptr<Command>& command, bool front = false);
+    static void complete(const std::shared_ptr<Command>& command, bool ok,
+                         JdwpPacket reply = {}, std::string error = {});
+    static void failCommandNoThrow(const std::shared_ptr<Command>& command,
+                                   const char* reason) noexcept;
+    void failQueuedCommands(const char* reason) noexcept;
+
+    // Caller-side RPC: enqueue + bounded wait for connection-thread completion.
     bool request(uint8_t set, uint8_t cmd, const std::vector<uint8_t>& payload,
                  JdwpPacket& reply, int timeoutMs = 1500);
-    // Reader-side RPC: send + pump the socket inline until the reply arrives
+    // Connection-thread RPC: send + pump the owned socket until the reply arrives
     // (events seen meanwhile are queued, not recursed into).
     bool readerRequest(uint8_t set, uint8_t cmd, const std::vector<uint8_t>& payload,
-                       JdwpPacket& reply, int timeoutMs = 1500);
+                       JdwpPacket& reply, int timeoutMs = 1500,
+                       const std::atomic<bool>* cancelled = nullptr);
+    bool readerRequestUntil(uint8_t set, uint8_t cmd,
+                            const std::vector<uint8_t>& payload,
+                            JdwpPacket& reply, Deadline deadline,
+                            const std::atomic<bool>* cancelled = nullptr);
+    uint32_t sendCommandOwned(uint8_t set, uint8_t cmd,
+                              const std::vector<uint8_t>& payload,
+                              Deadline deadline,
+                              const std::atomic<bool>* cancelled = nullptr);
+    bool sendAllOwned(const uint8_t* data, size_t size, Deadline deadline,
+                      const std::atomic<bool>* cancelled = nullptr);
     bool pumpSocket(int timeoutMs);         // select+recv+frame; parks replies, queues events
-    void readerMain();
+    bool connectOwned(const std::string& host, uint16_t port, Deadline deadline,
+                      const std::atomic<bool>* cancelled, std::string& err);
+    bool bootstrapOwned(const std::string& host, uint16_t port, Deadline deadline,
+                        const std::atomic<bool>* cancelled, std::string& err);
+    void readerMain() noexcept;
+    void readerLoop(std::shared_ptr<Command>& activeCommand);
+    void finishReader(const std::shared_ptr<Command>& activeCommand,
+                      const char* reason, bool failed) noexcept;
     void handleEvent(const JdwpEventSet& es);
     void onStopped(const JdwpEvent& e, const char* kind);
     void stepCommon(uint32_t depth, const char* what);
-    // Reader-thread refreshers (attach() uses them too, before the thread starts).
-    void refreshClassesViaReader();
-    void refreshThreadsViaReader();
+    // Connection-thread refreshers. Optional cancellation is used by attach.
+    void refreshClassesViaReader(int timeoutMs = 5000,
+                                 const std::atomic<bool>* cancelled = nullptr);
+    void refreshThreadsViaReader(int timeoutMs = 2500,
+                                 const std::atomic<bool>* cancelled = nullptr);
     std::string locationLabel(const JdwpLocation& loc);   // reader thread only
-    void closeSocket();
+    void closeSocketOwned();
     void pushEvent(const std::string& line);
 
     // ---- session state (guarded by mtx_ unless noted) ----
     std::mutex                     mtx_;
-    std::condition_variable        replyCv_;
     std::map<uint32_t, JdwpPacket> replies_;       // parked replies by packet id
     std::atomic<uint32_t>          nextId_{1};
-    std::atomic<bool>              quit_{false};
+    std::atomic<bool>              disconnectRequested_{false};
 
-    uintptr_t                      sock_ = ~(uintptr_t)0;   // INVALID_SOCKET
-    std::mutex                     sendMtx_;                // serializes send()
+    // Command queue state. sock_, rxBuf_, pendingEvents_, and pumpDepth_ are
+    // accessed only by reader_ after it starts and until it exits.
+    std::mutex                     commandMtx_;
+    std::condition_variable        commandCv_;
+    std::deque<std::shared_ptr<Command>> commands_;
+    bool                           acceptingCommands_ = false;
+    bool                           workerRunning_ = false;
     std::thread                    reader_;
+    uintptr_t                      sock_ = ~(uintptr_t)0;   // connection thread only
     std::vector<uint8_t>           rxBuf_;                  // reader thread only
     std::deque<JdwpEventSet>       pendingEvents_;          // reader thread only (nested pumps)
     int                            pumpDepth_ = 0;          // reader thread only
@@ -165,6 +226,9 @@ private:
     std::deque<std::string>        events_;                 // capped ring
     std::shared_ptr<const std::vector<JdwpClassRow>> classes_;
     int32_t                        activeStepReq_ = -1;     // outstanding SINGLE_STEP request
+#if defined(DS_JDWP_TEST_HOOKS)
+    std::atomic<bool>              injectReaderFailure_{false};
+#endif
     // method-name cache for frame/stop labels: classID -> (methodID -> name)
     std::map<uint64_t, std::map<uint64_t, std::string>> methodNameCache_;
 };

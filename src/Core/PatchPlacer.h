@@ -11,7 +11,8 @@
 //   * Detour    - the body is larger: overwrite the span with a near JMP to a code
 //                 cave (or a caller-allocated region) holding the body + a JMP back.
 //   * NeedsAlloc- no cave fits and the caller permitted live allocation: it should
-//                 VirtualAllocEx `requiredCaveSize` bytes, then re-plan with allocVA.
+//                 VirtualAllocEx `requiredCaveSize` bytes, then re-plan with
+//                 allocVA + allocVAValid.
 //   * Refused   - the span is too small to host a 5-byte JMP, or no space is available,
 //                 or the cave is out of +/-2GB rel32 range. Reason is human-readable.
 //
@@ -58,6 +59,7 @@ struct PlaceResult {
     PlaceStatus             status = PlaceStatus::Refused;
     std::vector<PatchWrite> writes;               // apply in order via applyPatchBytes
     uint64_t                caveVA = 0;           // where the body landed (Detour)
+    bool                    caveVAValid = false;  // Detour may legitimately land at VA 0
     size_t                  requiredCaveSize = 0; // NeedsAlloc: bytes the caller must allocate
     std::string             reason;               // human-readable, esp. when Refused/NeedsAlloc
 };
@@ -84,7 +86,8 @@ struct PlaceInput {
     std::vector<uint8_t>  newBody;      // compiled, position-independent patch body
     std::vector<CodeCave> caves;        // candidate caves (FindCodeCaves output)
     bool                  allowAlloc = false; // live: may request a fresh RWX region
-    uint64_t              allocVA    = 0;      // a caller-allocated region to use (0 = none)
+    uint64_t              allocVA    = 0;      // a caller-allocated region to use
+    bool                  allocVAValid = false;// distinguishes an allocation at VA 0 from none
     uint8_t               nop = 0x90;          // pad byte
 };
 

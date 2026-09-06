@@ -6,6 +6,10 @@
 // the executable's shell icon; main.cpp loads it for the window/taskbar icon.
 IDI_APPICON ICON "app.ico"
 
+// Generated after the private helper project is built. The included file names
+// the current configuration's DLL and changes whenever its SHA-256 changes.
+#include "GameMakerHelperResource.rc"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION DS_VERSION_COMMA
  PRODUCTVERSION DS_VERSION_COMMA

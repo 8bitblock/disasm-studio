@@ -108,6 +108,12 @@ size_t FindFirstMasked(const uint8_t* data, size_t n, const SigPattern& pat, siz
 }
 
 std::vector<size_t> FindAllMasked(const uint8_t* data, size_t n, const SigPattern& pat, size_t maxHits) {
+    return FindAllMaskedAccepted(data, n, pat, maxHits, {});
+}
+
+std::vector<size_t> FindAllMaskedAccepted(
+    const uint8_t* data, size_t n, const SigPattern& pat, size_t maxHits,
+    const std::function<bool(size_t)>& admit) {
     std::vector<size_t> hits;
     const size_t m = pat.bytes.size();
     if (m == 0 || n < m) return hits;
@@ -116,8 +122,10 @@ std::vector<size_t> FindAllMasked(const uint8_t* data, size_t n, const SigPatter
     while (pos + m <= n) {
         size_t at = FindFirstMasked(data, n, pat, pos);
         if (at == SIZE_MAX) break;
-        hits.push_back(at);
-        if (maxHits && hits.size() >= maxHits) break;
+        if (!admit || admit(at)) {
+            hits.push_back(at);
+            if (maxHits && hits.size() >= maxHits) break;
+        }
         // Allow overlapping matches: resume one byte past this match's start.
         pos = at + 1;
     }

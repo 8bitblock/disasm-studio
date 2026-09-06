@@ -26,13 +26,13 @@
   <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -48,20 +48,11 @@
   <PropertyGroup>
     <DsEngines Condition="'$(DsEngines)'==''">false</DsEngines>
     <DsInlineC Condition="'$(DsInlineC)'==''">false</DsInlineC>
-    <DsPython  Condition="'$(DsPython)'==''">false</DsPython>
-    <VcpkgManifestFeatures Condition="'$(DsEngines)'=='true' And '$(DsPython)'=='true'">engines;embed-python</VcpkgManifestFeatures>
-    <VcpkgManifestFeatures Condition="'$(DsEngines)'=='true' And '$(DsPython)'!='true'">engines</VcpkgManifestFeatures>
-    <VcpkgManifestFeatures Condition="'$(DsEngines)'!='true' And '$(DsPython)'=='true'">embed-python</VcpkgManifestFeatures>
+    <VcpkgManifestFeatures Condition="'$(DsEngines)'=='true'">engines</VcpkgManifestFeatures>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(DsEngines)'=='true'">
     <ClCompile>
       <PreprocessorDefinitions>DS_HAVE_SYMENGINE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-    </ClCompile>
-  </ItemDefinitionGroup>
-  <!-- F2 inline Python tier: embed CPython (vcpkg 'embed-python' feature). -->
-  <ItemDefinitionGroup Condition="'$(DsPython)'=='true'">
-    <ClCompile>
-      <PreprocessorDefinitions>DS_HAVE_PYTHON;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <!-- F2 inline C tier: vendor libtcc under third_party\tcc (libtcc.h + libtcc.lib);
@@ -90,6 +81,10 @@
       <SubSystem>Windows</SubSystem>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;psapi.lib;iphlpapi.lib;ws2_32.lib;advapi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalInputs>$(ProjectDir)build\$(Platform)\$(Configuration)\GameMakerHelper.dll;%(AdditionalInputs)</AdditionalInputs>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
@@ -103,12 +98,15 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)$(TargetName).pdb</ProgramDatabaseFile>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -119,30 +117,76 @@
     <ClCompile Include="src\Ui\Widgets.cpp" />
     <ClCompile Include="src\Ui\CommandPalette.cpp" />
     <ClCompile Include="src\Core\BinaryFile.cpp" />
+    <ClCompile Include="src\Core\AddressInspector.cpp" />
     <ClCompile Include="src\Core\ProcessManager.cpp" />
+    <ClCompile Include="src\Core\ProcessMemorySession.cpp" />
     <ClCompile Include="src\Core\FunctionAnalyzer.cpp" />
+    <ClCompile Include="src\Core\CodeDataClassifier.cpp" />
+    <ClCompile Include="src\Core\BinaryOverview.cpp" />
+    <ClCompile Include="src\Core\JumpTableResolver.cpp" />
     <ClCompile Include="src\Core\FunctionNamer.cpp" />
     <ClCompile Include="src\Core\Debugger.cpp" />
+    <ClCompile Include="src\Core\DebuggerGameMaker.cpp" />
     <ClCompile Include="src\Core\SymbolResolver.cpp" />
+    <ClCompile Include="src\Core\SymbolService.cpp" />
     <ClCompile Include="src\Core\CFG.cpp" />
     <ClCompile Include="src\Core\Cond.cpp" />
     <ClCompile Include="src\Core\ConnectionSchema.cpp" />
+    <ClCompile Include="src\Core\Demangle.cpp" />
+    <ClCompile Include="src\Core\NetworkEndpoint.cpp" />
+    <ClCompile Include="src\Core\NetworkApiCatalog.cpp" />
+    <ClCompile Include="src\Core\ValidationApiCatalog.cpp" />
+    <ClCompile Include="src\Core\VerificationApiCatalog.cpp" />
+    <ClCompile Include="src\Core\MachineIdentityApiCatalog.cpp" />
+    <ClCompile Include="src\Core\AuthorizationTrail.cpp" />
+    <ClCompile Include="src\Core\AuthorizationPatchAdvisor.cpp" />
+    <ClCompile Include="src\Core\AuthorizationExperiment.cpp" />
+    <ClCompile Include="src\Core\AuthorizationFieldAlias.cpp" />
+    <ClCompile Include="src\Core\CrackmeTriage.cpp" />
+    <ClCompile Include="src\Core\PersistentStateCatalog.cpp" />
+    <ClCompile Include="src\Core\AuthorizationAnalysis.cpp" />
+    <ClCompile Include="src\Core\AuthorizationWatch.cpp" />
     <ClCompile Include="src\Core\Json.cpp" />
+    <ClCompile Include="src\Core\AtomicFile.cpp" />
+    <ClCompile Include="src\Core\Preferences.cpp" />
     <ClCompile Include="src\Core\Project.cpp" />
     <ClCompile Include="src\Core\Decompiler.cpp" />
     <ClCompile Include="src\Core\DataFlow.cpp" />
     <ClCompile Include="src\Core\TechScan.cpp" />
+    <ClCompile Include="src\Core\ResourceDecode.cpp" />
     <ClCompile Include="src\Core\JavaScan.cpp" />
     <ClCompile Include="src\Core\Inflate.cpp" />
     <ClCompile Include="src\Core\RuntimeScan.cpp" />
     <ClCompile Include="src\Core\JvmClass.cpp" />
+    <ClCompile Include="src\Core\GameMakerArchive.cpp" />
+    <ClCompile Include="src\Core\GameMakerDebug.cpp" />
+    <ClCompile Include="src\Core\GameMakerHelperImage.cpp" />
+    <ClCompile Include="src\Core\GameMakerInspection.cpp" />
+    <ClCompile Include="src\Core\GameMakerRunner.cpp" />
     <ClCompile Include="src\Core\Jdwp.cpp" />
     <ClCompile Include="src\Core\JdwpClient.cpp" />
     <ClCompile Include="src\Core\JvmAttach.cpp" />
     <ClCompile Include="src\Core\XrefIndex.cpp" />
     <ClCompile Include="src\Core\AnalysisJobs.cpp" />
     <ClCompile Include="src\Core\AnalysisService.cpp" />
+    <ClCompile Include="src\Core\AnalysisCache.cpp" />
+    <ClCompile Include="src\Core\DocumentContext.cpp" />
+    <ClCompile Include="src\Core\ModuleRegistry.cpp" />
+    <ClCompile Include="src\Core\InvestigationIndex.cpp" />
+    <ClCompile Include="src\Core\InvestigationService.cpp" />
+    <ClCompile Include="src\Core\CodeExport.cpp" />
+    <ClCompile Include="src\Core\FirmwareSniffer.cpp" />
+    <ClCompile Include="src\Core\TraceCoverage.cpp" />
+    <ClCompile Include="src\Core\DllDebugPlan.cpp" />
+    <ClCompile Include="src\Core\UnpackEngine.cpp" />
+    <ClCompile Include="src\Core\PeUnpack.cpp" />
+    <ClCompile Include="src\Core\StaticUnpack.cpp" />
+    <ClCompile Include="src\Core\PassiveDump.cpp" />
+    <ClCompile Include="src\Core\AntiDebug.cpp" />
     <ClCompile Include="src\Core\LiveScanService.cpp" />
+    <ClCompile Include="src\Core\MemoryScan.cpp" />
+    <ClCompile Include="src\Core\MemoryPointer.cpp" />
+    <ClCompile Include="src\Core\MemoryTable.cpp" />
     <ClCompile Include="src\Core\AlgoScan.cpp" />
     <ClCompile Include="src\Core\FuncAnnotate.cpp" />
     <ClCompile Include="src\Core\GameContext.cpp" />
@@ -161,26 +205,37 @@
     <ClCompile Include="src\Core\Cortex.cpp" />
     <ClCompile Include="src\Core\Prism.cpp" />
     <ClCompile Include="src\Core\PrismSampler.cpp" />
+    <ClCompile Include="src\Core\SemanticDiff.cpp" />
+    <ClCompile Include="src\Core\SemanticDiffBinary.cpp" />
+    <ClCompile Include="src\Core\SemanticTransfer.cpp" />
     <ClCompile Include="src\Disasm\ZydisDisassembler.cpp" />
     <ClCompile Include="src\Disasm\CapstoneDisassembler.cpp" />
     <ClCompile Include="src\Disasm\DisassemblerFactory.cpp" />
     <ClCompile Include="src\Disasm\JvmDisassembler.cpp" />
+    <ClCompile Include="src\Disasm\GmlDisassembler.cpp" />
     <ClCompile Include="src\Disasm\Assembler.cpp" />
     <ClCompile Include="src\Tabs\ProjectsTab.cpp" />
     <ClCompile Include="src\Tabs\CommunicationsTab.cpp" />
     <ClCompile Include="src\Tabs\ConnectionsTab.cpp" />
     <ClCompile Include="src\Tabs\SigScannerTab.cpp" />
-    <ClCompile Include="src\Tabs\BinaryViewTab.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewTab.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClCompile Include="src\Tabs\BinaryViewHostTab.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewOverview.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewGml.cpp" />
     <ClCompile Include="src\Tabs\MemoryToolsTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryDiffTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryTechTab.cpp" />
     <ClCompile Include="src\Tabs\CortexTab.cpp" />
     <ClCompile Include="src\Tabs\PrismTab.cpp" />
-    <ClCompile Include="src\Hv\HvDbgClient.cpp" />
-    <ClCompile Include="src\Hv\HvDbgLoader.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="vcpkg-configuration.json" />
+    <None Include="triplets\x64-windows-static.cmake" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="src\app.ico" />
@@ -192,17 +247,48 @@
     <ClInclude Include="src\Ui\Fonts.h" />
     <ClInclude Include="src\Ui\Icons.h" />
     <ClInclude Include="src\Ui\Widgets.h" />
+    <ClInclude Include="src\Ui\GraphViewport.h" />
     <ClInclude Include="src\Ui\CommandPalette.h" />
     <ClInclude Include="src\Ui\Splitter.h" />
     <ClInclude Include="src\Core\Fuzzy.h" />
+    <ClInclude Include="src\Core\AddressSpan.h" />
+    <ClInclude Include="src\Core\AttachImagePolicy.h" />
+    <ClInclude Include="src\Core\AddressInspector.h" />
     <ClInclude Include="src\Core\BinaryFile.h" />
+    <ClInclude Include="src\Core\ResourceDecode.h" />
+    <ClInclude Include="src\Core\RegisterEdit.h" />
     <ClInclude Include="src\Core\Debugger.h" />
+    <ClInclude Include="src\Core\DebugTargetIdentity.h" />
     <ClInclude Include="src\Core\SymbolResolver.h" />
+    <ClInclude Include="src\Core\SymbolService.h" />
     <ClInclude Include="src\Core\CFG.h" />
     <ClInclude Include="src\Core\Cond.h" />
     <ClInclude Include="src\Core\ConnectionSchema.h" />
+    <ClInclude Include="src\Core\Demangle.h" />
+    <ClInclude Include="src\Core\NetworkEndpoint.h" />
+    <ClInclude Include="src\Core\NetworkApiCatalog.h" />
+    <ClInclude Include="src\Core\ValidationApiCatalog.h" />
+    <ClInclude Include="src\Core\VerificationApiCatalog.h" />
+    <ClInclude Include="src\Core\MachineIdentityApiCatalog.h" />
+    <ClInclude Include="src\Core\AuthorizationTrail.h" />
+    <ClInclude Include="src\Core\AuthorizationPatchAdvisor.h" />
+    <ClInclude Include="src\Core\AuthorizationExperiment.h" />
+    <ClInclude Include="src\Core\AuthorizationFieldAlias.h" />
+    <ClInclude Include="src\Core\PatchSet.h" />
+    <ClInclude Include="src\Core\CrackmeTriage.h" />
+    <ClInclude Include="src\Core\PersistentStateCatalog.h" />
+    <ClInclude Include="src\Core\AuthorizationAnalysis.h" />
+    <ClInclude Include="src\Core\AuthorizationWatch.h" />
+    <ClInclude Include="src\Core\CodeByteSignature.h" />
+    <ClInclude Include="src\Core\CodeByteSignatureBuilder.h" />
+    <ClInclude Include="src\Core\NetworkObservation.h" />
     <ClInclude Include="src\Core\Json.h" />
+    <ClInclude Include="src\Core\AtomicFile.h" />
+    <ClInclude Include="src\Core\Preferences.h" />
     <ClInclude Include="src\Core\Project.h" />
+    <ClInclude Include="src\Core\PatchedImage.h" />
+    <ClInclude Include="src\Core\PatchRefresh.h" />
+    <ClInclude Include="src\Core\LivePatchOriginal.h" />
     <ClInclude Include="src\Core\Decompiler.h" />
     <ClInclude Include="src\Core\DataFlow.h" />
     <ClInclude Include="src\Core\TechScan.h" />
@@ -211,18 +297,49 @@
     <ClInclude Include="src\Core\RuntimeScan.h" />
     <ClInclude Include="src\Core\Findings.h" />
     <ClInclude Include="src\Core\JvmClass.h" />
+    <ClInclude Include="src\Core\GameMakerArchive.h" />
+    <ClInclude Include="src\Core\GameMakerDebug.h" />
+    <ClInclude Include="src\Core\GameMakerDebugProtocol.h" />
+    <ClInclude Include="src\Core\GameMakerHelperImage.h" />
+    <ClInclude Include="src\Core\GameMakerHookMutation.h" />
+    <ClInclude Include="src\Core\GameMakerInspection.h" />
+    <ClInclude Include="src\Core\GameMakerRunner.h" />
+    <ClInclude Include="src\Core\GameMakerSession.h" />
     <ClInclude Include="src\Core\Jdwp.h" />
     <ClInclude Include="src\Core\JdwpClient.h" />
     <ClInclude Include="src\Core\JvmAttach.h" />
     <ClInclude Include="src\Core\XrefIndex.h" />
     <ClInclude Include="src\Core\AnalysisJobs.h" />
+    <ClInclude Include="src\Core\CodeDataClassifier.h" />
+    <ClInclude Include="src\Core\InstructionReference.h" />
+    <ClInclude Include="src\Core\BinaryOverview.h" />
+    <ClInclude Include="src\Core\JumpTableResolver.h" />
+    <ClInclude Include="src\Core\ListingVirtualIndex.h" />
     <ClInclude Include="src\Core\AnalysisService.h" />
+    <ClInclude Include="src\Core\AnalysisCache.h" />
+    <ClInclude Include="src\Core\DocumentContext.h" />
+    <ClInclude Include="src\Core\DocumentResultIdentity.h" />
+    <ClInclude Include="src\Core\InvestigationIndex.h" />
+    <ClInclude Include="src\Core\InvestigationService.h" />
+    <ClInclude Include="src\Core\CodeExport.h" />
+    <ClInclude Include="src\Core\FirmwareSniffer.h" />
+    <ClInclude Include="src\Core\TraceCoverage.h" />
+    <ClInclude Include="src\Core\DllDebugPlan.h" />
+    <ClInclude Include="src\Core\UnpackEngine.h" />
+    <ClInclude Include="src\Core\PeUnpack.h" />
+    <ClInclude Include="src\Core\StaticUnpack.h" />
+    <ClInclude Include="src\Core\PassiveDump.h" />
+    <ClInclude Include="src\Core\AntiDebug.h" />
     <ClInclude Include="src\Core\LiveScanService.h" />
+    <ClInclude Include="src\Core\MemoryScan.h" />
+    <ClInclude Include="src\Core\MemoryPointer.h" />
+    <ClInclude Include="src\Core\MemoryTable.h" />
     <ClInclude Include="src\Core\ModuleRegistry.h" />
     <ClInclude Include="src\Core\AlgoScan.h" />
     <ClInclude Include="src\Core\FuncAnnotate.h" />
     <ClInclude Include="src\Core\GameContext.h" />
     <ClInclude Include="src\Core\ApiInfo.h" />
+    <ClInclude Include="src\Core\ApiDatabase.h" />
     <ClInclude Include="src\Core\JvmAnnotate.h" />
     <ClInclude Include="src\Core\SigMatch.h" />
     <ClInclude Include="src\Core\PatchPlacer.h" />
@@ -242,10 +359,12 @@
     <ClInclude Include="src\Tabs\DataRef.h" />
     <ClInclude Include="src\Core\StepLogic.h" />
     <ClInclude Include="src\Core\ProcessManager.h" />
+    <ClInclude Include="src\Core\ProcessMemorySession.h" />
     <ClInclude Include="src\Core\FunctionAnalyzer.h" />
     <ClInclude Include="src\Core\FunctionNamer.h" />
     <ClInclude Include="src\Disasm\IDisassembler.h" />
     <ClInclude Include="src\Disasm\JvmDisassembler.h" />
+    <ClInclude Include="src\Disasm\GmlDisassembler.h" />
     <ClInclude Include="src\Disasm\ZydisDisassembler.h" />
     <ClInclude Include="src\Disasm\CapstoneDisassembler.h" />
     <ClInclude Include="src\Disasm\DisassemblerFactory.h" />
@@ -256,6 +375,7 @@
     <ClInclude Include="src\Tabs\ConnectionsTab.h" />
     <ClInclude Include="src\Tabs\SigScannerTab.h" />
     <ClInclude Include="src\Tabs\BinaryViewTab.h" />
+    <ClInclude Include="src\Tabs\BinaryViewHostTab.h" />
     <ClInclude Include="src\Tabs\MemoryToolsTab.h" />
     <ClInclude Include="src\Tabs\BinaryDiffTab.h" />
     <ClInclude Include="src\Tabs\BinaryTechTab.h" />
@@ -264,9 +384,75 @@
     <ClInclude Include="src\Core\Cortex.h" />
     <ClInclude Include="src\Core\Prism.h" />
     <ClInclude Include="src\Core\PrismSampler.h" />
-    <ClInclude Include="src\Hv\HvDbgClient.h" />
-    <ClInclude Include="src\Hv\HvDbgLoader.h" />
-    <ClInclude Include="src\Hv\HvDbgProtocol.h" />
+    <ClInclude Include="src\Core\SemanticDiff.h" />
+    <ClInclude Include="src\Core\SemanticDiffBinary.h" />
+    <ClInclude Include="src\Core\SemanticTransfer.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="GameMakerHelper.vcxproj">
+      <Project>{5A12C234-21E8-42BF-94C6-7AE91D047EF2}</Project>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <Private>false</Private>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <PropertyGroup>
+    <_DsGameMakerHelperPath>$(ProjectDir)build\$(Platform)\$(Configuration)\GameMakerHelper.dll</_DsGameMakerHelperPath>
+    <_DsGameMakerResourcePath>$([System.String]::Copy('$(_DsGameMakerHelperPath)').Replace('\','/'))</_DsGameMakerResourcePath>
+  </PropertyGroup>
+  <Target Name="DsPrepareGameMakerHelperResource" BeforeTargets="ResourceCompile" DependsOnTargets="ResolveProjectReferences">
+    <Error Condition="!Exists('$(_DsGameMakerHelperPath)')" Text="The built-in GameMaker helper must be built before application resources." />
+    <GetFileHash Files="$(_DsGameMakerHelperPath)" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="_DsGameMakerHelperHash" />
+    </GetFileHash>
+    <PropertyGroup><_DsGameMakerHelperDigest>@(_DsGameMakerHelperHash->'%(FileHash)')</_DsGameMakerHelperDigest></PropertyGroup>
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(IntDir)GameMakerHelperResource.rc"
+                      Lines="// Helper SHA256 $(_DsGameMakerHelperDigest);IDR_GML_HELPER RCDATA &quot;$(_DsGameMakerResourcePath)&quot;"
+                      Encoding="UTF-8" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup><FileWrites Include="$(IntDir)GameMakerHelperResource.rc" /></ItemGroup>
+  </Target>
+  <Target Name="DsVerifyGameMakerHelperResource" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)tests\verify_gamemaker_helper_resource.ps1&quot; -Executable &quot;$(TargetPath)&quot; -HelperDll &quot;$(_DsGameMakerHelperPath)&quot;" />
+  </Target>
+
+  <!-- The stock vcpkg MSBuild target inherits its compiler selection from the
+       build-node environment, and its stamp only watches manifest/config files.
+       Bind that environment to this project's compiler and include the identity
+       in the stock target's incremental inputs. -->
+  <PropertyGroup>
+    <_DsVcpkgVisualStudioPath>$([System.Text.RegularExpressions.Regex]::Replace('$(VSInstallDir)', '[\\/]+$', ''))</_DsVcpkgVisualStudioPath>
+    <_DsVcpkgToolchainIdentityFile>$(IntDir)vcpkg-toolchain-identity.txt</_DsVcpkgToolchainIdentityFile>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(VcpkgEnabled)' == 'true' and '$(VcpkgEnableManifest)' == 'true' and '$(VcpkgManifestInstall)' == 'true'">
+    <_ZVcpkgInstallManifestDependenciesInputs Include="$(ProjectDir)triplets\x64-windows-static.cmake" />
+    <_ZVcpkgInstallManifestDependenciesInputs Include="$(_DsVcpkgToolchainIdentityFile)" />
+    <_ZVcpkgInstallManifestDependenciesInputs
+      Include="$(VSInstallDir)VC\Auxiliary\Build\Microsoft.VCToolsVersion.v143.default.txt"
+      Condition="Exists('$(VSInstallDir)VC\Auxiliary\Build\Microsoft.VCToolsVersion.v143.default.txt')" />
+  </ItemGroup>
+  <Target Name="DsPrepareVcpkgToolchainIdentity"
+          BeforeTargets="VcpkgInstallManifestDependencies"
+          Condition="'$(VcpkgEnabled)' == 'true' and '$(VcpkgEnableManifest)' == 'true' and '$(VcpkgManifestInstall)' == 'true'">
+    <Error Text="DisasmStudio requires an active Visual Studio instance for vcpkg manifest installation."
+           Condition="'$(_DsVcpkgVisualStudioPath)' == ''" />
+    <Error Text="The active Visual Studio instance does not contain v143 $(VCToolsVersion)."
+           Condition="'$(VCToolsVersion)' == '' or !Exists('$(_DsVcpkgVisualStudioPath)\VC\Tools\MSVC\$(VCToolsVersion)\bin\Hostx64\x64\cl.exe')" />
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(_DsVcpkgToolchainIdentityFile)"
+                      Lines="VS=$(_DsVcpkgVisualStudioPath)|v143=$(VCToolsVersion)"
+                      Encoding="UTF-8"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true" />
+    <SetEnv Name="VCPKG_VISUAL_STUDIO_PATH"
+            Value="$(_DsVcpkgVisualStudioPath)"
+            Prefix="false" />
+    <SetEnv Name="DS_VCPKG_PLATFORM_TOOLSET_VERSION"
+            Value="$(VCToolsVersion)"
+            Prefix="false" />
+    <Message Text="Binding vcpkg to VS '$(_DsVcpkgVisualStudioPath)', v143 $(VCToolsVersion)."
+             Importance="High" />
+  </Target>
 </Project>

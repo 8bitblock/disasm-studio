@@ -340,6 +340,14 @@ std::unique_ptr<ISymEngine> MakeSymEngine(Arch arch) {
 #endif
 }
 
+bool SymEngineAvailable() {
+#ifdef DS_HAVE_SYMENGINE
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::unique_ptr<ISolver> MakeSolver() {
     return std::make_unique<DefaultSolver>();
 }

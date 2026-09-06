@@ -9,6 +9,7 @@
 // own-thread follow-up. Kept in its own TU so PathExplore stays engine/binary-free.
 //
 #include "PathExplore.h"
+#include "CFG.h"
 #include "../Disasm/IDisassembler.h"   // Arch, IDisassembler
 
 #include <cstdint>
@@ -18,6 +19,7 @@ namespace ds {
 class BinaryFile;
 
 PathTree PathExploreJob(const BinaryFile& bin, IDisassembler& dis, Arch arch, uint64_t rootVA,
-                        const ExploreConfig& cfg = {});
+                        const ExploreConfig& cfg = {},
+                        const NoreturnCallResolver& isNoreturnCall = {});
 
 } // namespace ds

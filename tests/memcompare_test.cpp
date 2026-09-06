@@ -9,12 +9,21 @@
 //   .\memcompare_test.exe
 //
 #include "Core/MemCompare.h"
+#include "Core/Debugger.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 
 using namespace ds;
+
+static_assert(std::is_same_v<
+    decltype(&Debugger::duplicateProcessHandleForSession),
+    void* (Debugger::*)(DebugTargetIdentity)>);
+static_assert(std::is_same_v<
+    decltype(&Debugger::setRegisterForSession),
+    bool (Debugger::*)(uint32_t, uint64_t, const std::string&, uint64_t)>);
 
 static int g_fail = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -96,6 +105,84 @@ int main() {
     CHECK(MemAsNumber(DB, bitsD(2.25), true)  ==  2.25);
     CHECK(MemLess(F, true, bitsF(-1.0f), bitsF(0.0f)));      // -1.0 < 0.0 regardless of mode
     CHECK(MemGreater(DB, false, bitsD(10.0), bitsD(9.99)));
+
+    // ---- strict mutation-input parsing ------------------------------------
+    {
+        uint64_t bits = 0;
+        size_t size = 0;
+        CHECK(MemParseValue(B, "255", false, bits, size) && bits == 255 && size == 1);
+        CHECK(MemParseValue(B, "-128", false, bits, size) && bits == 0x80 && size == 1);
+        CHECK(!MemParseValue(B, "256", false, bits, size));
+        CHECK(!MemParseValue(B, "-129", false, bits, size));
+        CHECK(MemParseValue(B, "ff", true, bits, size) && bits == 0xFF);
+        CHECK(!MemParseValue(B, "100", true, bits, size));
+        CHECK(!MemParseValue(D, "12junk", false, bits, size));
+        CHECK(!MemParseValue(D, "", false, bits, size));
+        CHECK(MemParseValue(Q, "18446744073709551615", false, bits, size) &&
+              bits == UINT64_MAX && size == 8);
+        CHECK(!MemParseValue(Q, "18446744073709551616", false, bits, size));
+        CHECK(MemParseValue(Q, "-9223372036854775808", false, bits, size) &&
+              bits == 0x8000000000000000ull);
+        CHECK(MemParseValue(F, " 1.25 ", false, bits, size) &&
+              bits == bitsF(1.25f) && size == 4);
+        CHECK(MemParseValue(DB, "-2.5", false, bits, size) &&
+              bits == bitsD(-2.5) && size == 8);
+        CHECK(!MemParseValue(F, "3.5f", false, bits, size));
+        CHECK(!MemParseValue(F, "nan", false, bits, size));
+        CHECK(!MemParseValue(DB, "inf", false, bits, size));
+        CHECK(!MemParseValue(DB, "1e9999", false, bits, size));
+
+        uint64_t address = 0xDEADBEEF;
+        CHECK(MemParseHexAddress("0", address) && address == 0);
+        CHECK(MemParseHexAddress("0x0", address) && address == 0);
+        CHECK(MemParseHexAddress("  000  ", address) && address == 0);
+        CHECK(MemParseHexAddress("7fffFFFF", address) && address == 0x7FFFFFFF);
+        address = 0xDEADBEEF;
+        CHECK(!MemParseHexAddress("", address) && address == 0xDEADBEEF);
+        CHECK(!MemParseHexAddress("xyz", address) && address == 0xDEADBEEF);
+        CHECK(!MemParseHexAddress("10junk", address) && address == 0xDEADBEEF);
+        CHECK(!MemParseHexAddress("-0", address) && address == 0xDEADBEEF);
+        CHECK(!MemParseHexAddress("10000000000000000", address) && address == 0xDEADBEEF);
+    }
+
+    // The address-table master switch is authoritative: leaving Freeze checked
+    // while disabling a row must not continue writing into the target process.
+    CHECK(MemAddressTableShouldWrite(true, true, true));
+    CHECK(!MemAddressTableShouldWrite(true, false, true));
+    CHECK(!MemAddressTableShouldWrite(true, true, false));
+    CHECK(!MemAddressTableShouldWrite(false, true, true));
+    CHECK(MemAddressTableShouldWrite(true, true, true, 7, 1234, 7, 1234));
+    CHECK(!MemAddressTableShouldWrite(true, true, true, 8, 1234, 7, 1234));
+    CHECK(!MemAddressTableShouldWrite(true, true, true, 7, 5678, 7, 1234));
+    CHECK(!MemAddressTableShouldWrite(true, true, true, 0, 1234, 0, 1234));
+    CHECK(!MemAddressTableShouldWrite(true, true, true, 7, 0, 7, 0));
+
+    // The same pure predicate is used inside Debugger::readMemoryForSession and
+    // writeMemoryForSession while hProcMtx_ remains held through the actual OS
+    // operation. Exercise detach/reattach ABA cases without a live debuggee.
+    constexpr DebugTargetIdentity firstAttach{ 4242, 10 };
+    constexpr DebugTargetIdentity sameSession{ 4242, 10 };
+    constexpr DebugTargetIdentity samePidReattached{ 4242, 11 };
+    constexpr DebugTargetIdentity pidReused{ 7777, 10 };
+    constexpr DebugTargetIdentity noPublishedHandle{};
+    static_assert(DebugTargetIdentityMatches(firstAttach, sameSession));
+    static_assert(!DebugTargetIdentityMatches(firstAttach, samePidReattached));
+    static_assert(!DebugTargetIdentityMatches(firstAttach, pidReused));
+    static_assert(!DebugTargetIdentityMatches(noPublishedHandle, noPublishedHandle));
+    CHECK(DebugTargetIdentityMatches(firstAttach, sameSession));
+    CHECK(!DebugTargetIdentityMatches(firstAttach, samePidReattached));
+    CHECK(!DebugTargetIdentityMatches(firstAttach, pidReused));
+    CHECK(!DebugTargetIdentityMatches(noPublishedHandle, firstAttach));
+
+    // A naturally exited target retains its PID/generation in the debugger's
+    // post-mortem snapshot, but it is no longer a usable memory session. That
+    // state transition must clear scans/frozen rows just like an explicit detach.
+    CHECK(MemTargetSessionUsable(true, 7, 1234));
+    CHECK(!MemTargetSessionUsable(false, 7, 1234));
+    CHECK(MemTargetSessionChanged(false, 7, 1234, true, 7, 1234));
+    CHECK(MemTargetSessionChanged(true, 8, 1234, true, 7, 1234));
+    CHECK(MemTargetSessionChanged(true, 7, 5678, true, 7, 1234));
+    CHECK(!MemTargetSessionChanged(true, 7, 1234, true, 7, 1234));
 
     if (g_fail == 0) std::printf("ALL MEMCOMPARE TESTS PASSED\n");
     else             std::printf("%d CHECK(S) FAILED\n", g_fail);

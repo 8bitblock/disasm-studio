@@ -107,6 +107,7 @@ int main() {
         in.caves = { { 0x402000, 64 } };
         PlaceResult r = PlacePatch(in);
         CHECK(r.status == PlaceStatus::Detour);
+        CHECK(r.caveVAValid);
         CHECK(r.caveVA == 0x402000);
         CHECK(r.writes.size() == 2);
         if (r.writes.size() == 2) {
@@ -162,10 +163,36 @@ int main() {
         in.newBody.assign(20, 0xAA);
         in.allowAlloc = true;
         in.allocVA = 0x50000000;                     // within +/-2GB of the site
+        in.allocVAValid = true;
         PlaceResult r = PlacePatch(in);
         CHECK(r.status == PlaceStatus::Detour);
+        CHECK(r.caveVAValid);
         CHECK(r.caveVA == 0x50000000);
         CHECK(r.writes.size() == 2);
+    }
+
+    // ---- VA 0 is data, not an absent-address sentinel ---------------------
+    {
+        PlaceInput in;
+        in.siteVA = 0;
+        in.origLen = 5;
+        in.newBody = { 0xC3 };
+        PlaceResult r = PlacePatch(in);
+        CHECK(r.status == PlaceStatus::InSpan);
+        CHECK(r.writes.size() == 1 && r.writes[0].va == 0);
+    }
+    {
+        PlaceInput in;
+        in.siteVA = 0x1000;
+        in.origLen = 6;
+        in.newBody.assign(20, 0xAA);
+        in.allowAlloc = true;
+        in.allocVA = 0;
+        in.allocVAValid = true;
+        PlaceResult r = PlacePatch(in);
+        CHECK(r.status == PlaceStatus::Detour);
+        CHECK(r.caveVAValid && r.caveVA == 0);
+        CHECK(r.writes.size() == 2 && r.writes[1].va == 0);
     }
 
     if (g_fail == 0) std::printf("ALL PATCHPLACER TESTS PASSED\n");

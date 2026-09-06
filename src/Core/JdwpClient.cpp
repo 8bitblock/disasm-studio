@@ -1,12 +1,18 @@
 #include "JdwpClient.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <stdexcept>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -36,116 +42,76 @@ JdwpClient::~JdwpClient() { detach(); }
 
 bool JdwpClient::attach(const std::string& host, uint16_t port, std::string& err) {
     detach();                              // drop any previous session first
-    ensureWinsock();
+    err.clear();
 
-    addrinfo hints{};
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    char portStr[16];
-    std::snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
-    addrinfo* res = nullptr;
-    if (::getaddrinfo(host.c_str(), portStr, &hints, &res) != 0 || !res) {
-        err = "cannot resolve host '" + host + "'";
+    auto command = std::make_shared<Command>();
+    command->kind = Command::Kind::Connect;
+    command->host = host;
+    command->port = port;
+    // Connect + handshake are each capped internally. The larger aggregate
+    // budget also covers ID negotiation and the initial bounded snapshots.
+    command->deadline = Clock::now() + std::chrono::seconds(15);
+
+    disconnectRequested_.store(false);
+    {
+        std::lock_guard<std::mutex> lk(commandMtx_);
+        commands_.clear();
+        acceptingCommands_ = true;
+        workerRunning_ = true;
+    }
+    try {
+        reader_ = std::thread(&JdwpClient::readerMain, this);
+    } catch (...) {
+        std::lock_guard<std::mutex> lk(commandMtx_);
+        acceptingCommands_ = false;
+        workerRunning_ = false;
+        err = "could not start the JDWP connection thread";
         return false;
     }
 
-    SOCKET s = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { ::freeaddrinfo(res); err = "socket() failed"; return false; }
-
-    // Non-blocking connect with a 3 s timeout so a wrong port can't hang the UI.
-    u_long nb = 1;
-    ::ioctlsocket(s, FIONBIO, &nb);
-    int rc = ::connect(s, res->ai_addr, (int)res->ai_addrlen);
-    ::freeaddrinfo(res);
-    if (rc == SOCKET_ERROR && ::WSAGetLastError() != WSAEWOULDBLOCK) {
-        ::closesocket(s); err = "connect() failed"; return false;
-    }
-    {
-        fd_set wf; FD_ZERO(&wf); FD_SET(s, &wf);
-        timeval tv{3, 0};
-        if (::select(0, nullptr, &wf, nullptr, &tv) != 1) {
-            ::closesocket(s);
-            err = "connection timed out (is the JVM running with -agentlib:jdwp=transport=dt_socket,server=y,address=*:" + std::string(portStr) + " ?)";
-            return false;
-        }
-        int soerr = 0, len = sizeof(soerr);
-        ::getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soerr, &len);
-        if (soerr != 0) { ::closesocket(s); err = "connection refused"; return false; }
-    }
-    nb = 0;
-    ::ioctlsocket(s, FIONBIO, &nb);
-    {
-        BOOL nd = TRUE;
-        ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
-    }
-
-    // Handshake: send the 14 ASCII bytes, expect the same 14 back.
-    if (::send(s, JdwpHandshake(), (int)kJdwpHandshakeLen, 0) != (int)kJdwpHandshakeLen) {
-        ::closesocket(s); err = "handshake send failed"; return false;
-    }
-    {
-        char got[kJdwpHandshakeLen];
-        size_t have = 0;
-        const auto deadline = Clock::now() + std::chrono::seconds(3);
-        while (have < kJdwpHandshakeLen) {
-            fd_set rf; FD_ZERO(&rf); FD_SET(s, &rf);
-            timeval tv{0, 200 * 1000};
-            if (::select(0, &rf, nullptr, nullptr, &tv) == 1) {
-                int n = ::recv(s, got + have, (int)(kJdwpHandshakeLen - have), 0);
-                if (n <= 0) break;
-                have += (size_t)n;
-            }
-            if (Clock::now() > deadline) break;
-        }
-        if (have != kJdwpHandshakeLen ||
-            std::memcmp(got, JdwpHandshake(), kJdwpHandshakeLen) != 0) {
-            ::closesocket(s);
-            err = "JDWP handshake failed (not a JDWP endpoint?)";
-            return false;
-        }
-    }
-
-    // Session up. The attach thread acts as the reader until the thread starts
-    // (rxBuf_/pendingEvents_ are reader-only; nothing else touches them yet).
-    quit_.store(false);
-    sock_ = (uintptr_t)s;
-
-    JdwpPacket rep;
-    if (!readerRequest(JDWP_SET_VirtualMachine, JDWP_VM_IDSizes, {}, rep, 3000) ||
-        rep.errorCode != 0 || !JdwpParseIdSizes(rep.payload, sizes_)) {
-        closeSocket();
-        err = "IDSizes exchange failed";
+    if (!submitAndWait(command, nullptr, &err)) {
+        if (err.empty()) err = "JDWP attach timed out";
+        detach();
         return false;
     }
-    if (readerRequest(JDWP_SET_VirtualMachine, JDWP_VM_Version, {}, rep, 3000) &&
-        rep.errorCode == 0) {
-        JdwpVersionInfo v;
-        if (JdwpParseVersion(rep.payload, v)) { vmName_ = v.vmName; vmVersion_ = v.vmVersion; }
-    }
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        state_ = JdwpState::Running;
-        host_  = host;
-        port_  = port;
-    }
-    refreshClassesViaReader();
-    refreshThreadsViaReader();
-    reader_ = std::thread(&JdwpClient::readerMain, this);
-    pushEvent("attached: " + (vmName_.empty() ? host + ":" + portStr : vmName_) +
-              (vmVersion_.empty() ? "" : " (Java " + vmVersion_ + ")"));
     return true;
 }
 
 void JdwpClient::detach() {
-    const bool hadSession = sock_ != kInvalidSock || reader_.joinable();
-    quit_.store(true);
-    if (sock_ != kInvalidSock)
-        sendCommand(JDWP_SET_VirtualMachine, JDWP_VM_Dispose, {});   // best effort, no wait
-    closeSocket();                          // unblocks the reader's select
+    bool hadSession = reader_.joinable();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        hadSession = hadSession || state_ != JdwpState::Detached;
+    }
+
+    disconnectRequested_.store(true);
+    auto command = std::make_shared<Command>();
+    command->kind = Command::Kind::Disconnect;
+    command->deadline = Clock::now() + std::chrono::seconds(3);
+    std::deque<std::shared_ptr<Command>> cancelled;
+    bool queuedDisconnect = false;
+    {
+        std::lock_guard<std::mutex> lk(commandMtx_);
+        acceptingCommands_ = false;
+        cancelled.swap(commands_);
+        if (workerRunning_) {
+            commands_.push_front(command);
+            queuedDisconnect = true;
+        }
+    }
+    for (auto& pending : cancelled) {
+        pending->cancelled.store(true);
+        complete(pending, false, {}, "JDWP session is detaching");
+    }
+    commandCv_.notify_all();
+
+    if (queuedDisconnect) {
+        std::unique_lock<std::mutex> lk(command->doneMtx);
+        command->doneCv.wait_until(lk, command->deadline + std::chrono::milliseconds(250),
+                                   [&] { return command->done; });
+    }
     if (reader_.joinable()) reader_.join();
-    rxBuf_.clear();
-    pendingEvents_.clear();
+
     {
         std::lock_guard<std::mutex> lk(mtx_);
         state_ = JdwpState::Detached;
@@ -158,16 +124,11 @@ void JdwpClient::detach() {
         stopThread_ = 0;
         stopLoc_ = JdwpLocation{};
         activeStepReq_ = -1;
-        if (hadSession) lastEvent_ = "detached";
-    }
-    replyCv_.notify_all();
-}
-
-void JdwpClient::closeSocket() {
-    std::lock_guard<std::mutex> lk(sendMtx_);
-    if (sock_ != kInvalidSock) {
-        ::closesocket((SOCKET)sock_);
-        sock_ = kInvalidSock;
+        // Preserve an unexpected worker-failure diagnostic across the
+        // attach-failure path's automatic detach. A later successful attach
+        // replaces it with the normal "attached" event.
+        if (hadSession && lastEvent_.rfind("JDWP worker failed", 0) != 0)
+            lastEvent_ = "detached";
     }
 }
 
@@ -195,48 +156,120 @@ void JdwpClient::pushEvent(const std::string& line) {
     std::lock_guard<std::mutex> lk(mtx_);
     events_.push_back(line);
     while (events_.size() > 300) events_.pop_front();
-    lastEvent_ = line;
+    // A caller released by the reader's exception cleanup may publish a
+    // secondary "request failed" message. Keep the root worker failure as the
+    // public terminal event until detach/re-attach establishes a new session.
+    if (state_ != JdwpState::Dead || lastEvent_.rfind("JDWP worker failed", 0) != 0)
+        lastEvent_ = line;
 }
 
 // ---- RPC plumbing ---------------------------------------------------------------
 
-uint32_t JdwpClient::sendCommand(uint8_t set, uint8_t cmd, const std::vector<uint8_t>& payload) {
-    std::lock_guard<std::mutex> lk(sendMtx_);
-    if (sock_ == kInvalidSock) return 0;
-    const uint32_t id = nextId_.fetch_add(1);
-    auto bytes = JdwpEncodeCommand(id, set, cmd, payload);
-    const char* p = (const char*)bytes.data();
-    size_t left = bytes.size();
-    while (left) {
-        int w = ::send((SOCKET)sock_, p, (int)left, 0);
-        if (w <= 0) return 0;
-        p += w;
-        left -= (size_t)w;
+void JdwpClient::complete(const std::shared_ptr<Command>& command, bool ok,
+                          JdwpPacket reply, std::string error) {
+    {
+        std::lock_guard<std::mutex> lk(command->doneMtx);
+        if (command->done) return;
+        command->ok = ok;
+        command->reply = std::move(reply);
+        command->error = std::move(error);
+        command->done = true;
     }
-    return id;
+    command->doneCv.notify_all();
+}
+
+void JdwpClient::failCommandNoThrow(const std::shared_ptr<Command>& command,
+                                    const char* reason) noexcept {
+    if (!command) return;
+    command->cancelled.store(true);
+    try {
+        complete(command, false, {}, reason);
+        return;
+    } catch (...) {
+        // If even copying the diagnostic fails, still release the bounded
+        // waiter. The snapshot retains the root worker failure separately.
+    }
+    try {
+        std::lock_guard<std::mutex> lk(command->doneMtx);
+        if (!command->done) {
+            command->ok = false;
+            command->error.clear();
+            command->done = true;
+        }
+    } catch (...) {}
+    command->doneCv.notify_all();
+}
+
+bool JdwpClient::enqueue(const std::shared_ptr<Command>& command, bool front) {
+    {
+        std::lock_guard<std::mutex> lk(commandMtx_);
+        if (!workerRunning_ ||
+            (!acceptingCommands_ && command->kind != Command::Kind::Disconnect) ||
+            commands_.size() >= 128)
+            return false;
+        if (front) commands_.push_front(command);
+        else commands_.push_back(command);
+    }
+    commandCv_.notify_one();
+    return true;
+}
+
+bool JdwpClient::submitAndWait(const std::shared_ptr<Command>& command,
+                               JdwpPacket* reply, std::string* error) {
+    if (!enqueue(command)) {
+        if (error) *error = "JDWP connection is not accepting requests";
+        return false;
+    }
+    std::unique_lock<std::mutex> lk(command->doneMtx);
+    if (!command->doneCv.wait_until(lk, command->deadline + std::chrono::milliseconds(250),
+                                    [&] { return command->done; })) {
+        command->cancelled.store(true);
+        commandCv_.notify_all();
+        if (error) *error = "JDWP request timed out";
+        return false;
+    }
+    if (reply) *reply = std::move(command->reply);
+    if (error) *error = command->error;
+    return command->ok;
+}
+
+void JdwpClient::failQueuedCommands(const char* reason) noexcept {
+    std::deque<std::shared_ptr<Command>> pending;
+    try {
+        std::lock_guard<std::mutex> lk(commandMtx_);
+        pending.swap(commands_);
+    } catch (...) { return; }
+    for (auto& command : pending) failCommandNoThrow(command, reason);
 }
 
 bool JdwpClient::request(uint8_t set, uint8_t cmd, const std::vector<uint8_t>& payload,
                          JdwpPacket& reply, int timeoutMs) {
-    const uint32_t id = sendCommand(set, cmd, payload);
-    if (!id) return false;
-    std::unique_lock<std::mutex> lk(mtx_);
-    const bool got = replyCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&] {
-        return replies_.count(id) != 0 ||
-               state_ == JdwpState::Dead || state_ == JdwpState::Detached;
-    });
-    auto it = replies_.find(id);
-    if (!got || it == replies_.end()) return false;
-    reply = std::move(it->second);
-    replies_.erase(it);
-    return true;
+    auto command = std::make_shared<Command>();
+    command->kind = Command::Kind::Request;
+    command->set = set;
+    command->cmd = cmd;
+    command->payload = payload;
+    command->deadline = Clock::now() + std::chrono::milliseconds(std::max(timeoutMs, 1));
+    return submitAndWait(command, &reply);
 }
 
 bool JdwpClient::readerRequest(uint8_t set, uint8_t cmd, const std::vector<uint8_t>& payload,
-                               JdwpPacket& reply, int timeoutMs) {
-    const uint32_t id = sendCommand(set, cmd, payload);
+                               JdwpPacket& reply, int timeoutMs,
+                               const std::atomic<bool>* cancelled) {
+    return readerRequestUntil(set, cmd, payload, reply,
+                              Clock::now() + std::chrono::milliseconds(std::max(timeoutMs, 1)),
+                              cancelled);
+}
+
+bool JdwpClient::readerRequestUntil(uint8_t set, uint8_t cmd,
+                                    const std::vector<uint8_t>& payload,
+                                    JdwpPacket& reply, Deadline deadline,
+                                    const std::atomic<bool>* cancelled) {
+    if (disconnectRequested_.load() || (cancelled && cancelled->load()) ||
+        Clock::now() >= deadline)
+        return false;
+    const uint32_t id = sendCommandOwned(set, cmd, payload, deadline, cancelled);
     if (!id) return false;
-    const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
     for (;;) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -247,15 +280,251 @@ bool JdwpClient::readerRequest(uint8_t set, uint8_t cmd, const std::vector<uint8
                 return true;
             }
         }
-        if (Clock::now() > deadline) return false;
+        if (disconnectRequested_.load() ||
+            (cancelled && cancelled->load()) || Clock::now() >= deadline)
+            return false;
         ++pumpDepth_;
-        const bool ok = pumpSocket(50);
+        const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        const bool ok = pumpSocket((int)std::max<int64_t>(1, std::min<int64_t>(50, remain)));
         --pumpDepth_;
         if (!ok) return false;
     }
 }
 
+bool JdwpClient::sendAllOwned(const uint8_t* data, size_t size, Deadline deadline,
+                              const std::atomic<bool>* cancelled) {
+    if (sock_ == kInvalidSock) return false;
+    const SOCKET s = (SOCKET)sock_;
+    while (size) {
+        if ((cancelled && cancelled->load()) || Clock::now() >= deadline)
+            return false;
+        const int chunk = (int)std::min<size_t>(size, INT_MAX);
+        const int sent = ::send(s, reinterpret_cast<const char*>(data), chunk, 0);
+        if (sent > 0) {
+            data += sent;
+            size -= (size_t)sent;
+            continue;
+        }
+        const int error = ::WSAGetLastError();
+        if (sent == SOCKET_ERROR && (error == WSAEWOULDBLOCK || error == WSAEINTR)) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(s, &wf);
+            timeval tv{0, 50 * 1000};
+            const int rc = ::select(0, nullptr, &wf, nullptr, &tv);
+            if (rc >= 0) continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+uint32_t JdwpClient::sendCommandOwned(uint8_t set, uint8_t cmd,
+                                      const std::vector<uint8_t>& payload,
+                                      Deadline deadline,
+                                      const std::atomic<bool>* cancelled) {
+    if (sock_ == kInvalidSock) return 0;
+    const uint32_t id = nextId_.fetch_add(1);
+    const auto bytes = JdwpEncodeCommand(id, set, cmd, payload);
+    return sendAllOwned(bytes.data(), bytes.size(), deadline, cancelled) ? id : 0;
+}
+
+bool JdwpClient::connectOwned(const std::string& host, uint16_t port, Deadline deadline,
+                              const std::atomic<bool>* cancelled, std::string& err) {
+    ensureWinsock();
+    if ((cancelled && cancelled->load()) || disconnectRequested_.load()) {
+        err = "attach cancelled";
+        return false;
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    char portStr[16];
+    std::snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(host.c_str(), portStr, &hints, &res) != 0 || !res) {
+        err = "cannot resolve host '" + host + "'";
+        return false;
+    }
+
+    bool connected = false;
+    const Deadline connectDeadline = std::min(deadline, Clock::now() + std::chrono::seconds(3));
+    for (addrinfo* ai = res; ai && !connected; ai = ai->ai_next) {
+        if ((cancelled && cancelled->load()) || disconnectRequested_.load() ||
+            Clock::now() >= connectDeadline)
+            break;
+        const SOCKET s = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+        sock_ = (uintptr_t)s;
+        u_long nonBlocking = 1;
+        if (::ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
+            closeSocketOwned();
+            continue;
+        }
+        const int rc = ::connect(s, ai->ai_addr, (int)ai->ai_addrlen);
+        if (rc == 0) {
+            connected = true;
+            break;
+        }
+        const int connectError = ::WSAGetLastError();
+        if (connectError != WSAEWOULDBLOCK && connectError != WSAEINPROGRESS) {
+            closeSocketOwned();
+            continue;
+        }
+        while (!(cancelled && cancelled->load()) && !disconnectRequested_.load() &&
+               Clock::now() < connectDeadline) {
+            fd_set wf, ef;
+            FD_ZERO(&wf); FD_SET(s, &wf);
+            FD_ZERO(&ef); FD_SET(s, &ef);
+            timeval tv{0, 50 * 1000};
+            const int selected = ::select(0, nullptr, &wf, &ef, &tv);
+            if (selected < 0) break;
+            if (selected == 0) continue;
+            int soError = 0;
+            int soErrorSize = sizeof(soError);
+            if (::getsockopt(s, SOL_SOCKET, SO_ERROR,
+                             reinterpret_cast<char*>(&soError), &soErrorSize) == 0 && soError == 0)
+                connected = true;
+            break;
+        }
+        if (!connected) closeSocketOwned();
+    }
+    ::freeaddrinfo(res);
+
+    if (!connected) {
+        if ((cancelled && cancelled->load()) || disconnectRequested_.load())
+            err = "attach cancelled";
+        else if (Clock::now() >= connectDeadline)
+            err = "connection timed out (is the JVM listening for JDWP on port " +
+                  std::string(portStr) + "?)";
+        else
+            err = "connection refused";
+        return false;
+    }
+
+    BOOL noDelay = TRUE;
+    ::setsockopt((SOCKET)sock_, IPPROTO_TCP, TCP_NODELAY,
+                 reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+
+    const Deadline handshakeDeadline = std::min(deadline, Clock::now() + std::chrono::seconds(3));
+    if (!sendAllOwned(reinterpret_cast<const uint8_t*>(JdwpHandshake()),
+                      kJdwpHandshakeLen, handshakeDeadline, cancelled)) {
+        err = "handshake send failed";
+        closeSocketOwned();
+        return false;
+    }
+    char got[kJdwpHandshakeLen]{};
+    size_t have = 0;
+    while (have < kJdwpHandshakeLen && Clock::now() < handshakeDeadline &&
+           !(cancelled && cancelled->load()) && !disconnectRequested_.load()) {
+        const SOCKET s = (SOCKET)sock_;
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(s, &rf);
+        timeval tv{0, 50 * 1000};
+        const int selected = ::select(0, &rf, nullptr, nullptr, &tv);
+        if (selected < 0) break;
+        if (selected == 0) continue;
+        const int received = ::recv(s, got + have, (int)(kJdwpHandshakeLen - have), 0);
+        if (received > 0) have += (size_t)received;
+        else if (received == 0 || ::WSAGetLastError() != WSAEWOULDBLOCK) break;
+    }
+    if (have != kJdwpHandshakeLen ||
+        std::memcmp(got, JdwpHandshake(), kJdwpHandshakeLen) != 0) {
+        err = "JDWP handshake failed (not a JDWP endpoint?)";
+        closeSocketOwned();
+        return false;
+    }
+    return true;
+}
+
+bool JdwpClient::bootstrapOwned(const std::string& host, uint16_t port, Deadline deadline,
+                                const std::atomic<bool>* cancelled, std::string& err) {
+    if (!connectOwned(host, port, deadline, cancelled, err)) return false;
+    rxBuf_.clear();
+    pendingEvents_.clear();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        replies_.clear();
+    }
+
+    JdwpPacket rep;
+    JdwpIdSizes negotiated;
+    const Deadline idsDeadline = std::min(deadline, Clock::now() + std::chrono::seconds(3));
+    if (!readerRequestUntil(JDWP_SET_VirtualMachine, JDWP_VM_IDSizes, {}, rep,
+                            idsDeadline, cancelled) || rep.errorCode != 0 ||
+        !JdwpParseIdSizes(rep.payload, negotiated)) {
+        err = "IDSizes exchange failed";
+        closeSocketOwned();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        sizes_ = negotiated;
+        state_ = JdwpState::Running;
+        host_ = host;
+        port_ = port;
+        vmName_.clear();
+        vmVersion_.clear();
+    }
+
+    const Deadline versionDeadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(1500));
+    if (readerRequestUntil(JDWP_SET_VirtualMachine, JDWP_VM_Version, {}, rep,
+                           versionDeadline, cancelled) && rep.errorCode == 0) {
+        JdwpVersionInfo version;
+        if (JdwpParseVersion(rep.payload, version)) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            vmName_ = std::move(version.vmName);
+            vmVersion_ = std::move(version.vmVersion);
+        }
+    }
+
+    auto remainingMs = [&]() -> int {
+        return (int)std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()).count());
+    };
+    if (remainingMs() > 0)
+        refreshClassesViaReader(std::min(5000, remainingMs()), cancelled);
+    if (remainingMs() > 0)
+        refreshThreadsViaReader(std::min(2500, remainingMs()), cancelled);
+
+    if ((cancelled && cancelled->load()) || disconnectRequested_.load()) {
+        err = "attach cancelled";
+        closeSocketOwned();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (state_ == JdwpState::Dead) {
+            err = "connection lost during JDWP initialization";
+            closeSocketOwned();
+            return false;
+        }
+    }
+
+    std::string name, version;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        name = vmName_;
+        version = vmVersion_;
+    }
+    char portStr[16];
+    std::snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
+    pushEvent("attached: " + (name.empty() ? host + ":" + portStr : name) +
+              (version.empty() ? "" : " (Java " + version + ")"));
+    return true;
+}
+
 bool JdwpClient::pumpSocket(int timeoutMs) {
+#if defined(DS_JDWP_TEST_HOOKS)
+    if (injectReaderFailure_.exchange(false))
+        throw std::runtime_error("injected reader failure");
+#endif
+    char buf[65536];
+    int got = 0;
+    bool dead = false;
     const SOCKET s = (SOCKET)sock_;
     if (s == INVALID_SOCKET || sock_ == kInvalidSock) return false;
 
@@ -264,15 +533,14 @@ bool JdwpClient::pumpSocket(int timeoutMs) {
     FD_SET(s, &rf);
     timeval tv{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
     const int rc = ::select(0, &rf, nullptr, nullptr, &tv);
-    if (rc == 0) return true;              // idle tick, connection still fine
-    bool dead = rc < 0;
-
+    if (rc == 0) return true;           // idle tick, connection still fine
+    dead = rc < 0;
     if (!dead) {
-        char buf[65536];
-        const int got = ::recv(s, buf, sizeof(buf), 0);
+        got = ::recv(s, buf, sizeof(buf), 0);
+        if (got == SOCKET_ERROR && ::WSAGetLastError() == WSAEWOULDBLOCK) return true;
         if (got <= 0) dead = true;
-        else rxBuf_.insert(rxBuf_.end(), buf, buf + got);
     }
+    if (got > 0) rxBuf_.insert(rxBuf_.end(), buf, buf + got);
 
     size_t off = 0;
     while (!dead) {
@@ -287,7 +555,6 @@ bool JdwpClient::pumpSocket(int timeoutMs) {
             std::lock_guard<std::mutex> lk(mtx_);
             replies_[p.id] = std::move(p);
             if (replies_.size() > 256) replies_.erase(replies_.begin());   // abandoned-waiter backstop
-            replyCv_.notify_all();
         } else if (p.cmdSet == JDWP_SET_Event && p.cmd == JDWP_E_Composite) {
             JdwpEventSet es;
             if (JdwpParseEventComposite(p.payload, sizes_, es))
@@ -305,23 +572,149 @@ bool JdwpClient::pumpSocket(int timeoutMs) {
                 lastEvent_ = "connection lost";
             }
         }
-        replyCv_.notify_all();
         return false;
     }
     return true;
 }
 
-void JdwpClient::readerMain() {
-    while (!quit_.load()) {
-        if (!pumpSocket(100)) break;
-        while (!pendingEvents_.empty() && !quit_.load()) {
+void JdwpClient::closeSocketOwned() {
+    if (sock_ == kInvalidSock) return;
+    const SOCKET s = (SOCKET)sock_;
+    ::shutdown(s, SD_BOTH);
+    ::closesocket(s);
+    sock_ = kInvalidSock;
+}
+
+void JdwpClient::readerLoop(std::shared_ptr<Command>& activeCommand) {
+    bool stop = false;
+    while (!stop) {
+        {
+            std::unique_lock<std::mutex> lk(commandMtx_);
+            if (commands_.empty() && sock_ == kInvalidSock)
+                commandCv_.wait(lk, [&] { return !commands_.empty(); });
+            if (!commands_.empty()) {
+                activeCommand = std::move(commands_.front());
+                commands_.pop_front();
+            }
+        }
+
+        if (activeCommand) {
+            if (activeCommand->kind == Command::Kind::Disconnect) {
+                if (sock_ != kInvalidSock) {
+                    const Deadline disposeDeadline = Clock::now() + std::chrono::milliseconds(200);
+                    (void)sendCommandOwned(JDWP_SET_VirtualMachine, JDWP_VM_Dispose, {},
+                                           disposeDeadline, nullptr);
+                }
+                closeSocketOwned();
+                complete(activeCommand, true);
+                activeCommand.reset();
+                stop = true;
+                continue;
+            }
+            if (activeCommand->cancelled.load() || Clock::now() >= activeCommand->deadline) {
+                complete(activeCommand, false, {}, "JDWP request timed out");
+                activeCommand.reset();
+                continue;
+            }
+            if (activeCommand->kind == Command::Kind::Connect) {
+                std::string error;
+                const bool ok = bootstrapOwned(activeCommand->host, activeCommand->port,
+                                               activeCommand->deadline,
+                                               &activeCommand->cancelled, error);
+                complete(activeCommand, ok, {}, std::move(error));
+            } else {
+                JdwpPacket reply;
+                const bool ok = readerRequestUntil(activeCommand->set, activeCommand->cmd,
+                                                   activeCommand->payload, reply,
+                                                   activeCommand->deadline,
+                                                   &activeCommand->cancelled);
+                complete(activeCommand, ok, std::move(reply),
+                         ok ? std::string() : "no reply from the VM");
+            }
+            activeCommand.reset();
+        } else if (sock_ != kInvalidSock && !pumpSocket(50)) {
+            stop = true;
+        }
+
+        while (!pendingEvents_.empty() && !disconnectRequested_.load() && !stop) {
             JdwpEventSet es = std::move(pendingEvents_.front());
             pendingEvents_.pop_front();
             handleEvent(es);
         }
     }
-    replyCv_.notify_all();
 }
+
+void JdwpClient::finishReader(const std::shared_ptr<Command>& activeCommand,
+                              const char* reason, bool failed) noexcept {
+    // Every reader exit, normal or exceptional, converges here. Keep each
+    // cleanup step independently guarded: cleanup itself must never escape the
+    // std::thread entry point and call std::terminate.
+    if (failed) {
+        try {
+            std::lock_guard<std::mutex> lk(mtx_);
+            state_ = JdwpState::Dead;
+            stopThread_ = 0;
+            stopLoc_ = JdwpLocation{};
+            frames_.clear();
+            lastEvent_ = reason;
+            events_.push_back(reason);
+            while (events_.size() > 300) events_.pop_front();
+        } catch (...) {
+            // State is assigned before diagnostic storage above, so even an
+            // allocation failure leaves the session non-authoritative.
+        }
+        // Publish the terminal state before releasing any caller. That caller
+        // can immediately snapshot or emit a secondary request-failure event.
+        failCommandNoThrow(activeCommand, reason);
+    }
+
+    try { closeSocketOwned(); } catch (...) {}
+    try { rxBuf_.clear(); } catch (...) {}
+    try { pendingEvents_.clear(); } catch (...) {}
+    pumpDepth_ = 0;
+    try {
+        std::lock_guard<std::mutex> lk(mtx_);
+        replies_.clear();
+    } catch (...) {}
+    try {
+        std::lock_guard<std::mutex> lk(commandMtx_);
+        acceptingCommands_ = false;
+        workerRunning_ = false;
+    } catch (...) {}
+    failQueuedCommands(reason);
+    commandCv_.notify_all();
+}
+
+void JdwpClient::readerMain() noexcept {
+    std::shared_ptr<Command> activeCommand;
+    std::string failureReason;
+    bool failed = false;
+    try {
+        readerLoop(activeCommand);
+    } catch (const std::exception& e) {
+        failed = true;
+        try {
+            failureReason = "JDWP worker failed: ";
+            failureReason += e.what();
+        } catch (...) {}
+    } catch (...) {
+        failed = true;
+        try { failureReason = "JDWP worker failed: unknown exception"; }
+        catch (...) {}
+    }
+
+    const char* reason = failed
+        ? (failureReason.empty() ? "JDWP worker failed" : failureReason.c_str())
+        : "JDWP connection closed";
+    finishReader(activeCommand, reason, failed);
+}
+
+#if defined(DS_JDWP_TEST_HOOKS)
+void JdwpClient::injectReaderFailureForTest() {
+    injectReaderFailure_.store(true);
+    commandCv_.notify_all();
+}
+#endif
 
 // ---- events -----------------------------------------------------------------------
 
@@ -468,9 +861,11 @@ std::string JdwpClient::locationLabel(const JdwpLocation& loc) {
     return cn + "." + mn + " bci=" + std::to_string((long long)loc.index);
 }
 
-void JdwpClient::refreshClassesViaReader() {
+void JdwpClient::refreshClassesViaReader(int timeoutMs,
+                                         const std::atomic<bool>* cancelled) {
     JdwpPacket rep;
-    if (!readerRequest(JDWP_SET_VirtualMachine, JDWP_VM_AllClasses, {}, rep, 5000) ||
+    if (!readerRequest(JDWP_SET_VirtualMachine, JDWP_VM_AllClasses, {}, rep,
+                       timeoutMs, cancelled) ||
         rep.errorCode != 0)
         return;
     std::vector<JdwpClassInfo> cs;
@@ -491,9 +886,16 @@ void JdwpClient::refreshClassesViaReader() {
     classes_ = std::move(rows);
 }
 
-void JdwpClient::refreshThreadsViaReader() {
+void JdwpClient::refreshThreadsViaReader(int timeoutMs,
+                                         const std::atomic<bool>* cancelled) {
+    const Deadline deadline = Clock::now() + std::chrono::milliseconds(std::max(timeoutMs, 1));
+    auto remainingMs = [&]() -> int {
+        return (int)std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()).count());
+    };
     JdwpPacket rep;
-    if (!readerRequest(JDWP_SET_VirtualMachine, JDWP_VM_AllThreads, {}, rep) ||
+    if (!readerRequestUntil(JDWP_SET_VirtualMachine, JDWP_VM_AllThreads, {}, rep,
+                            deadline, cancelled) ||
         rep.errorCode != 0)
         return;
     std::vector<uint64_t> ids;
@@ -501,16 +903,24 @@ void JdwpClient::refreshThreadsViaReader() {
     std::vector<JdwpThreadRow> rows;
     rows.reserve(ids.size());
     for (size_t i = 0; i < ids.size() && i < 64; ++i) {   // name/status RPCs: cap the fan-out
+        if (remainingMs() <= 0 || (cancelled && cancelled->load()) ||
+            disconnectRequested_.load())
+            break;
         JdwpThreadRow t;
         t.id = ids[i];
         JdwpWriter w;
         w.id(t.id, sizes_.objectID);
-        if (readerRequest(JDWP_SET_ThreadReference, JDWP_TR_Name, w.bytes(), rep, 500) &&
+        Deadline oneDeadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(500));
+        if (readerRequestUntil(JDWP_SET_ThreadReference, JDWP_TR_Name, w.bytes(), rep,
+                               oneDeadline, cancelled) &&
             rep.errorCode == 0) {
             JdwpReader r(rep.payload.data(), rep.payload.size());
             t.name = r.str();
         }
-        if (readerRequest(JDWP_SET_ThreadReference, JDWP_TR_Status, w.bytes(), rep, 500) &&
+        oneDeadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(500));
+        if (Clock::now() < oneDeadline &&
+            readerRequestUntil(JDWP_SET_ThreadReference, JDWP_TR_Status, w.bytes(), rep,
+                               oneDeadline, cancelled) &&
             rep.errorCode == 0) {
             int32_t st = 0, su = 0;
             if (JdwpParseThreadStatus(rep.payload, st, su)) t.status = st;

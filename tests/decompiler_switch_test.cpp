@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -73,6 +74,22 @@ static Instruction mk(uint64_t addr, uint32_t len, const char* mnem, const char*
 }
 
 int main() {
+    // Thumb architectural address arithmetic: PC is instruction+4; TBB/TBH
+    // table base aligns that PC down, while branch targets use the unaligned PC.
+    {
+        uint64_t entry = 0, target = 0;
+        CHECK(ThumbTableEntryVA(0x1000, false, 3, entry) && entry == 0x1007);
+        CHECK(ThumbTableTargetVA(0x1000, 5, target) && target == 0x100e);
+        CHECK(ThumbTableEntryVA(0x1002, true, 3, entry) && entry == 0x100a);
+        CHECK(ThumbTableTargetVA(0x1002, 5, target) && target == 0x1010);
+        const uint64_t mx = (std::numeric_limits<uint64_t>::max)();
+        CHECK(!ThumbTableEntryVA(mx - 3, false, 0, entry)); // PC+4 overflow
+        CHECK(ThumbTableEntryVA(mx - 7, false, 3, entry) && entry == mx);
+        CHECK(!ThumbTableEntryVA(mx - 7, false, 4, entry));
+        CHECK(ThumbTableTargetVA(mx - 7, 1, target) && target == mx - 1);
+        CHECK(!ThumbTableTargetVA(mx - 7, 2, target));
+    }
+
     const uint64_t base = 0x1000;
     const uint64_t kDefault = 0x1012;   // mov eax,99
     const uint64_t kJoin    = 0x1019;   // ret
@@ -114,6 +131,53 @@ int main() {
     // Sanity: without a resolver, the same dispatch stays a plain (target-less) jmp.
     ControlFlowGraph g0 = BuildCFG(dummy.data(), dummy.size(), base, dis, 2000);
     for (const auto& b : g0.blocks) if (b.start == 0x1005) CHECK(!b.isSwitch);
+    const std::string unresolved = Decompile(g0);
+    CHECK(unresolved.find("unresolved indirect") != std::string::npos);
+    CHECK(unresolved.find("loc_0") == std::string::npos);
+
+    // TBB/TBH are unconditional indirect dispatches too, not conditional
+    // fallthrough branches. The generic resolver contract must mark the block.
+    {
+        MockDisassembler td;
+        td.at[0x3000] = mk(0x3000, 4, "tbb", "[pc, r0]", true, true, false, 0);
+        td.at[0x3004] = mk(0x3004, 2, "mov", "r1, #1", false, false, false, 0);
+        td.at[0x3006] = mk(0x3006, 2, "bx", "lr", true, true, true, 0);
+        JumpTableResolver tr = [](const Instruction& in) {
+            return in.mnemonic == "tbb" ? std::vector<uint64_t>{0x3004, 0x3006}
+                                          : std::vector<uint64_t>{};
+        };
+        std::vector<uint8_t> bytes(8);
+        ControlFlowGraph tg = BuildCFG(bytes.data(), bytes.size(), 0x3000, td, 20, tr);
+        const BasicBlock* tb = nullptr;
+        for (const BasicBlock& b : tg.blocks) if (b.start == 0x3000) tb = &b;
+        CHECK(tb && tb->isSwitch && tb->succ.size() == 2);
+    }
+
+    // Decoder-provided switch metadata retains sparse JVM keys and a distinct
+    // default edge rather than relabelling cases as dense 0..N-1 indices.
+    {
+        MockDisassembler jd;
+        Instruction sw = mk(0, 1, "lookupswitch", "", true, true, false, 0);
+        sw.flow.kind = FlowKind::Switch;
+        sw.switchInfo.cases = { { -3, 1, true }, { 42, 2, true } };
+        sw.switchInfo.defaultTarget = 4;
+        sw.switchInfo.defaultTargetValid = true;
+        jd.at[0] = sw;
+        jd.at[1] = mk(1, 1, "ireturn", "", true, false, true, 0);
+        jd.at[2] = mk(2, 1, "ireturn", "", true, false, true, 0);
+        jd.at[3] = mk(3, 1, "nop", "", false, false, false, 0);
+        jd.at[4] = mk(4, 1, "ireturn", "", true, false, true, 0);
+        std::vector<uint8_t> bytes(5);
+        ControlFlowGraph jg = BuildCFG(bytes.data(), bytes.size(), 0, jd, 20);
+        CHECK(jg.complete);
+        CHECK(!jg.blocks.empty() && jg.blocks[0].switchCases.size() == 2);
+        CHECK(!jg.blocks.empty() && jg.blocks[0].switchDefaultTargetValid);
+        DecompileOptions jo; jo.target = { Arch::JVM, DecompileABI::Unknown };
+        const std::string jout = Decompile(jg, jo);
+        CHECK(jout.find("case -3:") != std::string::npos);
+        CHECK(jout.find("case 42:") != std::string::npos);
+        CHECK(jout.find("default:") != std::string::npos);
+    }
 
     // 2) The decompiler emits switch/case with the recovered selector.
     std::string out = Decompile(g);

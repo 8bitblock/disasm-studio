@@ -5,14 +5,17 @@
 
 namespace ds {
 
-// Zydis-backed implementation. Fast, x86/x64 only, header-light.
+// Zydis-backed implementation. Fast, x86 real-mode/x86/x64 only, header-light.
 class ZydisDisassembler final : public IDisassembler {
 public:
     explicit ZydisDisassembler(Arch arch = Arch::X64);
+    explicit ZydisDisassembler(const DecoderConfig& config);
     ~ZydisDisassembler() override;
 
     Engine      engine()     const override { return Engine::Zydis; }
     const char* engineName() const override { return "Zydis"; }
+    bool ready() const override;
+    std::string_view errorMessage() const override;
 
     std::vector<Instruction> disassemble(const uint8_t* data, size_t size,
                                          uint64_t virtualAddress,
@@ -24,6 +27,8 @@ private:
     // The decoder + formatter depend only on the architecture, so they are built
     // once and reused for every instruction (kept opaque to stay header-light).
     struct ZyState;
+    void initialize();
+    DecoderConfig             config_;
     Arch                     arch_;
     std::unique_ptr<ZyState> st_;
 };

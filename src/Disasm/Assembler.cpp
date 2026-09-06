@@ -11,11 +11,12 @@ AsmResult Assemble(Arch arch, const std::string& text, uint64_t address) {
         case Arch::X86:   karch = KS_ARCH_X86;   kmode = KS_MODE_32;            break;
         case Arch::X64:   karch = KS_ARCH_X86;   kmode = KS_MODE_64;            break;
         case Arch::ARM:   karch = KS_ARCH_ARM;   kmode = KS_MODE_ARM;           break;
+        case Arch::THUMB: karch = KS_ARCH_ARM;   kmode = KS_MODE_THUMB;         break;
         case Arch::ARM64: karch = KS_ARCH_ARM64; kmode = KS_MODE_LITTLE_ENDIAN; break;
         default:
             // Disassembly/analysis support more arches (via Capstone) than the
             // patch assembler does; fail clearly instead of mis-encoding as x64.
-            res.error = "patch assembler supports x86 / x64 / ARM / ARM64 only";
+            res.error = "patch assembler supports x86 / x64 / ARM / Thumb / ARM64 only";
             return res;
     }
 

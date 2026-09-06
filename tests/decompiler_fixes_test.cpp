@@ -18,6 +18,7 @@
 //
 #include "Core/CFG.h"
 #include "Core/Decompiler.h"
+#include "Core/DataFlow.h"
 #include "Disasm/IDisassembler.h"
 
 #include <cstdint>
@@ -80,7 +81,8 @@ struct Asm {
 };
 
 static std::string decompile(const std::vector<Instruction>& ins, const DecompileOptions& opt = {},
-                             const JumpTableResolver& resolver = {}) {
+                             const JumpTableResolver& resolver = {},
+                             const NoreturnCallResolver& noreturn = {}) {
     MockDisassembler dis;
     // Instructions may be appended out of address order (e.g. a back-patched branch),
     // so compute base/end from the min/max VA — NOT ins.front()/ins.back() — to size
@@ -90,7 +92,7 @@ static std::string decompile(const std::vector<Instruction>& ins, const Decompil
                            if (in.address + in.length > end) end = in.address + in.length; }
     for (auto& in : ins) dis.at[in.address] = in;
     std::vector<uint8_t> buf((size_t)(end - base) + 16, 0);
-    ControlFlowGraph g = BuildCFG(buf.data(), buf.size(), base, dis, 2000, resolver);
+    ControlFlowGraph g = BuildCFG(buf.data(), buf.size(), base, dis, 2000, resolver, noreturn);
     return Decompile(g, opt);
 }
 static bool has(const std::string& s, const char* sub) { return s.find(sub) != std::string::npos; }
@@ -359,7 +361,8 @@ int main() {
         a.op(4, "mov", "eax, dword ptr [esp + 4]");
         a.op(4, "add", "eax, dword ptr [esp + 8]");
         a.ret();
-        std::string out = decompile(a.ins);
+        DecompileOptions opt; opt.target = { Arch::X86, DecompileABI::X86Cdecl };
+        std::string out = decompile(a.ins, opt);
         CHECK(has(out, "a1"));      // [esp+4] named a1
         CHECK(has(out, "a2"));      // [esp+8] named a2
         CHECK(has(out, "(a1, a2)"));  // detected args now flow into the function HEADER, not just the body
@@ -374,7 +377,8 @@ int main() {
         a.op(3, "add",  "eax, dword ptr [ebp + 0xC]");
         a.op(1, "pop",  "ebp");
         a.ret();
-        std::string out = decompile(a.ins);
+        DecompileOptions opt; opt.target = { Arch::X86, DecompileABI::X86Cdecl };
+        std::string out = decompile(a.ins, opt);
         CHECK(has(out, "a1"));
         CHECK(has(out, "a2"));
         if (g_fail) std::printf("--- test4 (ebp) ---\n%s\n", out.c_str());
@@ -388,7 +392,8 @@ int main() {
         a.op(2, "mov", "eax, ecx");        // eax = a1 (rcx)
         a.op(2, "add", "eax, edx");        // += a2 (rdx)
         a.ret();
-        std::string out = decompile(a.ins);
+        DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Win64 };
+        std::string out = decompile(a.ins, opt);
         CHECK(has(out, "a1"));             // rcx still recognized as a1
         CHECK(has(out, "a2"));             // rdx still recognized as a2
         if (g_fail) std::printf("--- test4c (x64 32-bit ops) ---\n%s\n", out.c_str());
@@ -407,6 +412,96 @@ int main() {
         CHECK(has(out, "rax = 5;"));    // raw register lift, no propagation
         CHECK(has(out, "rbx = rax;"));
         if (g_fail) std::printf("--- test5 ---\n%s\n", out.c_str());
+    }
+
+    // --- (6) an analyst-authoritative noreturn call is retained as an
+    // observable call, terminates the block, and never acquires fallthrough. ---
+    {
+        Asm a;
+        a.br(5, "call", 0x9000, "0x9000");
+        a.op(5, "mov", "eax, 0xDEAD"); // unreachable fallthrough candidate
+        const uint64_t deadJump = a.cur;
+        a.cur += 2;
+        a.op(5, "mov", "ebx, 0xBEEF");
+        const uint64_t deadTarget = a.cur;
+        a.ret();
+        a.ins.push_back(mk(deadJump, 2, "jmp", "", true, false, deadTarget));
+        DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Auto };
+        MockDisassembler dis;
+        for (const Instruction& instruction : a.ins) dis.at[instruction.address] = instruction;
+        std::vector<uint8_t> bytes(static_cast<size_t>(a.cur - a.base));
+        ControlFlowGraph graph = BuildCFG(
+            bytes.data(), bytes.size(), a.base, dis, 2000, {},
+            [](uint64_t target) { return target == 0x9000; });
+        const std::string out = Decompile(graph, opt);
+        CHECK(has(out, "sub_9000()"));
+        CHECK(has(out, "noreturn"));
+        CHECK(!has(out, "0xDEAD"));
+        CHECK(!has(out, "0xBEEF"));
+        CHECK(graph.blocks.size() == 1);
+        CHECK(!graph.blocks.empty() && graph.blocks[0].isNoReturnCall);
+    }
+
+    // --- (6b) A static indirect call through an x64 RIP-relative IAT slot is
+    // resolved to the slot coordinate for noreturn metadata. Indexed/register
+    // calls remain unresolved and therefore keep their fallthrough.
+    {
+        constexpr uint64_t iat = 0x3000;
+        Instruction call = mk(0x1000, 6, "call", "qword ptr [rip + 0x1FFA]", true);
+        call.flow.kind = FlowKind::IndirectCall;
+        TypedOperand memory;
+        memory.kind = OperandKind::Memory;
+        memory.access = OperandAccess::Read;
+        memory.widthBits = 64;
+        memory.baseRegister = "rip";
+        memory.displacement = static_cast<int64_t>(iat - 0x1006);
+        memory.displacementValid = true;
+        memory.pcRelative = true;
+        call.typedOperands = { memory };
+        Asm a;
+        a.ins = { call,
+                  mk(0x1006, 5, "mov", "eax, 0xDEAD"),
+                  mk(0x100B, 1, "ret", "", true, true) };
+        a.base = 0x1000; a.cur = 0x100C;
+        const std::string out = decompile(
+            a.ins, DecompileOptions{}, {},
+            [](uint64_t target) { return target == iat; });
+        CHECK(has(out, "noreturn"));
+        CHECK(!has(out, "0xDEAD"));
+
+        call.typedOperands[0].indexRegister = "rax";
+        call.typedOperands[0].scale = 8;
+        a.ins[0] = call;
+        const std::string indexed = decompile(
+            a.ins, DecompileOptions{}, {},
+            [](uint64_t target) { return target == iat; });
+        CHECK(!has(indexed, "noreturn"));
+    }
+
+    // --- (7) exact target selection gates the x86 data-flow/ABI pass. ---
+    {
+        Asm a; a.op(5, "mov", "rax, 1"); a.ret();
+        MockDisassembler dis; for (const Instruction& in : a.ins) dis.at[in.address] = in;
+        std::vector<uint8_t> bytes((size_t)(a.cur - a.base));
+        ControlFlowGraph g = BuildCFG(bytes.data(), bytes.size(), a.base, dis);
+        CHECK(!AnalyzeDataFlow(g, {}, {}, true, Arch::ARM64).ok);
+        CHECK(AnalyzeDataFlow(g, {}, {}, true, Arch::X64).ok);
+
+        Asm sysv; sysv.op(3, "mov", "rax, rdi"); sysv.op(3, "add", "rax, rsi"); sysv.ret();
+        DecompileOptions sysvOpt; sysvOpt.target = DecompileTarget{ Arch::X64, DecompileABI::SysV64 };
+        const std::string sysvOut = decompile(sysv.ins, sysvOpt);
+        CHECK(has(sysvOut, "(a1, a2)"));
+
+        DecompileOptions unknown;
+        unknown.target = DecompileTarget{ Arch::X64, DecompileABI::Unknown };
+        // The authoritative descriptor wins over compatibility shims.
+        unknown.target = { Arch::ARM64, DecompileABI::SysV64 };
+        const std::string unknownOut = decompile(sysv.ins, unknown);
+        CHECK(!has(unknownOut, "a1") && !has(unknownOut, "a2"));
+        CHECK(has(unknownOut, "__asm { mov rax, rdi };"));
+        CHECK(has(unknownOut, "__asm { add rax, rsi };"));
+        DataFlowResult unknownDf = AnalyzeDataFlow(g, {}, {}, true, Arch::X64, DecompileABI::Unknown);
+        CHECK(unknownDf.ok && unknownDf.args.empty());
     }
 
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }

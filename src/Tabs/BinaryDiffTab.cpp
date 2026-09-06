@@ -1,97 +1,313 @@
 #include "BinaryDiffTab.h"
 #include "../Ui/Fonts.h"
 #include "../Ui/Theme.h"
+#include "../Ui/Widgets.h"
 #include "../Core/DiffRegions.h"
+#include "../Core/Project.h"
+#include "../Core/SemanticDiffBinary.h"
+#include "../Core/SemanticTransfer.h"
 #include "../Disasm/DisassemblerFactory.h"
+#include "../Disasm/JvmDisassembler.h"
+#include "../Disasm/GmlDisassembler.h"
 #include "imgui.h"
 
 #include <algorithm>
+#include <exception>
+#include <limits>
 #include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
 #include <windows.h>
 #include <commdlg.h>
 
 namespace ds {
+
+static DocumentResultIdentity currentDiffTargetIdentity(const AppContext& ctx) {
+    const BinaryFile& binary = ctx.staticBinary();
+    return MakeDocumentResultIdentity(
+        ctx.staticDocumentId(), ctx.staticImageGeneration(), binary.loaded(),
+        binary.loaded() ? binary.contentHash() : 0,
+        binary.loaded() ? binary.imageRevision() : 0);
+}
+
+BinaryDiffTab::BinaryDiffTab() {
+    // Start only after every synchronization member has been constructed.
+    worker_ = std::jthread([this](std::stop_token stop) { workerLoop(stop); });
+}
+
+BinaryDiffTab::~BinaryDiffTab() {
+    desiredEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(workerMutex_);
+        pendingJob_.reset();
+        readyResult_.reset();
+    }
+    worker_.request_stop();
+    workerCv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
 
 static std::string baseName(const std::string& p) {
     size_t s = p.find_last_of("/\\");
     return s == std::string::npos ? p : p.substr(s + 1);
 }
 
-// Map a loaded binary's machine type to the disassembler Arch enum (mirrors the
-// shell's archFromMachine; kept local so the diff tab needs no AppContext).
-static Arch archOf(const BinaryFile& bf) {
-    switch (bf.machine()) {
-        case MachineArch::X86:     return Arch::X86;
-        case MachineArch::X64:     return Arch::X64;
-        case MachineArch::ARM:     return Arch::ARM;
-        case MachineArch::ARM64:   return Arch::ARM64;
-        case MachineArch::MIPS:    return Arch::MIPS;
-        case MachineArch::MIPS64:  return Arch::MIPS64;
-        case MachineArch::PPC:     return Arch::PPC;
-        case MachineArch::PPC64:   return Arch::PPC64;
-        case MachineArch::RISCV:   return Arch::RISCV32;
-        case MachineArch::RISCV64: return Arch::RISCV64;
-        case MachineArch::JVM:     return Arch::JVM;
-        default:                   return bf.is64Bit() ? Arch::X64 : Arch::X86;
+static const char* semanticBasisName(SemanticMatchBasis basis) {
+    switch (basis) {
+        case SemanticMatchBasis::AuthoritativeName: return "symbol";
+        case SemanticMatchBasis::SemanticHash:      return "semantic hash";
+        case SemanticMatchBasis::CfgStructure:      return "CFG structure";
+        case SemanticMatchBasis::CallNeighborhood:  return "call neighborhood";
+        default:                                     return "unknown";
     }
+}
+
+static const char* semanticEditName(InstructionEditKind kind) {
+    switch (kind) {
+        case InstructionEditKind::Insert:  return "insert";
+        case InstructionEditKind::Delete:  return "delete";
+        case InstructionEditKind::Replace: return "replace";
+        default:                           return "edit";
+    }
+}
+
+static const char* semanticTransferName(MetadataTransferKind kind) {
+    switch (kind) {
+        case MetadataTransferKind::Name:      return "name";
+        case MetadataTransferKind::Comment:   return "comment";
+        case MetadataTransferKind::Prototype: return "prototype";
+        case MetadataTransferKind::Bookmark:  return "bookmark";
+        default:                              return "metadata";
+    }
+}
+
+static std::string semanticFunctionLabel(const SemanticFunction& function) {
+    if (!function.name.empty()) return function.name;
+    char address[32]{};
+    std::snprintf(address, sizeof(address), "sub_%llX",
+                  static_cast<unsigned long long>(function.address));
+    return address;
+}
+
+// Map a structured image's machine type to a decoder. Raw/Unknown has no
+// authoritative ISA in Binary Diff because this surface has no explicit Raw
+// architecture picker; flat/section byte comparison remains available.
+static bool archOf(const BinaryFile& bf, Arch& out) {
+    switch (bf.machine()) {
+        case MachineArch::X86:     out = Arch::X86; return true;
+        case MachineArch::X64:     out = Arch::X64; return true;
+        case MachineArch::ARM:     out = Arch::ARM; return true;
+        case MachineArch::THUMB:   out = Arch::THUMB; return true;
+        case MachineArch::ARM64:   out = Arch::ARM64; return true;
+        case MachineArch::MIPS:    out = Arch::MIPS; return true;
+        case MachineArch::MIPS64:  out = Arch::MIPS64; return true;
+        case MachineArch::PPC:     out = Arch::PPC; return true;
+        case MachineArch::PPC64:   out = Arch::PPC64; return true;
+        case MachineArch::RISCV:   out = Arch::RISCV32; return true;
+        case MachineArch::RISCV64: out = Arch::RISCV64; return true;
+        case MachineArch::JVM:     out = Arch::JVM; return true;
+        case MachineArch::GML:     out = Arch::GML; return true;
+        case MachineArch::Unknown: return false;
+    }
+    return false;
+}
+
+static DecoderConfig decoderFor(const BinaryFile& binary, Arch arch) {
+    DecoderConfig config;
+    config.engine = Engine::Zydis;
+    config.arch = arch;
+    return DecoderConfigForImage(binary, config);
 }
 
 // Locate the section of `bf` whose raw file data covers file offset `off`.
 // Returns nullptr if the offset is outside every section's raw range.
 static const Section* sectionAtOffset(const BinaryFile& bf, uint64_t off) {
     for (const auto& s : bf.sections())
-        if (s.rawSize && off >= s.rawOffset && off < s.rawOffset + s.rawSize) return &s;
+        if (s.rawSize && off >= s.rawOffset && off - s.rawOffset < s.rawSize) return &s;
     return nullptr;
 }
 
-void BinaryDiffTab::openInto(BinaryFile& target) {
-    wchar_t file[MAX_PATH] = L"";
+bool BinaryDiffTab::queryFileIdentity(const std::string& path, FileIdentity& out) {
+    out = {};
+    if (path.empty()) return false;
+
+    const int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                           path.c_str(), -1, nullptr, 0);
+    if (chars <= 0) return false;
+    std::vector<wchar_t> wide(static_cast<size_t>(chars));
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1,
+                             wide.data(), chars)) return false;
+
+    HANDLE file = CreateFileW(wide.data(), FILE_READ_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const BOOL ok = GetFileInformationByHandle(file, &info);
+    CloseHandle(file);
+    if (!ok) return false;
+
+    out.size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    out.writeTime = (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+                    info.ftLastWriteTime.dwLowDateTime;
+    out.fileIndex = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    out.volumeSerial = info.dwVolumeSerialNumber;
+    out.valid = true;
+    return true;
+}
+
+bool BinaryDiffTab::sameIdentity(const FileIdentity& a, const FileIdentity& b) {
+    return a.valid && b.valid && a.size == b.size && a.writeTime == b.writeTime &&
+           a.fileIndex == b.fileIndex && a.volumeSerial == b.volumeSerial;
+}
+
+const char* BinaryDiffTab::phaseName(DiffPhase phase) {
+    switch (phase) {
+        case DiffPhase::LoadingLeft:       return "Loading left file";
+        case DiffPhase::LoadingRight:      return "Loading right file";
+        case DiffPhase::ComparingBytes:    return "Comparing bytes";
+        case DiffPhase::ComparingSections: return "Comparing sections";
+        case DiffPhase::BuildingSemanticLeft:  return "Analyzing left functions";
+        case DiffPhase::BuildingSemanticRight: return "Analyzing right functions";
+        case DiffPhase::MatchingSemantics:     return "Matching semantic functions";
+        case DiffPhase::Complete:          return "Complete";
+        case DiffPhase::Cancelled:         return "Cancelled";
+        case DiffPhase::Failed:            return "Failed";
+        default:                           return "Idle";
+    }
+}
+
+void BinaryDiffTab::openInto(bool leftSide) {
+    std::vector<wchar_t> file(32768, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
-    ofn.lpstrFilter = L"Binaries\0*.exe;*.dll;*.sys;*.bin\0All Files\0*.*\0";
-    ofn.lpstrFile   = file;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_FILEMUSTEXIST;
+    ofn.lpstrFilter = L"Binaries\0*.exe;*.dll;*.sys;*.bin;*.elf;*.so;*.dylib;*.class\0All Files\0*.*\0";
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (GetOpenFileNameW(&ofn)) {
-        char path[MAX_PATH * 2] = {0};
-        WideCharToMultiByte(CP_UTF8, 0, file, -1, path, sizeof(path), nullptr, nullptr);
-        target.load(path);
-        computed_ = false;
-    }
-}
-
-void BinaryDiffTab::computeDiff() {
-    diffs_.clear();
-    totalDiff_ = 0;
-    if (!left_.loaded() || !right_.loaded()) return;
-    const auto& a = left_.bytes();
-    const auto& b = right_.bytes();
-    size_t n = std::min(a.size(), b.size());
-    for (size_t i = 0; i < n; ++i) {
-        if (a[i] != b[i]) {
-            ++totalDiff_;
-            if (diffs_.size() < 5000) diffs_.push_back({ i, a[i], b[i] });
+        const int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+            file.data(), -1, nullptr, 0, nullptr, nullptr);
+        if (length <= 1) {
+            diffError_ = "The selected file path could not be read as Unicode.";
+            return;
         }
+        std::string path(static_cast<size_t>(length), '\0');
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, file.data(), -1,
+                                path.data(), length, nullptr, nullptr)) {
+            diffError_ = "The selected file path could not be read as Unicode.";
+            return;
+        }
+        path.pop_back();
+
+        // Selection performs metadata-only identity capture. BinaryFile::load,
+        // hashing, parsing, and semantic construction all belong to workerLoop.
+        FileIdentity identity{};
+        if (!queryFileIdentity(path, identity)) {
+            diffError_ = "Could not inspect the selected file.";
+            diffPhase_.store(DiffPhase::Failed, std::memory_order_release);
+        } else {
+            cancelDiff();
+            invalidateComparison();
+            if (leftSide) {
+                selectedLeftPath_ = path;
+                leftIdentity_ = identity;
+            } else {
+                selectedRightPath_ = path;
+                rightIdentity_ = identity;
+            }
+            diffError_.clear();
+            diffPhase_.store(DiffPhase::Idle, std::memory_order_release);
+        }
+        // Keep the owned image buffers until their replacement arrives by move,
+        // but never present their differences under a newly selected file name.
     }
-    totalDiff_ += (a.size() > b.size() ? a.size() - b.size() : b.size() - a.size());
-    computed_ = true;
-    buildRegions();
-    if (sectionAware_) computeSectionDiff();
 }
 
-// Coalesce differing file offsets into navigable regions (pure logic in
-// Core/DiffRegions.h, unit-tested separately). Independent of the diffs_ cap.
-void BinaryDiffTab::buildRegions() {
-    regions_.clear();
+void BinaryDiffTab::computeDiff(const AppContext* ctx) {
+    if (selectedLeftPath_.empty() || selectedRightPath_.empty()) return;
+    invalidateComparison();
+
+    FileIdentity leftNow{}, rightNow{};
+    if (!queryFileIdentity(selectedLeftPath_, leftNow) ||
+        !queryFileIdentity(selectedRightPath_, rightNow) ||
+        !sameIdentity(leftNow, leftIdentity_) ||
+        !sameIdentity(rightNow, rightIdentity_)) {
+        cancelDiff();
+        diffError_ = "A source file changed on disk. Reload it before computing a diff.";
+        diffPhase_.store(DiffPhase::Failed, std::memory_order_release);
+        return;
+    }
+
+    DiffJob job;
+    job.epoch = desiredEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    job.leftPath = selectedLeftPath_;
+    job.rightPath = selectedRightPath_;
+    job.leftIdentity = leftIdentity_;
+    job.rightIdentity = rightIdentity_;
+    job.sectionAware = sectionAware_ && !semanticMode_;
+    job.semantic = semanticMode_;
+    if (ctx && job.semantic && ctx->staticProject().hash) {
+        const ProjectState& project = ctx->staticProject();
+        job.activeMetadata.hash = project.hash;
+        job.activeMetadata.names.reserve(project.names.size());
+        for (const auto& [address, name] : project.names)
+            job.activeMetadata.names.emplace_back(address, name);
+        job.activeMetadata.comments.reserve(project.comments.size());
+        for (const auto& [address, comment] : project.comments)
+            job.activeMetadata.comments.emplace_back(address, comment);
+        for (const PjFunctionOverride& item : project.functionOverrides)
+            if (item.action == PjFunctionAction::Define && !item.prototype.empty())
+                job.activeMetadata.prototypes.emplace_back(item.address, item.prototype);
+        job.activeMetadata.bookmarks.reserve(project.bookmarks.size());
+        for (const PjBookmark& bookmark : project.bookmarks)
+            job.activeMetadata.bookmarks.push_back(bookmark.address);
+        auto byAddress = [](const auto& a, const auto& b) { return a.first < b.first; };
+        std::sort(job.activeMetadata.names.begin(), job.activeMetadata.names.end(), byAddress);
+        std::sort(job.activeMetadata.comments.begin(), job.activeMetadata.comments.end(), byAddress);
+        std::sort(job.activeMetadata.prototypes.begin(), job.activeMetadata.prototypes.end(), byAddress);
+        std::sort(job.activeMetadata.bookmarks.begin(), job.activeMetadata.bookmarks.end());
+    }
+    {
+        std::lock_guard lock(workerMutex_);
+        pendingJob_ = std::move(job); // latest request wins
+        readyResult_.reset();
+        diffProgress_.store(0, std::memory_order_release);
+        diffProgressTotal_.store(0, std::memory_order_release);
+        diffPhase_.store(DiffPhase::LoadingLeft, std::memory_order_release);
+        diffRunning_.store(true, std::memory_order_release);
+    }
+    diffError_.clear();
+    semanticWarning_.clear();
+    semanticTransferStatus_.clear();
+    semanticTransferTarget_ = {};
+    workerCv_.notify_one();
+}
+
+void BinaryDiffTab::cancelDiff() {
+    desiredEpoch_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock(workerMutex_);
+        pendingJob_.reset();
+        readyResult_.reset();
+        diffRunning_.store(false, std::memory_order_release);
+        diffPhase_.store(DiffPhase::Cancelled, std::memory_order_release);
+        diffProgress_.store(0, std::memory_order_release);
+        diffProgressTotal_.store(0, std::memory_order_release);
+    }
+}
+
+void BinaryDiffTab::invalidateComparison() {
+    computed_ = false;
+    semanticComputed_ = false;
     curRegion_ = -1;
-    if (!left_.loaded() || !right_.loaded()) return;
-    const auto& a = left_.bytes();
-    const auto& b = right_.bytes();
-    std::vector<ByteDiffRegion> out;
-    CoalesceDiffRegions(a.data(), a.size(), b.data(), b.size(), /*gap=*/16, /*maxRegions=*/50000, out);
-    regions_.reserve(out.size());
-    for (const auto& r : out) regions_.push_back({ r.start, r.end });
+    applyScroll_ = false;
+    scrollY_ = 0.0f;
+    semanticProposalSelected_.clear();
+    semanticProposalSelectionCount_ = 0;
+    semanticTransferTarget_ = {};
+    semanticTransferStatus_.clear();
 }
 
 void BinaryDiffTab::gotoRegion(int idx) {
@@ -108,102 +324,524 @@ void BinaryDiffTab::gotoRegion(int idx) {
 void BinaryDiffTab::ensureDecoders() {
     if (left_.loaded() && (!leftDis_ || leftDisArch_ != left_.machine())) {
         leftDisArch_ = left_.machine();
-        leftDis_ = MakeDisassembler(Engine::Zydis, archOf(left_));
+        leftDisError_.clear();
+        Arch arch = Arch::X64;
+        if (!archOf(left_, arch)) {
+            leftDis_.reset();
+            leftDisError_ =
+                "Raw/unknown image has no explicit decoder architecture; disassembly is not authoritative.";
+        } else {
+            leftDis_ = MakeDisassembler(decoderFor(left_, arch));
+            if (!leftDis_) leftDisError_ = "decoder factory returned null";
+            else if (!leftDis_->ready()) {
+                leftDisError_ = leftDis_->errorMessage().empty()
+                    ? "decoder initialization failed"
+                    : std::string(leftDis_->errorMessage());
+            }
+        }
     }
     if (right_.loaded() && (!rightDis_ || rightDisArch_ != right_.machine())) {
         rightDisArch_ = right_.machine();
-        rightDis_ = MakeDisassembler(Engine::Zydis, archOf(right_));
+        rightDisError_.clear();
+        Arch arch = Arch::X64;
+        if (!archOf(right_, arch)) {
+            rightDis_.reset();
+            rightDisError_ =
+                "Raw/unknown image has no explicit decoder architecture; disassembly is not authoritative.";
+        } else {
+            rightDis_ = MakeDisassembler(decoderFor(right_, arch));
+            if (!rightDis_) rightDisError_ = "decoder factory returned null";
+            else if (!rightDis_->ready()) {
+                rightDisError_ = rightDis_->errorMessage().empty()
+                    ? "decoder initialization failed"
+                    : std::string(rightDis_->errorMessage());
+            }
+        }
     }
 }
 
-// Section-aware diff: pair each LEFT section with a RIGHT section sharing its
-// name (or, failing that, its RVA), then byte-diff the two sections' raw data
-// aligned at their respective section starts. This keeps a shifted/relocated
-// section from registering as wholly different the way a flat offset diff would.
-void BinaryDiffTab::computeSectionDiff() {
-    secDiffs_.clear();
-    secTotalDiff_ = 0;
-    secUnmatched_ = 0;
-    if (!left_.loaded() || !right_.loaded()) return;
+void BinaryDiffTab::workerLoop(std::stop_token stop) {
+    for (;;) {
+        DiffJob job;
+        {
+            std::unique_lock lock(workerMutex_);
+            workerCv_.wait(lock, [&] { return stop.stop_requested() || pendingJob_.has_value(); });
+            if (stop.stop_requested()) return;
+            job = std::move(*pendingJob_);
+            pendingJob_.reset();
+        }
 
-    const auto& la = left_.bytes();
-    const auto& rb = right_.bytes();
-    const auto& rsecs = right_.sections();
+        auto stale = [&] {
+            return stop.stop_requested() ||
+                   desiredEpoch_.load(std::memory_order_acquire) != job.epoch;
+        };
+        auto setProgress = [&](DiffPhase phase, uint64_t current, uint64_t total) {
+            std::lock_guard lock(workerMutex_);
+            if (stale()) return;
+            diffPhase_.store(phase, std::memory_order_release);
+            diffProgress_.store(current, std::memory_order_release);
+            diffProgressTotal_.store(total, std::memory_order_release);
+        };
+        auto publish = [&](DiffResult&& result) {
+            if (stale()) return;
+            const bool failed = !result.error.empty();
+            {
+                std::lock_guard lock(workerMutex_);
+                if (stale()) return;
+                readyResult_ = std::move(result);
+                diffRunning_.store(false, std::memory_order_release);
+                diffPhase_.store(failed ? DiffPhase::Failed : DiffPhase::Complete,
+                                 std::memory_order_release);
+            }
+        };
 
-    // Find a right-side section matching by name first, then by RVA.
-    auto findRight = [&](const Section& ls) -> const Section* {
-        for (const auto& rs : rsecs) if (!rs.name.empty() && rs.name == ls.name) return &rs;
-        for (const auto& rs : rsecs) if (rs.virtualAddress == ls.virtualAddress) return &rs;
-        return nullptr;
-    };
+        try {
+            DiffResult result;
+            result.epoch = job.epoch;
+            result.leftIdentity = job.leftIdentity;
+            result.rightIdentity = job.rightIdentity;
 
-    for (const auto& ls : left_.sections()) {
-        SecDiff sd;
-        sd.name = ls.name;
-        sd.rva  = ls.virtualAddress;
-        sd.lOff = ls.rawOffset;
-        const Section* rs = findRight(ls);
-        if (!rs) { ++secUnmatched_; secDiffs_.push_back(std::move(sd)); continue; }
-        sd.matched = true;
-        sd.rOff = rs->rawOffset;
+        FileIdentity before{}, after{};
+        BinaryFile left, right;
+        BinaryLoadOptions loadOptions;
+        loadOptions.cancelled = stale;
+        setProgress(DiffPhase::LoadingLeft, 0, 0);
+        if (!queryFileIdentity(job.leftPath, before) ||
+            !sameIdentity(before, job.leftIdentity) || !left.load(job.leftPath, loadOptions) ||
+            !queryFileIdentity(job.leftPath, after) || !sameIdentity(before, after) ||
+            left.bytes().size() != after.size) {
+            result.error = "The left source changed or could not be reloaded.";
+            publish(std::move(result));
+            continue;
+        }
+        if (stale()) continue;
 
-        // Compare the on-disk overlap of the two sections, bounded by what is
-        // actually present in each file's byte buffer (raw sizes can lie).
-        uint64_t lAvail = (ls.rawOffset < la.size()) ? (la.size() - ls.rawOffset) : 0;
-        uint64_t rAvail = (rs->rawOffset < rb.size()) ? (rb.size() - rs->rawOffset) : 0;
-        size_t len = (size_t)std::min({ (uint64_t)ls.rawSize, (uint64_t)rs->rawSize, lAvail, rAvail });
-        sd.len = len;
-        for (size_t i = 0; i < len; ++i)
-            if (la[ls.rawOffset + i] != rb[rs->rawOffset + i]) ++sd.diffBytes;
-        // Size mismatch within the section counts as additional differing bytes.
-        uint64_t lraw = std::min<uint64_t>(ls.rawSize, lAvail);
-        uint64_t rraw = std::min<uint64_t>(rs->rawSize, rAvail);
-        sd.diffBytes += (size_t)(lraw > rraw ? lraw - rraw : rraw - lraw);
-        secTotalDiff_ += sd.diffBytes;
-        secDiffs_.push_back(std::move(sd));
+        setProgress(DiffPhase::LoadingRight, 0, 0);
+        if (!queryFileIdentity(job.rightPath, before) ||
+            !sameIdentity(before, job.rightIdentity) || !right.load(job.rightPath, loadOptions) ||
+            !queryFileIdentity(job.rightPath, after) || !sameIdentity(before, after) ||
+            right.bytes().size() != after.size) {
+            result.error = "The right source changed or could not be reloaded.";
+            publish(std::move(result));
+            continue;
+        }
+        if (stale()) continue;
+
+        const auto& a = left.bytes();
+        const auto& b = right.bytes();
+        if (!job.semantic) {
+        ByteDiffScanResult flat;
+        setProgress(DiffPhase::ComparingBytes, 0, std::min(a.size(), b.size()));
+        const bool complete = ScanByteDifferences(
+            a.data(), a.size(), b.data(), b.size(), 16, 5000, 50000, flat,
+            stale,
+            [&](uint64_t current, uint64_t total) {
+                setProgress(DiffPhase::ComparingBytes, current, total);
+            });
+        if (!complete || stale()) continue;
+
+        result.totalDiff = flat.totalDiff;
+        result.diffs.reserve(flat.samples.size());
+        for (const auto& d : flat.samples) result.diffs.push_back({ d.offset, d.a, d.b });
+        result.regions.reserve(flat.regions.size());
+        for (const auto& r : flat.regions) result.regions.push_back({ r.start, r.end });
+
+        if (job.sectionAware) {
+            const auto& rsecs = right.sections();
+            uint64_t sectionWork = 0;
+            for (const auto& ls : left.sections()) {
+                const Section* match = nullptr;
+                for (const auto& rs : rsecs)
+                    if (!rs.name.empty() && rs.name == ls.name) { match = &rs; break; }
+                if (!match) for (const auto& rs : rsecs)
+                    if (rs.virtualAddress == ls.virtualAddress) { match = &rs; break; }
+                if (!match) continue;
+                const uint64_t lAvail = ls.rawOffset < a.size() ? a.size() - ls.rawOffset : 0;
+                const uint64_t rAvail = match->rawOffset < b.size() ? b.size() - match->rawOffset : 0;
+                const uint64_t len = std::min({ ls.rawSize, match->rawSize, lAvail, rAvail });
+                sectionWork = len > UINT64_MAX - sectionWork ? UINT64_MAX : sectionWork + len;
+            }
+
+            uint64_t progressed = 0;
+            setProgress(DiffPhase::ComparingSections, 0, sectionWork);
+            for (const auto& ls : left.sections()) {
+                if (stale()) break;
+                SecDiff sd;
+                sd.name = ls.name;
+                sd.rva = ls.virtualAddress;
+                sd.lOff = ls.rawOffset;
+
+                const Section* match = nullptr;
+                for (const auto& rs : rsecs)
+                    if (!rs.name.empty() && rs.name == ls.name) { match = &rs; break; }
+                if (!match) for (const auto& rs : rsecs)
+                    if (rs.virtualAddress == ls.virtualAddress) { match = &rs; break; }
+                if (!match) {
+                    ++result.sectionUnmatched;
+                    result.sections.push_back(std::move(sd));
+                    continue;
+                }
+
+                sd.matched = true;
+                sd.rOff = match->rawOffset;
+                const uint64_t lAvail = ls.rawOffset < a.size() ? a.size() - ls.rawOffset : 0;
+                const uint64_t rAvail = match->rawOffset < b.size() ? b.size() - match->rawOffset : 0;
+                const uint64_t len64 = std::min({ ls.rawSize, match->rawSize, lAvail, rAvail });
+                sd.len = static_cast<size_t>(len64);
+                for (size_t i = 0; i < sd.len; ++i) {
+                    if ((i % (64u * 1024u)) == 0) {
+                        if (stale()) break;
+                        setProgress(DiffPhase::ComparingSections, progressed + i, sectionWork);
+                    }
+                    if (a[static_cast<size_t>(ls.rawOffset) + i] !=
+                        b[static_cast<size_t>(match->rawOffset) + i]) ++sd.diffBytes;
+                }
+                if (stale()) break;
+                progressed = len64 > UINT64_MAX - progressed ? UINT64_MAX : progressed + len64;
+                const uint64_t lraw = std::min(ls.rawSize, lAvail);
+                const uint64_t rraw = std::min(match->rawSize, rAvail);
+                const uint64_t extra = lraw > rraw ? lraw - rraw : rraw - lraw;
+                if (extra > std::numeric_limits<size_t>::max() - sd.diffBytes)
+                    sd.diffBytes = std::numeric_limits<size_t>::max();
+                else
+                    sd.diffBytes += static_cast<size_t>(extra);
+                result.sectionTotalDiff = sd.diffBytes > UINT64_MAX - result.sectionTotalDiff
+                    ? UINT64_MAX : result.sectionTotalDiff + sd.diffBytes;
+                result.sections.push_back(std::move(sd));
+            }
+            if (stale()) continue;
+
+            // Account for right-only sections using the same name/RVA matching
+            // policy as the historical render-thread implementation.
+            for (const auto& rs : rsecs) {
+                bool inLeft = false;
+                for (const auto& ls : left.sections()) {
+                    if ((!rs.name.empty() && rs.name == ls.name) ||
+                        rs.virtualAddress == ls.virtualAddress) { inLeft = true; break; }
+                }
+                if (!inLeft) ++result.sectionUnmatched;
+            }
+        }
+        }
+
+        if (job.semantic) {
+            result.semanticRequested = true;
+            Arch leftArch = Arch::X64, rightArch = Arch::X64;
+            const bool leftArchValid = archOf(left, leftArch);
+            const bool rightArchValid = archOf(right, rightArch);
+            if (!leftArchValid || !rightArchValid) {
+                result.semanticError =
+                    "Semantic comparison is unavailable for Raw/unknown inputs because Binary Diff has no explicit per-side decoder selection. Flat byte comparison remains available.";
+            } else if (leftArch != rightArch) {
+                result.semanticError = std::string("Semantic comparison requires matching architectures (left: ") +
+                    ArchName(leftArch) + ", right: " + ArchName(rightArch) + ").";
+            } else {
+                auto makeFactory = [](const BinaryFile& image) {
+                    return [javaClass = image.javaClass(), archive = image.gameMakerArchive()](const DecoderConfig& config) {
+                        auto decoder = MakeDisassembler(config);
+                        if (decoder) AttachJvmClass(*decoder, javaClass);
+                        if (decoder && archive) AttachGameMakerArchive(*decoder, archive);
+                        return decoder;
+                    };
+                };
+                SemanticDiffLimits semanticLimits;
+                setProgress(DiffPhase::BuildingSemanticLeft, 0, a.size());
+                SemanticImageBuildResult leftSemantic = BuildSemanticImage(
+                    left, decoderFor(left, leftArch), makeFactory(left),
+                    semanticLimits, stale);
+                if (stale() || leftSemantic.cancelled) continue;
+                setProgress(DiffPhase::BuildingSemanticLeft, a.size(), a.size());
+                if (!leftSemantic.complete) {
+                    result.semanticError = leftSemantic.error.empty()
+                        ? "Left semantic analysis did not complete." : std::move(leftSemantic.error);
+                } else {
+                    setProgress(DiffPhase::BuildingSemanticRight, 0, b.size());
+                SemanticImageBuildResult rightSemantic = BuildSemanticImage(
+                    right, decoderFor(right, rightArch), makeFactory(right),
+                    semanticLimits, stale);
+                    if (stale() || rightSemantic.cancelled) continue;
+                    setProgress(DiffPhase::BuildingSemanticRight, b.size(), b.size());
+                    if (!rightSemantic.complete) {
+                        result.semanticError = rightSemantic.error.empty()
+                            ? "Right semantic analysis did not complete." : std::move(rightSemantic.error);
+                    } else {
+                        // Merge persisted analyst metadata only on the worker.
+                        // The active in-memory snapshot wins for its exact hash;
+                        // other sides use their atomically loaded project sidecar.
+                        auto metadataFor = [&](uint64_t hash, const char* side) {
+                            DiffJob::MetadataSnapshot snapshot;
+                            if (job.activeMetadata.hash && job.activeMetadata.hash == hash) {
+                                snapshot = job.activeMetadata;
+                                return snapshot;
+                            }
+                            ProjectState project;
+                            const ProjectLoadResult load = LoadProjectDetailed(hash, project);
+                            if (load.recoveredFromBackup() ||
+                                (!load.loaded &&
+                                 (ProjectLoadAttemptRequiresWarning(load.primary) ||
+                                  ProjectLoadAttemptRequiresWarning(load.backup)))) {
+                                if (!result.semanticWarning.empty()) result.semanticWarning += "\n";
+                                result.semanticWarning += side;
+                                result.semanticWarning += " metadata: ";
+                                result.semanticWarning += load.error.empty()
+                                    ? (load.recoveredFromBackup()
+                                        ? "recovered project analysis from the backup sidecar"
+                                        : "the invalid project sidecar was not applied")
+                                    : load.error;
+                                result.semanticWarning += ".";
+                            }
+                            if (!load.loaded || project.hash != hash) return snapshot;
+                            snapshot.hash = hash;
+                            snapshot.names.reserve(project.names.size());
+                            snapshot.comments.reserve(project.comments.size());
+                            snapshot.bookmarks.reserve(project.bookmarks.size());
+                            for (const auto& [address, name] : project.names)
+                                snapshot.names.emplace_back(address, name);
+                            for (const auto& [address, comment] : project.comments)
+                                snapshot.comments.emplace_back(address, comment);
+                            for (const PjFunctionOverride& item : project.functionOverrides)
+                                if (item.action == PjFunctionAction::Define && !item.prototype.empty())
+                                    snapshot.prototypes.emplace_back(item.address, item.prototype);
+                            for (const PjBookmark& bookmark : project.bookmarks)
+                                snapshot.bookmarks.push_back(bookmark.address);
+                            return snapshot;
+                        };
+                        auto applyMetadata = [](SemanticImage& image,
+                                                const DiffJob::MetadataSnapshot& snapshot) {
+                            if (!snapshot.hash || snapshot.hash != image.contentIdentity) return;
+                            std::unordered_map<uint64_t, std::string> names(
+                                snapshot.names.begin(), snapshot.names.end());
+                            std::unordered_map<uint64_t, std::string> comments(
+                                snapshot.comments.begin(), snapshot.comments.end());
+                            std::unordered_map<uint64_t, std::string> prototypes(
+                                snapshot.prototypes.begin(), snapshot.prototypes.end());
+                            std::unordered_set<uint64_t> bookmarks(snapshot.bookmarks.begin(),
+                                                                   snapshot.bookmarks.end());
+                            for (SemanticFunction& function : image.functions) {
+                                if (auto name = names.find(function.address); name != names.end()) {
+                                    function.name = name->second;
+                                    function.authoritativeName = true;
+                                    function.nameTransferable = true;
+                                }
+                                if (auto prototype = prototypes.find(function.address);
+                                    prototype != prototypes.end())
+                                    function.prototype = prototype->second;
+                                for (uint32_t instructionIndex = 0;
+                                     instructionIndex < function.instructions.size();
+                                     ++instructionIndex) {
+                                    const uint64_t address = function.instructions[instructionIndex].address;
+                                    if (auto comment = comments.find(address); comment != comments.end())
+                                        function.comments.push_back({instructionIndex, comment->second});
+                                    if (bookmarks.count(address))
+                                        function.bookmarkInstructions.push_back(instructionIndex);
+                                }
+                            }
+                        };
+                        applyMetadata(leftSemantic.image,
+                                      metadataFor(leftSemantic.image.contentIdentity, "Left"));
+                        applyMetadata(rightSemantic.image,
+                                      metadataFor(rightSemantic.image.contentIdentity, "Right"));
+
+                        setProgress(DiffPhase::MatchingSemantics, 0,
+                                    leftSemantic.image.functions.size() +
+                                    rightSemantic.image.functions.size());
+                        SemanticDiffResult semantic = ComputeSemanticDiff(
+                            leftSemantic.image, rightSemantic.image, semanticLimits, stale,
+                            [&](const SemanticDiffProgress& progress) {
+                                setProgress(DiffPhase::MatchingSemantics,
+                                            progress.completed, progress.total);
+                            });
+                        if (stale() || semantic.cancelled) continue;
+                        if (!semantic.complete) {
+                            result.semanticError = semantic.error.empty()
+                                ? "Semantic matching did not complete." : semantic.error;
+                        }
+                        result.semanticLeft = std::move(leftSemantic.image);
+                        result.semanticRight = std::move(rightSemantic.image);
+                        result.semanticDiff = std::move(semantic);
+                    }
+                }
+            }
+        }
+
+        // Detect an atomic replacement or edit that occurred after the reload.
+        FileIdentity leftFinal{}, rightFinal{};
+        if (!queryFileIdentity(job.leftPath, leftFinal) ||
+            !queryFileIdentity(job.rightPath, rightFinal) ||
+            !sameIdentity(leftFinal, job.leftIdentity) ||
+            !sameIdentity(rightFinal, job.rightIdentity)) {
+            result.error = "A source file changed while the diff was running.";
+        }
+        if (result.error.empty()) {
+            result.leftBinary = std::move(left);
+            result.rightBinary = std::move(right);
+        }
+            publish(std::move(result));
+        } catch (const std::exception& exception) {
+            DiffResult failure;
+            failure.epoch = job.epoch;
+            failure.leftIdentity = job.leftIdentity;
+            failure.rightIdentity = job.rightIdentity;
+            failure.error = std::string("Binary Diff worker failed: ") + exception.what();
+            publish(std::move(failure));
+        } catch (...) {
+            DiffResult failure;
+            failure.epoch = job.epoch;
+            failure.leftIdentity = job.leftIdentity;
+            failure.rightIdentity = job.rightIdentity;
+            failure.error = "Binary Diff worker failed: unknown exception.";
+            publish(std::move(failure));
+        }
     }
-    // Right-only sections (present on the right but with no left match) are also
-    // unmatched evidence.
-    for (const auto& rs : rsecs) {
-        bool inLeft = false;
-        for (const auto& ls : left_.sections())
-            if ((!rs.name.empty() && rs.name == ls.name) || rs.virtualAddress == ls.virtualAddress) { inLeft = true; break; }
-        if (!inLeft) ++secUnmatched_;
+}
+
+void BinaryDiffTab::pumpDiffResult() {
+    std::optional<DiffResult> ready;
+    {
+        std::lock_guard lock(workerMutex_);
+        if (readyResult_) {
+            ready = std::move(readyResult_);
+            readyResult_.reset();
+        }
     }
+    if (!ready || ready->epoch != desiredEpoch_.load(std::memory_order_acquire)) return;
+
+    FileIdentity leftNow{}, rightNow{};
+    if (!ready->error.empty() ||
+        !queryFileIdentity(selectedLeftPath_, leftNow) ||
+        !queryFileIdentity(selectedRightPath_, rightNow) ||
+        !sameIdentity(leftNow, ready->leftIdentity) ||
+        !sameIdentity(rightNow, ready->rightIdentity) ||
+        !sameIdentity(leftIdentity_, ready->leftIdentity) ||
+        !sameIdentity(rightIdentity_, ready->rightIdentity)) {
+        diffError_ = ready->error.empty()
+            ? "A source file changed before the diff result could be applied. Reload it."
+            : std::move(ready->error);
+        diffPhase_.store(DiffPhase::Failed, std::memory_order_release);
+        return;
+    }
+
+    left_ = std::move(ready->leftBinary);
+    right_ = std::move(ready->rightBinary);
+    leftDis_.reset();
+    rightDis_.reset();
+    leftDisError_.clear();
+    rightDisError_.clear();
+    leftDisArch_ = MachineArch::Unknown;
+    rightDisArch_ = MachineArch::Unknown;
+    diffs_ = std::move(ready->diffs);
+    regions_ = std::move(ready->regions);
+    secDiffs_ = std::move(ready->sections);
+    totalDiff_ = static_cast<size_t>(std::min<uint64_t>(
+        ready->totalDiff, std::numeric_limits<size_t>::max()));
+    secTotalDiff_ = static_cast<size_t>(std::min<uint64_t>(
+        ready->sectionTotalDiff, std::numeric_limits<size_t>::max()));
+    secUnmatched_ = ready->sectionUnmatched;
+    semanticLeft_ = std::move(ready->semanticLeft);
+    semanticRight_ = std::move(ready->semanticRight);
+    semanticDiff_ = std::move(ready->semanticDiff);
+    semanticComputed_ = ready->semanticRequested;
+    semanticError_ = std::move(ready->semanticError);
+    semanticWarning_ = std::move(ready->semanticWarning);
+    semanticSelectedMatch_ = semanticDiff_.matched.empty() ? -1 : 0;
+    semanticSelectedHunk_ = -1;
+    semanticProposalSelected_.assign(semanticDiff_.transferProposals.size(), false);
+    semanticProposalSelectionCount_ = 0;
+    semanticTransferTarget_ = {};
+    semanticTransferStatus_.clear();
+    curRegion_ = -1;
+    applyScroll_ = false;
+    computed_ = true;
+    diffError_.clear();
+    diffPhase_.store(DiffPhase::Complete, std::memory_order_release);
 }
 
 void BinaryDiffTab::render(AppContext& ctx) {
-    (void)ctx;
+    pumpDiffResult();
 
     // Before a diff exists, show a centered "drop zone": two load containers
     // forming one half-width block, centered horizontally and vertically.
     if (!computed_) {
-        renderLoadZone();
+        renderLoadZone(ctx);
         return;
     }
 
-    // Compact toolbar: swap files or recompute without leaving the diff view.
-    if (ImGui::Button("Load Left...")) openInto(left_);
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", left_.loaded() ? baseName(left_.path()).c_str() : "(none)");
-    ImGui::SameLine(0, 16);
-    if (ImGui::Button("Load Right...")) openInto(right_);
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", right_.loaded() ? baseName(right_.path()).c_str() : "(none)");
-    ImGui::SameLine(0, 16);
-    ImGui::BeginDisabled(!(left_.loaded() && right_.loaded()));
-    if (ImGui::Button("Recompute")) computeDiff();
-    ImGui::EndDisabled();
-    ImGui::SameLine();
+    // Source names stay within equal columns; long paths remain available in
+    // tooltips instead of pushing the comparison controls off the window.
+    const float scale = theme::UiScale();
+    if (ImGui::BeginTable("##diff_toolbar_sources", 2,
+                          ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableNextRow();
+        auto source = [&](int column, const char* button, bool left,
+                          const std::string& path) {
+            ImGui::TableSetColumnIndex(column);
+            if (ImGui::Button(button)) openInto(left);
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", baseName(path).c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\n%llu bytes", path.c_str(),
+                    static_cast<unsigned long long>(left ? leftIdentity_.size : rightIdentity_.size));
+        };
+        source(0, "Baseline...", true, selectedLeftPath_);
+        source(1, "Candidate...", false, selectedRightPath_);
+        ImGui::EndTable();
+    }
+    if (!computed_) return;
+    const bool running = diffRunning_.load(std::memory_order_acquire);
+    if (running) {
+        ctx.wantContinuousRedraw = true;
+        if (ImGui::Button("Cancel")) cancelDiff();
+    } else {
+        ImGui::BeginDisabled(selectedLeftPath_.empty() || selectedRightPath_.empty());
+        if (ImGui::Button("Recompute")) computeDiff(&ctx);
+        ImGui::EndDisabled();
+    }
+    ui::SameLineIfFits(ImGui::CalcTextSize("Section-aware").x + ImGui::GetFrameHeight() + 12.0f * scale);
     // Section-aware alignment toggle: recompute immediately so the summary +
     // (when on) the per-section breakdown reflect the chosen mode.
-    if (ImGui::Checkbox("Section-aware", &sectionAware_)) computeDiff();
+    ImGui::BeginDisabled(semanticMode_);
+    if (ImGui::Checkbox("Section-aware", &sectionAware_)) computeDiff(&ctx);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Align matching sections (by name, else RVA) before diffing,\n"
                           "instead of comparing by flat file offset.");
-    ImGui::SameLine();
-    ImGui::Text("| Left: %zu B   Right: %zu B", left_.bytes().size(), right_.bytes().size());
+    ImGui::EndDisabled();
+    ui::SameLineIfFits(ImGui::CalcTextSize("Semantic").x + ImGui::GetFrameHeight() + 12.0f * scale);
+    if (ImGui::Checkbox("Semantic", &semanticMode_)) computeDiff(&ctx);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Match functions by symbols, normalized instruction semantics, CFG shape, and calls.\n"
+                          "Analysis runs on the Binary Diff worker; metadata is never transferred automatically.");
+    // A mode change enqueues a fresh worker result. Hide the old totals and
+    // metadata proposals immediately, including the frame that enqueued it.
+    if (!computed_) {
+        ctx.wantContinuousRedraw = diffRunning_.load(std::memory_order_acquire);
+        return;
+    }
     ImGui::Separator();
+
+    if (running) {
+        const uint64_t current = diffProgress_.load(std::memory_order_acquire);
+        const uint64_t total = diffProgressTotal_.load(std::memory_order_acquire);
+        ImGui::TextDisabled("%s", phaseName(diffPhase_.load(std::memory_order_acquire)));
+        ImGui::SameLine();
+        if (total) {
+            const float fraction = static_cast<float>(std::min(current, total)) /
+                                   static_cast<float>(total);
+            ImGui::ProgressBar(fraction, ImVec2(220.0f * theme::UiScale(), 0));
+        } else {
+            const float t = static_cast<float>(ImGui::GetTime());
+            ImGui::ProgressBar(t - static_cast<float>(static_cast<long long>(t)),
+                               ImVec2(220.0f * theme::UiScale(), 0), "");
+        }
+        ImGui::Separator();
+    } else if (!diffError_.empty()) {
+        ImGui::TextColored(theme::col::bad(), "%s", diffError_.c_str());
+        ImGui::Separator();
+    }
+
+    if (semanticMode_) {
+        renderSemantic(ctx);
+        return;
+    }
 
     // Section-aware breakdown: a compact per-section diff table above the synced
     // hex panes (the hex panes still show the flat byte view for navigation).
@@ -213,18 +851,19 @@ void BinaryDiffTab::render(AppContext& ctx) {
         ImGui::Text("Section-aware: %zu differing byte(s) across %zu matched section(s)",
                     secTotalDiff_, matchedCount);
         if (secUnmatched_) {
-            ImGui::SameLine();
+            ui::SameLineIfFits(340.0f * scale);
             ImGui::TextColored(theme::col::warn(), "  %zu section(s) present on only one side", secUnmatched_);
         }
-        float tableH = std::min(ImGui::GetContentRegionAvail().y * 0.35f, 160.0f * theme::UiScale());
+        float tableH = std::max(1.0f, std::min(ImGui::GetContentRegionAvail().y * 0.35f, 160.0f * scale));
         if (ImGui::BeginTable("secdiff", 5,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
                 ImVec2(0, tableH))) {
             ImGui::TableSetupColumn("Section", ImGuiTableColumnFlags_WidthFixed, 120.0f * theme::UiScale());
             ImGui::TableSetupColumn("RVA",     ImGuiTableColumnFlags_WidthFixed, 110.0f * theme::UiScale());
             ImGui::TableSetupColumn("Compared",ImGuiTableColumnFlags_WidthFixed, 90.0f * theme::UiScale());
             ImGui::TableSetupColumn("Diff",    ImGuiTableColumnFlags_WidthFixed, 90.0f * theme::UiScale());
             ImGui::TableSetupColumn("Status");
+            ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
             for (const auto& sd : secDiffs_) {
                 ImGui::TableNextRow();
@@ -246,17 +885,26 @@ void BinaryDiffTab::render(AppContext& ctx) {
     }
 
     const size_t maxN = std::max(left_.bytes().size(), right_.bytes().size());
-    const int    rows = (int)((maxN + 15) / 16);
+    const uint64_t rowCount = (static_cast<uint64_t>(maxN) + 15) / 16;
+    const int rows = static_cast<int>(std::min<uint64_t>(
+        rowCount, static_cast<uint64_t>(std::numeric_limits<int>::max())));
 
-    ImGui::Text("Differing bytes (overlap): %zu", totalDiff_);
+    ImGui::Text("Differing bytes: %zu", totalDiff_);
+    ui::ItemTooltip("Includes changed bytes in the shared range and bytes present on only one side.");
+    ui::SameLineIfFits(ImGui::CalcTextSize("Changed bytes   Selected change").x);
+    ImGui::BeginGroup();
+    ImGui::TextColored(theme::col::bad(), "Changed bytes");
     ImGui::SameLine();
-    ImGui::TextDisabled("   red = byte differs, yellow = selected change");
+    ImGui::TextColored(theme::col::warn(), "Selected change");
+    ImGui::EndGroup();
 
     // Difference navigation: jump between coalesced change regions; F3 / Shift+F3
     // step forward / back while the tab is focused. Selecting a region scrolls both
     // panes to it and drives the side-by-side ASM panel below.
     const int nReg = (int)regions_.size();
-    bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen(nullptr,
+            ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
     ImGui::BeginDisabled(nReg == 0);
     bool prev = ImGui::Button("\xE2\x97\x80 Prev") ||
                 (focused && ImGui::IsKeyPressed(ImGuiKey_F3) && ImGui::GetIO().KeyShift);
@@ -264,21 +912,22 @@ void BinaryDiffTab::render(AppContext& ctx) {
     bool next = ImGui::Button("Next \xE2\x96\xB6") ||
                 (focused && ImGui::IsKeyPressed(ImGuiKey_F3) && !ImGui::GetIO().KeyShift);
     ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (nReg) ImGui::Text("Change %d / %d  @ 0x%llX", curRegion_ + 1, nReg,
+    ui::SameLineIfFits(300.0f * scale);
+    if (nReg && curRegion_ < 0) ImGui::TextDisabled("%d changes; select Prev or Next (F3)", nReg);
+    else if (nReg) ImGui::Text("Change %d / %d  @ 0x%llX", curRegion_ + 1, nReg,
                           (unsigned long long)(curRegion_ >= 0 ? regions_[curRegion_].start : regions_[0].start));
     else      ImGui::TextDisabled("(no differences)");
     if (next && nReg) gotoRegion(curRegion_ + 1 >= nReg ? 0 : curRegion_ + 1);
     if (prev && nReg) gotoRegion(curRegion_ <= 0 ? nReg - 1 : curRegion_ - 1);
 
-    // Reserve room at the bottom for the ASM panel once a region is selected.
-    const float asmH = (curRegion_ >= 0) ? 200.0f * theme::UiScale() : 0.0f;
-
     // Two equal, bordered containers side by side (symmetric = visually centered).
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float gap   = 12.0f;
-    const float paneW = (avail.x - gap) * 0.5f;
-    const float paneH = avail.y - (asmH > 0 ? asmH + ImGui::GetStyle().ItemSpacing.y : 0);
+    const float asmH = curRegion_ >= 0
+        ? std::max(0.0f, std::min(200.0f * scale, avail.y * 0.45f)) : 0.0f;
+    const float gap   = 12.0f * scale;
+    const float paneW = std::max(1.0f, (avail.x - gap) * 0.5f);
+    const float paneH = std::max(1.0f, avail.y -
+        (asmH > 0 ? asmH + ImGui::GetStyle().ItemSpacing.y : 0));
 
     const bool force = applyScroll_;
     float ls = scrollY_, rs = scrollY_;
@@ -287,7 +936,7 @@ void BinaryDiffTab::render(AppContext& ctx) {
     // LEFT container.
     ImGui::BeginChild("Lcont", ImVec2(paneW, paneH), ImGuiChildFlags_Borders);
     ImGui::TextColored(theme::col::accent(), "%s", baseName(left_.path()).c_str());
-    ImGui::SameLine(); ImGui::TextDisabled("(%zu B)", left_.bytes().size());
+    ui::ItemTooltip(left_.path().c_str());
     ImGui::Separator();
     renderPane("Lhex", left_, right_, rows, leftMaster_, ls, lhov, force);
     ImGui::EndChild();
@@ -297,7 +946,7 @@ void BinaryDiffTab::render(AppContext& ctx) {
     // RIGHT container.
     ImGui::BeginChild("Rcont", ImVec2(paneW, paneH), ImGuiChildFlags_Borders);
     ImGui::TextColored(theme::col::accent(), "%s", baseName(right_.path()).c_str());
-    ImGui::SameLine(); ImGui::TextDisabled("(%zu B)", right_.bytes().size());
+    ui::ItemTooltip(right_.path().c_str());
     ImGui::Separator();
     renderPane("Rhex", right_, left_, rows, !leftMaster_, rs, rhov, force);
     ImGui::EndChild();
@@ -328,27 +977,38 @@ void BinaryDiffTab::renderDiffAsm() {
                        (unsigned long long)reg.start, (unsigned long long)reg.end);
     ImGui::Separator();
 
-    const float gap   = 12.0f;
-    const float colW  = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+    const float gap   = 12.0f * theme::UiScale();
+    const float colW  = std::max(1.0f, (ImGui::GetContentRegionAvail().x - gap) * 0.5f);
 
-    auto renderSide = [&](const char* id, const char* label, const BinaryFile& bf, IDisassembler* dis) {
+    auto renderSide = [&](const char* id, const char* label, const BinaryFile& bf,
+                          IDisassembler* dis, const std::string& decoderError) {
         ImGui::BeginChild(id, ImVec2(colW, 0), ImGuiChildFlags_Borders);
         ImGui::TextColored(theme::col::accent(), "%s", label);
-        ImGui::SameLine(); ImGui::TextDisabled("(%s)", ArchName(archOf(bf)));
+        Arch displayArch = Arch::X64;
+        ImGui::SameLine();
+        if (archOf(bf, displayArch)) ImGui::TextDisabled("(%s)", ArchName(displayArch));
+        else ImGui::TextDisabled("(Raw ISA unspecified)");
         ImGui::Separator();
         ui::PushMono();
         const auto& bytes = bf.bytes();
         const Section* sec = sectionAtOffset(bf, reg.start);
         if (reg.start >= bytes.size()) {
             ImGui::TextDisabled("(offset past end of this file)");
+        } else if (sec && sec->executable && !decoderError.empty()) {
+            ImGui::TextColored(theme::col::bad(), "Decoder unavailable: %s",
+                               decoderError.c_str());
         } else if (!sec || !sec->executable || !dis) {
             // Data (or unknown) region: show the raw changed bytes instead of code.
             ImGui::TextDisabled("data");
             std::string hx;
-            for (uint64_t o = reg.start; o < reg.end && o < bytes.size(); ++o) {
+            const uint64_t dataEnd = std::min<uint64_t>(reg.end, bytes.size());
+            const uint64_t shownEnd = reg.start + std::min<uint64_t>(256, dataEnd - reg.start);
+            for (uint64_t o = reg.start; o < shownEnd; ++o) {
                 char t[4]; std::snprintf(t, sizeof(t), "%02X ", bytes[(size_t)o]); hx += t;
             }
             ImGui::TextWrapped("%s", hx.c_str());
+            if (shownEnd < dataEnd)
+                ImGui::TextDisabled("First 256 bytes shown; inspect the full region in the hex pane.");
         } else {
             // Start ~32 bytes before the change (clamped to the section start) so
             // the decode self-syncs onto an instruction boundary before the region.
@@ -366,13 +1026,18 @@ void BinaryDiffTab::renderDiffAsm() {
                 bool changed = (off < reg.end) && (off + len > reg.start);   // overlaps the change
                 if (changed) {
                     ImVec2 p0 = ImGui::GetCursorScreenPos();
+                    ImVec4 highlight = theme::col::warn();
+                    highlight.w = 0.18f;
                     ImGui::GetWindowDrawList()->AddRectFilled(
                         p0, ImVec2(p0.x + ImGui::GetContentRegionAvail().x, p0.y + ImGui::GetTextLineHeight()),
-                        ImGui::GetColorU32(ImVec4(0.55f, 0.45f, 0.10f, 0.45f)));
+                        ImGui::GetColorU32(highlight));
                 }
-                ImVec4 col = changed ? ImVec4(1.0f, 0.92f, 0.55f, 1.0f) : theme::col::muted();
-                if (ok) ImGui::TextColored(col, "%08llX  %-8s %s",
-                                           (unsigned long long)va, in.mnemonic.c_str(), in.operands.c_str());
+                ImVec4 col = changed ? theme::col::warn() : theme::col::muted();
+                if (ok) {
+                    const std::string text = InstructionText(in);
+                    ImGui::TextColored(col, "%08llX  %s",
+                                       (unsigned long long)va, text.c_str());
+                }
                 else    ImGui::TextColored(col, "%08llX  db 0x%02X",
                                            (unsigned long long)va, bytes[(size_t)off]);
                 off += len;
@@ -382,100 +1047,534 @@ void BinaryDiffTab::renderDiffAsm() {
         ImGui::EndChild();
     };
 
-    renderSide("AsmL", "OLD (left)",  left_,  leftDis_.get());
+    renderSide("AsmL", "OLD (left)",  left_,  leftDis_.get(), leftDisError_);
     ImGui::SameLine(0, gap);
-    renderSide("AsmR", "NEW (right)", right_, rightDis_.get());
+    renderSide("AsmR", "NEW (right)", right_, rightDis_.get(), rightDisError_);
 
     ImGui::EndChild();
 }
 
-void BinaryDiffTab::renderLoadZone() {
-    const ImGuiStyle& st = ImGui::GetStyle();
-    const float lineH = ImGui::GetTextLineHeight();
-    const float btnH  = ImGui::GetFrameHeight();
-    const float gap   = 12.0f;
+void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
+    const float scale = theme::UiScale();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float panelW = std::min(avail.x, 820.0f * scale);
+    const float topPad = std::max(12.0f * scale,
+                                  std::min(52.0f * scale, avail.y * 0.14f));
+    ImGui::Dummy(ImVec2(0, topPad));
+    const float offX = (avail.x - panelW) * 0.5f;
+    if (offX > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offX);
 
-    auto centerNext = [](float itemW) {
-        float w = ImGui::GetContentRegionAvail().x;
-        float off = (w - itemW) * 0.5f;
-        if (off > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + off);
-    };
-    auto centerText = [](const char* txt, bool dim, ImVec4 col) {
-        float w  = ImGui::GetContentRegionAvail().x;
-        float tw = ImGui::CalcTextSize(txt).x;
-        float off = (w - tw) * 0.5f;
-        if (off > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + off);
-        if (dim) ImGui::TextDisabled("%s", txt);
-        else     ImGui::TextColored(col, "%s", txt);
-    };
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::BeginChild("DiffLoadBlock", ImVec2(panelW, 0),
+                      ImGuiChildFlags_Borders);
+    ImGui::TextUnformatted("Binary comparison workspace");
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+    ImGui::TextWrapped("Choose the baseline and candidate images, then compute a byte or semantic diff.");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
 
-    // The block is half the tab width; its height is the natural content height.
-    // The whole block is then centered on both axes inside the tab.
-    const float titleH = lineH + st.ItemSpacing.y;
-    const float cardH  = st.WindowPadding.y * 2.0f
-                       + lineH + st.ItemSpacing.y    // title
-                       + btnH + st.ItemSpacing.y     // load button
-                       + lineH + 10.0f;              // filename + slack
-    const float blockH = st.WindowPadding.y * 2.0f
-                       + titleH + cardH + st.ItemSpacing.y + btnH + 6.0f;
+    if (ImGui::BeginTable("##diff_sources", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+            ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Side", ImGuiTableColumnFlags_WidthFixed,
+                                72.0f * scale);
+        ImGui::TableSetupColumn("Source image");
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
+                                130.0f * scale);
+        ImGui::TableHeadersRow();
+        auto sourceRow = [&](const char* side, bool leftSide,
+                             const std::string& path) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(theme::col::accent(), "%s", side);
+            ImGui::TableSetColumnIndex(1);
+            if (path.empty()) ImGui::TextDisabled("No file selected");
+            else {
+                ImGui::TextUnformatted(baseName(path).c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path.c_str());
+                const FileIdentity& identity = leftSide ? leftIdentity_ : rightIdentity_;
+                if (identity.valid)
+                    ImGui::TextDisabled("%llu bytes", static_cast<unsigned long long>(identity.size));
+            }
+            ImGui::TableSetColumnIndex(2);
+            if (ImGui::Button(leftSide ? "Choose baseline..." : "Choose candidate...",
+                              ImVec2(-FLT_MIN, 0)))
+                openInto(leftSide);
+        };
+        sourceRow("OLD", true, selectedLeftPath_);
+        sourceRow("NEW", false, selectedRightPath_);
+        ImGui::EndTable();
+    }
 
-    const ImVec2 start  = ImGui::GetCursorPos();
-    const ImVec2 avail  = ImGui::GetContentRegionAvail();
-    const float  blockW = avail.x * 0.5f;
-    float offX = (avail.x - blockW) * 0.5f;
-    float offY = (avail.y - blockH) * 0.5f;
-    if (offX < 0) offX = 0;
-    if (offY < 0) offY = 0;
-    ImGui::SetCursorPos(ImVec2(start.x + offX, start.y + offY));
-
-    ImGui::BeginChild("DiffLoadBlock", ImVec2(blockW, blockH),
-                      ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
-
-    centerText("Binary Diff \xE2\x80\x94 load two files to compare", true, ImVec4(1, 1, 1, 1));
-
-    const float innerW = ImGui::GetContentRegionAvail().x;
-    const float cardW  = (innerW - gap) * 0.5f;
-
-    auto drawCard = [&](const char* id, const char* title, const char* btn, BinaryFile& bf) {
-        ImGui::BeginChild(id, ImVec2(cardW, cardH), ImGuiChildFlags_Borders);
-        float availY     = ImGui::GetContentRegionAvail().y;
-        float innerCardW = ImGui::GetContentRegionAvail().x;
-        float btnW       = innerCardW * 0.8f;
-        if (btnW < 120.0f) btnW = 120.0f;
-        float contentH = lineH + st.ItemSpacing.y + btnH + st.ItemSpacing.y + lineH;
-        float oy = (availY - contentH) * 0.5f;
-        if (oy > 0) ImGui::SetCursorPosY(ImGui::GetCursorPosY() + oy);
-
-        centerText(title, false, theme::col::accent());
-        centerNext(btnW);
-        if (ImGui::Button(btn, ImVec2(btnW, 0))) openInto(bf);
-        std::string fn = bf.loaded() ? baseName(bf.path()) : std::string("(none)");
-        centerText(fn.c_str(), true, ImVec4(1, 1, 1, 1));
-        ImGui::EndChild();
-    };
-
-    drawCard("DiffLeftCard",  "LEFT",  "Load Left...",  left_);
-    ImGui::SameLine(0, gap);
-    drawCard("DiffRightCard", "RIGHT", "Load Right...", right_);
-
-    const bool ready = left_.loaded() && right_.loaded();
-    ImGui::BeginDisabled(!ready);
-    float cbW = innerW * 0.5f;
-    centerNext(cbW);
-    if (ImGui::Button("Compute Diff", ImVec2(cbW, 0))) computeDiff();
-    ImGui::EndDisabled();
+    const bool ready = !selectedLeftPath_.empty() && !selectedRightPath_.empty();
+    const bool running = diffRunning_.load(std::memory_order_acquire);
+    ImGui::Dummy(ImVec2(0, 6.0f * scale));
+    if (running) {
+        ctx.wantContinuousRedraw = true;
+        if (ImGui::Button("Cancel comparison")) cancelDiff();
+        ui::SameLineIfFits(200.0f * scale);
+        const uint64_t current = diffProgress_.load(std::memory_order_acquire);
+        const uint64_t total = diffProgressTotal_.load(std::memory_order_acquire);
+        const float fraction = total
+            ? static_cast<float>(std::min(current, total)) / static_cast<float>(total)
+            : static_cast<float>(ImGui::GetTime()) -
+              static_cast<float>(static_cast<long long>(ImGui::GetTime()));
+        ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, 0),
+                           total ? phaseName(diffPhase_.load(std::memory_order_acquire)) : "Working...");
+    } else {
+        if (ImGui::Checkbox("Semantic function comparison", &semanticMode_)) {
+            semanticTransferStatus_.clear();
+        }
+        ui::SameLineIfFits(ImGui::CalcTextSize("Section-aware").x + ImGui::GetFrameHeight() + 12.0f * scale);
+        ImGui::BeginDisabled(semanticMode_);
+        ImGui::Checkbox("Section-aware", &sectionAware_);
+        ImGui::EndDisabled();
+        ui::ItemTooltip("Align matching sections before byte comparison. Semantic mode compares functions.");
+        ui::SameLineIfFits(ImGui::CalcTextSize("Compute Diff").x + ImGui::GetStyle().FramePadding.x * 2.0f);
+        ImGui::BeginDisabled(!ready);
+        if (ImGui::Button("Compute Diff")) computeDiff(&ctx);
+        ImGui::EndDisabled();
+        if (!diffError_.empty()) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + panelW - 24.0f * scale);
+            ImGui::TextColored(theme::col::bad(), "%s", diffError_.c_str());
+            ImGui::PopTextWrapPos();
+        } else if (diffPhase_.load(std::memory_order_acquire) == DiffPhase::Cancelled) {
+            ImGui::TextDisabled("Comparison cancelled. Compute Diff to try again.");
+        }
+    }
 
     ImGui::EndChild();
+    ImGui::PopStyleVar();
+}
+
+void BinaryDiffTab::applySelectedSemanticTransfers(AppContext& ctx) {
+    size_t requested = 0;
+    for (bool selected : semanticProposalSelected_) if (selected) ++requested;
+    if (!requested) {
+        semanticTransferStatus_ = "Select one or more metadata proposals first.";
+        return;
+    }
+    if (!ctx.staticBinary().loaded() || ctx.staticBinary().isMappedImage()) {
+        semanticTransferStatus_ = "Metadata can only be transferred into an open static binary project.";
+        return;
+    }
+    const DocumentResultIdentity activeIdentity =
+        currentDiffTargetIdentity(ctx);
+    if (!SameDocumentResultImage(semanticTransferTarget_, activeIdentity)) {
+        semanticTransferStatus_ =
+            "The selected transfer belongs to a different document or image revision.";
+        return;
+    }
+
+    const uint64_t activeHash = ctx.staticBinary().contentHash();
+    if (!activeHash || ctx.staticProject().hash != activeHash) {
+        semanticTransferStatus_ = "The active project identity does not match its binary.";
+        return;
+    }
+
+    size_t applied = 0, unchanged = 0, rejected = 0;
+    const size_t count = (std::min)(semanticProposalSelected_.size(),
+                                    semanticDiff_.transferProposals.size());
+    for (size_t index = 0; index < count; ++index) {
+        if (!semanticProposalSelected_[index]) continue;
+        const MetadataTransferProposal& proposal = semanticDiff_.transferProposals[index];
+        const std::optional<SemanticImage>& target =
+            proposal.direction == MetadataTransferDirection::LeftToRight
+                ? semanticRight_ : semanticLeft_;
+        if (!target || target->contentIdentity != activeHash) {
+            ++rejected;
+            continue;
+        }
+
+        SemanticTransferApplyResult result = ApplySemanticTransferProposal(
+            ctx.staticProject(), activeHash, *target, proposal,
+            [&](uint64_t address) {
+                uint64_t fileOffset = 0;
+                return ctx.staticBinary().vaToOffset(address, fileOffset);
+            });
+        if (result.status == SemanticTransferStatus::Applied) {
+            ++applied;
+            semanticProposalSelected_[index] = false;
+        } else if (result.status == SemanticTransferStatus::Unchanged) {
+            ++unchanged;
+            semanticProposalSelected_[index] = false;
+        } else {
+            ++rejected;
+        }
+    }
+
+    if (applied) {
+        // Binary View mirrors these channels in tab-local maps. Signal it before
+        // marking the shared ProjectState dirty so a later tab switch cannot
+        // overwrite this user-approved transfer with stale local annotations.
+        ctx.projectAnnotationsExternallyChanged = true;
+        ctx.markProjectDirty();
+    }
+    semanticProposalSelectionCount_ = static_cast<size_t>(std::count(
+        semanticProposalSelected_.begin(), semanticProposalSelected_.end(), true));
+    if (!semanticProposalSelectionCount_) semanticTransferTarget_ = {};
+    semanticTransferStatus_ = std::to_string(applied) + " applied, " +
+                              std::to_string(unchanged) + " already present, " +
+                              std::to_string(rejected) + " rejected.";
+}
+
+void BinaryDiffTab::renderSemantic(AppContext& ctx) {
+    if (diffRunning_.load(std::memory_order_acquire)) {
+        ImGui::TextDisabled("The previous semantic result is hidden while the worker analyzes the selected files.");
+        return;
+    }
+    if (!semanticError_.empty()) {
+        ImGui::TextColored(theme::col::bad(), "%s", semanticError_.c_str());
+        return;
+    }
+    if (!semanticWarning_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
+        ImGui::TextWrapped("Project metadata warning: %s", semanticWarning_.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+    }
+    if (!semanticComputed_ || !semanticLeft_ || !semanticRight_) {
+        ImGui::TextDisabled("No semantic comparison has completed for these files.");
+        return;
+    }
+    if (!semanticDiff_.complete) {
+        ImGui::TextColored(theme::col::bad(), "%s",
+                           semanticDiff_.error.empty() ? "Semantic comparison did not complete."
+                                                       : semanticDiff_.error.c_str());
+        return;
+    }
+    if (semanticProposalSelected_.size() != semanticDiff_.transferProposals.size()) {
+        semanticProposalSelected_.assign(semanticDiff_.transferProposals.size(), false);
+        semanticProposalSelectionCount_ = 0;
+        semanticTransferTarget_ = {};
+    }
+
+    const DocumentResultIdentity activeTransferIdentity =
+        currentDiffTargetIdentity(ctx);
+    if (semanticProposalSelectionCount_ &&
+        !SameDocumentResultImage(semanticTransferTarget_,
+                                 activeTransferIdentity)) {
+        std::fill(semanticProposalSelected_.begin(),
+                  semanticProposalSelected_.end(), false);
+        semanticProposalSelectionCount_ = 0;
+        semanticTransferTarget_ = {};
+        semanticTransferStatus_ =
+            "Selection cleared because the active document or image changed.";
+    }
+
+    ImGui::Text("Matched: %zu   Added: %zu   Removed: %zu",
+                semanticDiff_.matched.size(), semanticDiff_.added.size(),
+                semanticDiff_.removed.size());
+    if (semanticDiff_.truncated) {
+        ImGui::SameLine();
+        ImGui::TextColored(theme::col::warn(), "bounded result (one or more limits reached)");
+    }
+
+    const float listHeight = std::max(1.0f, std::min(210.0f * theme::UiScale(),
+                                        ImGui::GetContentRegionAvail().y * 0.38f));
+    if (ImGui::BeginTabBar("SemanticLists")) {
+        if (ImGui::BeginTabItem("Matched")) {
+            if (ImGui::BeginTable("SemanticMatched", 5,
+                    ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+                    ImVec2(0, listHeight))) {
+                ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Confidence", ImGuiTableColumnFlags_WidthFixed,
+                                        90.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Evidence", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Edits", ImGuiTableColumnFlags_WidthFixed,
+                                        52.0f * theme::UiScale());
+                ImGui::TableHeadersRow();
+                ImGuiListClipper matchClipper;
+                matchClipper.Begin(static_cast<int>(semanticDiff_.matched.size()));
+                while (matchClipper.Step()) for (int clippedIndex = matchClipper.DisplayStart;
+                                                  clippedIndex < matchClipper.DisplayEnd;
+                                                  ++clippedIndex) {
+                    const size_t index = static_cast<size_t>(clippedIndex);
+                    const SemanticFunctionMatch& match = semanticDiff_.matched[index];
+                    if (match.leftIndex >= semanticLeft_->functions.size() ||
+                        match.rightIndex >= semanticRight_->functions.size()) continue;
+                    const SemanticFunction& leftFunction = semanticLeft_->functions[match.leftIndex];
+                    const SemanticFunction& rightFunction = semanticRight_->functions[match.rightIndex];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::PushID(static_cast<int>(index));
+                    const std::string leftLabel = semanticFunctionLabel(leftFunction);
+                    if (ImGui::Selectable(leftLabel.c_str(), semanticSelectedMatch_ == static_cast<int>(index),
+                                          ImGuiSelectableFlags_SpanAllColumns)) {
+                        semanticSelectedMatch_ = static_cast<int>(index);
+                        semanticSelectedHunk_ = -1;
+                    }
+                    ImGui::PopID();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("0x%llX", static_cast<unsigned long long>(match.leftAddress));
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(semanticFunctionLabel(rightFunction).c_str());
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("0x%llX", static_cast<unsigned long long>(match.rightAddress));
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.0f%%", static_cast<double>(match.confidence) * 100.0);
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::TextUnformatted(semanticBasisName(match.basis));
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", match.evidence.c_str());
+                    ImGui::TableSetColumnIndex(4);
+                    if (match.hunks.empty()) ImGui::TextColored(theme::col::good(), "0");
+                    else ImGui::TextColored(theme::col::warn(), "%zu", match.hunks.size());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Added")) {
+            if (ImGui::BeginTable("SemanticAdded", 2,
+                    ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                    ImVec2(0, listHeight))) {
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
+                                        130.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Function");
+                ImGui::TableHeadersRow();
+                ImGuiListClipper addedClipper;
+                addedClipper.Begin(static_cast<int>(semanticDiff_.added.size()));
+                while (addedClipper.Step()) for (int clippedIndex = addedClipper.DisplayStart;
+                                                  clippedIndex < addedClipper.DisplayEnd;
+                                                  ++clippedIndex) {
+                    const SemanticUnmatchedFunction& function =
+                        semanticDiff_.added[static_cast<size_t>(clippedIndex)];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("0x%llX", static_cast<unsigned long long>(function.address));
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(function.name.empty() ? "(unnamed)" : function.name.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Removed")) {
+            if (ImGui::BeginTable("SemanticRemoved", 2,
+                    ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                    ImVec2(0, listHeight))) {
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
+                                        130.0f * theme::UiScale());
+                ImGui::TableSetupColumn("Function");
+                ImGui::TableHeadersRow();
+                ImGuiListClipper removedClipper;
+                removedClipper.Begin(static_cast<int>(semanticDiff_.removed.size()));
+                while (removedClipper.Step()) for (int clippedIndex = removedClipper.DisplayStart;
+                                                    clippedIndex < removedClipper.DisplayEnd;
+                                                    ++clippedIndex) {
+                    const SemanticUnmatchedFunction& function =
+                        semanticDiff_.removed[static_cast<size_t>(clippedIndex)];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("0x%llX", static_cast<unsigned long long>(function.address));
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(function.name.empty() ? "(unnamed)" : function.name.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
+        const std::string transferTitle = "Transfer metadata (" +
+                                          std::to_string(semanticDiff_.transferProposals.size()) + ")";
+        if (ImGui::BeginTabItem(transferTitle.c_str())) {
+            const uint64_t activeHash = ctx.staticBinary().loaded()
+                                      ? ctx.staticBinary().contentHash() : 0;
+            const bool activeProjectValid = activeHash &&
+                                            ctx.staticProject().hash == activeHash &&
+                                            !ctx.staticBinary().isMappedImage();
+            ImGui::TextDisabled("Nothing is copied automatically. Check proposals, then apply the selection.");
+            ImGui::BeginChild("SemanticTransfers", ImVec2(0, std::max(1.0f,
+                                listHeight - ImGui::GetFrameHeightWithSpacing())),
+                              ImGuiChildFlags_Borders);
+            ImGuiListClipper transferClipper;
+            transferClipper.Begin(static_cast<int>(semanticDiff_.transferProposals.size()));
+            while (transferClipper.Step()) for (int clippedIndex = transferClipper.DisplayStart;
+                                                 clippedIndex < transferClipper.DisplayEnd;
+                                                 ++clippedIndex) {
+                const size_t index = static_cast<size_t>(clippedIndex);
+                const MetadataTransferProposal& proposal = semanticDiff_.transferProposals[index];
+                const std::optional<SemanticImage>& target =
+                    proposal.direction == MetadataTransferDirection::LeftToRight
+                        ? semanticRight_ : semanticLeft_;
+                const bool instructionMapped =
+                    (proposal.kind != MetadataTransferKind::Comment &&
+                     proposal.kind != MetadataTransferKind::Bookmark) ||
+                    proposal.targetInstructionValid;
+                const bool eligible = activeProjectValid && target &&
+                                      target->contentIdentity == activeHash && instructionMapped;
+                ImGui::PushID(static_cast<int>(index));
+                bool selected = semanticProposalSelected_[index];
+                ImGui::BeginDisabled(!eligible);
+                if (ImGui::Checkbox("##selected", &selected)) {
+                    semanticProposalSelected_[index] = selected;
+                    if (selected) {
+                        if (!semanticProposalSelectionCount_)
+                            semanticTransferTarget_ = activeTransferIdentity;
+                        ++semanticProposalSelectionCount_;
+                    } else if (semanticProposalSelectionCount_) {
+                        --semanticProposalSelectionCount_;
+                        if (!semanticProposalSelectionCount_)
+                            semanticTransferTarget_ = {};
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::Text("%s  %s  -> 0x%llX  %s",
+                            proposal.direction == MetadataTransferDirection::LeftToRight ? "L->R" : "R->L",
+                            semanticTransferName(proposal.kind),
+                            static_cast<unsigned long long>(proposal.targetFunction),
+                            proposal.value.empty() ? "" : proposal.value.c_str());
+                if (!eligible) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(theme::col::warn(), "%s",
+                        !instructionMapped ? "(no matched target instruction)"
+                                           : "(target is not the active project)");
+                }
+                if (ImGui::IsItemHovered() && !proposal.value.empty())
+                    ImGui::SetTooltip("%s", proposal.value.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            ImGui::BeginDisabled(!activeProjectValid || !semanticProposalSelectionCount_);
+            if (ImGui::Button("Apply selected")) applySelectedSemanticTransfers(ctx);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Clear selection")) {
+                std::fill(semanticProposalSelected_.begin(), semanticProposalSelected_.end(), false);
+                semanticProposalSelectionCount_ = 0;
+                semanticTransferTarget_ = {};
+            }
+            if (!semanticTransferStatus_.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", semanticTransferStatus_.c_str());
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    if (semanticSelectedMatch_ < 0 ||
+        semanticSelectedMatch_ >= static_cast<int>(semanticDiff_.matched.size())) return;
+    const SemanticFunctionMatch& selected = semanticDiff_.matched[semanticSelectedMatch_];
+    if (selected.leftIndex >= semanticLeft_->functions.size() ||
+        selected.rightIndex >= semanticRight_->functions.size()) return;
+    const SemanticFunction& leftFunction = semanticLeft_->functions[selected.leftIndex];
+    const SemanticFunction& rightFunction = semanticRight_->functions[selected.rightIndex];
+
+    ImGui::Separator();
+    ImGui::Text("%s  <->  %s", semanticFunctionLabel(leftFunction).c_str(),
+                semanticFunctionLabel(rightFunction).c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s; %.0f%% - %s", semanticBasisName(selected.basis),
+                        static_cast<double>(selected.confidence) * 100.0,
+                        selected.evidence.c_str());
+
+    if (!selected.hunks.empty()) {
+        ImGui::TextDisabled("Instruction edit hunks:");
+        const float hunkHeight = std::max(1.0f, std::min(110.0f * theme::UiScale(),
+                                                       ImGui::GetContentRegionAvail().y * 0.22f));
+        ImGui::BeginChild("SemanticHunks", ImVec2(0, hunkHeight), ImGuiChildFlags_Borders);
+        ImGuiListClipper hunkClipper;
+        hunkClipper.Begin(static_cast<int>(selected.hunks.size()));
+        while (hunkClipper.Step()) {
+            for (int clippedIndex = hunkClipper.DisplayStart;
+                 clippedIndex < hunkClipper.DisplayEnd; ++clippedIndex) {
+                const size_t index = static_cast<size_t>(clippedIndex);
+                const InstructionEditHunk& hunk = selected.hunks[index];
+                ImGui::PushID(clippedIndex);
+                char label[160]{};
+                std::snprintf(label, sizeof(label), "%s  L[%u +%u]  R[%u +%u]",
+                              semanticEditName(hunk.kind), hunk.leftBegin, hunk.leftCount,
+                              hunk.rightBegin, hunk.rightCount);
+                if (ImGui::Selectable(label, semanticSelectedHunk_ == clippedIndex))
+                    semanticSelectedHunk_ = clippedIndex;
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        if (selected.hunksTruncated) {
+            ImGui::TextColored(theme::col::warn(), "additional hunks omitted by bounds");
+        }
+    } else {
+        ImGui::TextColored(theme::col::good(), "No instruction edits in this match.");
+    }
+
+    size_t leftFirst = 0, rightFirst = 0;
+    size_t leftLast = leftFunction.instructions.size();
+    size_t rightLast = rightFunction.instructions.size();
+    const InstructionEditHunk* selectedHunk = nullptr;
+    if (semanticSelectedHunk_ >= 0 &&
+        semanticSelectedHunk_ < static_cast<int>(selected.hunks.size())) {
+        selectedHunk = &selected.hunks[semanticSelectedHunk_];
+        leftFirst = selectedHunk->leftBegin > 3 ? selectedHunk->leftBegin - 3 : 0;
+        rightFirst = selectedHunk->rightBegin > 3 ? selectedHunk->rightBegin - 3 : 0;
+        leftLast = (std::min)(leftFunction.instructions.size(),
+                              static_cast<size_t>(selectedHunk->leftBegin) +
+                              selectedHunk->leftCount + 3);
+        rightLast = (std::min)(rightFunction.instructions.size(),
+                               static_cast<size_t>(selectedHunk->rightBegin) +
+                               selectedHunk->rightCount + 3);
+    }
+    const size_t displayRows = (std::max)(leftLast - leftFirst, rightLast - rightFirst);
+    const float instructionHeight = std::max(1.0f, ImGui::GetContentRegionAvail().y);
+    if (ImGui::BeginTable("SemanticInstructions", 2,
+            ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable,
+            ImVec2(0, instructionHeight))) {
+        ImGui::TableSetupColumn("Left instructions", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Right instructions", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>((std::min)(displayRows,
+                            static_cast<size_t>(std::numeric_limits<int>::max()))));
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const size_t leftIndex = leftFirst + static_cast<size_t>(row);
+                const size_t rightIndex = rightFirst + static_cast<size_t>(row);
+                ImGui::TableNextRow();
+                auto renderInstruction = [&](int column, const SemanticFunction& function,
+                                             size_t index, size_t end, uint32_t editBegin,
+                                             uint32_t editCount) {
+                    ImGui::TableSetColumnIndex(column);
+                    if (index >= end || index >= function.instructions.size()) {
+                        ImGui::TextDisabled("-");
+                        return;
+                    }
+                    const SemanticInstruction& instruction = function.instructions[index];
+                    const bool edited = selectedHunk && index >= editBegin &&
+                                        index < static_cast<size_t>(editBegin) + editCount;
+                    const ImVec4 color = edited ? theme::col::warn()
+                                                : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                    ImGui::TextColored(color, "%08llX  %s",
+                                       static_cast<unsigned long long>(instruction.address),
+                                       instruction.display.empty() ? instruction.mnemonic.c_str()
+                                                                   : instruction.display.c_str());
+                };
+                renderInstruction(0, leftFunction, leftIndex, leftLast,
+                                  selectedHunk ? selectedHunk->leftBegin : 0,
+                                  selectedHunk ? selectedHunk->leftCount : 0);
+                renderInstruction(1, rightFunction, rightIndex, rightLast,
+                                  selectedHunk ? selectedHunk->rightBegin : 0,
+                                  selectedHunk ? selectedHunk->rightCount : 0);
+            }
+        }
+        ImGui::EndTable();
+    }
 }
 
 void BinaryDiffTab::renderPane(const char* id, const BinaryFile& self, const BinaryFile& other,
                                int rows, bool master, float& scrollOut, bool& hoveredOut, bool forceScroll) {
     const std::vector<uint8_t>& A = self.bytes();
     const std::vector<uint8_t>& B = other.bytes();
-    const ImVec4 cDiff (0.97f, 0.45f, 0.45f, 1.0f);
-    const ImVec4 cSame (0.84f, 0.86f, 0.90f, 1.0f);
-    const ImVec4 cSameA(0.64f, 0.67f, 0.74f, 1.0f);
-    const ImVec4 cCur  (1.00f, 0.92f, 0.45f, 1.0f);   // the currently selected change
+    const ImVec4 cDiff = theme::col::bad();
+    const ImVec4 cSame = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    const ImVec4 cSameA = theme::col::muted();
+    const ImVec4 cCur = theme::col::warn(); // the currently selected change
 
     uint64_t curS = 0, curE = 0;
     if (curRegion_ >= 0 && curRegion_ < (int)regions_.size()) { curS = regions_[curRegion_].start; curE = regions_[curRegion_].end; }

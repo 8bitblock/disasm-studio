@@ -27,6 +27,30 @@ enum : uint8_t {
     CP_Module = 19, CP_Package = 20,
 };
 
+// CONSTANT_Utf8 decoding never exposes ill-formed UTF-8.  Instead, malformed
+// modified-UTF-8 input is replaced with U+FFFD and its provenance is retained
+// here.  Flags are independent: a hostile string may contain an invalid byte
+// sequence and also exceed the bounded text-storage limit.
+enum class JvmUtf8Status : uint8_t {
+    Valid              = 0,
+    InvalidEncoding    = 1u << 0, // illegal/overlong modified-UTF-8 bytes
+    TruncatedEncoding  = 1u << 1, // incomplete 2- or 3-byte unit at payload end
+    UnpairedSurrogate  = 1u << 2, // valid Java UTF-16 unit, not a Unicode scalar
+    OutputTruncated    = 1u << 3, // decoded text exceeded the bounded model cap
+};
+
+constexpr JvmUtf8Status operator|(JvmUtf8Status a, JvmUtf8Status b) {
+    return static_cast<JvmUtf8Status>(static_cast<uint8_t>(a) |
+                                      static_cast<uint8_t>(b));
+}
+constexpr JvmUtf8Status& operator|=(JvmUtf8Status& a, JvmUtf8Status b) {
+    a = a | b;
+    return a;
+}
+constexpr bool HasJvmUtf8Status(JvmUtf8Status value, JvmUtf8Status flag) {
+    return (static_cast<uint8_t>(value) & static_cast<uint8_t>(flag)) != 0;
+}
+
 // One constant-pool slot. Long/Double occupy two slots (the second is tag 0).
 struct JvmCpEntry {
     uint8_t     tag = 0;
@@ -37,7 +61,17 @@ struct JvmCpEntry {
     int64_t     i64 = 0;     // CP_Long
     float       f32 = 0.0f;  // CP_Float
     double      f64 = 0.0;   // CP_Double
-    std::string utf8;        // CP_Utf8 payload (raw modified-UTF8 bytes, capped)
+    std::string utf8;        // CP_Utf8 decoded to valid UTF-8, capped on a code-point boundary
+    JvmUtf8Status utf8Status = JvmUtf8Status::Valid;
+
+    bool utf8EncodingValid() const {
+        return !HasJvmUtf8Status(utf8Status, JvmUtf8Status::InvalidEncoding) &&
+               !HasJvmUtf8Status(utf8Status, JvmUtf8Status::TruncatedEncoding);
+    }
+    bool utf8TextTruncated() const {
+        return HasJvmUtf8Status(utf8Status, JvmUtf8Status::TruncatedEncoding) ||
+               HasJvmUtf8Status(utf8Status, JvmUtf8Status::OutputTruncated);
+    }
 };
 
 struct JvmExceptionHandler {
@@ -88,6 +122,8 @@ struct JvmClassFile {
         return (idx > 0 && idx < cp.size()) ? &cp[idx] : nullptr;
     }
     std::string utf8At(uint16_t idx) const;        // CP_Utf8 payload
+    JvmUtf8Status utf8StatusAt(uint16_t idx) const;
+    bool hasUtf8Issues() const;
     std::string classNameAt(uint16_t idx) const;   // CP_Class -> its name
     // Human-readable text for any constant-pool index, used as the inline
     // disassembly comment: Methodref -> "java/io/PrintStream.println:(...)V",

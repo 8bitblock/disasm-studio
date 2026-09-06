@@ -74,6 +74,13 @@ struct CondProgram {
 // a malformed one yields {valid=false}. Never throws.
 CondProgram CompileCondition(const std::string& expr);
 
+// Validate a condition specifically for the native debugger. In addition to
+// checking the grammar, this rejects register names the breakpoint evaluator
+// cannot resolve. A blank expression is valid and means unconditional. When
+// supplied, `error` receives a user-facing explanation on failure and is
+// cleared on success.
+bool ValidateBreakpointCondition(const std::string& expr, std::string* error = nullptr);
+
 // Parse a single-operand `expr` (number | register | [base +/- disp]) into an
 // operand. Returns false (and leaves `out` unspecified) on a parse error.
 bool CompileExpression(const std::string& expr, CondOperand& out);

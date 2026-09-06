@@ -85,9 +85,14 @@ PathTree Explore(uint64_t rootVA, ISymCfg& cfg, ISolver& solver, const ExploreCo
                 break;  // leaf
             case BranchInfo::Fallthrough:
             case BranchInfo::Jump:
+                if (!bi.targetAValid) { t.nodes[idx].tag = PathTag::Escaped; break; }
                 addChild(bi.targetA, nullptr, true, path, /*leaf*/false);
                 break;
             case BranchInfo::CondBranch: {
+                if (!bi.targetAValid || !bi.targetBValid) {
+                    t.nodes[idx].tag = PathTag::Escaped;
+                    break;
+                }
                 if (DependsOnInput(bi.pred)) {
                     // FORK both feasible sides, accumulating the branch predicate.
                     std::vector<PathConstraint> pcA = path;

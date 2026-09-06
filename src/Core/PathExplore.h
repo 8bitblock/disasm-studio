@@ -27,6 +27,8 @@ struct BranchInfo {
     enum Kind { Fallthrough, Jump, CondBranch, Return, Escape } kind = Return;
     uint64_t targetA = 0;   // fallthrough / jump / taken target
     uint64_t targetB = 0;   // not-taken target (CondBranch only)
+    bool     targetAValid = false; // target addresses may legitimately be VA 0
+    bool     targetBValid = false;
     ExprRef  pred;          // 1-bit predicate (CondBranch); may or may not depend on input
     bool     overflowFeasible = false; // block has an add/sub/mul that can exceed its width
 };

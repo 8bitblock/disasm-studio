@@ -1,4 +1,5 @@
 #include "JvmAttach.h"
+#include "JvmAware.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -6,6 +7,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace ds {
@@ -50,6 +52,7 @@ JvmInfo InspectJvm(uint32_t pid) {
     if (snap == INVALID_HANDLE_VALUE) return info;
     bool haveJvm = false, haveJ9 = false;
     std::string jvmPath, j9Path;
+    uint64_t jvmBase = 0, jvmSize = 0, j9Base = 0, j9Size = 0;
     MODULEENTRY32W me{};
     me.dwSize = sizeof(me);
     if (::Module32FirstW(snap, &me)) {
@@ -61,14 +64,32 @@ JvmInfo InspectJvm(uint32_t pid) {
             ::WideCharToMultiByte(CP_UTF8, 0, me.szExePath, -1, full, sizeof(full), nullptr, nullptr);
             // OpenJ9 ships BOTH jvm.dll (a JNI shim) and j9vm.dll; the j9vm.dll
             // presence is what distinguishes it from HotSpot. Check it first.
-            if (isModuleNamed(name, "j9vm.dll")) { haveJ9 = true; j9Path = full; }
-            else if (isModuleNamed(name, "jvm.dll")) { haveJvm = true; jvmPath = full; }
+            if (isModuleNamed(name, "j9vm.dll")) {
+                haveJ9 = true;
+                j9Path = full;
+                j9Base = reinterpret_cast<uint64_t>(me.modBaseAddr);
+                j9Size = me.modBaseSize;
+            } else if (isModuleNamed(name, "jvm.dll")) {
+                haveJvm = true;
+                jvmPath = full;
+                jvmBase = reinterpret_cast<uint64_t>(me.modBaseAddr);
+                jvmSize = me.modBaseSize;
+            }
         } while (::Module32NextW(snap, &me));
     }
     ::CloseHandle(snap);
 
-    if (haveJ9)       { info.flavor = JvmFlavor::OpenJ9;  info.vmPath = j9Path.empty() ? jvmPath : j9Path; }
-    else if (haveJvm) { info.flavor = JvmFlavor::HotSpot; info.vmPath = jvmPath; }
+    if (haveJ9) {
+        info.flavor = JvmFlavor::OpenJ9;
+        info.vmPath = j9Path.empty() ? jvmPath : j9Path;
+        info.vmBase = j9Base;
+        info.vmSize = j9Size;
+    } else if (haveJvm) {
+        info.flavor = JvmFlavor::HotSpot;
+        info.vmPath = jvmPath;
+        info.vmBase = jvmBase;
+        info.vmSize = jvmSize;
+    }
     return info;
 }
 
@@ -81,68 +102,37 @@ bool ProcessHostsJvm(uint32_t pid, std::string& jvmPath, bool& is64) {
 
 // ---- the injected stub --------------------------------------------------------
 //
-// Position-independent x64 thread routine. RCX = &DataBlock on entry. It resolves
-// jvm.dll!JVM_EnqueueOperation in the TARGET (GetModuleHandleA + GetProcAddress)
-// and calls it with (cmd, arg0, arg1, arg2, pipename). All operands are
-// rbx-relative, so the stub needs no relocation once written into the target.
-//
-// CRITICAL: both resolutions are null-checked. A VM whose jvm.dll lacks
-// JVM_EnqueueOperation (OpenJ9, or any non-HotSpot VM) would otherwise have the
-// injected thread CALL address 0 and crash the target process. On a null result
-// the stub returns 0xFFFFFFFF instead, which LoadJdwpAgent reports as "not a
-// HotSpot VM" — the debuggee is left untouched.
-//
-// The exact bytes are emitted by Keystone from this asm (tests/jvm_stub_gen.cpp);
-// re-run it to regenerate if the asm changes — do NOT hand-edit the jz/jmp rels.
+// Position-independent x64 thread routine. RCX = &DataBlock on entry. The first
+// field is a JVM_EnqueueOperation address resolved from the TARGET's mapped
+// jvm.dll export table before injection. All other operands are rbx-relative, so
+// the stub needs no relocation once written into the target.
 //   push  rbx
 //   sub   rsp, 0x30                ; 0x20 shadow + 5th-arg slot, 16-aligned
 //   mov   rbx, rcx                 ; rbx = &DataBlock
-//   lea   rcx, [rbx+0x10]          ; jvmLib "jvm"
-//   call  qword ptr [rbx]          ; GetModuleHandleA
-//   test  rax, rax
-//   jz    fail                     ; jvm.dll not present
-//   mov   rcx, rax
-//   lea   rdx, [rbx+0x30]          ; func "JVM_EnqueueOperation"
-//   call  qword ptr [rbx+8]        ; GetProcAddress
-//   test  rax, rax
-//   jz    fail                     ; export absent -> never call NULL
 //   lea   rcx, [rbx+0x70]          ; cmd
 //   lea   rdx, [rbx+0x180]         ; arg0
 //   lea   r8,  [rbx+0x580]         ; arg1
 //   lea   r9,  [rbx+0x980]         ; arg2
 //   lea   r10, [rbx+0x80]          ; pipename
 //   mov   [rsp+0x20], r10          ; 5th arg
-//   call  rax                      ; JVM_EnqueueOperation(...)
-//   jmp   done
-// fail:
-//   mov   eax, 0xFFFFFFFF          ; sentinel: resolution failed
-// done:
+//   call  qword ptr [rbx]          ; JVM_EnqueueOperation(...)
 //   add   rsp, 0x30
 //   pop   rbx
 //   ret
 static const uint8_t kStub[] = {
     0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x89, 0xCB,
-    0x48, 0x8D, 0x4B, 0x10, 0xFF, 0x13, 0x48, 0x85,
-    0xC0, 0x74, 0x38, 0x48, 0x89, 0xC1, 0x48, 0x8D,
-    0x53, 0x30, 0xFF, 0x53, 0x08, 0x48, 0x85, 0xC0,
-    0x74, 0x29, 0x48, 0x8D, 0x4B, 0x70, 0x48, 0x8D,
-    0x93, 0x80, 0x01, 0x00, 0x00, 0x4C, 0x8D, 0x83,
+    0x48, 0x8D, 0x4B, 0x70, 0x48, 0x8D, 0x93, 0x80,
+    0x01, 0x00, 0x00, 0x4C, 0x8D, 0x83,
     0x80, 0x05, 0x00, 0x00, 0x4C, 0x8D, 0x8B, 0x80,
     0x09, 0x00, 0x00, 0x4C, 0x8D, 0x93, 0x80, 0x00,
     0x00, 0x00, 0x4C, 0x89, 0x54, 0x24, 0x20, 0xFF,
-    0xD0, 0xEB, 0x05, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x13,
     0x48, 0x83, 0xC4, 0x30, 0x5B, 0xC3,
 };
-// The stub returns this when it could not resolve JVM_EnqueueOperation (so it
-// safely did NOT call into the VM). Matches `mov eax, 0xFFFFFFFF` above.
-static constexpr DWORD kStubResolveFailed = 0xFFFFFFFFu;
 
 // DataBlock layout (offsets must match the lea displacements above).
 namespace {
-constexpr size_t kOffGetModuleHandle = 0x00;
-constexpr size_t kOffGetProcAddress  = 0x08;
-constexpr size_t kOffJvmLib          = 0x10;   // 32 bytes
-constexpr size_t kOffFunc            = 0x30;   // 64 bytes
+constexpr size_t kOffEnqueue         = 0x00;
 constexpr size_t kOffCmd             = 0x70;   // 16 bytes
 constexpr size_t kOffPipe            = 0x80;   // 256 bytes
 constexpr size_t kOffArg0            = 0x180;  // 1024 bytes
@@ -150,9 +140,8 @@ constexpr size_t kOffArg1            = 0x580;  // 1024 bytes
 constexpr size_t kOffArg2            = 0x980;  // 1024 bytes
 constexpr size_t kDataBlockSize      = 0xD80;  // 0x980 + 0x400
 
-void putPtr(std::vector<uint8_t>& b, size_t off, const void* p) {
-    uint64_t v = (uint64_t)p;
-    std::memcpy(b.data() + off, &v, 8);
+void putPtr(std::vector<uint8_t>& b, size_t off, uint64_t value) {
+    std::memcpy(b.data() + off, &value, 8);
 }
 void putStr(std::vector<uint8_t>& b, size_t off, size_t cap, const char* s) {
     size_t n = std::strlen(s);
@@ -222,6 +211,31 @@ static int parseCompletion(const std::string& s) {
     try { return std::stoi(head); } catch (...) { return -1; }
 }
 
+// A timed-out/failed wait gives us no authority to release memory the remote
+// thread may still be executing from. Transfer the handles to a detached reaper
+// which releases the allocations only after a positive thread-exit signal. If
+// creating the reaper itself fails, closing the handles and intentionally
+// retaining the target allocations is safer than risking a target-process UAF;
+// Windows reclaims them when the target exits.
+static bool deferRemoteAttachCleanup(HANDLE proc, HANDLE thread,
+                                     LPVOID rData, LPVOID rStub) noexcept {
+    try {
+        std::thread([proc, thread, rData, rStub] {
+            if (::WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0) {
+                if (rData) ::VirtualFreeEx(proc, rData, 0, MEM_RELEASE);
+                if (rStub) ::VirtualFreeEx(proc, rStub, 0, MEM_RELEASE);
+            }
+            ::CloseHandle(thread);
+            ::CloseHandle(proc);
+        }).detach();
+        return true;
+    } catch (...) {
+        ::CloseHandle(thread);
+        ::CloseHandle(proc);
+        return false;
+    }
+}
+
 // ---- the attach itself ---------------------------------------------------------
 
 JvmAttachResult LoadJdwpAgent(uint32_t pid, uint16_t port, int timeoutMs) {
@@ -253,21 +267,55 @@ JvmAttachResult LoadJdwpAgent(uint32_t pid, uint16_t port, int timeoutMs) {
     return res;
 #endif
 
-    // GetModuleHandleA / GetProcAddress live in kernel32, mapped at the same base in
-    // every process of the session, so their local addresses are valid in the target.
-    HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
-    void* pGetModuleHandle = k32 ? (void*)::GetProcAddress(k32, "GetModuleHandleA") : nullptr;
-    void* pGetProcAddress  = k32 ? (void*)::GetProcAddress(k32, "GetProcAddress")  : nullptr;
-    if (!pGetModuleHandle || !pGetProcAddress) {
-        res.error = "could not resolve kernel32 thunks";
-        return res;
-    }
-
     HANDLE proc = ::OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
                                 PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
                                 FALSE, pid);
     if (!proc) {
         res.error = "OpenProcess failed (try running the disassembler as Administrator)";
+        return res;
+    }
+
+    // Resolve the export from the target's own mapped image. The reader is
+    // constrained to Toolhelp's module extent, and the final address must be an
+    // executable MEM_IMAGE page owned by that same mapping. A local GetProcAddress
+    // value is never used across the process boundary.
+    if (!jvm.vmBase || !jvm.vmSize || jvm.vmSize > UINT64_MAX - jvm.vmBase) {
+        ::CloseHandle(proc);
+        res.error = "could not determine the target jvm.dll mapping";
+        return res;
+    }
+    RemoteReader remoteJvm = [proc, base = jvm.vmBase, size = jvm.vmSize]
+                             (uint64_t va, void* out, size_t n) {
+        if (!out || !n || va < base) return false;
+        const uint64_t off = va - base;
+        if (off > size || n > size - off) return false;
+        SIZE_T got = 0;
+        return ::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(va), out, n, &got) &&
+               got == n;
+    };
+    const uint32_t enqueueRva = FindExportRVA(remoteJvm, jvm.vmBase,
+                                               "JVM_EnqueueOperation");
+    const uint64_t enqueueVA = enqueueRva && enqueueRva < jvm.vmSize
+                             ? jvm.vmBase + enqueueRva : 0;
+    MEMORY_BASIC_INFORMATION enqueuePage{};
+    auto executableProtection = [](DWORD protection) {
+        if (protection & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        switch (protection & 0xFFu) {
+            case PAGE_EXECUTE:
+            case PAGE_EXECUTE_READ:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY: return true;
+            default: return false;
+        }
+    };
+    if (!enqueueVA ||
+        ::VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(enqueueVA), &enqueuePage,
+                         sizeof(enqueuePage)) != sizeof(enqueuePage) ||
+        enqueuePage.State != MEM_COMMIT || enqueuePage.Type != MEM_IMAGE ||
+        !executableProtection(enqueuePage.Protect) ||
+        reinterpret_cast<uint64_t>(enqueuePage.AllocationBase) != jvm.vmBase) {
+        ::CloseHandle(proc);
+        res.error = "target jvm.dll does not expose a validated executable JVM_EnqueueOperation export";
         return res;
     }
 
@@ -285,10 +333,7 @@ JvmAttachResult LoadJdwpAgent(uint32_t pid, uint16_t port, int timeoutMs) {
 
     // Build the data block.
     std::vector<uint8_t> data(kDataBlockSize, 0);
-    putPtr(data, kOffGetModuleHandle, pGetModuleHandle);
-    putPtr(data, kOffGetProcAddress,  pGetProcAddress);
-    putStr(data, kOffJvmLib, 32, "jvm");
-    putStr(data, kOffFunc,   64, "JVM_EnqueueOperation");
+    putPtr(data, kOffEnqueue, enqueueVA);
     putStr(data, kOffCmd,    16, "load");
     putStr(data, kOffPipe,  256, pipeName);
     putStr(data, kOffArg0, 1024, "jdwp");
@@ -326,24 +371,41 @@ JvmAttachResult LoadJdwpAgent(uint32_t pid, uint16_t port, int timeoutMs) {
                                          (LPTHREAD_START_ROUTINE)rStub, rData, 0, nullptr);
     if (!thread) return fail("CreateRemoteThread failed", rData, rStub);
 
-    // The enqueue thread returns quickly; the operation completes on the VM's
-    // attach-listener thread, which connects to our pipe with the result.
-    ::WaitForSingleObject(thread, (DWORD)timeoutMs);
-    DWORD enqueueRc = 0;
-    ::GetExitCodeThread(thread, &enqueueRc);
-    ::CloseHandle(thread);
-
-    // The stub returns the sentinel when it safely declined to call a missing
-    // JVM_EnqueueOperation (so the target was NOT touched). No pipe reply will come.
-    if (enqueueRc == kStubResolveFailed) {
-        ::VirtualFreeEx(proc, rData, 0, MEM_RELEASE);
-        ::VirtualFreeEx(proc, rStub, 0, MEM_RELEASE);
+    // The enqueue thread normally returns quickly; the operation completes on
+    // the VM's attach-listener thread, which connects to our pipe with the
+    // result. Only a positive signaled result proves the remote stub/data are no
+    // longer in use by this thread.
+    const DWORD waitRc = ::WaitForSingleObject(thread,
+        timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 0u);
+    const DWORD waitError = waitRc == WAIT_FAILED ? ::GetLastError() : ERROR_SUCCESS;
+    const JvmRemoteThreadCompletion completionState = waitRc == WAIT_OBJECT_0
+        ? JvmRemoteThreadCompletion::ConfirmedExited
+        : JvmRemoteThreadCompletion::MayStillRun;
+    if (!CanReleaseJvmAttachRemoteMemory(completionState)) {
         ::CloseHandle(pipe);
-        ::CloseHandle(proc);
-        res.error = "jvm.dll does not export JVM_EnqueueOperation \xE2\x80\x94 not a HotSpot VM "
-                    "(the target was left untouched)";
+        const bool cleanupScheduled = deferRemoteAttachCleanup(proc, thread, rData, rStub);
+        if (waitRc == WAIT_TIMEOUT) {
+            res.error = "the remote JVM attach thread timed out; its memory "
+                        "will be released only after the thread exits";
+        } else {
+            res.error = "waiting for the remote JVM attach thread failed (Win32 error " +
+                        std::to_string(waitError) + "); its memory will not be released "
+                        "unless thread exit is later confirmed";
+        }
+        if (!cleanupScheduled)
+            res.error += "; deferred cleanup could not be scheduled, so Windows will reclaim it when the target exits";
         return res;
     }
+
+    DWORD enqueueRc = 0;
+    if (!::GetExitCodeThread(thread, &enqueueRc)) {
+        const DWORD exitError = ::GetLastError();
+        ::CloseHandle(thread);
+        const std::string why = "GetExitCodeThread failed after the remote attach thread exited (Win32 error " +
+                                std::to_string(exitError) + ")";
+        return fail(why.c_str(), rData, rStub);
+    }
+    ::CloseHandle(thread);
 
     // enqueueRc == 0 means JVM_EnqueueOperation accepted the load request; the
     // operation then runs on the VM's attach-listener thread.

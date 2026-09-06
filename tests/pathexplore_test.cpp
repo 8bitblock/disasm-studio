@@ -54,6 +54,7 @@ struct MockCfg : ISymCfg {
             bi.kind = BranchInfo::CondBranch;
             bi.pred = Bin(ExprOp::Ult, C(0x41, 8), Var(0, 8));   // 0x41 < input  ==  input > 0x41
             bi.targetA = 0x1100; bi.targetB = 0x9000;
+            bi.targetAValid = bi.targetBValid = true;
         } else if (va == 0x1100) {
             bi.kind = BranchInfo::Return; bi.overflowFeasible = true;
         } else {
@@ -68,6 +69,30 @@ struct MockCfg : ISymCfg {
 struct EscapeCfg : ISymCfg {
     BranchInfo blockTerminator(uint64_t, const std::vector<PathConstraint>&) override {
         BranchInfo bi; bi.kind = BranchInfo::Escape; return bi;
+    }
+    bool isStaticallyReached(uint64_t) override { return true; }
+    bool inAnyFunction(uint64_t) override { return true; }
+};
+
+struct ZeroTargetCfg : ISymCfg {
+    BranchInfo blockTerminator(uint64_t va, const std::vector<PathConstraint>&) override {
+        BranchInfo bi;
+        if (va == 0x1000) {
+            bi.kind = BranchInfo::Jump;
+            bi.targetA = 0;
+            bi.targetAValid = true;
+        }
+        return bi;
+    }
+    bool isStaticallyReached(uint64_t) override { return true; }
+    bool inAnyFunction(uint64_t) override { return true; }
+};
+
+struct MissingTargetCfg : ISymCfg {
+    BranchInfo blockTerminator(uint64_t, const std::vector<PathConstraint>&) override {
+        BranchInfo bi;
+        bi.kind = BranchInfo::Jump; // default target value is not an implicit VA 0
+        return bi;
     }
     bool isStaticallyReached(uint64_t) override { return true; }
     bool inAnyFunction(uint64_t) override { return true; }
@@ -114,6 +139,20 @@ int main() {
     {
         EscapeCfg cfg; ByteSolver solver; ExploreConfig ec;
         PathTree t = Explore(0x2000, cfg, solver, ec);
+        CHECK(t.nodes.size() == 1);
+        CHECK(t.nodes[0].tag == PathTag::Escaped);
+    }
+
+    // ---- Explicit target validity preserves a real branch to VA 0 --------
+    {
+        ZeroTargetCfg cfg; ByteSolver solver; ExploreConfig ec;
+        PathTree t = Explore(0x1000, cfg, solver, ec);
+        CHECK(t.nodes.size() == 2);
+        if (t.nodes.size() == 2) CHECK(t.nodes[1].blockVA == 0);
+    }
+    {
+        MissingTargetCfg cfg; ByteSolver solver; ExploreConfig ec;
+        PathTree t = Explore(0x1000, cfg, solver, ec);
         CHECK(t.nodes.size() == 1);
         CHECK(t.nodes[0].tag == PathTag::Escaped);
     }

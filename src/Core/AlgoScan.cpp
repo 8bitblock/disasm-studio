@@ -17,6 +17,7 @@
 // sections falls back to a whole-image scan.
 //
 #include "AlgoScan.h"
+#include "AddressSpan.h"
 #include "BinaryFile.h"
 #include "SigMatch.h"
 #include "XrefIndex.h"
@@ -156,9 +157,11 @@ struct B64Sets {
 
 std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
                                       const XrefIndex* xref,
-                                      const std::vector<FuncResult>* functions) {
+                                      const std::vector<FuncResult>* functions,
+                                      const std::function<bool()>& cancelled) {
     std::vector<AlgoMatch> out;
     if (!bin.loaded()) return out;
+    const auto stopped = [&] { return cancelled && cancelled(); };
 
     const std::vector<Rule>& R = rules();
     static const B64Sets B;
@@ -171,7 +174,8 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
                          float conf, const char* det, const uint8_t* window, std::string subNote) {
         AlgoMatch m;
         m.name = name; m.category = "encoding"; m.kind = kind; m.confidence = conf;
-        m.address = va; m.dataVAs.push_back(va); m.section = sec; m.detail = det ? det : "";
+        m.address = va; m.addressValid = true; m.dataVAs.push_back(va);
+        m.section = sec; m.detail = det ? det : "";
         m.alphabet.assign((const char*)window, 64);
         m.substitutionNote = std::move(subNote);
         out.push_back(std::move(m));
@@ -182,11 +186,16 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
     auto scanBuf = [&](const uint8_t* p, size_t len, uint64_t baseVA, const std::string& sec) {
         // (1) constant rules
         for (size_t i = 0; i < R.size(); ++i) {
+            if (stopped()) return;
             for (const Variant& vrt : R[i].variants) {
+                if (stopped()) return;
                 if (vrt.pat.empty() || len < vrt.pat.size()) continue;
                 std::vector<size_t> offs = FindAllMasked(p, len, vrt.pat, kMaxHitsPerRule);
                 for (size_t off : offs) {
-                    acc[i].vas.push_back(baseVA + off);
+                    uint64_t hitVA = 0;
+                    if (!CheckedAddressAdd(baseVA, static_cast<uint64_t>(off), hitVA))
+                        continue;
+                    acc[i].vas.push_back(hitVA);
                     if (!vrt.note.empty()) acc[i].orients.push_back(vrt.note);
                     if (!acc[i].used) { acc[i].section = sec; acc[i].used = true; }
                 }
@@ -196,15 +205,20 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
         if (len >= 64) {
             int emitted = 0;
             for (size_t i = 0; i + 64 <= len && emitted < kMaxAlphabetPerSection; ) {
+                if ((i & 0x3FFFu) == 0 && stopped()) return;
                 const uint8_t* w = p + i;
                 if (std::memcmp(w, kB64Std, 64) == 0) {
-                    emitAlpha(baseVA + i, sec, AlgoKind::AlphabetStd, "Base64 (standard alphabet)", 0.95f,
-                              "Standard Base64 alphabet", w, "");
+                    uint64_t hitVA = 0;
+                    if (CheckedAddressAdd(baseVA, static_cast<uint64_t>(i), hitVA))
+                        emitAlpha(hitVA, sec, AlgoKind::AlphabetStd, "Base64 (standard alphabet)", 0.95f,
+                                  "Standard Base64 alphabet", w, "");
                     i += 64; ++emitted; continue;
                 }
                 if (std::memcmp(w, kB64Url, 64) == 0) {
-                    emitAlpha(baseVA + i, sec, AlgoKind::AlphabetStd, "Base64 (URL-safe alphabet)", 0.95f,
-                              "URL-safe Base64 alphabet", w, "");
+                    uint64_t hitVA = 0;
+                    if (CheckedAddressAdd(baseVA, static_cast<uint64_t>(i), hitVA))
+                        emitAlpha(hitVA, sec, AlgoKind::AlphabetStd, "Base64 (URL-safe alphabet)", 0.95f,
+                                  "URL-safe Base64 alphabet", w, "");
                     i += 64; ++emitted; continue;
                 }
                 // mutated candidate: all printable + 64 distinct + same symbol SET as std/url
@@ -221,10 +235,12 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
                     else { bool inUrl = true; for (int j = 0; j < 64; ++j) if (!B.url_[w[j]]) { inUrl = false; break; } if (inUrl) base = kB64Url; }
                     if (base) {
                         int delta = 0; for (int j = 0; j < 64; ++j) if (w[j] != (uint8_t)base[j]) ++delta;
-                        emitAlpha(baseVA + i, sec, AlgoKind::AlphabetMutated, "Base64 (mutated alphabet)", 0.85f,
-                                  "Permuted Base64 alphabet (custom symbol order)", w,
-                                  std::to_string(delta) + " of 64 positions differ from the " +
-                                  (base == kB64Std ? "standard" : "URL-safe") + " alphabet");
+                        uint64_t hitVA = 0;
+                        if (CheckedAddressAdd(baseVA, static_cast<uint64_t>(i), hitVA))
+                            emitAlpha(hitVA, sec, AlgoKind::AlphabetMutated, "Base64 (mutated alphabet)", 0.85f,
+                                      "Permuted Base64 alphabet (custom symbol order)", w,
+                                      std::to_string(delta) + " of 64 positions differ from the " +
+                                      (base == kB64Std ? "standard" : "URL-safe") + " alphabet");
                         i += 64; ++emitted; continue;
                     }
                 }
@@ -236,8 +252,10 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
     // Prefer initialised, non-executable DATA sections (cuts code-byte false positives).
     bool scannedAny = false;
     for (const Section& s : bin.sections()) {
+        if (stopped()) return {};
         if (s.executable || s.rawSize == 0) continue;
-        uint64_t va = bin.imageBase() + s.virtualAddress;
+        uint64_t va = 0;
+        if (!CheckedAddressAdd(bin.imageBase(), s.virtualAddress, va)) continue;
         size_t avail = 0;
         const uint8_t* p = bin.ptrFromVA(va, avail);
         if (!p || avail == 0) continue;
@@ -245,14 +263,33 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
         scanBuf(p, len, va, s.name);
         scannedAny = true;
     }
-    // Raw blob / header-less image: no usable data sections -> scan the whole image.
+    // Raw owns one identity-mapped image and can safely scan the whole buffer. A
+    // structured image must never turn file offsets (headers/overlay included)
+    // into imageBase-relative VAs. If it has no data section, scan only its real
+    // file-backed mapped sections, including executable-only images.
     if (!scannedAny) {
-        const std::vector<uint8_t>& d = bin.bytes();
-        if (!d.empty()) scanBuf(d.data(), d.size(), bin.imageBase(), "image");
+        if (bin.format() == BinFormat::Raw) {
+            const std::vector<uint8_t>& d = bin.bytes();
+            if (!d.empty()) scanBuf(d.data(), d.size(), bin.imageBase(), "image");
+        } else {
+            for (const Section& s : bin.sections()) {
+                if (stopped()) return {};
+                if (!s.rawSize) continue;
+                uint64_t va = 0;
+                if (!CheckedAddressAdd(bin.imageBase(), s.virtualAddress, va)) continue;
+                size_t avail = 0;
+                const uint8_t* p = bin.ptrFromVA(va, avail);
+                if (!p || !avail) continue;
+                const size_t len = static_cast<size_t>(
+                    std::min<uint64_t>(avail, s.rawSize));
+                scanBuf(p, len, va, s.name);
+            }
+        }
     }
 
     // Materialise constant matches from the accumulators.
     for (size_t i = 0; i < R.size(); ++i) {
+        if (stopped()) return {};
         if (!acc[i].used) continue;
         std::vector<uint64_t>& vas = acc[i].vas;
         std::sort(vas.begin(), vas.end());
@@ -263,6 +300,7 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
         m.name = R[i].name; m.category = R[i].category; m.kind = AlgoKind::ConstantTable;
         m.confidence = R[i].conf; m.section = acc[i].section;
         m.dataVAs = vas; m.address = vas.empty() ? 0 : vas.front();
+        m.addressValid = !vas.empty();
 
         std::vector<std::string>& o = acc[i].orients;
         std::sort(o.begin(), o.end()); o.erase(std::unique(o.begin(), o.end()), o.end());
@@ -297,16 +335,28 @@ std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
         };
 
         for (AlgoMatch& m : out) {
+            if (stopped()) return {};
             std::vector<AlgoXref> refs;
             std::unordered_set<uint64_t> seenFunc;
+            bool seenUnresolved = false;
             for (uint64_t dva : m.dataVAs) {
                 const std::vector<uint64_t>* srcs = xref->sources(dva);
                 if (!srcs) continue;
                 for (uint64_t insn : *srcs) {
                     const FuncResult* f = containing(insn);
                     uint64_t fa = f ? f->address : 0;
-                    if (!seenFunc.insert(fa).second) continue;
-                    AlgoXref x; x.funcAddress = fa; x.funcName = f ? f->name : std::string(); x.refInsn = insn;
+                    if (f) {
+                        if (!seenFunc.insert(fa).second) continue;
+                    } else {
+                        if (seenUnresolved) continue;
+                        seenUnresolved = true;
+                    }
+                    AlgoXref x;
+                    x.funcAddress = fa;
+                    x.funcAddressValid = f != nullptr;
+                    x.funcName = f ? f->name : std::string();
+                    x.refInsn = insn;
+                    x.refInsnValid = true;
                     refs.push_back(std::move(x));
                     if (refs.size() >= kMaxRefsPerMatch) break;
                 }

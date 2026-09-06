@@ -18,6 +18,7 @@
 // mapping consumes an already-built XrefIndex (no live decode here).
 //
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,9 +37,11 @@ enum class AlgoKind : uint8_t {
 
 // One referencing function for a constant hit (the extent-mapping result).
 struct AlgoXref {
-    uint64_t    funcAddress = 0;   // enclosing function start (0 = none resolved)
+    uint64_t    funcAddress = 0;   // enclosing function start (VA 0 is valid)
     std::string funcName;          // function name (sub_/export/guess)
     uint64_t    refInsn     = 0;   // a representative referencing instruction VA
+    bool        funcAddressValid = false;
+    bool        refInsnValid = false;
 };
 
 struct AlgoMatch {
@@ -53,6 +56,7 @@ struct AlgoMatch {
     std::vector<AlgoXref> referencedBy;   // extent mapping (de-duped by func, capped)
     std::string alphabet;                 // 64-char alphabet (alphabet matches only)
     std::string substitutionNote;         // AlphabetMutated only ("k of 64 positions differ")
+    bool        addressValid = false;
 };
 
 // Scan `bin` for recognized algorithms. `xref` and `functions` are OPTIONAL: when
@@ -62,6 +66,7 @@ struct AlgoMatch {
 // confidence. Returns empty for a clean image (no fabricated rows).
 std::vector<AlgoMatch> ScanAlgorithms(const BinaryFile& bin,
                                       const XrefIndex* xref = nullptr,
-                                      const std::vector<FuncResult>* functions = nullptr);
+                                      const std::vector<FuncResult>* functions = nullptr,
+                                      const std::function<bool()>& cancelled = {});
 
 } // namespace ds

@@ -1,16 +1,21 @@
 #include "App.h"
+#include "Core/GameMakerArchive.h"
 #include "Tabs/ITab.h"
 
 #include "Tabs/ProjectsTab.h"
 #include "Tabs/CommunicationsTab.h"
-#include "Tabs/ConnectionsTab.h"
 #include "Tabs/SigScannerTab.h"
-#include "Tabs/BinaryViewTab.h"
+#include "Tabs/BinaryViewHostTab.h"
 #include "Tabs/MemoryToolsTab.h"
 #include "Tabs/BinaryDiffTab.h"
 #include "Tabs/BinaryTechTab.h"
 #include "Tabs/CortexTab.h"
 #include "Tabs/PrismTab.h"
+
+#include "Core/Demangle.h"
+#include "Core/PatchedImage.h"
+#include "Core/AttachImagePolicy.h"
+#include "Core/AddressInspector.h"
 
 #include "Ui/Theme.h"
 #include "Ui/Fonts.h"
@@ -21,6 +26,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -29,30 +35,422 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <cwchar>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace ds {
 
+static bool liveDocumentSessionState(const DbgSnapshot& snapshot) {
+    return snapshot.state == DbgState::Running ||
+           snapshot.state == DbgState::Paused;
+}
+
+static bool hasEnabledProjectPatches(const ProjectState& project) {
+    for (const PjPatch& patch : project.patches) {
+        if (patch.patchSetId == kUngroupedPatchSetId) return true;
+        const PjPatchSet* set = FindPatchSet(project.patchSets,
+                                             patch.patchSetId);
+        if (set && set->enabled) return true;
+    }
+    return false;
+}
+
+static AttachedModuleIdentity attachedModuleIdentity(const DbgModule& module) {
+    return { module.base, module.size, module.name, module.path,
+             module.loadGeneration };
+}
+
+static const DbgModule* matchingAttachedModule(
+    const DbgSnapshot& snapshot,
+    const AttachedModuleIdentity& expected) {
+    for (const DbgModule& module : snapshot.modules)
+        if (module.base == expected.base &&
+            AttachedModuleIdentityMatches(expected,
+                                          attachedModuleIdentity(module)))
+            return &module;
+    return nullptr;
+}
+
+static DocumentRuntimeMetadata::LiveImageIdentity debugImageIdentity(
+    const DbgSnapshot& snapshot, const DbgModule& module) {
+    DocumentRuntimeMetadata::LiveImageIdentity identity;
+    identity.valid = liveDocumentSessionState(snapshot) &&
+                     snapshot.pid != 0 &&
+                     snapshot.sessionGeneration != 0 && module.base != 0 &&
+                     module.loadGeneration != 0;
+    identity.pid = snapshot.pid;
+    identity.sessionGeneration = snapshot.sessionGeneration;
+    identity.moduleBase = module.base;
+    identity.moduleSize = module.size;
+    identity.moduleName = module.name;
+    identity.modulePath = module.path;
+    identity.moduleLoadGeneration = module.loadGeneration;
+    return identity;
+}
+
+static void storeRawDecoderFeatures(ProjectState& project,
+                                    const DecoderFeatures& features) {
+    project.rawDecoderFeatureBits = DecoderFeatureBits(features);
+    project.rawRiscvCompressed = features.riscvCompressed;
+}
+
+AppContext::AppContext()
+    : moduleAnalysis_([](const DecoderConfig& config) {
+          return MakeDisassembler(config);
+      }),
+      documents_(
+          [](const DecoderConfig& config) { return MakeDisassembler(config); },
+          [](const BinaryFile& binary, const ProjectState& snapshot,
+             std::string& error) {
+              // Live mapped images intentionally have no durable sidecar.
+              if (!binary.loaded() || binary.isMappedImage() || !snapshot.hash)
+                  return true;
+              if (SaveProject(snapshot)) return true;
+              error = "Project save failed; changes remain in memory.";
+              return false;
+          }) {
+    if (!documents_.create("Untitled"))
+        throw std::runtime_error("Unable to create the initial static document: " +
+                                 documents_.lastError());
+}
+
+AppContext::~AppContext() {
+    if (binaryLoadFuture_.valid()) {
+        cancelBinaryLoad();
+        try { binaryLoadFuture_.wait(); }
+        catch (...) {}
+    }
+    // std::future's async destructor also waits, but joining explicitly while
+    // DocumentManager is still alive lets the completion reach the exact
+    // originating document and preserves its dirty/failure state for the
+    // manager's final synchronous flush retry.
+    if (projectSaveFuture.valid()) (void)finishProjectSave(true);
+}
+
+DocumentContext& AppContext::activeStaticDocument() {
+    DocumentContext* document = documents_.active();
+    if (!document) throw std::logic_error("AppContext has no active static document");
+    return *document;
+}
+
+const DocumentContext& AppContext::activeStaticDocument() const {
+    const DocumentContext* document = documents_.active();
+    if (!document) throw std::logic_error("AppContext has no active static document");
+    return *document;
+}
+
+std::vector<AppContext::StaticDocumentSummary> AppContext::staticDocuments() const {
+    std::vector<StaticDocumentSummary> result;
+    result.reserve(documents_.size());
+    const std::optional<DocumentId> active = documents_.activeId();
+    for (size_t i = 0; i < documents_.size(); ++i) {
+        const DocumentContext* document = documents_.at(i);
+        if (!document) continue;
+        const BinaryFile& binary = document->binary();
+        result.push_back({
+            document->id(), document->title(), binary.path(),
+            binary.loaded() ? binary.formatName() : std::string(),
+            binary.loaded(), binary.loaded() && binary.isMappedImage(),
+            document->dirty(), active && *active == document->id()
+        });
+    }
+    return result;
+}
+
+bool AppContext::documentCommandPending() const {
+    return pendingDocumentCommand_.has_value() || binaryLoadFuture_.valid();
+}
+
+bool AppContext::queueDocumentOpen(PendingDocumentCommand command) {
+    documentCommandError_.clear();
+    if (pendingDocumentCommand_) {
+        documentCommandError_ =
+            "Another document operation is already queued for this frame.";
+        return false;
+    }
+    try {
+        pendingDocumentCommand_.emplace(std::move(command));
+    } catch (const std::exception& error) {
+        documentCommandError_ = std::string("Could not stage the document: ") + error.what();
+        return false;
+    } catch (...) {
+        documentCommandError_ = "Could not stage the document.";
+        return false;
+    }
+    return true;
+}
+
+bool AppContext::queueActivateStaticDocument(DocumentId id) {
+    documentCommandError_.clear();
+    if (!id || !documents_.find(id)) {
+        documentCommandError_ = "The selected document is no longer open.";
+        return false;
+    }
+    if (documents_.activeId() && *documents_.activeId() == id) return true;
+    PendingDocumentCommand command;
+    command.kind = PendingDocumentKind::Activate;
+    command.id = id;
+    return queueDocumentOpen(std::move(command));
+}
+
+bool AppContext::queueCloseStaticDocument(DocumentId id) {
+    documentCommandError_.clear();
+    if (!id || !documents_.find(id)) {
+        documentCommandError_ = "The selected document is no longer open.";
+        return false;
+    }
+    PendingDocumentCommand command;
+    command.kind = PendingDocumentKind::Close;
+    command.id = id;
+    return queueDocumentOpen(std::move(command));
+}
+
+AppContext::DocumentCommandOutcome AppContext::applyPendingDocumentCommand(
+    const PrepareDocumentUi& prepareUi) {
+    DocumentCommandOutcome outcome;
+    if (!pendingDocumentCommand_) return outcome;
+
+    outcome.hadCommand = true;
+    PendingDocumentCommand command = std::move(*pendingDocumentCommand_);
+    pendingDocumentCommand_.reset();
+    documentCommandError_.clear();
+    if (const auto active = documents_.activeId()) outcome.previous = *active;
+    if (command.liveModule) {
+        outcome.liveModule = true;
+        outcome.liveOrigin = command.liveOrigin;
+        outcome.livePid = command.livePid;
+        outcome.liveSessionGeneration = command.liveSessionGeneration;
+        outcome.liveBase = command.liveBase;
+    }
+
+    auto callPrepareUi = [&](DocumentId id, bool closing,
+                             std::string& error) -> bool {
+        if (!prepareUi) return true;
+        try {
+            if (prepareUi(id, closing, error)) return true;
+            if (error.empty()) error = "The document view rejected the transition.";
+        } catch (const std::exception& exception) {
+            error = exception.what();
+        } catch (...) {
+            error = "The document view could not prepare for the transition.";
+        }
+        return false;
+    };
+
+    // Manager callbacks run while the outgoing document is still the active
+    // compatibility target. Mirror its Binary View first, then serialize with
+    // the exact asynchronous sidecar ticket before changing activeId().
+    DocumentManager::PrepareTransition prepareOutgoing =
+        [&](DocumentContext& document, std::string& error) {
+            if (!callPrepareUi(document.id(), false, error)) return false;
+            return prepareStaticDocumentTransition(&error);
+        };
+    DocumentManager::PrepareTransition persistOutgoing =
+        [&](DocumentContext&, std::string& error) {
+            return prepareStaticDocumentTransition(&error);
+        };
+
+    auto fail = [&](std::string error) {
+        outcome.error = error.empty() ? "The document operation failed." : std::move(error);
+        documentCommandError_ = outcome.error;
+        if (const auto active = documents_.activeId()) outcome.current = *active;
+        outcome.activeChanged = outcome.previous != outcome.current;
+        if (outcome.activeChanged && outcome.current) resetProjectSaveMirrorFromActive();
+        return outcome;
+    };
+
+    if (command.kind == PendingDocumentKind::Open) {
+        if (command.liveModule) {
+            const DbgSnapshot snapshot = debug.snapshot();
+            const AttachedModuleIdentity expected{
+                command.liveBase, command.liveReportedSize,
+                command.liveName, command.livePath,
+                command.liveLoadGeneration
+            };
+            if (!liveDocumentSessionState(snapshot) ||
+                snapshot.pid != command.livePid ||
+                snapshot.sessionGeneration != command.liveSessionGeneration) {
+                return fail("The debug session changed before the live module could be opened.");
+            }
+            const DbgModule* current = matchingAttachedModule(snapshot, expected);
+            if (!current) {
+                return fail(
+                    "The exact live module unloaded or changed before its document could be opened.");
+            }
+            if (command.liveOrigin == LiveDocumentOpenOrigin::AttachMain &&
+                (snapshot.modules.empty() ||
+                 snapshot.modules.front().base != command.liveBase)) {
+                return fail("The process main image changed before its document could be opened.");
+            }
+            if (command.liveOrigin == LiveDocumentOpenOrigin::HostedDll &&
+                (!snapshot.dllHostedLaunch || !snapshot.dllTargetMatched ||
+                 snapshot.dllTargetBase != command.liveBase)) {
+                return fail("The hosted DLL target changed before its document could be opened.");
+            }
+        }
+
+        const bool retireInitialScratch = documents_.size() == 1 &&
+            documents_.active() && !documents_.active()->binary().loaded();
+        const DocumentId scratchId = retireInitialScratch
+                                   ? documents_.active()->id() : DocumentId{};
+        DocumentManager::OpenResult opened = documents_.openStaged(
+            std::move(command.title), std::move(command.image),
+            std::move(command.project), command.decoder,
+            command.persistence, std::move(command.metadata),
+            std::move(prepareOutgoing),
+            command.liveModule ? DocumentOpenReuse::AlwaysCreate
+                               : DocumentOpenReuse::ReuseContentHash);
+        if (!opened) return fail(std::move(opened.error));
+
+        outcome.success = true;
+        outcome.opened = true;
+        if (retireInitialScratch && scratchId != opened.id) {
+            std::string scratchError;
+            if (documents_.close(scratchId, {}, &scratchError)) {
+                outcome.retired = scratchId;
+            } else {
+                outcome.warning = scratchError.empty()
+                    ? "The initial empty document could not be retired."
+                    : "The initial empty document could not be retired: " + scratchError;
+            }
+        }
+
+        if (command.liveModule) {
+            modules.addOrUpdate(command.liveName, command.liveBase,
+                                command.liveReportedSize
+                                    ? command.liveReportedSize
+                                    : command.liveSize,
+                                command.livePath);
+            if (LoadedModule* module = modules.byBase(command.liveBase))
+                module->arch = staticBinary().machine();
+            modules.setActiveByBase(command.liveBase);
+        }
+        outcome.browseArchive = command.browseArchive;
+        if (command.ignoredInvalidRawProject) {
+            if (!outcome.warning.empty()) outcome.warning += " ";
+            outcome.warning +=
+                "Ignored an invalid saved raw mapping and used a safe fallback mapping.";
+        }
+        if (!command.projectLoadWarning.empty()) {
+            if (!outcome.warning.empty()) outcome.warning += " ";
+            outcome.warning += command.projectLoadWarning;
+        }
+        binaryJustLoaded = opened.status == DocumentManager::OpenStatus::Created;
+    } else if (command.kind == PendingDocumentKind::Activate) {
+        std::string error;
+        if (!documents_.activate(command.id, std::move(prepareOutgoing), &error))
+            return fail(std::move(error));
+        outcome.success = true;
+    } else {
+        DocumentContext* target = documents_.find(command.id);
+        if (!target) return fail("The selected document is no longer open.");
+
+        std::string error;
+        // Inactive views are already mirrored from their last deactivation, but
+        // they may still own a symbol worker. Give every close target this edge
+        // before DocumentContext releases its BinaryFile storage.
+        if (!callPrepareUi(command.id, true, error)) return fail(std::move(error));
+
+        if (documents_.size() == 1) {
+            // Construct the replacement scratch while the old owner is intact.
+            // If allocation/decoder construction fails, close is rejected with
+            // the original document still active.
+            const std::optional<DocumentId> scratch =
+                documents_.create("Untitled", std::move(persistOutgoing));
+            if (!scratch) return fail(documents_.lastError());
+
+            if (!documents_.close(command.id, {}, &error)) {
+                std::string ignored;
+                (void)documents_.activate(command.id, {}, &ignored);
+                (void)documents_.close(*scratch, {}, &ignored);
+                return fail(std::move(error));
+            }
+        } else if (!documents_.close(command.id, std::move(persistOutgoing), &error)) {
+            return fail(std::move(error));
+        }
+        outcome.success = true;
+        outcome.closed = true;
+        outcome.retired = command.id;
+        binaryJustLoaded = false;
+    }
+
+    if (const auto active = documents_.activeId()) outcome.current = *active;
+    outcome.activeChanged = outcome.previous != outcome.current;
+    ++documentRetryRevision_;
+    if (!documentRetryRevision_) ++documentRetryRevision_;
+    resetProjectSaveMirrorFromActive();
+    if (staticBinary().loaded() && staticBinary().isMappedImage())
+        modules.setActiveByBase(staticBinary().imageBase());
+    return outcome;
+}
+
+void AppContext::markProjectDirty() {
+    if (!staticBinary().loaded() || staticBinary().isMappedImage() ||
+        !staticProject().hash)
+        return;
+    activeStaticDocument().markDirty();
+    ++projectRevision;
+    if (!projectRevision) ++projectRevision;
+    projectSaveState = projectSaveFuture.valid()
+                     ? ProjectSaveState::Saving : ProjectSaveState::Dirty;
+    projectSaveError.clear();
+    projectDirtySince = std::chrono::steady_clock::now();
+}
+
+bool AppContext::projectDirty() const {
+    return activeStaticDocument().dirty();
+}
+
+bool AppContext::setStaticDecoderConfiguration(Engine engine, Arch arch) {
+    DecoderConfig decoder = staticDecoderConfig();
+    decoder.engine = engine;
+    decoder.arch = arch;
+    return setStaticDecoderConfiguration(decoder);
+}
+
+bool AppContext::setStaticDecoderConfiguration(const DecoderConfig& decoder) {
+    DocumentContext& document = activeStaticDocument();
+    const DecoderConfig previous = document.decoderConfig();
+    if (!document.setDecoderConfiguration(decoder)) return false;
+    const bool changed = document.decoderConfig() != previous;
+    if (changed && staticBinary().loaded() && staticBinary().isMappedImage()) {
+        // Decoder choices for ephemeral live mappings are session-only.
+        (void)document.acknowledgeExternalSave(document.externalSaveTicket());
+    } else if (changed && staticBinary().loaded() && staticProject().hash) {
+        // DocumentContext already marked its own revision while updating the
+        // persisted engine/architecture fields. Mirror only the legacy async
+        // writer's generation here so one UI action is one document edit.
+        ++projectRevision;
+        if (!projectRevision) ++projectRevision;
+        projectSaveState = projectSaveFuture.valid()
+                         ? ProjectSaveState::Saving : ProjectSaveState::Dirty;
+        projectSaveError.clear();
+        projectDirtySince = std::chrono::steady_clock::now();
+    }
+    return true;
+}
+
 App::App(std::string startupPath) {
     loadPrefs();                 // restore the last-used theme + density, if any
     theme::SetDensity(density_);
     theme::ApplyTheme(theme_);
-    ctx_.rebuildDisassembler();
-
     tabs_.emplace_back(std::make_unique<ProjectsTab>());
     tabs_.emplace_back(std::make_unique<CommunicationsTab>());
-    tabs_.emplace_back(std::make_unique<ConnectionsTab>());
     tabs_.emplace_back(std::make_unique<SigScannerTab>());
-    {   // keep a typed handle: the command palette pulls its symbol index from here
-        auto bv = std::make_unique<BinaryViewTab>();
+    {   // retained children keep one complete Binary View workspace per document
+        auto bv = std::make_unique<BinaryViewHostTab>();
         binaryView_ = bv.get();
         tabs_.emplace_back(std::move(bv));
     }
@@ -63,9 +461,9 @@ App::App(std::string startupPath) {
     tabs_.emplace_back(std::make_unique<PrismTab>());    // explanatory profiler (additions.md #5)
 
     if (!startupPath.empty()) {
-        if (ctx_.loadBinaryPath(startupPath)) {
+        if (ctx_.beginBinaryLoadPath(startupPath)) {
             ctx_.requestedTab = "Binary View";
-            ui::Toast(ui::ToastKind::Success, "Opened command-line target: " + startupPath);
+            ui::Toast(ui::ToastKind::Info, "Opening command-line target: " + startupPath);
         } else {
             ui::Toast(ui::ToastKind::Error, "Could not open command-line target: " + startupPath);
         }
@@ -73,7 +471,24 @@ App::App(std::string startupPath) {
 }
 
 App::~App() {
+    std::string ignored;
+    if (binaryView_)
+        (void)binaryView_->prepareDocumentTransition(
+            ctx_, ctx_.staticDocumentId(), false, ignored);
     ctx_.saveProject();   // flush analysis on shutdown (window close / Alt+F4)
+}
+
+void App::requestExit() {
+    std::string error;
+    if (binaryView_ && !binaryView_->prepareDocumentTransition(
+            ctx_, ctx_.staticDocumentId(), false, error)) {
+        ui::Toast(ui::ToastKind::Error,
+                  error.empty() ? "Could not prepare the active document for exit."
+                                : error);
+        return;
+    }
+    if (ctx_.saveProject()) exit_ = true;
+    else ui::Toast(ui::ToastKind::Error, ctx_.projectSaveError);
 }
 
 namespace {
@@ -121,6 +536,542 @@ std::filesystem::path pathFromUtf8(const std::string& value) {
     return std::filesystem::path(utf8);
 }
 
+AttachedFileIdentity attachedFileIdentityForHandle(HANDLE file) {
+    AttachedFileIdentity identity;
+    if (!file || file == INVALID_HANDLE_VALUE) return identity;
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileInformationByHandle(file, &info)) {
+        identity.valid = true;
+        identity.volumeSerial = info.dwVolumeSerialNumber;
+        identity.fileIndex =
+            (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
+            info.nFileIndexLow;
+        identity.fileSize =
+            (static_cast<uint64_t>(info.nFileSizeHigh) << 32) |
+            info.nFileSizeLow;
+        identity.lastWriteTime =
+            (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+            info.ftLastWriteTime.dwLowDateTime;
+    }
+    return identity;
+}
+
+bool loadedBytesStillMatchDisk(const BinaryFile& binary,
+                               AttachedFileIdentity* identityOut = nullptr) {
+    if (identityOut) *identityOut = {};
+    if (!binary.loaded() || binary.isMappedImage() || binary.path().empty())
+        return false;
+    const std::vector<uint8_t>& expected = binary.bytes();
+    if (expected.empty() ||
+        expected.size() > kAuthorizationWatchSourceByteCap)
+        return false;
+
+    std::vector<uint8_t> chunk;
+    try {
+        chunk.resize((std::min<size_t>)(1024u * 1024u, expected.size()));
+    } catch (...) {
+        return false;
+    }
+
+    std::wstring wide;
+    if (!wideFromUtf8(binary.path(), wide) || wide.empty()) return false;
+    HANDLE file = CreateFileW(
+        wide.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const AttachedFileIdentity identity = attachedFileIdentityForHandle(file);
+    if (!identity.valid || identity.fileSize != expected.size()) {
+        CloseHandle(file);
+        return false;
+    }
+
+    size_t offset = 0;
+    while (offset < expected.size()) {
+        const size_t count = (std::min)(chunk.size(), expected.size() - offset);
+        DWORD got = 0;
+        if (!ReadFile(file, chunk.data(), static_cast<DWORD>(count), &got,
+                      nullptr) || got != static_cast<DWORD>(count) ||
+            std::memcmp(chunk.data(), expected.data() + offset, count) != 0) {
+            CloseHandle(file);
+            return false;
+        }
+        offset += count;
+    }
+    const AttachedFileIdentity identityAfterRead =
+        attachedFileIdentityForHandle(file);
+    CloseHandle(file);
+    if (!SameAttachedFileIdentity(identity, identityAfterRead)) return false;
+    if (identityOut) *identityOut = identityAfterRead;
+    return true;
+}
+
+const char* dllBitnessName(DllBitness value) {
+    switch (value) {
+        case DllBitness::X86: return "x86";
+        case DllBitness::X64: return "x64";
+        default: return "unknown";
+    }
+}
+
+DllBitness nativeWindowsDllBitness() {
+    SYSTEM_INFO info{};
+    GetNativeSystemInfo(&info);
+    if (info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64)
+        return DllBitness::X64;
+    if (info.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL)
+        return DllBitness::X86;
+    // An ARM64 System32 host cannot load an x64 DLL even when Windows provides
+    // x64 emulation, so do not claim a safely compatible system host here.
+    return DllBitness::Unknown;
+}
+
+std::optional<std::string> systemRundll32Path(DllSystemHostPath policy) {
+    std::vector<wchar_t> dir(kDialogPathChars, L'\0');
+    UINT n = 0;
+    if (policy == DllSystemHostPath::NativeSystem32) {
+        n = GetSystemDirectoryW(dir.data(), static_cast<UINT>(dir.size()));
+    } else {
+        n = GetWindowsDirectoryW(dir.data(), static_cast<UINT>(dir.size()));
+        if (n && n < dir.size()) {
+            std::wstring value(dir.data(), n);
+            if (!value.empty() && value.back() != L'\\') value.push_back(L'\\');
+            value += L"SysWOW64";
+            if (value.size() >= dir.size()) return std::nullopt;
+            std::copy(value.begin(), value.end(), dir.begin());
+            dir[value.size()] = L'\0';
+            n = static_cast<UINT>(value.size());
+        }
+    }
+    if (!n || n >= dir.size()) return std::nullopt;
+    std::wstring path(dir.data(), n);
+    if (!path.empty() && path.back() != L'\\') path.push_back(L'\\');
+    path += L"rundll32.exe";
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return std::nullopt;
+    std::string utf8;
+    if (!utf8FromWide(path.c_str(), utf8) || utf8.empty()) return std::nullopt;
+    return utf8;
+}
+
+bool splitWindowsUserArguments(const char* text, std::vector<std::string>& out,
+                               std::string& error) {
+    out.clear();
+    error.clear();
+    if (!text || !*text) return true;
+    std::wstring args;
+    if (!wideFromUtf8(text, args)) {
+        error = "The argument text is not valid UTF-8.";
+        return false;
+    }
+    // CommandLineToArgvW applies special parsing to argv[0]. Prefix a harmless
+    // executable token so every user-supplied token follows the normal Windows
+    // backslash/quote rules, then discard that first result.
+    std::wstring command = L"dllhost ";
+    command += args;
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(command.c_str(), &argc);
+    if (!argv) {
+        error = "Windows could not parse the argument text.";
+        return false;
+    }
+    bool ok = true;
+    for (int i = 1; i < argc; ++i) {
+        std::string value;
+        if (!utf8FromWide(argv[i], value)) {
+            error = "A parsed argument could not be encoded as UTF-8.";
+            ok = false;
+            break;
+        }
+        out.push_back(std::move(value));
+    }
+    LocalFree(argv);
+    if (!ok) out.clear();
+    return ok;
+}
+
+std::string dllExportLabel(const DllCallableExport& value) {
+    if (!value.name.empty()) return DemangleForDisplay(value.name);
+    return "#" + std::to_string(value.ordinal);
+}
+
+bool parseHexU64(const char* text, uint64_t& out) {
+    if (!text) return false;
+    while (*text && std::isspace((unsigned char)*text)) ++text;
+    if (!*text || *text == '-') return false;
+    const char* begin = text;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 16);
+    while (end && *end && std::isspace((unsigned char)*end)) ++end;
+    if (errno == ERANGE || !end || end == begin || *end != '\0') return false;
+    out = static_cast<uint64_t>(value);
+    return true;
+}
+
+void formatHexU64(char* dst, size_t capacity, uint64_t value) {
+    if (dst && capacity)
+        std::snprintf(dst, capacity, "0x%llX", (unsigned long long)value);
+}
+
+int rawArchForFirmwareMode(FirmwareCpuMode mode) {
+    switch (mode) {
+        case FirmwareCpuMode::X86Real16: return 0;
+        case FirmwareCpuMode::X86_32:    return 1;
+        case FirmwareCpuMode::X86_64:    return 2;
+        case FirmwareCpuMode::ARM_A32:   return 3;
+        case FirmwareCpuMode::ARM_Thumb: return 4;
+        case FirmwareCpuMode::ARM_AArch64: return 5;
+        default:                         return 2;
+    }
+}
+
+Arch rawArchFromSelection(int selection) {
+    switch (selection) {
+        case 0: return Arch::X86_16;
+        case 1: return Arch::X86;
+        case 2: return Arch::X64;
+        case 3: return Arch::ARM;
+        case 4: return Arch::THUMB;
+        case 5: return Arch::ARM64;
+        case 6: return Arch::MIPS;
+        case 7: return Arch::MIPS64;
+        case 8: return Arch::PPC;
+        case 9: return Arch::PPC64;
+        case 10: return Arch::RISCV32;
+        case 11: return Arch::RISCV64;
+        default: return Arch::X64;
+    }
+}
+
+static bool archFitsActiveRawMapping(const AppContext& ctx, Arch arch) {
+    return !ctx.staticBinary().loaded() ||
+           ctx.staticBinary().format() != BinFormat::Raw ||
+           ArchMappingRangeFits(arch, ctx.staticBinary().imageBase(),
+                                ctx.staticBinary().bytes().size());
+}
+
+// Firmware probing happens after the native file picker but before the modal is
+// shown. Raw PC firmware is normally a few MiB; cap the synchronous probe so an
+// arbitrarily large blob never turns opening the options dialog into a huge
+// allocation. The normal raw loader remains available when probing is skipped.
+bool readFirmwareProbe(const std::string& path, uint64_t& sizeOut,
+                       FirmwareDetection& detection, std::string& note) {
+    sizeOut = 0;
+    detection = FirmwareDetection{};
+    note.clear();
+    std::ifstream f(pathFromUtf8(path), std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    const std::streamsize n = f.tellg();
+    if (n <= 0) return false;
+    sizeOut = static_cast<uint64_t>(n);
+    constexpr uint64_t kProbeFileCap = 64ull * 1024ull * 1024ull;
+    if (sizeOut > kProbeFileCap) {
+        note = "Firmware sniff skipped because the file exceeds the 64 MiB interactive probe limit.";
+        return true;
+    }
+    if (sizeOut > static_cast<uint64_t>((std::numeric_limits<size_t>::max)())) return false;
+    std::vector<uint8_t> bytes(static_cast<size_t>(sizeOut));
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(bytes.data()), n)) return false;
+    detection = SniffFirmware(bytes);
+    if (detection.scanTruncated)
+        note = "Signature scanning used bounded head/tail windows; fixed reset-vector checks still ran.";
+    else if (!detection.detected())
+        note = "No corroborated PC-firmware structure was detected; raw settings remain manual.";
+    return true;
+}
+
+std::string pathLeafLower(const std::string& value) {
+    size_t slash = value.find_last_of("/\\");
+    std::string leaf = slash == std::string::npos ? value : value.substr(slash + 1);
+    for (char& c : leaf) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return leaf;
+}
+
+std::wstring normalizedWindowsPath(const std::string& value) {
+    std::wstring wide;
+    if (!wideFromUtf8(value, wide) || wide.empty()) return {};
+    if (wide.rfind(L"\\\\?\\", 0) == 0) wide.erase(0, 4);
+    std::vector<wchar_t> full(kDialogPathChars, L'\0');
+    DWORD n = GetFullPathNameW(wide.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr);
+    if (n && n < full.size()) wide.assign(full.data(), n);
+    for (wchar_t& c : wide) {
+        if (c == L'/') c = L'\\';
+        c = static_cast<wchar_t>(std::towlower(c));
+    }
+    return wide;
+}
+
+const DbgModule* unpackMainModule(const DbgSnapshot& snap, const std::string& sourcePath) {
+    const std::wstring wantedPath = normalizedWindowsPath(sourcePath);
+    const std::string wantedLeaf = pathLeafLower(sourcePath);
+    for (const auto& m : snap.modules) {
+        if (!m.path.empty() && !wantedPath.empty() && normalizedWindowsPath(m.path) == wantedPath)
+            return &m;
+        if (m.path.empty() && !m.name.empty() && pathLeafLower(m.name) == wantedLeaf)
+            return &m;
+    }
+    // The debugger explicitly publishes CREATE_PROCESS as the first module. Use
+    // that fallback only when Windows supplied no path at all; a resolved path
+    // mismatch means the analyst attached a different process and must not dump it
+    // under the loaded file's identity.
+    if (!snap.modules.empty() && snap.modules.front().path.empty() &&
+        snap.modules.front().name.rfind("<main@", 0) == 0) return &snap.modules.front();
+    return nullptr;
+}
+
+bool readMappedImage(Debugger& dbg, uint64_t base, uint64_t size,
+                     std::vector<uint8_t>& out, uint64_t cap,
+                     std::vector<uint8_t>* validPages = nullptr) {
+    if (!base || !size || base > UINT64_MAX - size || size > cap ||
+        size > static_cast<uint64_t>((std::numeric_limits<size_t>::max)()))
+        return false;
+    out.assign(static_cast<size_t>(size), 0);
+    const size_t pageCount = (out.size() + 0xfff) / 0x1000;
+    std::vector<uint32_t> covered;
+    if (validPages) {
+        validPages->assign(pageCount, 0);
+        covered.assign(pageCount, 0);
+    }
+    bool any = false;
+    const auto regions = dbg.regions();
+    constexpr size_t kChunk = 1u << 20;
+    for (const auto& region : regions) {
+        if (!region.read || !region.size || region.base > UINT64_MAX - region.size) continue;
+        const uint64_t lo = std::max(base, region.base);
+        const uint64_t hi = std::min(base + size, region.base + region.size);
+        if (lo >= hi) continue;
+        uint64_t at = lo;
+        while (at < hi) {
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(hi - at, kChunk));
+            const size_t got = dbg.readMemoryMasked(at, out.data() + static_cast<size_t>(at - base), want);
+            if (!got) break;
+            any = true;
+            if (validPages) {
+                const uint64_t readLo = at - base;
+                const uint64_t readHi = readLo + got;
+                const size_t firstPage = static_cast<size_t>(readLo / 0x1000);
+                const size_t lastPage = static_cast<size_t>((readHi - 1) / 0x1000);
+                for (size_t page = firstPage; page <= lastPage; ++page) {
+                    const uint64_t pageLo = static_cast<uint64_t>(page) * 0x1000;
+                    const uint64_t pageHi = std::min<uint64_t>(size, pageLo + 0x1000);
+                    const uint64_t overlapLo = std::max(readLo, pageLo);
+                    const uint64_t overlapHi = std::min(readHi, pageHi);
+                    if (overlapLo < overlapHi)
+                        covered[page] += static_cast<uint32_t>(overlapHi - overlapLo);
+                }
+            }
+            at += got;
+            if (got < want) break;
+        }
+    }
+    if (validPages) {
+        for (size_t page = 0; page < pageCount; ++page) {
+            const size_t pageLo = page * 0x1000;
+            const size_t required = std::min<size_t>(0x1000, out.size() - pageLo);
+            (*validPages)[page] = covered[page] >= required ? 1 : 0;
+        }
+    }
+    return any;
+}
+
+double sampledEntropy(const std::vector<uint8_t>& bytes,
+                      const std::vector<uint8_t>* validPages = nullptr) {
+    if (bytes.empty()) return 0.0;
+    constexpr size_t kMaxSamples = 4u * 1024u * 1024u;
+    const size_t stride = std::max<size_t>(1, bytes.size() / kMaxSamples);
+    uint64_t hist[256]{};
+    uint64_t n = 0;
+    for (size_t i = 0; i < bytes.size(); i += stride) {
+        if (validPages && (i / 0x1000 >= validPages->size() || !(*validPages)[i / 0x1000])) continue;
+        ++hist[bytes[i]]; ++n;
+    }
+    if (!n) return 0.0;
+    double h = 0.0;
+    for (uint64_t count : hist) if (count) {
+        const double p = static_cast<double>(count) / static_cast<double>(n);
+        h -= p * std::log2(p);
+    }
+    return h;
+}
+
+bool mappedPeCoverageComplete(const std::vector<uint8_t>& mapped,
+                              const std::vector<uint8_t>& validPages,
+                              std::string& reason) {
+    auto read16 = [&](size_t off, uint16_t& v) {
+        if (off > mapped.size() || mapped.size() - off < sizeof(v)) return false;
+        std::memcpy(&v, mapped.data() + off, sizeof(v)); return true;
+    };
+    auto read32 = [&](size_t off, uint32_t& v) {
+        if (off > mapped.size() || mapped.size() - off < sizeof(v)) return false;
+        std::memcpy(&v, mapped.data() + off, sizeof(v)); return true;
+    };
+    auto covered = [&](uint64_t off, uint64_t len) {
+        if (!len) return true;
+        if (off > mapped.size() || len > mapped.size() - off) return false;
+        const size_t first = static_cast<size_t>(off / 0x1000);
+        const size_t last = static_cast<size_t>((off + len - 1) / 0x1000);
+        if (last >= validPages.size()) return false;
+        for (size_t page = first; page <= last; ++page) if (!validPages[page]) return false;
+        return true;
+    };
+    if (!covered(0, std::min<size_t>(mapped.size(), 0x1000))) {
+        reason = "PE headers were not fully readable"; return false;
+    }
+    uint32_t pe = 0, sig = 0, sizeHeaders = 0;
+    uint16_t sections = 0, optionalSize = 0;
+    if (mapped.size() < 0x40 || mapped[0] != 'M' || mapped[1] != 'Z' ||
+        !read32(0x3c, pe) || !read32(static_cast<size_t>(pe), sig) || sig != 0x00004550 ||
+        !read16(static_cast<size_t>(pe) + 6, sections) ||
+        !read16(static_cast<size_t>(pe) + 20, optionalSize) ||
+        !read32(static_cast<size_t>(pe) + 24 + 60, sizeHeaders)) {
+        reason = "captured PE headers are incomplete"; return false;
+    }
+    if (!covered(0, sizeHeaders)) {
+        reason = "one or more header pages were unreadable"; return false;
+    }
+    const uint64_t table = static_cast<uint64_t>(pe) + 24 + optionalSize;
+    if (sections > 96 || table > mapped.size() ||
+        static_cast<uint64_t>(sections) * 40 > mapped.size() - table) {
+        reason = "captured section table is incomplete"; return false;
+    }
+    for (uint16_t i = 0; i < sections; ++i) {
+        const size_t sh = static_cast<size_t>(table + static_cast<uint64_t>(i) * 40);
+        uint32_t virtualSize = 0, rawSize = 0, rva = 0;
+        if (!read32(sh + 8, virtualSize) || !read32(sh + 16, rawSize) ||
+            !read32(sh + 12, rva) || !covered(rva, std::max(virtualSize, rawSize))) {
+            reason = "one or more reconstructed section pages were unreadable"; return false;
+        }
+    }
+    return true;
+}
+
+struct LiveExportName {
+    std::string dll;
+    std::string name;
+    uint16_t ordinal = 0;
+    bool byOrdinal = false;
+};
+
+void collectLiveExports(Debugger& dbg, const DbgModule& module,
+                        std::unordered_map<uint64_t, LiveExportName>& out) {
+    if (!module.base || !module.size || module.size > 512ull * 1024ull * 1024ull) return;
+    uint8_t dos[0x40]{};
+    if (dbg.readMemory(module.base, dos, sizeof(dos)) != sizeof(dos) || dos[0] != 'M' || dos[1] != 'Z') return;
+    uint32_t pe = 0; std::memcpy(&pe, dos + 0x3c, 4);
+    if (pe > 0x100000 || pe + 24 > module.size) return;
+    uint8_t nt[0x1a]{};
+    if (dbg.readMemory(module.base + pe, nt, sizeof(nt)) != sizeof(nt) || nt[0] != 'P' || nt[1] != 'E') return;
+    uint16_t magic = 0; std::memcpy(&magic, nt + 24, 2);
+    if (magic != 0x10b && magic != 0x20b) return;
+    const uint32_t ddOff = pe + 24 + (magic == 0x20b ? 112u : 96u);
+    uint32_t expRva = 0, expSize = 0;
+    if (dbg.readMemory(module.base + ddOff, &expRva, 4) != 4 ||
+        dbg.readMemory(module.base + ddOff + 4, &expSize, 4) != 4 || !expRva ||
+        expRva > module.size || expSize > module.size - expRva) return;
+    uint8_t ed[40]{};
+    if (dbg.readMemory(module.base + expRva, ed, sizeof(ed)) != sizeof(ed)) return;
+    uint32_t ordinalBase = 0, funcs = 0, names = 0, eatRva = 0, namesRva = 0, ordsRva = 0;
+    std::memcpy(&ordinalBase, ed + 16, 4); std::memcpy(&funcs, ed + 20, 4);
+    std::memcpy(&names, ed + 24, 4); std::memcpy(&eatRva, ed + 28, 4);
+    std::memcpy(&namesRva, ed + 32, 4); std::memcpy(&ordsRva, ed + 36, 4);
+    if (!funcs || funcs > 200000 || names > 100000 ||
+        eatRva > module.size || funcs * 4ull > module.size - eatRva) return;
+    std::vector<uint32_t> eat(funcs);
+    if (dbg.readMemory(module.base + eatRva, eat.data(), eat.size() * 4) != eat.size() * 4) return;
+    std::vector<std::string> byIndex(funcs);
+    if (names && namesRva <= module.size && names * 4ull <= module.size - namesRva &&
+        ordsRva <= module.size && names * 2ull <= module.size - ordsRva) {
+        std::vector<uint32_t> nameRvas(names);
+        std::vector<uint16_t> ords(names);
+        if (dbg.readMemory(module.base + namesRva, nameRvas.data(), names * 4) == names * 4 &&
+            dbg.readMemory(module.base + ordsRva, ords.data(), names * 2) == names * 2) {
+            for (uint32_t i = 0; i < names; ++i) if (ords[i] < funcs && nameRvas[i] < module.size) {
+                char name[512]{};
+                const size_t got = dbg.readMemory(module.base + nameRvas[i], name, sizeof(name) - 1);
+                if (got) { name[sizeof(name) - 1] = 0; byIndex[ords[i]] = name; }
+            }
+        }
+    }
+    const std::string dll = !module.name.empty() ? module.name : pathLeafLower(module.path);
+    for (uint32_t i = 0; i < funcs && out.size() < 1000000; ++i) {
+        const uint32_t rva = eat[i];
+        if (!rva || rva >= module.size || (rva >= expRva && rva < expRva + expSize)) continue;
+        LiveExportName item;
+        item.dll = dll;
+        item.ordinal = static_cast<uint16_t>(std::min<uint64_t>(ordinalBase + i, UINT16_MAX));
+        item.name = byIndex[i];
+        item.byOrdinal = item.name.empty();
+        out.emplace(module.base + rva, std::move(item));
+    }
+}
+
+std::vector<PeUnpackImport> recoverLiveImports(AppContext& ctx, uint64_t moduleBase,
+                                                const std::vector<uint8_t>& mapped,
+                                                const DbgSnapshot& snap,
+                                                bool originalSectionLayout) {
+    std::unordered_map<uint64_t, LiveExportName> exports;
+    for (const auto& module : snap.modules) collectLiveExports(ctx.debug, module, exports);
+    std::unordered_set<uint64_t> knownSlots;
+    if (originalSectionLayout) {
+        for (const auto& im : ctx.staticBinary().imports())
+            if (im.addressKnown && im.iatVA >= ctx.staticBinary().imageBase())
+                knownSlots.insert(moduleBase +
+                                  (im.iatVA - ctx.staticBinary().imageBase()));
+    }
+
+    const size_t ptr = snap.is32 ? 4 : 8;
+    std::vector<PeUnpackImport> result;
+    uint64_t scannedBytes = 0;
+    constexpr uint64_t kMaxImportScanBytes = 32ull * 1024ull * 1024ull;
+    auto scanSpan = [&](uint64_t begin, uint64_t end) {
+        begin = (begin + ptr - 1) & ~(static_cast<uint64_t>(ptr) - 1);
+        std::vector<PeUnpackImport> run;
+        auto flush = [&] {
+            if (run.size() >= 2 || (run.size() == 1 && knownSlots.count(run[0].slotVA)))
+                result.insert(result.end(), run.begin(), run.end());
+            run.clear();
+        };
+        for (uint64_t rva = begin; rva + ptr <= end &&
+             result.size() + run.size() < 16384 && scannedBytes < kMaxImportScanBytes;
+             rva += ptr, scannedBytes += ptr) {
+            uint64_t value = 0;
+            if (ptr == 8) std::memcpy(&value, mapped.data() + rva, 8);
+            else { uint32_t v = 0; std::memcpy(&v, mapped.data() + rva, 4); value = v; }
+            auto it = exports.find(value);
+            if (it == exports.end()) { flush(); continue; }
+            PeUnpackImport im;
+            im.slotVA = moduleBase + rva;
+            im.dll = it->second.dll;
+            im.name = it->second.name;
+            im.ordinal = it->second.ordinal;
+            im.byOrdinal = it->second.byOrdinal;
+            im.resolvedVA = value;
+            if (!run.empty() && pathLeafLower(run.back().dll) != pathLeafLower(im.dll)) flush();
+            run.push_back(std::move(im));
+        }
+        flush();
+    };
+    if (originalSectionLayout) {
+        for (const auto& s : ctx.staticBinary().sections()) {
+            if (s.virtualAddress >= mapped.size()) continue;
+            const uint64_t span = std::max(s.virtualSize, s.rawSize);
+            const uint64_t end = span > UINT64_MAX - s.virtualAddress ? mapped.size() :
+                std::min<uint64_t>(mapped.size(), s.virtualAddress + span);
+            scanSpan(s.virtualAddress, end);
+        }
+    } else {
+        scanSpan(0, mapped.size());
+    }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.slotVA < b.slotVA; });
+    result.erase(std::unique(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        return a.slotVA == b.slotVA;
+    }), result.end());
+    return result;
+}
+
 // Small persisted-prefs file alongside the project sidecars in %APPDATA%.
 std::string prefsPath() {
     char appdata[MAX_PATH] = {0};
@@ -129,57 +1080,344 @@ std::string prefsPath() {
     CreateDirectoryA(dir.c_str(), nullptr);   // ensure it exists (no-op if already there)
     return dir + "\\prefs.ini";
 }
+
+std::string defaultSymbolCachePath() {
+    char base[MAX_PATH] = {0};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base)) &&
+        !GetEnvironmentVariableA("APPDATA", base, sizeof(base)))
+        return {};
+    return std::string(base) + "\\DisasmStudio\\symbols";
+}
+
+bool queryEqualsInsensitive(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) return false;
+    for (size_t i = 0; i < left.size(); ++i) {
+        unsigned char a = static_cast<unsigned char>(left[i]);
+        unsigned char b = static_cast<unsigned char>(right[i]);
+        if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b + ('a' - 'A'));
+        if (a != b) return false;
+    }
+    return true;
+}
 } // namespace
 
+bool AppContext::captureStaticAuthorizationWatchSourceEvidence(
+    AuthorizationWatchPlan& plan) const {
+    plan.launchSource = {};
+
+    AttachedFileIdentity identity;
+    if (!loadedBytesStillMatchDisk(staticBinary(), &identity)) return false;
+
+    try {
+        // BinaryFile is immutable after load, while project patches live in a
+        // separate overlay. Keep an independent const copy alive until the
+        // CREATE_PROCESS file handle has been checked byte-for-byte.
+        plan.launchSource.bytes =
+            std::make_shared<std::vector<uint8_t>>(staticBinary().bytes());
+    } catch (...) {
+        plan.launchSource = {};
+        return false;
+    }
+    plan.launchSource.fileIdentity = identity;
+    if (!CompleteAuthorizationWatchSourceEvidence(plan.launchSource)) {
+        plan.launchSource = {};
+        return false;
+    }
+    return true;
+}
+
 void App::loadPrefs() {
-    std::string path = prefsPath();
+    PreferencesData defaults;
+    defaults.theme = static_cast<int>(theme_);
+    defaults.density = static_cast<int>(density_);
+    defaults.symbolNetwork = false;
+    defaults.symbolCache = defaultSymbolCachePath();
+    defaults.symbolServer = "https://msdl.microsoft.com/download/symbols";
+    defaults.symbolSource = defaults.symbolTypes = defaults.symbolLocals = true;
+
+    // Defaults are authoritative when no valid copy exists. In particular,
+    // malformed prefs can never silently enable network symbol fetching.
+    ctx_.symbolOptions.networkEnabled = defaults.symbolNetwork;
+    ctx_.symbolOptions.cacheDirectory = defaults.symbolCache;
+    ctx_.symbolOptions.serverUrl = defaults.symbolServer;
+    ctx_.symbolOptions.collectSourceLines = defaults.symbolSource;
+    ctx_.symbolOptions.collectTypes = defaults.symbolTypes;
+    ctx_.symbolOptions.collectLocals = defaults.symbolLocals;
+    investigationRecentQueries_.clear();
+
+    const std::string path = prefsPath();
     if (path.empty()) return;
-    std::ifstream f(path);
-    if (!f) return;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.rfind("theme=", 0) == 0) {
-            int v = std::atoi(line.c_str() + 6);
-            if (v >= 0 && v < (int)theme::ThemeId::Count) theme_ = (theme::ThemeId)v;
-        } else if (line.rfind("density=", 0) == 0) {
-            int v = std::atoi(line.c_str() + 8);
-            if (v >= (int)theme::Density::Compact && v <= (int)theme::Density::Spacious)
-                density_ = (theme::Density)v;
+    const PreferencesBounds bounds{
+        static_cast<int>(theme::ThemeId::Count),
+        static_cast<int>(theme::Density::Compact),
+        static_cast<int>(theme::Density::Spacious),
+    };
+    PreferencesData loaded;
+    if (LoadPreferencesFile(path, defaults, bounds, loaded) ==
+        atomic_file::ReadSource::None)
+        return;
+
+    theme_ = static_cast<theme::ThemeId>(loaded.theme);
+    density_ = static_cast<theme::Density>(loaded.density);
+    ctx_.symbolOptions.networkEnabled = loaded.symbolNetwork;
+    ctx_.symbolOptions.cacheDirectory = std::move(loaded.symbolCache);
+    ctx_.symbolOptions.serverUrl = std::move(loaded.symbolServer);
+    ctx_.symbolOptions.collectSourceLines = loaded.symbolSource;
+    ctx_.symbolOptions.collectTypes = loaded.symbolTypes;
+    ctx_.symbolOptions.collectLocals = loaded.symbolLocals;
+    investigationRecentQueries_.reserve(loaded.investigationRecent.size());
+    for (PreferenceRecentQuery& recent : loaded.investigationRecent) {
+        investigationRecentQueries_.push_back({
+            recent.identity == PreferenceIdentity::Live
+                ? InvestigationIdentity::Live : InvestigationIdentity::File,
+            std::move(recent.query),
+        });
+    }
+}
+
+bool App::savePrefs() {
+    PreferencesData data;
+    data.theme = static_cast<int>(theme_);
+    data.density = static_cast<int>(density_);
+    data.symbolNetwork = ctx_.symbolOptions.networkEnabled;
+    data.symbolCache = ctx_.symbolOptions.cacheDirectory;
+    data.symbolServer = ctx_.symbolOptions.serverUrl;
+    data.symbolSource = ctx_.symbolOptions.collectSourceLines;
+    data.symbolTypes = ctx_.symbolOptions.collectTypes;
+    data.symbolLocals = ctx_.symbolOptions.collectLocals;
+    data.investigationRecent.reserve(
+        std::min(investigationRecentQueries_.size(), kMaxPreferenceRecentQueries));
+    for (size_t i = 0; i < investigationRecentQueries_.size() &&
+                       i < kMaxPreferenceRecentQueries; ++i) {
+        const InvestigationRecentQuery& recent = investigationRecentQueries_[i];
+        data.investigationRecent.push_back({
+            recent.identity == InvestigationIdentity::Live
+                ? PreferenceIdentity::Live : PreferenceIdentity::File,
+            recent.query,
+        });
+    }
+
+    const PreferencesBounds bounds{
+        static_cast<int>(theme::ThemeId::Count),
+        static_cast<int>(theme::Density::Compact),
+        static_cast<int>(theme::Density::Spacious),
+    };
+    const std::string path = prefsPath();
+    const bool ok = !path.empty() && SavePreferencesFile(path, data, bounds);
+    if (ok) {
+        prefsSaveFailed_ = false;
+        prefsSaveError_.clear();
+        return true;
+    }
+
+    const bool firstFailure = !prefsSaveFailed_;
+    prefsSaveFailed_ = true;
+    prefsSaveError_ = "Preferences save failed; the previous prefs.ini/.bak remain available.";
+    if (firstFailure) ui::Toast(ui::ToastKind::Error, prefsSaveError_);
+    return false;
+}
+
+void App::renderSymbolSettingsPopup() {
+    if (ctx_.requestedSymbolSettings) {
+        ctx_.requestedSymbolSettings = false;
+        symbolSettingsOpen_ = true;
+        symbolNetworkDraft_ = ctx_.symbolOptions.networkEnabled;
+        symbolSourceDraft_ = ctx_.symbolOptions.collectSourceLines;
+        symbolTypesDraft_ = ctx_.symbolOptions.collectTypes;
+        symbolLocalsDraft_ = ctx_.symbolOptions.collectLocals;
+        std::snprintf(symbolCacheDraft_, sizeof(symbolCacheDraft_), "%s",
+                      ctx_.symbolOptions.cacheDirectory.c_str());
+        std::snprintf(symbolServerDraft_, sizeof(symbolServerDraft_), "%s",
+                      ctx_.symbolOptions.serverUrl.c_str());
+        symbolSettingsError_.clear();
+        ImGui::OpenPopup("Symbol Settings");
+    }
+    if (!symbolSettingsOpen_) return;
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(650.0f * theme::UiScale(), 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Symbol Settings", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        symbolSettingsOpen_ = false;
+        return;
+    }
+
+    ImGui::TextWrapped("PDB discovery runs on a dedicated worker. Local PDBs and the configured cache are searched without network access unless you explicitly enable the symbol server below.");
+    ImGui::Separator();
+    ImGui::Checkbox("Enable network symbol fetching", &symbolNetworkDraft_);
+    if (symbolNetworkDraft_)
+        ImGui::TextColored(theme::col::warn(),
+                           "The worker may contact the configured server and write downloaded PDBs to the cache.");
+
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("Cache directory", "absolute local cache path",
+                             symbolCacheDraft_, sizeof(symbolCacheDraft_));
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("Symbol server", "https://... or a trusted symbol store",
+                             symbolServerDraft_, sizeof(symbolServerDraft_));
+    ImGui::Checkbox("Source lines", &symbolSourceDraft_);
+    ImGui::SameLine();
+    ImGui::Checkbox("PDB prototypes/types", &symbolTypesDraft_);
+    ImGui::SameLine();
+    ImGui::Checkbox("Parameters/locals", &symbolLocalsDraft_);
+
+    if (!symbolSettingsError_.empty())
+        ImGui::TextColored(theme::col::bad(), "%s", symbolSettingsError_.c_str());
+
+    auto invalidSearchPart = [](const char* value) {
+        return !value || std::strchr(value, '\n') || std::strchr(value, '\r') ||
+               std::strchr(value, ';') || std::strchr(value, '*');
+    };
+    auto remoteCachePath = [](const char* value) {
+        return value && ((value[0] == '\\' && value[1] == '\\') ||
+                         (value[0] == '/' && value[1] == '/') ||
+                         std::strstr(value, "://"));
+    };
+    if (ImGui::Button("Apply", ImVec2(110.0f * theme::UiScale(), 0))) {
+        symbolSettingsError_.clear();
+        if (invalidSearchPart(symbolCacheDraft_) || invalidSearchPart(symbolServerDraft_)) {
+            symbolSettingsError_ = "Cache and server values cannot contain newlines, semicolons, or '*'.";
+        } else if (remoteCachePath(symbolCacheDraft_)) {
+            symbolSettingsError_ = "The symbol cache must be a local path, not a UNC path or URL.";
+        } else if (symbolNetworkDraft_ && (!symbolCacheDraft_[0] || !symbolServerDraft_[0])) {
+            symbolSettingsError_ = "Network fetching requires both an explicit cache and a symbol server.";
+        } else if (symbolNetworkDraft_ && !pathFromUtf8(symbolCacheDraft_).is_absolute()) {
+            symbolSettingsError_ = "The symbol cache must be an absolute local path.";
+        } else {
+            ctx_.symbolOptions.networkEnabled = symbolNetworkDraft_;
+            ctx_.symbolOptions.cacheDirectory = symbolCacheDraft_;
+            ctx_.symbolOptions.serverUrl = symbolServerDraft_;
+            ctx_.symbolOptions.collectSourceLines = symbolSourceDraft_;
+            ctx_.symbolOptions.collectTypes = symbolTypesDraft_;
+            ctx_.symbolOptions.collectLocals = symbolLocalsDraft_;
+            ++ctx_.symbolOptionsRevision;
+            if (!ctx_.symbolOptionsRevision) ++ctx_.symbolOptionsRevision;
+            if (savePrefs()) {
+                symbolSettingsOpen_ = false;
+                ImGui::CloseCurrentPopup();
+            } else {
+                symbolSettingsError_ = prefsSaveError_;
+            }
         }
     }
-}
-
-void App::savePrefs() const {
-    std::string path = prefsPath();
-    if (path.empty()) return;
-    std::ofstream f(path, std::ios::trunc);
-    if (f) f << "theme=" << (int)theme_ << "\n"
-             << "density=" << (int)density_ << "\n";
-}
-
-static Arch archFromMachine(MachineArch m, bool is64) {
-    switch (m) {
-        case MachineArch::X86:     return Arch::X86;
-        case MachineArch::X64:     return Arch::X64;
-        case MachineArch::ARM:     return Arch::ARM;
-        case MachineArch::ARM64:   return Arch::ARM64;
-        case MachineArch::MIPS:    return Arch::MIPS;
-        case MachineArch::MIPS64:  return Arch::MIPS64;
-        case MachineArch::PPC:     return Arch::PPC;
-        case MachineArch::PPC64:   return Arch::PPC64;
-        case MachineArch::RISCV:   return Arch::RISCV32;
-        case MachineArch::RISCV64: return Arch::RISCV64;
-        case MachineArch::JVM:     return Arch::JVM;
-        default:                   return is64 ? Arch::X64 : Arch::X86;
+    ImGui::SameLine();
+    if (ImGui::Button("Defaults", ImVec2(110.0f * theme::UiScale(), 0))) {
+        symbolNetworkDraft_ = false;
+        symbolSourceDraft_ = symbolTypesDraft_ = symbolLocalsDraft_ = true;
+        std::snprintf(symbolCacheDraft_, sizeof(symbolCacheDraft_), "%s",
+                      defaultSymbolCachePath().c_str());
+        std::snprintf(symbolServerDraft_, sizeof(symbolServerDraft_), "%s",
+                      "https://msdl.microsoft.com/download/symbols");
+        symbolSettingsError_.clear();
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f * theme::UiScale(), 0))) {
+        symbolSettingsOpen_ = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
-void AppContext::loadProjectForBinary(bool applySavedArchEngine) {
-    project.reset();
-    if (!binary.loaded()) return;
-    uint64_t h = binary.contentHash();
+static bool archFromMachine(MachineArch m, Arch& out) {
+    switch (m) {
+        case MachineArch::X86:     out = Arch::X86; return true;
+        case MachineArch::X64:     out = Arch::X64; return true;
+        case MachineArch::ARM:     out = Arch::ARM; return true;
+        case MachineArch::THUMB:   out = Arch::THUMB; return true;
+        case MachineArch::ARM64:   out = Arch::ARM64; return true;
+        case MachineArch::MIPS:    out = Arch::MIPS; return true;
+        case MachineArch::MIPS64:  out = Arch::MIPS64; return true;
+        case MachineArch::PPC:     out = Arch::PPC; return true;
+        case MachineArch::PPC64:   out = Arch::PPC64; return true;
+        case MachineArch::RISCV:   out = Arch::RISCV32; return true;
+        case MachineArch::RISCV64: out = Arch::RISCV64; return true;
+        case MachineArch::JVM:     out = Arch::JVM; return true;
+        case MachineArch::GML:     out = Arch::GML; return true;
+        case MachineArch::Unknown: return false;
+    }
+    return false;
+}
+
+bool AppContext::debuggerRuntimeImage(const DbgSnapshot& snap, uint64_t& baseOut,
+                                      uint64_t& sizeOut) const {
+    baseOut = sizeOut = 0;
+    const BinaryFile& binary = staticBinary();
+    const Arch arch = staticArch();
+    const bool liveDebuggee = snap.state == DbgState::Running ||
+                              snap.state == DbgState::Paused;
+    if (!liveDebuggee || !binary.loaded() || !debuggerActionsMatchImage()) return false;
+    const bool wants32 = arch == Arch::X86;
+    if ((!wants32 && arch != Arch::X64) || snap.is32 != wants32) return false;
+
+    const DocumentRuntimeMetadata::LiveImageIdentity& live =
+        staticRuntimeMetadata().liveImage;
+    if (!live.valid || live.pid != snap.pid ||
+        live.sessionGeneration != snap.sessionGeneration ||
+        !live.moduleBase)
+        return false;
+    if (!binary.isMappedImage()) {
+        // A session stamp is granted only by the fresh-attach backing-file
+        // validation. Any enabled analyst patch makes the file/process byte
+        // relationship uncertain again and disables FILE->LIVE writes; disabled
+        // experiment records leave the verified pristine image untouched.
+        if (hasEnabledProjectPatches(staticProject()) || live.modulePath.empty() ||
+            !AttachedImagePathsMatch(binary.path(), live.modulePath))
+            return false;
+    }
+    const AttachedModuleIdentity expected{
+        live.moduleBase, live.moduleSize,
+        live.moduleName, live.modulePath,
+        live.moduleLoadGeneration
+    };
+    const DbgModule* module = matchingAttachedModule(snap, expected);
+    if (!module || !module->size) return false;
+    baseOut = module->base;
+    sizeOut = module->size;
+    return true;
+}
+
+bool AppContext::debuggerStaticRuntimeVA(const DbgSnapshot& snap, uint64_t fileVA,
+                                         uint64_t& runtimeVA) const {
+    runtimeVA = 0;
+    const BinaryFile& binary = staticBinary();
+    uint64_t runtimeBase = 0, runtimeSize = 0;
+    if (!debuggerRuntimeImage(snap, runtimeBase, runtimeSize) ||
+        fileVA < binary.imageBase())
+        return false;
+    // A static address can be mapped without having file bytes (for example,
+    // zero-filled PE section padding).  Runtime translation is an image/RVA
+    // relationship, so do not incorrectly require ptrFromVA/file backing.
+    const AddressInspection inspected = InspectAddress(binary, fileVA);
+    if (!inspected.staticMapped || !inspected.rva.valid) return false;
+    const uint64_t rva = inspected.rva.value;
+    return rva < runtimeSize && CheckedAddressAdd(runtimeBase, rva, runtimeVA);
+}
+
+ProjectState AppContext::projectForBinary(const BinaryFile& binary, Engine& engine,
+                                          Arch& arch, bool applySavedArchEngine,
+                                          bool loadSavedState,
+                                          std::string* loadWarning) const {
+    ProjectState project;
+    if (!binary.loaded()) return project;
+    const uint64_t h = binary.contentHash();
     ProjectState loaded;
-    if (LoadProject(h, loaded)) {
+    ProjectLoadResult loadResult;
+    if (loadSavedState) loadResult = LoadProjectDetailed(h, loaded);
+    if (loadWarning && loadSavedState) {
+        if (loadResult.recoveredFromBackup() ||
+            (!loadResult.loaded &&
+             (ProjectLoadAttemptRequiresWarning(loadResult.primary) ||
+              ProjectLoadAttemptRequiresWarning(loadResult.backup)))) {
+            *loadWarning = loadResult.error.empty()
+                ? (loadResult.recoveredFromBackup()
+                    ? "Recovered project analysis from the backup sidecar."
+                    : "The saved project sidecar is invalid and was not applied.")
+                : loadResult.error;
+        }
+    }
+    if (loadResult.loaded) {
         project = std::move(loaded);   // restore saved analysis
         // Reapply the saved engine/arch so the binary reopens exactly as last
         // analyzed - especially valuable for raw blobs and mis-detected images
@@ -188,7 +1426,6 @@ void AppContext::loadProjectForBinary(bool applySavedArchEngine) {
         if (applySavedArchEngine) {
             Arch   savedArch;   if (ArchFromName(project.arch.c_str(), savedArch))   arch   = savedArch;
             Engine savedEngine; if (EngineFromName(project.engine.c_str(), savedEngine)) engine = savedEngine;
-            rebuildDisassembler();
         }
     }
     project.hash       = h;
@@ -198,115 +1435,831 @@ void AppContext::loadProjectForBinary(bool applySavedArchEngine) {
     size_t s = binary.path().find_last_of("/\\");
     project.name       = (s == std::string::npos) ? binary.path() : binary.path().substr(s + 1);
     project.lastOpenedUnix = (int64_t)std::time(nullptr);
+    return project;
 }
 
-void AppContext::saveProject() {
+void AppContext::prepareProjectSaveSnapshot() {
+    ProjectState& project = staticProject();
+    const BinaryFile& binary = staticBinary();
+    const Engine engine = staticEngine();
+    const Arch arch = staticArch();
+    project.arch   = ArchName(arch);
+    project.engine = EngineNameOf(engine);
+    project.rawMappingSaved = binary.format() == BinFormat::Raw;
+    project.rawLandmarks.clear();
+    if (project.rawMappingSaved) {
+        const DecoderConfig decoder = staticDecoderConfig();
+        project.rawImageBase = binary.imageBase();
+        project.rawEntryExplicit = binary.rawEntryExplicit();
+        project.rawEntry = project.rawEntryExplicit ? binary.entryPointVA() : 0;
+        project.rawBigEndian = decoder.byteOrder == ByteOrder::Big;
+        storeRawDecoderFeatures(project, decoder.features);
+        project.rawLandmarks.reserve(binary.analysisLandmarks().size());
+        for (const AnalysisLandmark& landmark : binary.analysisLandmarks())
+            project.rawLandmarks.push_back({landmark.address, landmark.name, landmark.evidence});
+    } else {
+        project.rawImageBase = project.rawEntry = 0;
+        project.rawEntryExplicit = false;
+        project.rawBigEndian = false;
+        storeRawDecoderFeatures(project, DecoderFeatures{});
+    }
+}
+
+bool AppContext::finishProjectSave(bool wait) {
+    if (!projectSaveFuture.valid()) return projectSaveState != ProjectSaveState::Failed;
+    if (!wait && projectSaveFuture.wait_for(std::chrono::seconds(0)) !=
+                 std::future_status::ready)
+        return true;
+
+    const DocumentSaveTicket ticket = projectSaveInFlightTicket;
+    const uint64_t appRevision = projectSaveInFlightRevision;
+    const uint64_t sequence = projectSaveInFlightSequence;
+    ProjectSaveResult result;
+    try {
+        if (wait) projectSaveFuture.wait();
+        result = projectSaveFuture.get();
+    } catch (...) {
+        result.saved = false;
+        result.error = "Project save worker failed unexpectedly.";
+    }
+    projectSaveInFlightTicket = {};
+    projectSaveInFlightRevision = 0;
+    projectSaveInFlightSequence = 0;
+    if (sequence) projectSaveCompletedSequence =
+        (std::max)(projectSaveCompletedSequence, sequence);
+
+    DocumentContext* origin = ticket ? documents_.find(ticket.document) : nullptr;
+    if (!result.saved) {
+        projectSaveState = ProjectSaveState::Failed;
+        projectSaveError = result.error.empty()
+                         ? "Project save failed; your in-memory changes are still dirty."
+                         : result.error;
+        projectSaveWarning.clear();
+        if (origin) (void)origin->rejectExternalSave(ticket, projectSaveError);
+        projectDirtySince = std::chrono::steady_clock::now();
+        return false;
+    }
+
+    ++documentRetryRevision_;
+    if (!documentRetryRevision_) ++documentRetryRevision_;
+
+    // A transition is required to join this writer before replacing/closing its
+    // image. Validate anyway so an accidental future caller cannot acknowledge
+    // a different image which happens to reuse the same DocumentId/revision.
+    const bool acknowledged = origin && origin->acknowledgeExternalSave(ticket);
+    if (acknowledged && documents_.activeId() == ticket.document) {
+        projectSavedRevision = (std::max)(projectSavedRevision, appRevision);
+        projectSaveError.clear();
+        projectSaveWarning = std::move(result.warning);
+        projectSaveState = origin->dirty() ? ProjectSaveState::Dirty
+                                           : ProjectSaveState::Clean;
+    } else if (documents_.active()) {
+        DocumentContext* active = documents_.active();
+        projectSaveState = active->dirty() ? ProjectSaveState::Dirty
+                                           : ProjectSaveState::Clean;
+        if (active->saveState() != DocumentSaveState::Failed)
+            projectSaveError.clear();
+        projectSaveWarning = std::move(result.warning);
+    }
+    return true;
+}
+
+void AppContext::pollProjectSave() {
+    finishProjectSave(false);
+}
+
+bool AppContext::beginProjectSave() {
+    DocumentContext& document = activeStaticDocument();
+    if (projectSaveFuture.valid()) {
+        // The same document's worker is already the latest permitted writer.
+        // A different document may never start while it is outstanding: join
+        // and publish A's completion before taking B's snapshot.
+        if (projectSaveInFlightTicket.document == document.id() &&
+            projectSaveInFlightTicket.imageGeneration ==
+                document.imageGeneration())
+            return true;
+        if (!finishProjectSave(true)) return false;
+    }
+
     // Live (memory-mapped) modules are not sidecar-persisted: their content hash is a
     // memory image, not the on-disk file, so a sidecar would never re-match and would
     // litter %APPDATA% with junk keyed to a one-off mapping.
-    if (!binary.loaded() || !project.hash || binary.isMappedImage()) return;
-    // Refresh the engine/arch so a choice made via the Engine menu since load is
-    // persisted (these are stamped at load but the menu mutates the live context).
-    project.arch   = ArchName(arch);
-    project.engine = EngineNameOf(engine);
-    SaveProject(project);
+    const BinaryFile& binary = staticBinary();
+    const ProjectState& project = staticProject();
+    if (!binary.loaded() || !project.hash ||
+        document.persistence() == DocumentInstallPersistence::Ephemeral ||
+        binary.isMappedImage()) {
+        projectSavedRevision = projectRevision;
+        (void)document.acknowledgeExternalSave(document.externalSaveTicket());
+        projectSaveState = ProjectSaveState::Clean;
+        projectSaveError.clear();
+        projectSaveWarning.clear();
+        return true;
+    }
+    if (!document.dirty()) {
+        projectSavedRevision = projectRevision;
+        projectSaveState = ProjectSaveState::Clean;
+        projectSaveError.clear();
+        projectSaveWarning.clear();
+        return true;
+    }
+
+    prepareProjectSaveSnapshot();
+    ProjectState snapshot = project;
+    projectSaveInFlightRevision = projectRevision;
+    projectSaveInFlightTicket = document.externalSaveTicket();
+    projectSaveInFlightSequence = projectSaveNextSequence++;
+    if (!projectSaveNextSequence) ++projectSaveNextSequence;
+    projectSaveState = ProjectSaveState::Saving;
+    projectSaveError.clear();
+    projectSaveWarning.clear();
+    try {
+        projectSaveFuture = std::async(std::launch::async,
+            [snapshot = std::move(snapshot)]() { return SaveProjectDetailed(snapshot); });
+    } catch (...) {
+        projectSaveState = ProjectSaveState::Failed;
+        projectSaveError = "Project save worker could not be started; changes remain in memory.";
+        (void)document.rejectExternalSave(projectSaveInFlightTicket,
+                                          projectSaveError);
+        projectSaveInFlightTicket = {};
+        projectSaveInFlightRevision = 0;
+        projectSaveInFlightSequence = 0;
+        projectDirtySince = std::chrono::steady_clock::now();
+        return false;
+    }
+    return true;
+}
+
+bool AppContext::saveProject() {
+    if (projectSaveFuture.valid() && !finishProjectSave(true)) return false;
+    if (!beginProjectSave()) return false;
+    return finishProjectSave(true);
+}
+
+bool AppContext::prepareStaticDocumentTransition(std::string* error) {
+    if (error) error->clear();
+    // This is the serialization point between the render-thread controller and
+    // both the async writer and DocumentContext's synchronous transition store.
+    // It ensures an older snapshot can never finish after a replacement save.
+    if (saveProject()) return true;
+    if (error) *error = projectSaveError.empty()
+                      ? "Project save failed; the current target was preserved."
+                      : projectSaveError;
+    return false;
+}
+
+void AppContext::resetProjectSaveMirrorFromActive() {
+    const DocumentContext& document = activeStaticDocument();
+    projectRevision = document.revision();
+    projectSavedRevision = document.savedRevision();
+    projectSaveError = document.saveError();
+    projectSaveWarning.clear();
+    switch (document.saveState()) {
+    case DocumentSaveState::Dirty:  projectSaveState = ProjectSaveState::Dirty; break;
+    case DocumentSaveState::Saving: projectSaveState = ProjectSaveState::Saving; break;
+    case DocumentSaveState::Failed: projectSaveState = ProjectSaveState::Failed; break;
+    default:                        projectSaveState = ProjectSaveState::Clean; break;
+    }
+    if (document.dirty()) projectDirtySince = std::chrono::steady_clock::now();
+}
+
+bool AppContext::clearStaticImage(std::string* error) {
+    if (!prepareStaticDocumentTransition(error)) return false;
+    if (!activeStaticDocument().clearImage(error)) return false;
+    resetProjectSaveMirrorFromActive();
+    return true;
+}
+
+AppContext::BinaryLoadCandidate AppContext::buildBinaryLoadCandidate(
+    const std::string& path,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    BinaryLoadCandidate result;
+    result.path = path;
+    const auto cancellationRequested = [&] {
+        return cancelled && cancelled->load(std::memory_order_acquire);
+    };
+    BinaryFile candidate;
+    BinaryLoadOptions loadOptions;
+    loadOptions.cancelled = cancellationRequested;
+    if (!candidate.load(path, loadOptions)) {
+        result.cancelled = candidate.loadError() == BinaryLoadError::Cancelled;
+        result.error = candidate.loadErrorText().empty()
+                     ? "The binary could not be loaded."
+                     : candidate.loadErrorText();
+        switch (candidate.loadError()) {
+        case BinaryLoadError::UnsupportedMachine:
+        case BinaryLoadError::MalformedPE:
+        case BinaryLoadError::MalformedELF:
+        case BinaryLoadError::MalformedMachO:
+        case BinaryLoadError::MalformedJavaClass:
+        case BinaryLoadError::MalformedGameMakerArchive:
+            result.offerRaw = true;
+            result.error +=
+                " The format was recognized, so no fallback instruction set was granted. "
+                "Use File > Open as Raw only if you intentionally want to choose the mapping and architecture.";
+            break;
+        default:
+            break;
+        }
+        return result;
+    }
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Binary load cancelled.";
+        return result;
+    }
+    bool ignoredInvalidRawProject = false;
+    std::string projectLoadWarning;
+    std::optional<RawLoadSelection> restoredRawSelection;
+
+    // A raw file has no self-describing base, entry, or code roots. If its
+    // content-hash sidecar carries an exact raw mapping, rebuild that mapping
+    // before exposing the target; loading once at the fallback base and only
+    // restoring annotations would silently shift every saved VA.
+    if (candidate.format() == BinFormat::Raw) {
+        ProjectState saved;
+        const ProjectLoadResult rawLoad = LoadProjectDetailed(candidate.contentHash(), saved);
+        if (rawLoad.recoveredFromBackup() && !rawLoad.error.empty())
+            projectLoadWarning = rawLoad.error;
+        if (rawLoad.loaded && saved.rawMappingSaved) {
+            Arch savedArch;
+            bool valid = ArchFromName(saved.arch.c_str(), savedArch) &&
+                         ArchMappingRangeFits(savedArch, saved.rawImageBase,
+                                              candidate.bytes().size());
+            RawLoadSelection selection;
+            if (valid) {
+                selection.arch = savedArch;
+                selection.entryVA = saved.rawEntry;
+                selection.entryExplicit = saved.rawEntryExplicit;
+                selection.byteOrder = saved.rawBigEndian ? ByteOrder::Big : ByteOrder::Little;
+                DecoderFeatures features;
+                if (DecoderFeaturesFromBits(saved.rawDecoderFeatureBits, features))
+                    selection.riscvCompressed = features.riscvCompressed;
+                selection.landmarks.reserve(saved.rawLandmarks.size());
+                for (const PjRawLandmark& landmark : saved.rawLandmarks)
+                    selection.landmarks.push_back(
+                        {landmark.address, landmark.name, landmark.evidence});
+                BinaryFile remapped;
+                valid = remapped.loadRaw(path, saved.rawImageBase, loadOptions) &&
+                        (!saved.rawEntryExplicit || remapped.setRawEntryPointVA(saved.rawEntry)) &&
+                        remapped.setAnalysisLandmarks(selection.landmarks);
+                if (valid) {
+                    candidate = std::move(remapped);
+                    restoredRawSelection = std::move(selection);
+                }
+            }
+            ignoredInvalidRawProject = !valid;
+        }
+        if (cancellationRequested()) {
+            result.cancelled = true;
+            result.error = "Binary load cancelled.";
+            return result;
+        }
+        if (!restoredRawSelection) {
+            result.offerRaw = true;
+            result.error = ignoredInvalidRawProject
+                ? "The saved Raw mapping or decoder metadata was invalid. Review the mapping and architecture explicitly."
+                : "The file has no supported structured format. Review the Raw mapping and architecture explicitly; no fallback instruction set was granted.";
+            return result;
+        }
+    }
+    // Cheap metadata still runs on the load worker: large archives and firmware
+    // probes must not monopolize the Win32/ImGui thread.
+    DocumentRuntimeMetadata metadata;
+    metadata.java = ScanJava(candidate);
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Binary load cancelled.";
+        return result;
+    }
+    metadata.runtime = ScanRuntimes(candidate, metadata.java);
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Binary load cancelled.";
+        return result;
+    }
+    constexpr size_t kFirmwareUiProbeCap = 512ull * 1024ull * 1024ull;
+    metadata.firmware = candidate.format() == BinFormat::Raw &&
+                        candidate.bytes().size() <= kFirmwareUiProbeCap
+                      ? SniffFirmware(candidate.bytes()) : FirmwareDetection{};
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Binary load cancelled.";
+        return result;
+    }
+
+    result.browseArchive = metadata.runtime.isStandaloneArchive &&
+                           !metadata.java.entries.empty();
+    result.image = std::move(candidate);
+    result.metadata = std::move(metadata);
+    result.ignoredInvalidRawProject = ignoredInvalidRawProject;
+    result.projectLoadWarning = std::move(projectLoadWarning);
+    if (restoredRawSelection) {
+        restoredRawSelection->firmware = metadata.firmware;
+        result.rawSelection = std::move(restoredRawSelection);
+    }
+    result.success = true;
+    return result;
+}
+
+AppContext::BinaryLoadCandidate AppContext::buildRawLoadCandidate(
+    const std::string& path, uint64_t base, RawLoadSelection selection,
+    const std::shared_ptr<std::atomic_bool>& cancelled) {
+    BinaryLoadCandidate result;
+    result.path = path;
+    const auto cancellationRequested = [&] {
+        return cancelled && cancelled->load(std::memory_order_acquire);
+    };
+    BinaryLoadOptions loadOptions;
+    loadOptions.cancelled = cancellationRequested;
+    BinaryFile image;
+    if (!image.loadRaw(path, base, loadOptions)) {
+        result.cancelled = image.loadError() == BinaryLoadError::Cancelled;
+        result.error = image.loadErrorText().empty()
+                     ? "The Raw image could not be loaded."
+                     : image.loadErrorText();
+        return result;
+    }
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Raw binary load cancelled.";
+        return result;
+    }
+    if (!ArchMappingRangeFits(selection.arch, base, image.bytes().size())) {
+        result.error = "The selected architecture cannot address the complete Raw mapping.";
+        return result;
+    }
+    if ((selection.entryExplicit && !image.setRawEntryPointVA(selection.entryVA)) ||
+        !image.setAnalysisLandmarks(std::move(selection.landmarks))) {
+        result.error = "The Raw entry point or an analysis landmark is outside the mapped file.";
+        return result;
+    }
+    DocumentRuntimeMetadata metadata;
+    metadata.runtime = ScanRuntimes(image, metadata.java);
+    metadata.firmware = std::move(selection.firmware);
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Raw binary load cancelled.";
+        return result;
+    }
+    result.image = std::move(image);
+    result.metadata = std::move(metadata);
+    result.rawSelection = std::move(selection);
+    result.success = true;
+    return result;
+}
+
+bool AppContext::stageBinaryLoadCandidate(BinaryLoadCandidate candidate) {
+    if (!candidate.success) {
+        documentCommandError_ = candidate.error.empty()
+                              ? "The binary could not be loaded." : candidate.error;
+        return false;
+    }
+    if (pendingDocumentCommand_) {
+        documentCommandError_ =
+            "Another document operation is already queued for this frame.";
+        return false;
+    }
+
+    BinaryFile& image = candidate.image;
+    Engine targetEngine = staticEngine();
+    Arch targetArch = candidate.rawSelection ? candidate.rawSelection->arch : Arch::X64;
+    if (!candidate.rawSelection && !archFromMachine(image.machine(), targetArch)) {
+        documentCommandError_ =
+            "The structured image has no supported machine architecture. Open it explicitly as Raw to choose a decoder.";
+        return false;
+    }
+    ProjectState targetProject = projectForBinary(
+        image, targetEngine, targetArch,
+        /*applySavedArchEngine=*/!candidate.rawSelection.has_value(),
+        /*loadSavedState=*/!candidate.ignoredInvalidRawProject,
+        &candidate.projectLoadWarning);
+    DecoderConfig targetDecoder;
+    targetDecoder.engine = targetEngine;
+    targetDecoder.arch = targetArch;
+    if (candidate.rawSelection) {
+        const RawLoadSelection& raw = *candidate.rawSelection;
+        targetProject.rawBigEndian = raw.byteOrder == ByteOrder::Big;
+        DecoderFeatures rawFeatures;
+        if (!DecoderFeaturesFromBits(targetProject.rawDecoderFeatureBits,
+                                     rawFeatures)) {
+            rawFeatures = DecoderFeatures{};
+            candidate.projectLoadWarning =
+                "The saved Raw decoder feature mask was invalid; default ISA features were used.";
+        }
+        rawFeatures.riscvCompressed = raw.riscvCompressed;
+        storeRawDecoderFeatures(targetProject, rawFeatures);
+        targetDecoder.byteOrder = raw.byteOrder;
+        targetDecoder.features = rawFeatures;
+    } else if (image.format() == BinFormat::Raw) {
+        targetDecoder.byteOrder = targetProject.rawBigEndian
+                                ? ByteOrder::Big : ByteOrder::Little;
+        DecoderFeatures savedFeatures;
+        if (DecoderFeaturesFromBits(targetProject.rawDecoderFeatureBits,
+                                    savedFeatures)) {
+            targetDecoder.features = savedFeatures;
+        } else {
+            // Deserialization rejects this already; retain a defensive visible
+            // fallback for any future programmatic ProjectState producer.
+            targetDecoder.features = DecoderFeatures{};
+            candidate.projectLoadWarning =
+                "The saved Raw decoder feature mask was invalid; default ISA features were used.";
+        }
+    }
+    const size_t slash = candidate.path.find_last_of("/\\");
+    PendingDocumentCommand command;
+    command.kind = PendingDocumentKind::Open;
+    command.title = slash == std::string::npos
+                  ? candidate.path : candidate.path.substr(slash + 1);
+    if (command.title.empty()) command.title = "Untitled";
+    command.image = std::move(candidate.image);
+    command.project = std::move(targetProject);
+    command.decoder = targetDecoder;
+    command.persistence = DocumentInstallPersistence::RequiresInitialSave;
+    command.metadata = std::move(candidate.metadata);
+    command.browseArchive = candidate.browseArchive;
+    command.ignoredInvalidRawProject = candidate.ignoredInvalidRawProject;
+    command.projectLoadWarning = std::move(candidate.projectLoadWarning);
+    return queueDocumentOpen(std::move(command));
 }
 
 bool AppContext::loadBinaryPath(const std::string& path) {
-    saveProject();                 // persist the outgoing target's analysis first
-    analysis.cancelAndWaitIdle();  // no worker may be reading the old image when load() frees its bytes
-    if (!binary.load(path)) return false;
-    // A still-attached debug session belongs to the previous target: end it so the
-    // new binary starts from a clean static state (the Binary View's detach edge
-    // then releases the per-session live caches + module registry). Done after a
-    // successful load so a failed open doesn't tear down the running session.
-    {
-        DbgSnapshot s = debug.snapshot();
-        if (s.attached()) {
-            debug.detach();
-            ui::Toast(ui::ToastKind::Info,
-                      "Detached from pid " + std::to_string(s.pid) + " (new target loaded)");
-        }
-    }
-    arch = archFromMachine(binary.machine(), binary.is64Bit());
-    rebuildDisassembler();
-    loadProjectForBinary();
-    // Java wrapper / embedded-JAR detection: cheap (EOCD + CD walk + a few BMH
-    // string scans), so it runs synchronously here -- after cancelAndWaitIdle,
-    // before any worker touches the new image. Not pushed into AnalysisService.
-    javaInfo = ScanJava(binary);
-    runtimeInfo = ScanRuntimes(binary, javaInfo);
-    // Opening a .jar/.zip directly: land the user in the archive-entries browser.
-    if (runtimeInfo.isStandaloneArchive && !javaInfo.entries.empty())
-        requestedBrowseArchive = true;
-    binaryJustLoaded = true;       // Binary View re-homes to the entry point + auto-analyzes
-    return true;
+    return stageBinaryLoadCandidate(buildBinaryLoadCandidate(path));
 }
 
-bool AppContext::loadRawPath(const std::string& path, uint64_t base, Arch a) {
-    // Stage the new mapping first. A malformed base/overflow/I/O failure must not
-    // clear the currently-open target or detach its live debug session.
-    BinaryFile candidate;
-    if (!candidate.loadRaw(path, base)) return false;
-    saveProject();
-    analysis.cancelAndWaitIdle();  // see loadBinaryPath
-    binary = std::move(candidate);  // keep the AppContext BinaryFile object address stable
-    {   // see loadBinaryPath: a leftover session belongs to the previous target
-        DbgSnapshot s = debug.snapshot();
-        if (s.attached()) {
-            debug.detach();
-            ui::Toast(ui::ToastKind::Info,
-                      "Detached from pid " + std::to_string(s.pid) + " (new target loaded)");
-        }
+bool AppContext::beginBinaryLoadPath(const std::string& path) {
+    documentCommandError_.clear();
+    if (path.empty()) {
+        documentCommandError_ = "No binary path was supplied.";
+        return false;
     }
-    arch = a;
-    rebuildDisassembler();
-    loadProjectForBinary(/*applySavedArchEngine=*/false);   // the dialog's arch choice wins
-    javaInfo = JavaScanResult{};   // raw blobs: no PE overlay semantics
-    runtimeInfo = ScanRuntimes(binary, javaInfo); // includes low-confidence entropy/runtime heuristics
-    binaryJustLoaded = true;
-    return true;
+    if (pendingDocumentCommand_ || binaryLoadFuture_.valid()) {
+        documentCommandError_ = "Another document load or operation is already pending.";
+        return false;
+    }
+    try {
+        binaryLoadCancelled_ = std::make_shared<std::atomic_bool>(false);
+        binaryLoadPath_ = path;
+        const auto cancelled = binaryLoadCancelled_;
+        binaryLoadFuture_ = std::async(std::launch::async,
+            [path, cancelled] { return buildBinaryLoadCandidate(path, cancelled); });
+        return true;
+    } catch (const std::exception& exception) {
+        documentCommandError_ = std::string("Could not start the binary-load worker: ") +
+                                exception.what();
+    } catch (...) {
+        documentCommandError_ = "Could not start the binary-load worker.";
+    }
+    binaryLoadCancelled_.reset();
+    binaryLoadPath_.clear();
+    return false;
 }
 
-bool AppContext::loadLiveModule(uint64_t base, uint64_t size, const std::string& name) {
-    if (!debug.snapshot().attached() || !base) return false;
-    if (!size) size = 0x10000;
-    if (size > 256ull * 1024 * 1024) size = 256ull * 1024 * 1024;   // cap pathological sizes
+bool AppContext::beginRawLoadPath(const std::string& path, uint64_t base, Arch arch,
+                                  uint64_t entryVA,
+                                  std::vector<AnalysisLandmark> landmarks,
+                                  FirmwareDetection firmware,
+                                  bool entryExplicit,
+                                  ByteOrder byteOrder,
+                                  bool riscvCompressed) {
+    documentCommandError_.clear();
+    if (path.empty()) {
+        documentCommandError_ = "No Raw binary path was supplied.";
+        return false;
+    }
+    if (pendingDocumentCommand_ || binaryLoadFuture_.valid()) {
+        documentCommandError_ = "Another document load or operation is already pending.";
+        return false;
+    }
+    RawLoadSelection selection;
+    selection.arch = arch;
+    selection.entryVA = entryVA;
+    selection.entryExplicit = entryExplicit;
+    selection.byteOrder = byteOrder;
+    selection.riscvCompressed = riscvCompressed;
+    selection.landmarks = std::move(landmarks);
+    selection.firmware = std::move(firmware);
+    try {
+        binaryLoadCancelled_ = std::make_shared<std::atomic_bool>(false);
+        binaryLoadPath_ = path;
+        const auto cancelled = binaryLoadCancelled_;
+        binaryLoadFuture_ = std::async(std::launch::async,
+            [path, base, selection = std::move(selection), cancelled]() mutable {
+                return buildRawLoadCandidate(path, base, std::move(selection), cancelled);
+            });
+        return true;
+    } catch (const std::exception& exception) {
+        documentCommandError_ = std::string("Could not start the Raw-load worker: ") +
+                                exception.what();
+    } catch (...) {
+        documentCommandError_ = "Could not start the Raw-load worker.";
+    }
+    binaryLoadCancelled_.reset();
+    binaryLoadPath_.clear();
+    return false;
+}
+
+void AppContext::cancelBinaryLoad() {
+    if (binaryLoadCancelled_)
+        binaryLoadCancelled_->store(true, std::memory_order_release);
+}
+
+AppContext::BinaryLoadPoll AppContext::pollBinaryLoad() {
+    BinaryLoadPoll poll;
+    if (!binaryLoadFuture_.valid() ||
+        binaryLoadFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return poll;
+
+    poll.completed = true;
+    poll.path = std::move(binaryLoadPath_);
+    try {
+        BinaryLoadCandidate candidate = binaryLoadFuture_.get();
+        poll.path = candidate.path;
+        poll.cancelled = candidate.cancelled;
+        poll.offerRaw = candidate.offerRaw;
+        poll.success = stageBinaryLoadCandidate(std::move(candidate));
+        if (!poll.success)
+            poll.error = poll.cancelled ? "Binary load cancelled." : documentCommandError_;
+    } catch (const std::exception& exception) {
+        poll.error = std::string("Binary-load worker failed: ") + exception.what();
+        documentCommandError_ = poll.error;
+    } catch (...) {
+        poll.error = "Binary-load worker failed with an unknown exception.";
+        documentCommandError_ = poll.error;
+    }
+    binaryLoadCancelled_.reset();
+    return poll;
+}
+
+bool AppContext::loadRawPath(const std::string& path, uint64_t base, Arch a,
+                             uint64_t entryVA,
+                             std::vector<AnalysisLandmark> landmarks,
+                             FirmwareDetection firmware,
+                             bool entryExplicit,
+                             ByteOrder byteOrder,
+                             bool riscvCompressed) {
+    RawLoadSelection selection;
+    selection.arch = a;
+    selection.entryVA = entryVA;
+    selection.entryExplicit = entryExplicit;
+    selection.byteOrder = byteOrder;
+    selection.riscvCompressed = riscvCompressed;
+    selection.landmarks = std::move(landmarks);
+    selection.firmware = std::move(firmware);
+    return stageBinaryLoadCandidate(
+        buildRawLoadCandidate(path, base, std::move(selection)));
+}
+
+bool AppContext::loadLiveModule(uint64_t base, uint64_t size,
+                                const std::string& name,
+                                const std::string& path,
+                                LiveDocumentOpenOrigin origin) {
+    if (pendingDocumentCommand_) {
+        documentCommandError_ =
+            "Another document operation is already queued for this frame.";
+        return false;
+    }
+    const DbgSnapshot session = debug.snapshot();
+    if (!liveDocumentSessionState(session) || !base) return false;
+
+    const DbgModule* observed = nullptr;
+    for (const DbgModule& module : session.modules) {
+        if (module.base == base) {
+            observed = &module;
+            break;
+        }
+    }
+    if (!observed) return false;
+    if (size && observed->size && size != observed->size) return false;
+    if (!path.empty() && !observed->path.empty() &&
+        !AttachedImagePathsMatch(path, observed->path) && path != observed->path)
+        return false;
+    if (path.empty() && !name.empty() && !observed->name.empty() &&
+        !AttachedModuleNamesMatch(name, observed->name))
+        return false;
+
+    const AttachedModuleIdentity exactModule = attachedModuleIdentity(*observed);
+    const uint64_t reportedSize = exactModule.size;
+    uint64_t captureSize = reportedSize ? reportedSize : size;
+    if (!captureSize) captureSize = 0x10000;
+    if (captureSize > 256ull * 1024 * 1024)
+        captureSize = 256ull * 1024 * 1024;   // cap pathological sizes
     // Read the module's mapped image straight from the debuggee (masked so our own
     // 0xCC breakpoints don't corrupt the decode). This is one module (a few MB), so the
     // brief read on the UI thread is acceptable; "analyze all modules" uses the worker.
-    std::vector<uint8_t> img(size);
+    std::vector<uint8_t> img(static_cast<size_t>(captureSize));
     size_t got = debug.readMemoryMasked(base, img.data(), img.size());
     if (!got) return false;
     img.resize(got);
 
-    saveProject();                 // persist the OUTGOING target (no-op for a live module)
-    analysis.cancelAndWaitIdle();  // no worker may be reading the image we're about to replace
-    if (!binary.loadFromMemory(std::move(img), base, name)) return false;
-    arch = archFromMachine(binary.machine(), binary.is64Bit());
-    rebuildDisassembler();
-    // Live modules are in-session only: start from a clean project (no sidecar load),
-    // and register/activate this module so the browser tracks the active one.
-    project.reset();
-    javaInfo = JavaScanResult{};   // live mapping: rawOffset is an RVA, overlay math is meaningless
-    runtimeInfo = RuntimeScanResult{};
-    modules.addOrUpdate(name, base, size);
-    if (LoadedModule* m = modules.byBase(base)) m->arch = binary.machine();
-    modules.setActiveByBase(base);
-    binaryJustLoaded = true;       // Binary View re-homes to the entry point + auto-analyzes
-    return true;
+    BinaryFile candidate;
+    const std::string imageIdentity = exactModule.path.empty()
+        ? exactModule.name : exactModule.path;
+    if (!candidate.loadFromMemory(std::move(img), base, imageIdentity)) return false;
+    Arch targetArch = Arch::X64;
+    if (!archFromMachine(candidate.machine(), targetArch)) {
+        ui::Toast(ui::ToastKind::Error,
+                  "The live module's structured machine architecture is unsupported; no decoder was selected.");
+        return false;
+    }
+    const Engine targetEngine = staticEngine();
+    const DbgSnapshot confirmed = debug.snapshot();
+    if (!liveDocumentSessionState(confirmed) ||
+        confirmed.pid != session.pid ||
+        confirmed.sessionGeneration != session.sessionGeneration ||
+        !matchingAttachedModule(confirmed, exactModule))
+        return false;
+
+    const std::string& displayIdentity = exactModule.name.empty()
+        ? imageIdentity : exactModule.name;
+    const size_t slash = displayIdentity.find_last_of("/\\");
+    std::string leaf = slash == std::string::npos
+                     ? displayIdentity : displayIdentity.substr(slash + 1);
+    if (leaf.empty()) leaf = "module";
+    PendingDocumentCommand command;
+    command.kind = PendingDocumentKind::Open;
+    command.title = "[LIVE] " + leaf;
+    command.image = std::move(candidate);
+    command.project = {};
+    command.decoder.engine = targetEngine;
+    command.decoder.arch = targetArch;
+    command.persistence = DocumentInstallPersistence::Ephemeral;
+    command.metadata.liveImage = debugImageIdentity(session, *observed);
+    command.liveModule = true;
+    command.livePid = session.pid;
+    command.liveSessionGeneration = session.sessionGeneration;
+    command.liveBase = base;
+    command.liveSize = captureSize;
+    command.liveReportedSize = reportedSize;
+    command.liveLoadGeneration = exactModule.loadGeneration;
+    command.liveName = exactModule.name;
+    command.livePath = exactModule.path;
+    command.liveOrigin = origin;
+    return queueDocumentOpen(std::move(command));
 }
 
 void AppContext::analyzeModule(LoadedModule& m, bool guess) {
     if (!m.imageLoaded || !m.bin.loaded()) return;
-    Arch a = archFromMachine(m.bin.machine(), m.bin.is64Bit());   // per-module bitness (WOW64 etc.)
-    // moduleBase tag routes the results to ModuleRegistry's per-module cache (not the
-    // active tab). Uses the current epoch so it isn't dropped unless a load/patch bumps it.
-    analysis.requestBulk(&m.bin, engine, a, K_Funcs | K_Strings | K_Listing | K_Xref,
-                         guess, analysis.epoch(), m.base);
+    if (m.analyzing && m.analysisEpoch == moduleAnalysis_.epoch()) return;
+    Arch a = Arch::X64;
+    if (!archFromMachine(m.bin.machine(), a)) {
+        m.analysisComplete = false;
+        m.analysisError =
+            "The live module's structured machine architecture is unsupported; analysis was not started.";
+        return;
+    }
+    // This cache represents one coherent request. Partial data from an earlier
+    // failed/cancelled attempt must not combine with the retry's final xrefs.
+    m.cache.clear();
+    m.analysisComplete = false;
+    m.analysisError.clear();
+    m.analyzing = true;
+    m.analysisEpoch = moduleAnalysis_.epoch();
+    // moduleBase routes the immutable per-pass results to ModuleRegistry. The
+    // service is app-global, so changing the active static document cannot cancel
+    // or accidentally consume this live-module work.
+    try {
+        moduleAnalysis_.requestBulk(&m.bin, staticEngine(), a,
+                                    K_Funcs | K_Strings | K_Listing | K_Xref,
+                                    guess, m.analysisEpoch, m.base);
+    } catch (const std::exception& error) {
+        m.analyzing = false;
+        m.analysisComplete = false;
+        m.analysisError = std::string("Could not queue module analysis: ") + error.what();
+        if (m.analysisError.size() > 1024) m.analysisError.resize(1024);
+        ui::Toast(ui::ToastKind::Error, m.analysisError);
+    } catch (...) {
+        m.analyzing = false;
+        m.analysisComplete = false;
+        m.analysisError = "Could not queue module analysis: unknown error.";
+        ui::Toast(ui::ToastKind::Error, m.analysisError);
+    }
+}
+
+size_t AppContext::moduleAnalysesInFlight() const {
+    size_t count = 0;
+    for (const auto& module : modules.all())
+        if (module && module->analyzing && module->analysisEpoch) ++count;
+    return count;
+}
+
+void AppContext::drainModuleAnalysisResults() {
+    AnalysisResult result;
+    while (moduleAnalysis_.tryTakeBulk(result)) {
+        if (result.epoch != moduleAnalysis_.epoch()) continue;
+        const uint64_t base = result.moduleBase;
+        const ModuleAnalysisRoute route = modules.applyAnalysisResult(std::move(result));
+        if (route == ModuleAnalysisRoute::Failed) {
+            if (LoadedModule* module = modules.byBase(base)) {
+                std::string label = module->name;
+                if (label.empty()) {
+                    char value[32];
+                    std::snprintf(value, sizeof(value), "module at 0x%llX",
+                                  (unsigned long long)base);
+                    label = value;
+                }
+                ui::Toast(ui::ToastKind::Error,
+                          "Background analysis failed for " + label + ": " +
+                          module->analysisError);
+            }
+        }
+    }
+
+    const ProgressSnapshot progress = moduleAnalysis_.progress();
+    if (progress.resultsDropped > moduleAnalysisDroppedSeen_) {
+        moduleAnalysisDroppedSeen_ = progress.resultsDropped;
+        ui::Toast(ui::ToastKind::Warn,
+                  "One or more live-module analysis results were dropped; incomplete modules can be retried.");
+    }
+
+    // The result queue was drained above. If the service is now idle, any module
+    // from this epoch which never received its terminal xref result was cancelled,
+    // failed before publication, or lost a bounded-queue result. Make that state
+    // retryable and visible instead of leaving a permanent spinner.
+    if (!moduleAnalysis_.bulkPending()) {
+        const uint64_t epoch = moduleAnalysis_.epoch();
+        for (const auto& module : modules.all()) {
+            if (!module || !module->analyzing || !module->analysisEpoch ||
+                module->analysisEpoch != epoch)
+                continue;
+            module->analyzing = false;
+            module->analysisComplete = false;
+            if (module->analysisError.empty())
+                module->analysisError = "Module analysis ended without a complete result; retry the module.";
+        }
+    }
+}
+
+void AppContext::cancelModuleAnalysisPending() {
+    const uint64_t cancelledEpoch = moduleAnalysis_.epoch();
+    moduleAnalysis_.cancelPending();
+    for (const auto& module : modules.all()) {
+        if (!module || !module->analyzing || module->analysisEpoch != cancelledEpoch)
+            continue;
+        module->analyzing = false;
+        module->analysisComplete = false;
+        module->analysisEpoch = 0;
+        module->analysisError = "Module analysis was cancelled.";
+    }
+}
+
+void AppContext::cancelModuleAnalysisAndWait() {
+    moduleAnalysis_.cancelAndWaitIdle();
+    for (const auto& module : modules.all()) {
+        if (!module || !module->analyzing || !module->analysisEpoch) continue;
+        module->analyzing = false;
+        module->analysisComplete = false;
+        module->analysisEpoch = 0;
+        if (module->analysisError.empty())
+            module->analysisError = "Module analysis was cancelled because the live module set changed.";
+    }
+}
+
+void AppContext::clearModules() {
+    cancelModuleAnalysisAndWait();
+    modules.clear();
+}
+
+void AppContext::removeModuleByBase(uint64_t base) {
+    // One global pool may currently read any registry image. Joining the whole
+    // bounded pool is required before erasing even one BinaryFile.
+    cancelModuleAnalysisAndWait();
+    modules.removeByBase(base);
+}
+
+void AppContext::synchronizeModuleSession(const DbgSnapshot& snapshot) {
+    if (!snapshot.attached()) {
+        if (moduleRegistrySessionValid_) livescan.cancelPending();
+        if (moduleRegistrySessionValid_ || !modules.empty()) clearModules();
+        moduleRegistrySessionValid_ = false;
+        moduleRegistryPid_ = 0;
+        moduleRegistrySessionGeneration_ = 0;
+        return;
+    }
+
+    const bool changed = !moduleRegistrySessionValid_ ||
+        moduleRegistryPid_ != snapshot.pid ||
+        moduleRegistrySessionGeneration_ != snapshot.sessionGeneration;
+    if (!changed) return;
+
+    // This gate is app-global because retained Binary View children can all miss
+    // a detach/reattach edge while another workbench section is visible. Never
+    // carry module BinaryFiles, memory scans, or results into a new debugger
+    // generation. This is deliberately app-global: individual retained Binary
+    // View children only retire their own result tokens and projections.
+    livescan.cancelPending();
+    clearModules();
+    moduleRegistrySessionValid_ = true;
+    moduleRegistryPid_ = snapshot.pid;
+    moduleRegistrySessionGeneration_ = snapshot.sessionGeneration;
 }
 
 bool AppContext::openBinaryDialog() {
+    if (documentCommandPending()) {
+        ui::Toast(ui::ToastKind::Info,
+                  "Wait for the current document operation to finish, or cancel its load in the status bar.");
+        return false;
+    }
     std::vector<wchar_t> file(kDialogPathChars, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -322,11 +2275,22 @@ bool AppContext::openBinaryDialog() {
         ui::Toast(ui::ToastKind::Error, "Open failed: the selected path is not valid Unicode.");
         return false;
     }
-    return loadBinaryPath(path);
+    if (beginBinaryLoadPath(path)) return true;
+    ui::Toast(ui::ToastKind::Error, documentCommandError_.empty()
+        ? "The selected binary could not be opened." : documentCommandError_);
+    return false;
 }
 
 void App::openFileDialog() {
-    if (ctx_.openBinaryDialog()) ctx_.requestedTab = "Binary View";
+    if (ctx_.openBinaryDialog()) {
+        // A palette action runs after its render pass. Retire the old immutable
+        // session immediately rather than exposing it until the next frame's
+        // snapshot collection notices the replacement target.
+        investigation_.cancel();
+        investigationSubmittedGeneration_ = 0;
+        investigationSubmittedLiveTarget_ = {};
+        ctx_.requestedTab = "Binary View";
+    }
 }
 
 void App::openRawFileDialog() {
@@ -334,7 +2298,7 @@ void App::openRawFileDialog() {
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = ::GetActiveWindow();
-    ofn.lpstrFilter = L"All Files\0*.*\0Shellcode/bin\0*.bin;*.shc;*.dat\0";
+    ofn.lpstrFilter = L"Raw / firmware images\0*.bin;*.rom;*.fd;*.cap;*.shc;*.dat\0All Files\0*.*\0";
     ofn.lpstrFile   = file.data();
     ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -344,31 +2308,68 @@ void App::openRawFileDialog() {
         ui::Toast(ui::ToastKind::Error, "Open Raw failed: the selected path is not valid Unicode.");
         return;
     }
-    rawPendingPath_ = std::move(path);
-    openRawPopup_   = true;   // prompt for base + arch
+    if (!prepareRawLoadPath(path))
+        ui::Toast(ui::ToastKind::Error, "Open Raw failed while reading the selected file.");
 }
 
-// Splice accumulated patches into a copy of the loaded image's bytes.
-// INVARIANT: ctx.project.patches order = application order. Overlapping patches
-// resolve by later-wins, matching the in-memory image (applyPatchBytes captures
-// pristine origs via SubstitutePristine; revertPatchAt re-applies survivors in
-// the same order). Do not re-sort the patch list.
-static std::vector<uint8_t> buildPatchedImage(const BinaryFile& bin,
-                                              const std::vector<PjPatch>& patches,
-                                              int& applied, int& skipped) {
-    std::vector<uint8_t> out = bin.bytes();
-    applied = skipped = 0;
-    for (const auto& p : patches) {
-        uint64_t off = 0;
-        if (!bin.vaToOffset(p.address, off) || off + p.bytes.size() > out.size()) { ++skipped; continue; }
-        for (size_t i = 0; i < p.bytes.size(); ++i) out[off + i] = p.bytes[i];
-        ++applied;
+bool App::prepareRawLoadPath(const std::string& path) {
+    if (path.empty()) return false;
+    rawPendingPath_ = path;
+    rawBaseBuf_[0] = rawEntryBuf_[0] = '\0';
+    formatHexU64(rawBaseBuf_, sizeof(rawBaseBuf_), 0x140000000ull);
+    formatHexU64(rawEntryBuf_, sizeof(rawEntryBuf_), 0x140000000ull);
+    rawArchSel_ = 2; // manual default: x64
+    rawBigEndian_ = false;
+    rawRiscvCompressed_ = true;
+    rawSeedFirmwareLandmarks_ = true;
+    if (!readFirmwareProbe(rawPendingPath_, rawPendingSize_, rawFirmware_, rawFirmwareNote_)) {
+        rawPendingPath_.clear();
+        return false;
     }
-    return out;
+    if (rawFirmware_.detected()) {
+        const uint64_t base = rawFirmware_.recommendedImageBaseValid
+                            ? rawFirmware_.recommendedImageBase : 0x140000000ull;
+        uint64_t entry = base;
+        if (rawFirmware_.entry.detected && rawFirmware_.entry.location.valid &&
+            rawFirmware_.entry.location.fileOffset < rawPendingSize_ &&
+            rawFirmware_.entry.location.fileOffset <=
+                (std::numeric_limits<uint64_t>::max)() - base)
+            entry = base + rawFirmware_.entry.location.fileOffset;
+        formatHexU64(rawBaseBuf_, sizeof(rawBaseBuf_), base);
+        formatHexU64(rawEntryBuf_, sizeof(rawEntryBuf_), entry);
+    }
+    // A flat blob may have a strong instruction-motif architecture hint without
+    // claiming a BIOS/UEFI container or changing the editable mapping defaults.
+    if (rawFirmware_.architecture.mode != FirmwareCpuMode::Unknown)
+        rawArchSel_ = rawArchForFirmwareMode(rawFirmware_.architecture.mode);
+    // A recovered entry has its own authoritative mode even if embedded images
+    // supplied conflicting machine hints.
+    if (rawFirmware_.entry.mode != FirmwareCpuMode::Unknown)
+        rawArchSel_ = rawArchForFirmwareMode(rawFirmware_.entry.mode);
+    // A32/Thumb have a 32-bit architectural PC and Capstone reports their
+    // direct branch targets in that address space. An architecture-only motif
+    // hint must therefore replace the generic x64 high-base default with a
+    // mapping whose entire file fits below 4 GiB.
+    {
+        uint64_t base = 0, entry = 0;
+        const Arch hinted = rawArchFromSelection(rawArchSel_);
+        if (parseHexU64(rawBaseBuf_, base) && parseHexU64(rawEntryBuf_, entry) &&
+            !ArchMappingRangeFits(hinted, base, rawPendingSize_) &&
+            (hinted == Arch::ARM || hinted == Arch::THUMB)) {
+            base = 0;
+            entry = rawFirmware_.entry.detected && rawFirmware_.entry.location.valid &&
+                    rawFirmware_.entry.location.fileOffset < rawPendingSize_
+                  ? rawFirmware_.entry.location.fileOffset : 0;
+            formatHexU64(rawBaseBuf_, sizeof(rawBaseBuf_), base);
+            formatHexU64(rawEntryBuf_, sizeof(rawEntryBuf_), entry);
+        }
+    }
+    openRawPopup_   = true;   // prompt for base + arch
+    return true;
 }
 
 void App::saveBinaryAs() {
-    if (!ctx_.binary.loaded()) return;
+    if (!ctx_.staticBinary().loaded()) return;
     std::vector<wchar_t> file(kDialogPathChars, L'\0');
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -378,15 +2379,44 @@ void App::saveBinaryAs() {
     ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    int applied = 0, skipped = 0;
-    std::vector<uint8_t> img = buildPatchedImage(ctx_.binary, ctx_.project.patches, applied, skipped);
+    PatchSetImageResult built = BuildPatchSetImageForSelection(
+        ctx_.staticBinary(), ctx_.staticProject().patches,
+        ctx_.staticProject().patchSets, {},
+        PatchSetImageSource::CurrentEnabledSets);
+    if (!built.success) {
+        char msg[512];
+        const PjPatchSetPlan* failedPlan =
+            !built.currentPlan.success ? &built.currentPlan
+            : !built.desiredPlan.success ? &built.desiredPlan : nullptr;
+        const char* planError = failedPlan &&
+                                failedPlan->error != PjPatchSetPlanError::None
+            ? PjPatchSetPlanErrorText(failedPlan->error) : nullptr;
+        if (built.failedPatch != std::numeric_limits<size_t>::max()) {
+            std::snprintf(msg, sizeof(msg),
+                          "Save blocked: patch #%zu at 0x%llX is invalid (%s%s%s). No file was written.",
+                          built.failedPatch + 1,
+                          static_cast<unsigned long long>(built.failedAddress),
+                          PatchSetImageErrorText(built.error),
+                          planError ? ": " : "",
+                          planError ? planError : "");
+        } else {
+            std::snprintf(msg, sizeof(msg),
+                          "Save blocked: %s%s%s. No file was written.",
+                          PatchSetImageErrorText(built.error),
+                          planError ? ": " : "",
+                          planError ? planError : "");
+        }
+        ui::Toast(ui::ToastKind::Error, msg);
+        return;
+    }
     std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
     char msg[256];
-    if (f && f.write(reinterpret_cast<const char*>(img.data()), (std::streamsize)img.size())) {
-        std::snprintf(msg, sizeof(msg), "Wrote %zu bytes with %d patch(es) applied%s%s.",
-                      img.size(), applied,
-                      skipped ? ", " : "", skipped ? (std::to_string(skipped) + " unmapped/skipped").c_str() : "");
-        ui::Toast(skipped ? ui::ToastKind::Warn : ui::ToastKind::Success, msg);
+    if (f && f.write(reinterpret_cast<const char*>(built.image.data()),
+                     static_cast<std::streamsize>(built.image.size()))) {
+        std::snprintf(msg, sizeof(msg), "Wrote %zu bytes with %zu patch(es) applied.",
+                      built.image.size(),
+                      built.desiredPlan.activePatchIndices.size());
+        ui::Toast(ui::ToastKind::Success, msg);
     } else {
         ui::Toast(ui::ToastKind::Error, "Save failed: could not write the file (check the path / permissions).");
     }
@@ -397,9 +2427,9 @@ void App::saveBinaryAs() {
 // validated by ScanJava (EOCD + central-directory math, trailing Authenticode
 // cert excluded), so this is a plain byte copy -- no re-parsing here.
 void App::extractEmbeddedJar() {
-    const JavaScanResult& ji = ctx_.javaInfo;
-    if (!ctx_.binary.loaded() || !ji.jarSize) return;
-    const auto& bytes = ctx_.binary.bytes();
+    const JavaScanResult& ji = ctx_.staticJavaInfo();
+    if (!ctx_.staticBinary().loaded() || !ji.jarSize) return;
+    const auto& bytes = ctx_.staticBinary().bytes();
     if (ji.jarOffset >= bytes.size() || ji.jarSize > bytes.size() - ji.jarOffset) {
         ui::Toast(ui::ToastKind::Error, "Extract failed: archive span is out of bounds (stale scan?).");
         return;
@@ -408,7 +2438,7 @@ void App::extractEmbeddedJar() {
     // Default name: "<binary stem>.jar" (".zip" when there is no JAR manifest).
     std::wstring def;
     {
-        std::string base = ctx_.binary.path();
+        std::string base = ctx_.staticBinary().path();
         size_t slash = base.find_last_of("/\\");
         if (slash != std::string::npos) base = base.substr(slash + 1);
         size_t dot = base.find_last_of('.');
@@ -450,7 +2480,7 @@ namespace {
 
 // Re-read the archive's container file from disk and decompress one entry. The
 // browser snapshot may outlive the loaded binary ("Open as binary" replaces it),
-// so the bytes always come fresh from sourcePath, never from ctx_.binary.
+// so the bytes always come fresh from sourcePath, never from ctx_.staticBinary().
 bool extractArchiveEntryBytes(const std::string& srcPath, uint64_t zipBase,
                               const JavaZipEntry& e, std::vector<uint8_t>& out,
                               std::string& err) {
@@ -497,14 +2527,14 @@ std::string writeExtractedTemp(const std::string& name, const std::vector<uint8_
 } // namespace
 
 void App::openArchiveBrowser() {
-    if (!ctx_.binary.loaded() || ctx_.javaInfo.entries.empty()) return;
+    if (!ctx_.staticBinary().loaded() || ctx_.staticJavaInfo().entries.empty()) return;
     archiveBrowser_ = {};
-    archiveBrowser_.sourcePath = ctx_.binary.path();
+    archiveBrowser_.sourcePath = ctx_.staticBinary().path();
     size_t s = archiveBrowser_.sourcePath.find_last_of("/\\");
     archiveBrowser_.sourceName = (s == std::string::npos) ? archiveBrowser_.sourcePath
                                                           : archiveBrowser_.sourcePath.substr(s + 1);
-    archiveBrowser_.zipBase = ctx_.javaInfo.jarOffset;
-    archiveBrowser_.entries = ctx_.javaInfo.entries;
+    archiveBrowser_.zipBase = ctx_.staticJavaInfo().jarOffset;
+    archiveBrowser_.entries = ctx_.staticJavaInfo().entries;
     archiveBrowser_.open    = true;
 }
 
@@ -620,14 +2650,14 @@ void App::renderArchiveBrowser() {
             // NOTE: loadBinaryPath re-runs the scans, so a nested .jar/.zip entry
             // re-raises requestedBrowseArchive and reopens this browser for it —
             // the Native EXE -> JAR -> class chain is intended.
-            } else if (!ctx_.loadBinaryPath(tmpPath)) {
-                ui::Toast(ui::ToastKind::Error, "Extracted, but the entry could not be loaded: " + tmpPath);
+            } else if (!ctx_.beginBinaryLoadPath(tmpPath)) {
+                ui::Toast(ui::ToastKind::Error, "Extracted, but its background load could not start: " + tmpPath);
             } else {
                 ctx_.requestedTab = "Binary View";
                 char msg[512];
-                std::snprintf(msg, sizeof(msg), "Opened %s (%zu bytes) from the archive.",
+                std::snprintf(msg, sizeof(msg), "Extracted %s (%zu bytes); opening in the background.",
                               e.name.c_str(), bytes.size());
-                ui::Toast(ui::ToastKind::Success, msg);
+                ui::Toast(ui::ToastKind::Info, msg);
                 ImGui::CloseCurrentPopup();
             }
         }
@@ -693,91 +2723,363 @@ bool AppContext::exportAnalysisFile(const std::string& defaultBaseName,
     return false;
 }
 
+bool AppContext::selectCodeExportPath(const std::string& defaultName,
+                                      CodeExportFormat format,
+                                      std::string& pathOut, std::string& err) {
+    pathOut.clear();
+    err.clear();
+
+    std::wstring def;
+    const std::string fallback = format == CodeExportFormat::Assembly ? "disassembly.asm" : "decompiled.c";
+    if (!wideFromUtf8(defaultName.empty() ? fallback : defaultName, def)) {
+        if (!wideFromUtf8(fallback, def)) def = format == CodeExportFormat::Assembly
+                                               ? L"disassembly.asm" : L"decompiled.c";
+    }
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = ::GetActiveWindow();
+    ofn.lpstrFilter = format == CodeExportFormat::Assembly
+                    ? L"Assembly source (*.asm)\0*.asm\0All Files\0*.*\0"
+                    : L"C source (*.c)\0*.c\0All Files\0*.*\0";
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
+    ofn.lpstrDefExt = format == CodeExportFormat::Assembly ? L"asm" : L"c";
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return false; // cancelled is not an error
+
+    if (!utf8FromWide(file.data(), pathOut)) {
+        err = "Failed to encode the selected path as UTF-8.";
+        pathOut.clear();
+        return false;
+    }
+    return true;
+}
+
+bool AppContext::saveBytesFile(const std::string& defaultName,
+                               const std::vector<uint8_t>& bytes, std::string& msg,
+                               const wchar_t* filterSpec, const wchar_t* defExt,
+                               std::string* savedPath) {
+    if (savedPath) savedPath->clear();
+    std::wstring def;
+    if (!wideFromUtf8(defaultName.empty() ? std::string("resource.bin") : defaultName, def))
+        def = L"resource.bin";
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = ::GetActiveWindow();
+    ofn.lpstrFilter = filterSpec ? filterSpec : L"All Files\0*.*\0";
+    ofn.lpstrFile   = file.data();
+    ofn.nMaxFile    = static_cast<DWORD>(file.size());
+    ofn.lpstrDefExt = defExt;
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) { msg.clear(); return false; }   // cancelled
+
+    std::string p;
+    if (!utf8FromWide(file.data(), p)) {
+        msg = "Failed to encode the selected path as UTF-8.";
+        return false;
+    }
+    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
+    if (f && (bytes.empty() ||
+              f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size()))) {
+        if (savedPath) *savedPath = p;
+        msg = "Wrote " + std::to_string(bytes.size()) + " bytes to " + p;
+        return true;
+    }
+    msg = "Failed to write " + p + " (check the path / permissions).";
+    return false;
+}
+
 void App::closeBinary() {
-    // An active debug session belongs to the binary being closed: end it first so
-    // the Binary View's detach edge releases the live caches + module registry
-    // and the app drops back to a clean welcome state.
-    if (ctx_.debug.snapshot().attached()) ctx_.debug.detach();
-    ctx_.saveProject();                 // flush analysis before unloading
-    ctx_.analysis.cancelAndWaitIdle();  // drain the worker before clear() frees the bytes
-    ctx_.binary.clear();
-    ctx_.project.reset();
-    ctx_.javaInfo = JavaScanResult{};
-    ctx_.runtimeInfo = RuntimeScanResult{};
-    // Stale cross-tab requests must not fire into the next binary.
-    ctx_.requestedGotoVA = 0; ctx_.hasGotoRequest = false; ctx_.requestedGotoLive = false;
-    ctx_.requestedLiveAssembly = false; ctx_.binaryJustLoaded = false;
-    ctx_.hasCursor = false; ctx_.cursorVA = 0; ctx_.runtimeCursorVA = 0;
+    if (!ctx_.queueCloseStaticDocument(ctx_.staticDocumentId())) {
+        ui::Toast(ui::ToastKind::Error,
+                  ctx_.documentCommandError().empty()
+                    ? "Could not queue the document close."
+                    : ctx_.documentCommandError());
+    }
+}
+
+void App::retireActiveDocumentRequests() {
+    palette_.close();
+    investigation_.cancel();
+    investigationSubmittedGeneration_ = 0;
+    investigationSubmittedLiveTarget_ = {};
+
+    // Every address-bearing request below was authored against the outgoing
+    // document. The debugger/JDWP/Prism targets are intentionally not touched:
+    // they are app-global and survive static tab switches.
+    ctx_.requestedGotoVA = 0;
+    ctx_.hasGotoRequest = false;
+    ctx_.requestedGotoLive = false;
+    ctx_.requestedGotoTarget = {};
+    ctx_.requestedLiveAssembly = false;
+    ctx_.requestedCrackmeTriage = false;
+    ctx_.requestedTriageView = TriageWorkspaceView::StartHere;
+    ctx_.requestedTriageAuthorizationFlow.clear();
+    ctx_.requestedTriageStartupEntitlementLead = false;
+    ctx_.requestedTriageFileOffset = 0;
+    ctx_.requestedTriageFileOffsetValid = false;
+    ctx_.hasCursor = false;
+    ctx_.cursorVA = 0;
+    ctx_.cursorLive = false;
+    ctx_.cursorTarget = {};
+    ctx_.runtimeCursorVA = 0;
+    ctx_.runtimeCursorTarget = {};
     ctx_.cursorFuncName.clear();
-    ctx_.pendingSignature.clear(); ctx_.pendingSignatureLive = false;
-    ctx_.requestedExtractJava = false; ctx_.requestedBrowseArchive = false;
+    ctx_.clearPendingSignature();
+    ctx_.requestedExtractJava = false;
+    ctx_.requestedBrowseArchive = false;
+    ctx_.requestedExportAnalysis = false;
+    ctx_.requestedCodeExport = false;
+    ctx_.requestResetDockLayout = false;
+    ctx_.projectAnnotationsExternallyChanged = false;
+    ctx_.requestedDebugDll = false;
+    ctx_.requestedTraceToggle = false;
+    ctx_.requestedTraceTarget = {};
+    ctx_.requestedTraceClear = false;
+    ctx_.requestedTraceClearTarget = {};
+    ctx_.requestedTraceCancel = false;
+    ctx_.requestedTraceCancelTarget = {};
+    ctx_.traceSeedPlanning = false;
+    ctx_.traceSeedCurrent = ctx_.traceSeedTotal = ctx_.traceSeedFound = 0;
+    toolbarAddressEditing_ = false;
+    toolbarAddressMirrorValid_ = false;
+    toolbarAddressMirrorLive_ = false;
+    toolbarAddressMirrorTarget_ = {};
+    toolbarAddress_[0] = 0;
+}
+
+void App::applyPendingDocumentCommand() {
+    const AppContext::DocumentCommandOutcome outcome =
+        ctx_.applyPendingDocumentCommand(
+            [this](DocumentId id, bool closing, std::string& error) {
+                return !binaryView_ ||
+                       binaryView_->prepareDocumentTransition(
+                           ctx_, id, closing, error);
+            });
+    if (!outcome.hadCommand) return;
+    if (outcome.liveModule) {
+        auto recordFailure = [&](LiveDocumentAttempt& attempt) {
+            attempt.valid = true;
+            attempt.pid = outcome.livePid;
+            attempt.sessionGeneration = outcome.liveSessionGeneration;
+            attempt.base = outcome.liveBase;
+            attempt.retryRevision = ctx_.documentRetryRevision();
+        };
+        if (outcome.liveOrigin == LiveDocumentOpenOrigin::AttachMain) {
+            if (attachMainDocumentPending_.matches(
+                    outcome.livePid, outcome.liveSessionGeneration,
+                    outcome.liveBase))
+                attachMainDocumentPending_.clear();
+            if (outcome.success) {
+                attachMainDocumentSessionValid_ = true;
+                attachMainDocumentPid_ = outcome.livePid;
+                attachMainDocumentGeneration_ = outcome.liveSessionGeneration;
+                attachMainDocumentFailure_.clear();
+            } else {
+                recordFailure(attachMainDocumentFailure_);
+            }
+        } else if (outcome.liveOrigin == LiveDocumentOpenOrigin::HostedDll) {
+            if (dllRetargetPending_.matches(
+                    outcome.livePid, outcome.liveSessionGeneration,
+                    outcome.liveBase))
+                dllRetargetPending_.clear();
+            if (outcome.success) {
+                dllRetargetPid_ = outcome.livePid;
+                dllRetargetGeneration_ = outcome.liveSessionGeneration;
+                dllRetargetBase_ = outcome.liveBase;
+                dllRetargetFailure_.clear();
+                ctx_.requestedTab = "Binary View";
+                ui::Toast(ui::ToastKind::Success,
+                          "Loaded the target DLL at its runtime ASLR base for live analysis.");
+            } else {
+                recordFailure(dllRetargetFailure_);
+            }
+        }
+    }
+    auto finishOwnedLoad = [&](bool success) {
+        const PendingDocumentLoadOwner owner = pendingDocumentLoadOwner_;
+        pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::None;
+        switch (owner) {
+        case PendingDocumentLoadOwner::AdaptiveUnpack:
+            if (success) {
+                unpackPopup_.result = {};
+                unpackPopup_.closeAfterDocumentLoad = true;
+            } else {
+                unpackPopup_.error = outcome.error;
+            }
+            break;
+        case PendingDocumentLoadOwner::StaticUnpack:
+            if (success) {
+                staticUnpackPopup_.result = {};
+                staticUnpackPopup_.sourcePath.clear();
+                staticUnpackPopup_.sourceHash = 0;
+                staticUnpackPopup_.sourceRevision = 0;
+                staticUnpackPopup_.sourceWasDll = false;
+                staticUnpackPopup_.closeAfterDocumentLoad = true;
+            } else {
+                staticUnpackPopup_.error = outcome.error;
+            }
+            break;
+        case PendingDocumentLoadOwner::PassiveDump:
+            if (success) {
+                passiveDumpPopup_.result = {};
+                passiveDumpPopup_.closeAfterDocumentLoad = true;
+            } else {
+                passiveDumpPopup_.error = outcome.error;
+            }
+            break;
+        default:
+            break;
+        }
+    };
+    if (!outcome.success) {
+        finishOwnedLoad(false);
+        if (outcome.activeChanged) retireActiveDocumentRequests();
+        ui::Toast(ui::ToastKind::Error,
+                  outcome.error.empty() ? "The document operation failed."
+                                        : outcome.error);
+        return;
+    }
+
+    finishOwnedLoad(true);
+
+    if (outcome.retired && binaryView_)
+        binaryView_->retireDocument(outcome.retired);
+    if (outcome.activeChanged) retireActiveDocumentRequests();
+    if (outcome.browseArchive) ctx_.requestedBrowseArchive = true;
+    if (!outcome.warning.empty())
+        ui::Toast(ui::ToastKind::Warn, outcome.warning);
 }
 
 void App::renderMenuBar() {
+    const float k = theme::UiScale();
+    titleDragRegionValid_ = false;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * k, 8.0f * k));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * k, 4.0f * k));
     if (ImGui::BeginMainMenuBar()) {
+        // The reference treats the menu as app chrome: brand and menus share one
+        // compact row, with documents living in the browser strip beneath it.
+        if (ui::IconsLoaded()) {
+            ImGui::TextColored(theme::col::accent(), "%s", DS_ICON_CODE);
+            ImGui::SameLine(0.0f, 5.0f * k);
+        }
+        ImGui::TextUnformatted("DisasmStudio");
+        ImGui::SameLine(0.0f, 12.0f * k);
+        ImGui::Separator();
+        ImGui::SameLine(0.0f, 12.0f * k);
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open Binary...", "Ctrl+O")) openFileDialog();
             if (ImGui::MenuItem("Open as Raw...")) openRawFileDialog();
-            if (ImGui::MenuItem("Save Binary As...", nullptr, false, ctx_.binary.loaded()))
+            ImGui::Separator();
+            const bool canDebugDll = ctx_.binaryDllDebuggable() &&
+                                     (!ctx_.frameDebugSnapshot || !ctx_.frameDebugSnapshot->attached());
+            if (ImGui::MenuItem("Debug DLL...", nullptr, false, canDebugDll))
+                ctx_.requestedDebugDll = true;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(ctx_.binaryDebugArchitectureMatches()
+                    ? "Launch this PE DLL in a bitness-compatible host and break at DllMain or an export."
+                    : "Hosted DLL debugging requires a matching x86/x64 PE machine and decoder mode (active: %s).",
+                    ArchName(ctx_.staticArch()));
+            if (ImGui::MenuItem("Save Binary As...", nullptr, false, ctx_.staticBinary().loaded()))
                 saveBinaryAs();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Write a copy of the loaded file with all accumulated patches applied.");
-            if (ImGui::MenuItem("Export Analysis...", nullptr, false, ctx_.binary.loaded())) {
+                ImGui::SetTooltip("Write a copy of the loaded file with the currently enabled patch-set selection applied.");
+            const bool canCodeExport = ctx_.staticBinary().loaded() && !ctx_.staticCodeExport().pending();
+            if (ImGui::MenuItem("Save ASM...", nullptr, false, canCodeExport)) {
+                ctx_.requestedCodeExport = true;
+                ctx_.requestedCodeExportFormat = CodeExportFormat::Assembly;
+                ctx_.requestedTab = "Binary View";
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Export the whole program or current function as assembly on a background worker.");
+            const bool canCExport = canCodeExport && ArchIsX86_32Or64(ctx_.staticArch());
+            if (ImGui::MenuItem("Save C...", nullptr, false, canCExport)) {
+                ctx_.requestedCodeExport = true;
+                ctx_.requestedCodeExportFormat = CodeExportFormat::C;
+                ctx_.requestedTab = "Binary View";
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(ArchIsX86_32Or64(ctx_.staticArch())
+                    ? "Export readable pseudocode or a self-contained compilable C translation unit."
+                    : "C export currently requires an x86 or x64 target; Save ASM supports this architecture.");
+            if (ImGui::MenuItem("Export Analysis...", nullptr, false, ctx_.staticBinary().loaded())) {
                 ctx_.requestedExportAnalysis = true;
                 ctx_.requestedTab = "Binary View";
             }
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("Export comments, renames, bookmarks, notes and decompiled named functions to Markdown / HTML.");
-            if (ImGui::MenuItem(ctx_.javaInfo.isJar ? "Extract Embedded JAR..." : "Extract Embedded ZIP...",
-                                nullptr, false, ctx_.javaInfo.jarSize > 0))
+            if (ImGui::MenuItem(ctx_.staticJavaInfo().isJar ? "Extract Embedded JAR..." : "Extract Embedded ZIP...",
+                                nullptr, false, ctx_.staticJavaInfo().jarSize > 0))
                 extractEmbeddedJar();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip(ctx_.javaInfo.jarSize > 0
+                ImGui::SetTooltip(ctx_.staticJavaInfo().jarSize > 0
                                       ? "Carve the appended archive a Java launcher embedded in this EXE out to a file."
                                       : "Enabled when an appended JAR/ZIP archive is detected in the loaded binary.");
-            if (ImGui::MenuItem("Browse Embedded Archive...", nullptr, false, !ctx_.javaInfo.entries.empty()))
+            if (ImGui::MenuItem("Browse Embedded Archive...", nullptr, false, !ctx_.staticJavaInfo().entries.empty()))
                 ctx_.requestedBrowseArchive = true;
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip(!ctx_.javaInfo.entries.empty()
+                ImGui::SetTooltip(!ctx_.staticJavaInfo().entries.empty()
                                       ? "List the embedded archive's entries; open one as a binary or extract it decompressed."
                                       : "Enabled when a JAR/ZIP archive with entries is detected in the loaded binary.");
-            if (ImGui::MenuItem("Close Binary", nullptr, false, ctx_.binary.loaded()))
+            ImGui::Separator();
+            if (ImGui::MenuItem("Close Document", "Ctrl+W", false,
+                                ctx_.staticDocumentCount() != 0))
                 closeBinary();
             ImGui::Separator();
-            if (ImGui::MenuItem("Exit", "Alt+F4")) { ctx_.saveProject(); exit_ = true; }
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Engine")) {
-            // ARM/ARM64 force Capstone (Zydis is x86-only); reflect the *effective*
-            // engine in the check marks so the menu never disagrees with reality.
-            const bool nonX86 = !ArchIsX86(ctx_.arch);
-            const Engine effective = ctx_.disasm ? ctx_.disasm->engine() : ctx_.engine;
-            bool z = effective == Engine::Zydis;
-            bool c = effective == Engine::Capstone;
-            ImGui::BeginDisabled(nonX86);
-            if (ImGui::MenuItem("Zydis", nullptr, z)) { ctx_.engine = Engine::Zydis; ctx_.rebuildDisassembler(); }
-            ImGui::EndDisabled();
-            if (nonX86 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("Zydis decodes x86/x64 only - Capstone is used for every other architecture.");
-            if (ImGui::MenuItem("Capstone", nullptr, c)) { ctx_.engine = Engine::Capstone; ctx_.rebuildDisassembler(); }
-            ImGui::Separator();
-            ImGui::TextDisabled("Architecture");
-            auto archItem = [&](const char* label, Arch a) {
-                if (ImGui::MenuItem(label, nullptr, ctx_.arch == a)) { ctx_.arch = a; ctx_.rebuildDisassembler(); }
-            };
-            archItem("x86",       Arch::X86);
-            archItem("x64",       Arch::X64);
-            archItem("ARM",       Arch::ARM);
-            archItem("ARM64",     Arch::ARM64);
-            archItem("MIPS",      Arch::MIPS);
-            archItem("MIPS64",    Arch::MIPS64);
-            archItem("PowerPC",   Arch::PPC);
-            archItem("PowerPC64", Arch::PPC64);
-            archItem("RISC-V 32", Arch::RISCV32);
-            archItem("RISC-V 64", Arch::RISCV64);
+            if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                requestExit();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
+            if (ImGui::BeginMenu("Disassembler")) {
+                // A32/Thumb/A64 force Capstone (Zydis is x86-only); reflect the
+                // effective engine so the menu never disagrees with reality.
+                const bool nonX86 = !ArchIsX86(ctx_.staticArch());
+                const Engine effective = ctx_.staticDisassembler()
+                    ? ctx_.staticDisassembler()->engine() : ctx_.staticEngine();
+                const bool z = effective == Engine::Zydis;
+                const bool c = effective == Engine::Capstone;
+                ImGui::BeginDisabled(nonX86);
+                if (ImGui::MenuItem("Zydis", nullptr, z))
+                    ctx_.setStaticDecoderConfiguration(Engine::Zydis, ctx_.staticArch());
+                ImGui::EndDisabled();
+                if (nonX86 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Zydis decodes x86-16/x86/x64 only - Capstone is used for every other architecture.");
+                if (ImGui::MenuItem("Capstone", nullptr, c))
+                    ctx_.setStaticDecoderConfiguration(Engine::Capstone, ctx_.staticArch());
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Architecture")) {
+                auto archItem = [&](const char* label, Arch a) {
+                    const bool mappingFits = archFitsActiveRawMapping(ctx_, a);
+                    if (ImGui::MenuItem(label, nullptr,
+                                        ctx_.staticArch() == a, mappingFits))
+                        ctx_.setStaticDecoderConfiguration(ctx_.staticEngine(), a);
+                    if (!mappingFits && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("This raw mapping does not fit the %s address space. Reopen it with a lower base.",
+                                          ArchName(a));
+                };
+                archItem("x86-16",        Arch::X86_16);
+                archItem("x86",           Arch::X86);
+                archItem("x64",           Arch::X64);
+                archItem("ARM",           Arch::ARM);
+                archItem("Thumb/Thumb-2", Arch::THUMB);
+                archItem("ARM64",         Arch::ARM64);
+                archItem("MIPS",          Arch::MIPS);
+                archItem("MIPS64",        Arch::MIPS64);
+                archItem("PowerPC",       Arch::PPC);
+                archItem("PowerPC64",     Arch::PPC64);
+                archItem("RISC-V 32",     Arch::RISCV32);
+                archItem("RISC-V 64",     Arch::RISCV64);
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Theme")) {
                 for (int i = 0; i < (int)theme::ThemeId::Count; ++i) {
                     theme::ThemeId id = (theme::ThemeId)i;
@@ -793,290 +3095,1768 @@ void App::renderMenuBar() {
                 const theme::Density opts[] = { theme::Density::Compact,
                                                 theme::Density::Comfortable,
                                                 theme::Density::Spacious };
-                for (theme::Density d : opts) {
-                    if (ImGui::MenuItem(theme::DensityName(d), nullptr, density_ == d)) {
-                        density_ = d;
-                        theme::SetDensity(d);
-                        theme::ApplyTheme();   // re-derive spacing live (same as theme switch)
+                for (theme::Density density : opts) {
+                    if (ImGui::MenuItem(theme::DensityName(density), nullptr,
+                                        density_ == density)) {
+                        density_ = density;
+                        theme::SetDensity(density);
+                        theme::ApplyTheme();
                         savePrefs();
                     }
                 }
                 ImGui::EndMenu();
             }
-            if (ImGui::MenuItem("Reset Layout"))
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset Binary View Layout"))
                 ctx_.requestResetDockLayout = true;
+            if (ImGui::MenuItem("Symbol Settings..."))
+                ctx_.requestedSymbolSettings = true;
+#ifdef _DEBUG
             ImGui::MenuItem("ImGui Demo", nullptr, &showDemo_);
+#endif
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Debug")) {
+            if (ImGui::MenuItem("Hide Debugger / Anti-Anti-Debug..."))
+                antiDebugPopupOpen_ = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Configure an opt-in, reversible concealment policy for the next debug session.");
+            ImGui::Separator();
+            if (ImGui::MenuItem("Passive Process Dump..."))
+                passiveDumpPopup_.open = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Snapshot an existing process or launch-and-watch without DebugActiveProcess, injection, or target writes.");
+            ImGui::Separator();
+            const bool canUnpack = ctx_.binaryLaunchable();
+            const bool canStaticUnpack = ctx_.staticBinary().loaded() && !ctx_.staticBinary().isMappedImage() &&
+                (ctx_.staticBinary().format() == BinFormat::PE32 || ctx_.staticBinary().format() == BinFormat::PE32Plus);
+            if (ImGui::MenuItem("Static Packed-PE Recovery...", nullptr, false, canStaticUnpack))
+                staticUnpackPopup_.open = true;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Parse VMProtect-style PACKER_INFO blocks or bounded embedded LZMA streams without executing the target.");
+            if (ImGui::MenuItem("Adaptive Unpack...", nullptr, false, canUnpack))
+                unpackPopup_.open = true;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(ctx_.binaryDebugArchitectureMatches()
+                    ? "Observe a live PE unpacking stub, score OEP candidates, rebuild imports/sections/metadata, and save a clean disk image."
+                    : "Adaptive Unpack requires a matching x86/x64 PE machine and decoder mode (active: %s). Use Static Packed-PE Recovery otherwise.",
+                    ArchName(ctx_.staticArch()));
+            ImGui::Separator();
+            const bool canDebugDll = ctx_.binaryDllDebuggable() &&
+                                     (!ctx_.frameDebugSnapshot || !ctx_.frameDebugSnapshot->attached());
+            if (ImGui::MenuItem("Debug DLL...", nullptr, false, canDebugDll))
+                ctx_.requestedDebugDll = true;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(ctx_.binaryDebugArchitectureMatches()
+                    ? "Choose a callable export and a bitness-compatible DLL host."
+                    : "Hosted DLL debugging requires a matching x86/x64 PE machine and decoder mode (active: %s).",
+                    ArchName(ctx_.staticArch()));
+            ImGui::Separator();
+            const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
+            const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
+            uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
+            const bool exactTraceImage = ctx_.frameDebugSnapshot &&
+                ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
+                                          traceRuntimeBase, traceRuntimeSize);
+            const bool canStartTrace = ctx_.staticBinary().loaded() &&
+                                       ctx_.frameDebugSnapshot &&
+                                       ctx_.frameDebugSnapshot->state == DbgState::Paused &&
+                                       exactTraceImage;
+            if (ImGui::MenuItem(traceOn ? "Stop Trace Coverage" : "Start Trace Coverage",
+                                nullptr, traceOn, traceOn || canStartTrace)) {
+                ctx_.requestedTraceToggle = true;
+                ctx_.requestedTraceTarget = ctx_.frameDebugSnapshot
+                    ? DebugTargetIdentity{ctx_.frameDebugSnapshot->pid,
+                                          ctx_.frameDebugSnapshot->sessionGeneration}
+                    : DebugTargetIdentity{};
+                ctx_.requestedTab = "Binary View";
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(exactTraceImage || traceOn
+                    ? "Plant one-shot basic-block sites in the background and retain green execution coverage."
+                    : "Trace requires the exact matching x86/x64 module and target bitness; no sites are planted for an unrelated or ARM image.");
+            const bool haveTrace = tr && (!tr->instructions.empty() || !tr->blocks.empty());
+            if (ImGui::MenuItem("Clear Trace Coverage", nullptr, false, haveTrace)) {
+                ctx_.requestedTraceClear = true;
+                ctx_.requestedTraceClearTarget = ctx_.frameDebugSnapshot
+                    ? DebugTargetIdentity{ ctx_.frameDebugSnapshot->pid,
+                                           ctx_.frameDebugSnapshot->sessionGeneration }
+                    : DebugTargetIdentity{};
+                ctx_.requestedTab = "Binary View";
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("Keyboard Shortcuts", "F1")) showHelp_ = true;
+            if (ImGui::MenuItem("Command Palette", "Ctrl+K") &&
+                ctx_.frameDebugSnapshot)
+                openCommandPalette(*ctx_.frameDebugSnapshot);
             ImGui::Separator();
             ImGui::MenuItem("About", nullptr, &showAbout_);
             ImGui::EndMenu();
         }
 
-        // Right side: browser-style tab for the loaded file (wireframe wf-file-tab),
-        // mono name + format, with a close glyph that unloads the binary.
-        const float k = theme::UiScale();
-        if (ctx_.binary.loaded()) {
-            const std::string& p = ctx_.binary.path();
-            size_t slash = p.find_last_of("/\\");
-            const char* fname = slash == std::string::npos ? p.c_str() : p.c_str() + slash + 1;
-            char info[160];
-            std::snprintf(info, sizeof(info), "%s  \xC2\xB7 %s", fname, ctx_.binary.formatName());
-            ui::PushMono();
-            const ImVec2 ts = ImGui::CalcTextSize(info);
-            ui::PopMono();
-            const float h  = ImGui::GetFrameHeight();
-            const float xs = ts.y * 0.62f;                 // close-glyph box
-            const float w  = 9.0f * k + ts.x + 8.0f * k + xs + 9.0f * k;
-            ImGui::SameLine(ImGui::GetWindowWidth() - w - 12.0f * k);
-            const ImVec2 pos = ImGui::GetCursorScreenPos();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h),
-                              ImGui::GetColorU32(theme::col::panel()), 5.0f * k,
-                              ImDrawFlags_RoundCornersTop);
-            dl->AddRect(pos, ImVec2(pos.x + w, pos.y + h),
-                        ImGui::GetColorU32(theme::col::line()), 5.0f * k,
-                        ImDrawFlags_RoundCornersTop, 1.0f);
-            ui::PushMono();
-            dl->AddText(ImVec2(pos.x + 9.0f * k, pos.y + (h - ts.y) * 0.5f),
-                        ImGui::GetColorU32(ImGuiCol_Text), info);
-            ui::PopMono();
-            // Close glyph (drawn cross; hover = bad).
-            const ImVec2 xp(pos.x + 9.0f * k + ts.x + 8.0f * k, pos.y + (h - xs) * 0.5f);
-            ImGui::SetCursorScreenPos(xp);
-            bool xClick = ImGui::InvisibleButton("##filetabclose", ImVec2(xs, xs));
-            bool xHov   = ImGui::IsItemHovered();
-            const ImU32 xc = ImGui::GetColorU32(xHov ? theme::col::bad() : theme::col::muted());
-            const float in = xs * 0.22f;
-            dl->AddLine(ImVec2(xp.x + in, xp.y + in), ImVec2(xp.x + xs - in, xp.y + xs - in), xc, 1.4f);
-            dl->AddLine(ImVec2(xp.x + xs - in, xp.y + in), ImVec2(xp.x + in, xp.y + xs - in), xc, 1.4f);
-            if (xHov) ImGui::SetTooltip("Close binary");
-            else if (ImGui::IsMouseHoveringRect(pos, ImVec2(pos.x + w, pos.y + h)))
-                ImGui::SetTooltip("%s", p.c_str());
-            if (xClick) closeBinary();
-        } else {
-            const char* none = "no binary";
-            float w = ImGui::CalcTextSize(none).x;
-            ImGui::SameLine(ImGui::GetWindowWidth() - w - 20.0f * k);
-            ImGui::TextDisabled("%s", none);
+        const ImVec2 menuPos = ImGui::GetWindowPos();
+        const ImVec2 menuSize = ImGui::GetWindowSize();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float menusEndX = ImGui::GetCursorScreenPos().x;
+        HWND mainHwnd = reinterpret_cast<HWND>(
+            ImGui::GetMainViewport()->PlatformHandleRaw);
+        const float captionW = 46.0f * k;
+        const float captionStart = menuPos.x + menuSize.x - captionW * 3.0f;
+        const float captionH = (std::max)(1.0f, menuSize.y - 1.0f);
+        const bool maximized = mainHwnd && ::IsZoomed(mainHwnd);
+
+        enum class CaptionGlyph { Minimize, Maximize, Close };
+        auto captionButton = [&](const char* id, float x, CaptionGlyph glyph,
+                                 const char* tip) {
+            const ImVec2 a(x, menuPos.y);
+            const ImVec2 b(x + captionW, menuPos.y + captionH);
+            ImGui::SetCursorScreenPos(a);
+            const bool clicked = ImGui::InvisibleButton(id, ImVec2(captionW, captionH));
+            const bool hovered = ImGui::IsItemHovered();
+            const bool held = ImGui::IsItemActive();
+            if (hovered || held) {
+                ImVec4 fill = glyph == CaptionGlyph::Close
+                    ? theme::col::bad() : theme::col::accent();
+                fill.w = glyph == CaptionGlyph::Close
+                    ? (held ? 0.95f : 0.78f) : (held ? 0.25f : 0.14f);
+                dl->AddRectFilled(a, b, ImGui::GetColorU32(fill));
+            }
+
+            const ImU32 ink = ImGui::GetColorU32(
+                hovered && glyph == CaptionGlyph::Close
+                    ? ImVec4(1, 1, 1, 1)
+                    : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+            const float cx = (a.x + b.x) * 0.5f;
+            const float cy = (a.y + b.y) * 0.5f;
+            const float half = 6.0f * k;
+            if (glyph == CaptionGlyph::Minimize) {
+                dl->AddLine(ImVec2(cx - half, cy + 3.0f * k),
+                            ImVec2(cx + half, cy + 3.0f * k), ink, 1.2f * k);
+            } else if (glyph == CaptionGlyph::Close) {
+                dl->AddLine(ImVec2(cx - half, cy - half),
+                            ImVec2(cx + half, cy + half), ink, 1.2f * k);
+                dl->AddLine(ImVec2(cx + half, cy - half),
+                            ImVec2(cx - half, cy + half), ink, 1.2f * k);
+            } else if (maximized) {
+                dl->AddRect(ImVec2(cx - 4.0f * k, cy - 6.0f * k),
+                            ImVec2(cx + 6.0f * k, cy + 4.0f * k), ink,
+                            0.0f, 0, 1.1f * k);
+                dl->AddRect(ImVec2(cx - 7.0f * k, cy - 3.0f * k),
+                            ImVec2(cx + 3.0f * k, cy + 7.0f * k), ink,
+                            0.0f, 0, 1.1f * k);
+            } else {
+                dl->AddRect(ImVec2(cx - half, cy - half),
+                            ImVec2(cx + half, cy + half), ink,
+                            0.0f, 0, 1.1f * k);
+            }
+            if (hovered && tip) ImGui::SetTooltip("%s", tip);
+            return clicked;
+        };
+
+        if (mainHwnd) {
+            if (captionButton("##caption_minimize", captionStart,
+                              CaptionGlyph::Minimize, "Minimize"))
+                ::ShowWindow(mainHwnd, SW_MINIMIZE);
+            if (captionButton("##caption_maximize", captionStart + captionW,
+                              CaptionGlyph::Maximize,
+                              maximized ? "Restore" : "Maximize"))
+                ::ShowWindow(mainHwnd, maximized ? SW_RESTORE : SW_MAXIMIZE);
+            if (captionButton("##caption_close", captionStart + captionW * 2.0f,
+                              CaptionGlyph::Close, "Close"))
+                ::PostMessageW(mainHwnd, WM_CLOSE, 0, 0);
+
+            titleDragMinX_ = menusEndX + 8.0f * k;
+            titleDragMinY_ = menuPos.y;
+            titleDragMaxX_ = captionStart - 4.0f * k;
+            titleDragMaxY_ = menuPos.y + captionH;
+            titleDragRegionValid_ = titleDragMaxX_ > titleDragMinX_;
         }
+
+        dl->AddLine(
+            ImVec2(menuPos.x, menuPos.y + menuSize.y - 1.0f),
+            ImVec2(menuPos.x + menuSize.x, menuPos.y + menuSize.y - 1.0f),
+            ImGui::GetColorU32(theme::col::line()));
         ImGui::EndMainMenuBar();
+    }
+    ImGui::PopStyleVar(2);
+}
+
+bool App::saveStaticUnpackArtifact(int artifactKind, bool loadAfterSave) {
+    const StaticUnpackResult& result = staticUnpackPopup_.result;
+    const std::vector<uint8_t>* bytes = nullptr;
+    const wchar_t* filter = nullptr;
+    const wchar_t* extension = nullptr;
+    std::string suffix;
+    bool loadable = false;
+    switch (artifactKind) {
+        case 0:
+            if (result.diskImageReady && !result.image.empty()) bytes = &result.image;
+            if (result.oepTrusted) {
+                suffix = staticUnpackPopup_.sourceWasDll ? ".static-unpacked.dll" : ".static-unpacked.exe";
+            } else {
+                suffix = staticUnpackPopup_.sourceWasDll
+                    ? ".static-recovered-analysis.dll" : ".static-recovered-analysis.exe";
+            }
+            filter = staticUnpackPopup_.sourceWasDll
+                ? L"PE dynamic library\0*.dll\0All Files\0*.*\0"
+                : L"PE executable\0*.exe\0All Files\0*.*\0";
+            extension = staticUnpackPopup_.sourceWasDll ? L"dll" : L"exe";
+            loadable = true;
+            break;
+        case 1:
+            if (!result.mappedImage.empty()) bytes = &result.mappedImage;
+            suffix = ".static-unpacked-mapped.bin";
+            filter = L"Mapped PE image\0*.bin\0All Files\0*.*\0";
+            extension = L"bin";
+            break;
+        default:
+            if (!result.rawArtifact.empty()) bytes = &result.rawArtifact;
+            suffix = ".static-unpack-raw.bin";
+            filter = L"Raw recovery artifact\0*.bin\0All Files\0*.*\0";
+            extension = L"bin";
+            break;
+    }
+    if (!bytes) {
+        staticUnpackPopup_.error = "That recovery artifact is not available.";
+        return false;
+    }
+
+    std::string base = staticUnpackPopup_.sourcePath;
+    const size_t slash = base.find_last_of("/\\");
+    if (slash != std::string::npos) base.erase(0, slash + 1);
+    const size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) base.resize(dot);
+    if (base.empty()) base = "packed-image";
+
+    std::string message, savedPath;
+    if (!ctx_.saveBytesFile(base + suffix, *bytes, message, filter, extension, &savedPath)) {
+        if (!message.empty()) staticUnpackPopup_.error = message;
+        return false;
+    }
+
+    std::wstring reportPath;
+    if (wideFromUtf8(savedPath + ".static-unpack-report.txt", reportPath)) {
+        std::ofstream out(std::filesystem::path(reportPath), std::ios::binary | std::ios::trunc);
+        if (!out || !(out << result.report))
+            ui::Toast(ui::ToastKind::Warn, "Artifact saved, but its static-unpack report could not be written.");
+    } else {
+        ui::Toast(ui::ToastKind::Warn, "Artifact saved, but its report path could not be encoded.");
+    }
+
+    if (artifactKind == 0 && !result.oepTrusted) {
+        ui::Toast(ui::ToastKind::Warn,
+                  "Saved reconstructed PE for analysis; its original entry point remains unverified.");
+    } else {
+        ui::Toast(ui::ToastKind::Success, "Saved static-unpack artifact and recovery report.");
+    }
+    if (loadable && loadAfterSave && ctx_.beginBinaryLoadPath(savedPath)) {
+        ctx_.requestedTab = "Binary View";
+        pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::StaticUnpack;
+    }
+    return true;
+}
+
+void App::renderStaticUnpackPopup() {
+    StaticUnpackResult completed;
+    if (staticUnpackService_.tryTakeResult(completed)) {
+        staticUnpackPopup_.result = std::move(completed);
+        if (!staticUnpackPopup_.result.success) {
+            staticUnpackPopup_.error = "Static recovery did not produce a complete disk-layout PE; inspect the retained artifacts and evidence below.";
+        } else if (staticUnpackPopup_.result.diskImageReady &&
+                   !staticUnpackPopup_.result.oepTrusted) {
+            staticUnpackPopup_.error = "Sections were recovered and a disk-layout PE was reconstructed, but its entry point is not a verified unpacked OEP. Treat this artifact as analysis-only or provide a validated OEP.";
+        } else {
+            staticUnpackPopup_.error.clear();
+        }
+    }
+    if (staticUnpackPopup_.open) {
+        staticUnpackPopup_.open = false;
+        const uint64_t currentHash = ctx_.staticBinary().loaded() ? ctx_.staticBinary().contentHash() : 0;
+        if (!staticUnpackService_.pending() && staticUnpackPopup_.sourceHash &&
+            (currentHash != staticUnpackPopup_.sourceHash ||
+             ctx_.staticBinary().imageRevision() != staticUnpackPopup_.sourceRevision)) {
+            staticUnpackPopup_.result = {};
+            staticUnpackPopup_.error.clear();
+            staticUnpackPopup_.sourcePath.clear();
+            staticUnpackPopup_.sourceHash = 0;
+            staticUnpackPopup_.sourceRevision = 0;
+            staticUnpackPopup_.sourceWasDll = false;
+        }
+        ImGui::OpenPopup("Static Packed-PE Recovery");
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(860.0f * theme::UiScale(), 730.0f * theme::UiScale()),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("Static Packed-PE Recovery", nullptr,
+                                ImGuiWindowFlags_NoSavedSettings)) return;
+    if (staticUnpackPopup_.closeAfterDocumentLoad) {
+        staticUnpackPopup_.closeAfterDocumentLoad = false;
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    const bool pending = staticUnpackService_.pending();
+    const StaticUnpackProgress progress = staticUnpackService_.progress();
+    ImGui::TextWrapped("Recover compressed PE sections without executing the sample. Automatic mode validates VMProtect-style PACKER_INFO descriptors first, then falls back to bounded embedded LZMA-alone recovery. All decode, dictionary, block, and output sizes are capped.");
+
+    ImGui::BeginDisabled(pending);
+    const char* strategies[] = {
+        "Automatic: PACKER_INFO, then LZMA-alone",
+        "VMProtect PACKER_INFO only",
+        "Embedded LZMA-alone only"
+    };
+    ImGui::SetNextItemWidth(340.0f * theme::UiScale());
+    ImGui::Combo("Recovery strategy", &staticUnpackPopup_.strategy,
+                 strategies, IM_ARRAYSIZE(strategies));
+    ImGui::Checkbox("Reconstruct an aligned disk-layout PE", &staticUnpackPopup_.rebuildDiskPe);
+    ImGui::InputInt("Maximum decompressed output (MiB)", &staticUnpackPopup_.maxOutputMiB, 64, 256);
+    staticUnpackPopup_.maxOutputMiB = std::clamp(staticUnpackPopup_.maxOutputMiB, 16, 512);
+    ImGui::InputInt("Maximum LZMA dictionary (MiB)", &staticUnpackPopup_.maxDictionaryMiB, 8, 32);
+    staticUnpackPopup_.maxDictionaryMiB = std::clamp(staticUnpackPopup_.maxDictionaryMiB, 1, 64);
+    ImGui::SetNextItemWidth(220.0f * theme::UiScale());
+    ImGui::InputText("Optional OEP VA", staticUnpackPopup_.oep,
+                     sizeof(staticUnpackPopup_.oep), ImGuiInputTextFlags_CharsHexadecimal);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("For a complete nested PE payload, use that payload's own preferred-base VA; the outer packer's base is not reused.");
+
+    const bool hasPendingPatches =
+        hasEnabledProjectPatches(ctx_.staticProject());
+    const bool sourceReady = ctx_.staticBinary().loaded() && !ctx_.staticBinary().isMappedImage() &&
+        !hasPendingPatches &&
+        ctx_.staticBinary().bytes().size() <= 512ull * 1024ull * 1024ull &&
+        (ctx_.staticBinary().format() == BinFormat::PE32 || ctx_.staticBinary().format() == BinFormat::PE32Plus);
+    ImGui::BeginDisabled(!sourceReady);
+    if (ImGui::Button("Recover statically", ImVec2(170.0f * theme::UiScale(), 0))) {
+        staticUnpackPopup_.error.clear();
+        bool optionsValid = true;
+        StaticUnpackRequest request;
+        // The worker opens and owns the disk input; do not copy a potentially
+        // 512-MiB BinaryFile vector on the render thread.
+        request.inputPath = ctx_.staticBinary().path();
+        request.verifySourceIdentity = true;
+        request.expectedSourceSize = ctx_.staticBinary().bytes().size();
+        request.expectedSourceHash = ctx_.staticBinary().contentHash();
+        request.options.strategy = static_cast<StaticUnpackStrategy>(staticUnpackPopup_.strategy);
+        request.options.rebuildDiskPe = staticUnpackPopup_.rebuildDiskPe;
+        request.options.maxInputBytes = 512ull * 1024ull * 1024ull;
+        request.options.maxOutputBytes = static_cast<size_t>(staticUnpackPopup_.maxOutputMiB) * 1024ull * 1024ull;
+        request.options.maxDictionaryBytes = static_cast<size_t>(staticUnpackPopup_.maxDictionaryMiB) * 1024ull * 1024ull;
+        request.options.runtimeImageBase = ctx_.staticBinary().imageBase();
+        uint64_t oep = 0;
+        if (staticUnpackPopup_.oep[0]) {
+            if (!parseHexU64(staticUnpackPopup_.oep, oep)) {
+                staticUnpackPopup_.error = "The optional OEP must be a hexadecimal virtual address.";
+                optionsValid = false;
+            } else {
+                request.options.hasOep = true;
+                request.options.oepVA = oep;
+            }
+        }
+        if (optionsValid) {
+            staticUnpackPopup_.result = {};
+            staticUnpackPopup_.error.clear();
+            staticUnpackPopup_.sourcePath = ctx_.staticBinary().path();
+            staticUnpackPopup_.sourceHash = ctx_.staticBinary().contentHash();
+            staticUnpackPopup_.sourceRevision = ctx_.staticBinary().imageRevision();
+            staticUnpackPopup_.sourceWasDll = ctx_.staticBinary().isDll();
+            if (!staticUnpackService_.request(std::move(request)))
+                staticUnpackPopup_.error = "The static recovery request was rejected (a job is already active or a safety cap was exceeded).";
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (!sourceReady && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (hasPendingPatches)
+            ImGui::SetTooltip("Static recovery reads an identity-checked disk file. Save the patched binary and reopen it first so in-memory patches cannot be silently ignored.");
+        else
+            ImGui::SetTooltip("Load a disk-layout PE32 or PE32+ image no larger than 512 MiB first.");
+    }
+
+    if (pending) {
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel static recovery")) staticUnpackService_.cancel();
+        ImGui::SeparatorText("Worker progress");
+        ImGui::Text("%s | block %u/%u | output %llu bytes",
+                    StaticUnpackPhaseName(progress.phase), progress.blockIndex,
+                    progress.blockCount, static_cast<unsigned long long>(progress.outputBytes));
+        const float fraction = progress.total
+            ? std::clamp(static_cast<float>(progress.current) / static_cast<float>(progress.total), 0.0f, 1.0f)
+            : 0.0f;
+        ImGui::ProgressBar(fraction, ImVec2(-1, 0));
+    }
+
+    if (!staticUnpackPopup_.error.empty())
+        ImGui::TextColored(theme::col::warn(), "%s", staticUnpackPopup_.error.c_str());
+
+    const StaticUnpackResult& result = staticUnpackPopup_.result;
+    if (!result.report.empty() || !result.blocks.empty()) {
+        ImGui::SeparatorText("Recovery result");
+        const ImVec4 resultColor = result.success &&
+                                   (!result.diskImageReady || result.oepTrusted)
+                                       ? theme::col::good()
+                                       : (result.success || result.decoded)
+                                           ? theme::col::warn()
+                                           : theme::col::bad();
+        ImGui::TextColored(resultColor, "%s | confidence %.0f%% | %zu block(s)",
+                           StaticUnpackStrategyName(result.strategy), result.confidence * 100.0f,
+                           result.blocks.size());
+        ImGui::Text("Descriptor file offset 0x%llX | mapped %zu bytes | disk artifact %zu bytes",
+                    static_cast<unsigned long long>(result.probe.packerInfoOffset),
+                    result.mappedImage.size(), result.image.size());
+        if (result.diskImageReady) {
+            ImGui::TextColored(result.oepTrusted ? theme::col::good() : theme::col::warn(),
+                               "Entry RVA 0x%08X | OEP %s", result.entryRVA,
+                               result.oepTrusted ? "validated" : "UNVERIFIED");
+            if (!result.oepAssessment.empty())
+                ImGui::TextWrapped("%s", result.oepAssessment.c_str());
+        }
+
+        if (!result.blocks.empty() && ImGui::BeginTable("##static_blocks", 8,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+                ImVec2(0, 150.0f * theme::UiScale()))) {
+            ImGui::TableSetupColumn("#");
+            ImGui::TableSetupColumn("Source RVA");
+            ImGui::TableSetupColumn("Destination RVA");
+            ImGui::TableSetupColumn("Packed");
+            ImGui::TableSetupColumn("Output");
+            ImGui::TableSetupColumn("Codec");
+            ImGui::TableSetupColumn("Confidence");
+            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < result.blocks.size(); ++i) {
+                const StaticUnpackBlock& block = result.blocks[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%zu", i + 1);
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%08X", block.sourceRVA);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%08X", block.destinationRVA);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%llu", static_cast<unsigned long long>(block.compressedSize));
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%llu", static_cast<unsigned long long>(block.outputSize));
+                ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(StaticUnpackCodecName(block.codec));
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%.0f%%", block.confidence * 100.0f);
+                ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(block.status.c_str());
+                if (ImGui::IsItemHovered() && !block.evidence.empty())
+                    ImGui::SetTooltip("%s", block.evidence.c_str());
+            }
+            ImGui::EndTable();
+        }
+
+        if (ImGui::BeginChild("##static_evidence", ImVec2(0, 125.0f * theme::UiScale()),
+                              ImGuiChildFlags_Borders)) {
+            for (const StaticUnpackEvidence& evidence : result.probe.evidence)
+                ImGui::BulletText("[%3.0f%%] %s: %s (file +0x%llX)", evidence.confidence * 100.0f,
+                                  evidence.code.c_str(), evidence.detail.c_str(),
+                                  static_cast<unsigned long long>(evidence.fileOffset));
+            for (const StaticUnpackIssue& issue : result.issues) {
+                const ImVec4 color = issue.severity == StaticUnpackSeverity::Error ? theme::col::bad() :
+                                     issue.severity == StaticUnpackSeverity::Warning ? theme::col::warn() :
+                                     theme::col::muted();
+                ImGui::TextColored(color, "%s: %s", issue.code.c_str(), issue.message.c_str());
+            }
+        }
+        ImGui::EndChild();
+
+        if (result.diskImageReady && !result.image.empty()) {
+            ImGui::Checkbox("Load saved PE into analysis", &staticUnpackPopup_.loadAfterSave);
+            const char* saveLabel = result.oepTrusted
+                ? "Save runnable reconstructed PE + report"
+                : "Save analysis PE (OEP unverified) + report";
+            if (ImGui::Button(saveLabel))
+                saveStaticUnpackArtifact(0, staticUnpackPopup_.loadAfterSave);
+            ImGui::SameLine();
+        }
+        if (!result.mappedImage.empty()) {
+            if (ImGui::Button("Save mapped image + report")) saveStaticUnpackArtifact(1, false);
+            ImGui::SameLine();
+        }
+        if (!result.rawArtifact.empty() && ImGui::Button("Save raw artifact + report"))
+            saveStaticUnpackArtifact(2, false);
+
+        if (ImGui::CollapsingHeader("Full static-unpack report")) {
+            ImGui::BeginChild("##static_report", ImVec2(0, 150.0f * theme::UiScale()), ImGuiChildFlags_Borders);
+            ImGui::TextUnformatted(result.report.c_str());
+            ImGui::EndChild();
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(pending);
+    if (ImGui::Button("Close")) {
+        staticUnpackPopup_.result = {};
+        staticUnpackPopup_.error.clear();
+        staticUnpackPopup_.sourcePath.clear();
+        staticUnpackPopup_.sourceHash = 0;
+        staticUnpackPopup_.sourceRevision = 0;
+        staticUnpackPopup_.sourceWasDll = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
+void App::renderAntiDebugPopup() {
+    if (antiDebugPopupOpen_) {
+        antiDebugPopupOpen_ = false;
+        antiDebugDraft_ = ctx_.debug.antiDebugPolicy();
+        antiDebugError_.clear();
+        ImGui::OpenPopup("Hide Debugger / Anti-Anti-Debug");
+    }
+    ImGui::SetNextWindowSize(ImVec2(760.0f * theme::UiScale(), 660.0f * theme::UiScale()),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("Hide Debugger / Anti-Anti-Debug", nullptr,
+                                ImGuiWindowFlags_NoSavedSettings)) return;
+
+    const DbgSnapshot snap = ctx_.debug.snapshot();
+    const bool attached = snap.attached();
+    ImGui::TextWrapped("This session policy conceals common debugger observations while preserving DisasmStudio's own breakpoints. Every option is off by default. Detach attempts a conditional, best-effort restore; target-modified fields or code are not overwritten.");
+    if (attached)
+        ImGui::TextColored(theme::col::warn(),
+                           "Policy is session-atomic. Detach before changing it; live statistics remain visible below.");
+
+    ImGui::BeginDisabled(attached);
+    if (ImGui::Button("Recommended coverage")) {
+        antiDebugDraft_.normalizePeb = true;
+        antiDebugDraft_.normalizeProcessHeap = true;
+        antiDebugDraft_.hideProcessDebugQueries = true;
+        antiDebugDraft_.hideKernelDebuggerQuery = true;
+        antiDebugDraft_.acceptThreadHideRequests = true;
+        antiDebugDraft_.neutralizeInvalidHandleClose = true;
+        antiDebugDraft_.maskDebugRegisters = true;
+        antiDebugDraft_.syntheticClock = true;
+        // Software RDTSC traps necessarily patch target code and cannot offer
+        // the Hv backend's transparent coverage. Keep them explicit opt-in.
+        antiDebugDraft_.rdtsc = RdtscInterception::Off;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Disable all")) antiDebugDraft_ = {};
+
+    ImGui::SeparatorText("Environment normalization");
+    ImGui::Checkbox("Normalize PEB BeingDebugged and NtGlobalFlag", &antiDebugDraft_.normalizePeb);
+    ImGui::Checkbox("Normalize validated process-heap debug flags", &antiDebugDraft_.normalizeProcessHeap);
+
+    ImGui::SeparatorText("Native query mediation");
+    ImGui::Checkbox("Hide process debug port/object/flags queries", &antiDebugDraft_.hideProcessDebugQueries);
+    ImGui::Checkbox("Hide kernel-debugger system query", &antiDebugDraft_.hideKernelDebuggerQuery);
+    ImGui::Checkbox("Accept ThreadHideFromDebugger without losing control", &antiDebugDraft_.acceptThreadHideRequests);
+    ImGui::Checkbox("Neutralize invalid-handle close probes", &antiDebugDraft_.neutralizeInvalidHandleClose);
+    ImGui::Checkbox("Mask target-visible DR0-DR7 context queries", &antiDebugDraft_.maskDebugRegisters);
+
+    ImGui::SeparatorText("Time virtualization");
+    ImGui::Checkbox("Synthetic monotonic QPC and system time", &antiDebugDraft_.syntheticClock);
+    int rdtsc = static_cast<int>(antiDebugDraft_.rdtsc);
+    const char* rdtscModes[] = { "Off", "Main executable", "All executable images" };
+    ImGui::SetNextItemWidth(230.0f * theme::UiScale());
+    if (ImGui::Combo("RDTSC / RDTSCP interception", &rdtsc, rdtscModes, IM_ARRAYSIZE(rdtscModes)))
+        antiDebugDraft_.rdtsc = static_cast<RdtscInterception>(rdtsc);
+    if (antiDebugDraft_.rdtsc != RdtscInterception::Off)
+        ImGui::TextColored(theme::col::warn(),
+                           "Software timing traps patch only statically proven reachable sites; generated/self-modifying code is not covered.");
+    ImGui::EndDisabled();
+
+    const AntiDebugCapabilityReport capabilities = BuildAntiDebugCapabilityReport(antiDebugDraft_);
+    if (ImGui::BeginChild("##anti_debug_capabilities", ImVec2(0, 150.0f * theme::UiScale()),
+                          ImGuiChildFlags_Borders)) {
+        ImGui::TextColored(theme::col::good(), "Win32 debugger coverage");
+        for (const std::string& line : capabilities.userModeCoverage)
+            ImGui::BulletText("%s", line.c_str());
+        if (!capabilities.beyondUserMode.empty()) {
+            ImGui::TextColored(theme::col::warn(), "Not achievable from user mode (out of scope)");
+            for (const std::string& line : capabilities.beyondUserMode)
+                ImGui::BulletText("%s", line.c_str());
+        }
+    }
+    ImGui::EndChild();
+
+    const AntiDebugSessionStats& s = snap.antiDebug;
+    if (s.active || s.policy.enabled()) {
+        ImGui::Text("%s: %llu field(s) normalized, %llu query call(s), %llu clock call(s), %llu RDTSC/RDTSCP instruction(s)",
+                    attached && s.active ? "Live" : "Last session",
+                    static_cast<unsigned long long>(s.memoryFieldsNormalized),
+                    static_cast<unsigned long long>(s.queryCallsConcealed + s.contextCallsMediated),
+                    static_cast<unsigned long long>(s.clockCallsSynthesized),
+                    static_cast<unsigned long long>(s.rdtscInstructionsEmulated));
+        if (s.memoryFieldsRestored || s.memoryFieldNormalizeFailures ||
+            s.memoryFieldRestoreFailures || s.antiTrapRestoreFailures) {
+            ImGui::TextDisabled("Environment: %llu field(s) restored; normalize/field-restore/trap-restore failures %llu/%llu/%llu.",
+                static_cast<unsigned long long>(s.memoryFieldsRestored),
+                static_cast<unsigned long long>(s.memoryFieldNormalizeFailures),
+                static_cast<unsigned long long>(s.memoryFieldRestoreFailures),
+                static_cast<unsigned long long>(s.antiTrapRestoreFailures));
+        }
+        if (s.rdtscDiscoveryBudgetTotal) {
+            ImGui::TextDisabled("RDTSC discovery: %llu instruction(s), %llu/%llu budget remaining, %llu image(s) capped%s",
+                static_cast<unsigned long long>(s.rdtscDiscoveryInstructions),
+                static_cast<unsigned long long>(s.rdtscDiscoveryBudgetRemaining),
+                static_cast<unsigned long long>(s.rdtscDiscoveryBudgetTotal),
+                static_cast<unsigned long long>(s.rdtscDiscoveryImagesCapped),
+                s.rdtscDiscoveryBudgetExhausted ? " (session exhausted)" : "");
+        }
+        if (s.clockRunIntervals) {
+            const double resumedSeconds = s.clockQpcFrequency
+                ? static_cast<double>(s.clockRunningQpcTicks) /
+                    static_cast<double>(s.clockQpcFrequency)
+                : 0.0;
+            ImGui::TextDisabled("Synthetic time advanced %.3f s across %llu resumed run interval(s); debugger-paused time excluded%s.",
+                                resumedSeconds,
+                                static_cast<unsigned long long>(s.clockRunIntervals),
+                                s.clockRunIntervalsClamped ? " (one or more intervals safety-clamped)" : "");
+        }
+        for (const std::string& warning : s.warnings)
+            ImGui::TextColored(theme::col::warn(), "%s", warning.c_str());
+        if (s.warningsDropped || s.warningsDeduplicated)
+            ImGui::TextDisabled("Anti-debug warnings bounded: %llu dropped, %llu duplicate occurrence(s) suppressed.",
+                                static_cast<unsigned long long>(s.warningsDropped),
+                                static_cast<unsigned long long>(s.warningsDeduplicated));
+    }
+    if (!antiDebugError_.empty())
+        ImGui::TextColored(theme::col::bad(), "%s", antiDebugError_.c_str());
+
+    ImGui::BeginDisabled(attached);
+    if (ImGui::Button("Apply for next session", ImVec2(180.0f * theme::UiScale(), 0))) {
+        std::string error;
+        if (ctx_.debug.setAntiDebugPolicy(antiDebugDraft_, &error)) {
+            ui::Toast(ui::ToastKind::Success,
+                      antiDebugDraft_.enabled() ? "Debugger concealment policy armed for the next session."
+                                                : "Debugger concealment disabled.");
+            ImGui::CloseCurrentPopup();
+        } else antiDebugError_ = error;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void App::browsePassiveExecutable() {
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFilter = L"Windows executables\0*.exe\0All Files\0*.*\0";
+    ofn.lpstrFile = file.data();
+    ofn.nMaxFile = static_cast<DWORD>(file.size());
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+    std::string path;
+    if (!utf8FromWide(file.data(), path)) {
+        passiveDumpPopup_.error = "Could not encode the selected launch path as UTF-8.";
+        return;
+    }
+    strncpy_s(passiveDumpPopup_.launchPath, path.c_str(), _TRUNCATE);
+    const size_t slash = path.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        const std::string directory = path.substr(0, slash);
+        strncpy_s(passiveDumpPopup_.workingDirectory, directory.c_str(), _TRUNCATE);
     }
 }
 
-// Toolbar height: room for the 30px square tool buttons + padding (the wireframe
-// wf-toolbar is 44px); never smaller than a frame row so inline text still fits.
+bool App::savePassiveDumpArtifacts(bool loadAfterSave) {
+    const bool rebuilt = passiveDumpPopup_.result.rebuilt.success &&
+                         !passiveDumpPopup_.result.rebuilt.image.empty();
+    const bool manualOepValidated = rebuilt &&
+        passiveDumpPopup_.result.oep.trust == PassiveOepTrust::ManualOepValidated;
+    const bool runnable = rebuilt &&
+        passiveDumpPopup_.result.artifactAssessment == PassiveArtifactAssessment::RebuiltRunnable;
+    const std::vector<uint8_t>& bytes = rebuilt ? passiveDumpPopup_.result.rebuilt.image
+                                                : passiveDumpPopup_.result.capture.bytes;
+    if (bytes.empty()) {
+        passiveDumpPopup_.error = "There is no captured image to save.";
+        return false;
+    }
+    std::string baseName;
+    utf8FromWide(passiveDumpPopup_.result.module.name.c_str(), baseName);
+    if (baseName.empty()) baseName = "process";
+    const size_t dot = baseName.find_last_of('.');
+    if (dot != std::string::npos) baseName.resize(dot);
+    baseName += rebuilt
+        ? (runnable ? ".passive-unpacked.exe" : ".passive-recovered-analysis.exe")
+        : ".passive-capture.bin";
+
+    std::string message, savedPath;
+    const bool saved = ctx_.saveBytesFile(
+        baseName, bytes, message,
+        rebuilt ? L"PE executable\0*.exe\0All Files\0*.*\0"
+                : L"Mapped process capture\0*.bin\0All Files\0*.*\0",
+        rebuilt ? L"exe" : L"bin", &savedPath);
+    if (!saved) {
+        if (!message.empty()) passiveDumpPopup_.error = message;
+        return false;
+    }
+
+    std::wstring reportWide;
+    if (!wideFromUtf8(savedPath + ".passive-report.txt", reportWide)) {
+        passiveDumpPopup_.error = "The image was saved, but the report path could not be encoded.";
+        return false;
+    }
+    std::ofstream reportFile(std::filesystem::path(reportWide), std::ios::binary | std::ios::trunc);
+    if (!reportFile || !(reportFile << passiveDumpPopup_.result.report)) {
+        passiveDumpPopup_.error = "The image was saved, but the passive-dump report could not be written.";
+        ui::Toast(ui::ToastKind::Warn, passiveDumpPopup_.error);
+        return false;
+    }
+    if (rebuilt && !runnable) {
+        ui::Toast(ui::ToastKind::Warn, manualOepValidated
+            ? "Saved reconstructed PE for analysis; its manual OEP is validated, but disk-backfilled bytes prevent runnable classification."
+            : "Saved reconstructed PE for analysis; its original entry point remains unverified.");
+    } else {
+        ui::Toast(ui::ToastKind::Success, "Saved passive process image and capture report.");
+    }
+    if (rebuilt && loadAfterSave) {
+        // Loading hands the analyst to a new binary and closes this modal. Do
+        // not leave an owned launch alive with its explicit stop control hidden.
+        if (ctx_.beginBinaryLoadPath(savedPath)) {
+            if (passiveDumpPopup_.result.launched &&
+                passiveDumpPopup_.result.launchContained)
+                passiveDumpService_.terminateContainedLaunch();
+            ctx_.requestedTab = "Binary View";
+            passiveDumpPopup_.result.launchContained = false;
+            pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::PassiveDump;
+        }
+    }
+    return true;
+}
+
+void App::renderPassiveDumpPopup() {
+    if (ctx_.requestedPassiveDump) {
+        passiveDumpPopup_.selectedPid = ctx_.requestedPassiveDumpPid;
+        passiveDumpPopup_.open = true;
+        ctx_.requestedPassiveDump = false;
+        ctx_.requestedPassiveDumpPid = 0;
+    }
+    PassiveDumpResult completed;
+    if (passiveDumpService_.tryTakeResult(completed)) {
+        passiveDumpPopup_.result = std::move(completed);
+        passiveDumpPopup_.error = passiveDumpPopup_.result.error;
+    }
+    if (passiveDumpPopup_.open) {
+        passiveDumpPopup_.open = false;
+        if (!passiveDumpService_.busy()) {
+            const uint32_t requestedPid = passiveDumpPopup_.selectedPid;
+            passiveDumpPopup_.result = {};
+            passiveDumpPopup_.error.clear();
+            passiveDumpPopup_.processes = EnumeratePassiveProcesses();
+            passiveDumpPopup_.selectedPid = requestedPid;
+            passiveDumpPopup_.launchMode = false;
+            passiveDumpPopup_.suspendFinal = true;
+            passiveDumpPopup_.rebuildImports = true;
+            passiveDumpPopup_.normalizeRelocations = true;
+            passiveDumpPopup_.loadAfterSave = true;
+            passiveDumpPopup_.timing = static_cast<int>(PassiveTiming::AutoSettle);
+            passiveDumpPopup_.sampleIntervalMs = 250;
+            passiveDumpPopup_.maxWatchMs = 60000;
+            passiveDumpPopup_.stableSamples = 4;
+            passiveDumpPopup_.manualOep[0] = '\0';
+            if (passiveDumpPopup_.launchPath[0] == '\0' && ctx_.binaryLaunchable()) {
+                strncpy_s(passiveDumpPopup_.launchPath, ctx_.staticBinary().path().c_str(), _TRUNCATE);
+                const size_t slash = ctx_.staticBinary().path().find_last_of("/\\");
+                if (slash != std::string::npos) {
+                    const std::string directory = ctx_.staticBinary().path().substr(0, slash);
+                    strncpy_s(passiveDumpPopup_.workingDirectory, directory.c_str(), _TRUNCATE);
+                }
+            }
+        }
+        ImGui::OpenPopup("Passive Process Dump");
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(820.0f * theme::UiScale(), 720.0f * theme::UiScale()),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("Passive Process Dump", nullptr,
+                                ImGuiWindowFlags_NoSavedSettings)) return;
+    if (passiveDumpPopup_.closeAfterDocumentLoad) {
+        passiveDumpPopup_.closeAfterDocumentLoad = false;
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const bool busy = passiveDumpService_.busy();
+    const PassiveDumpProgress progress = passiveDumpService_.progress();
+
+    ImGui::TextWrapped("Capture an existing process using query/read handles only, or launch normally without DEBUG flags and watch memory until writes and entropy settle. No code is injected and no target bytes are patched.");
+    ImGui::BeginDisabled(busy);
+    if (ImGui::RadioButton("Existing process", !passiveDumpPopup_.launchMode))
+        passiveDumpPopup_.launchMode = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Launch and watch", passiveDumpPopup_.launchMode))
+        passiveDumpPopup_.launchMode = true;
+
+    if (!passiveDumpPopup_.launchMode) {
+        if (ImGui::Button("Refresh processes"))
+            passiveDumpPopup_.processes = EnumeratePassiveProcesses();
+        ImGui::SameLine();
+        ui::SearchBox("##passive_filter", "filter process...", passiveDumpPopup_.processFilter,
+                      sizeof(passiveDumpPopup_.processFilter), 240.0f * theme::UiScale());
+        if (ImGui::BeginChild("##passive_processes", ImVec2(0, 155.0f * theme::UiScale()),
+                              ImGuiChildFlags_Borders)) {
+            std::string filter = passiveDumpPopup_.processFilter;
+            std::transform(filter.begin(), filter.end(), filter.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            for (const PassiveProcessInfo& process : passiveDumpPopup_.processes) {
+                std::string name, path;
+                utf8FromWide(process.imageName.c_str(), name);
+                utf8FromWide(process.imagePath.c_str(), path);
+                std::string hay = name + " " + path;
+                std::transform(hay.begin(), hay.end(), hay.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (!filter.empty() && hay.find(filter) == std::string::npos) continue;
+                char label[512];
+                std::snprintf(label, sizeof(label), "%s  (PID %u)##passive%u",
+                              name.empty() ? "<unknown>" : name.c_str(), process.pid, process.pid);
+                if (ImGui::Selectable(label, passiveDumpPopup_.selectedPid == process.pid))
+                    passiveDumpPopup_.selectedPid = process.pid;
+                if (ImGui::IsItemHovered() && !path.empty()) ImGui::SetTooltip("%s", path.c_str());
+            }
+        }
+        ImGui::EndChild();
+    } else {
+        ImGui::SetNextItemWidth(-125.0f * theme::UiScale());
+        ImGui::InputText("Executable", passiveDumpPopup_.launchPath,
+                         sizeof(passiveDumpPopup_.launchPath));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) browsePassiveExecutable();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("Arguments", passiveDumpPopup_.launchArguments,
+                         sizeof(passiveDumpPopup_.launchArguments));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Optional Windows command tail. Quotes and backslashes follow CommandLineToArgvW rules; Core re-quotes every parsed argument safely.");
+        ImGui::SetNextItemWidth(-145.0f * theme::UiScale());
+        ImGui::InputText("Working directory", passiveDumpPopup_.workingDirectory,
+                         sizeof(passiveDumpPopup_.workingDirectory));
+        ImGui::SameLine();
+        if (ImGui::Button("Use exe folder")) {
+            const std::string executable = passiveDumpPopup_.launchPath;
+            const size_t slash = executable.find_last_of("/\\");
+            if (slash != std::string::npos) {
+                const std::string directory = executable.substr(0, slash);
+                strncpy_s(passiveDumpPopup_.workingDirectory, directory.c_str(), _TRUNCATE);
+            }
+        }
+        ImGui::TextWrapped("Fresh launches are always assigned to a one-process kill-on-close Job while CREATE_SUSPENDED, then resumed. If containment setup fails, the process is terminated before its first instruction. This does not virtualize filesystem or network access.");
+    }
+
+    const char* timingModes[] = { "Immediate snapshot", "Manual capture", "Automatic settle" };
+    ImGui::SetNextItemWidth(220.0f * theme::UiScale());
+    ImGui::Combo("Capture timing", &passiveDumpPopup_.timing, timingModes, IM_ARRAYSIZE(timingModes));
+    ImGui::InputInt("Sample interval (ms)", &passiveDumpPopup_.sampleIntervalMs, 50, 250);
+    passiveDumpPopup_.sampleIntervalMs = std::clamp(passiveDumpPopup_.sampleIntervalMs, 100, 5000);
+    if (passiveDumpPopup_.timing == static_cast<int>(PassiveTiming::AutoSettle)) {
+        ImGui::InputInt("Maximum watch time (ms)", &passiveDumpPopup_.maxWatchMs, 1000, 5000);
+        passiveDumpPopup_.maxWatchMs = std::clamp(passiveDumpPopup_.maxWatchMs, 1000, 10 * 60 * 1000);
+        ImGui::InputInt("Stable samples required", &passiveDumpPopup_.stableSamples, 1, 2);
+        passiveDumpPopup_.stableSamples = std::clamp(passiveDumpPopup_.stableSamples, 2, 32);
+    }
+    ImGui::Checkbox("Briefly suspend for the final coherent capture", &passiveDumpPopup_.suspendFinal);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Uses dynamically resolved NtSuspendProcess/NtResumeProcess only around final capture; failure falls back to read-only live capture.");
+    ImGui::Checkbox("Match exact loaded exports and rebuild imports", &passiveDumpPopup_.rebuildImports);
+    ImGui::Checkbox("Normalize relocations when transactionally safe", &passiveDumpPopup_.normalizeRelocations);
+    ImGui::SetNextItemWidth(200.0f * theme::UiScale());
+    ImGui::InputText("Optional OEP VA", passiveDumpPopup_.manualOep,
+                     sizeof(passiveDumpPopup_.manualOep), ImGuiInputTextFlags_CharsHexadecimal);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Only a supplied VA validated against an exactly captured executable page is trusted; runnable output additionally requires zero disk-backfilled pages. The original header entry remains analysis-only.");
+    ImGui::EndDisabled();
+
+    if (!busy) {
+        const bool selectedAttached = !passiveDumpPopup_.launchMode &&
+            ctx_.frameDebugSnapshot && ctx_.frameDebugSnapshot->attached() &&
+            ctx_.frameDebugSnapshot->pid == passiveDumpPopup_.selectedPid;
+        const bool sourceReady = passiveDumpPopup_.launchMode
+            ? passiveDumpPopup_.launchPath[0] != '\0'
+            : passiveDumpPopup_.selectedPid != 0 && !selectedAttached;
+        if (selectedAttached)
+            ImGui::TextColored(theme::col::warn(),
+                               "Detach this PID first; a passive read cannot safely remove debugger-owned int3 bytes.");
+        ImGui::BeginDisabled(!sourceReady);
+        if (ImGui::Button("Start passive capture", ImVec2(180.0f * theme::UiScale(), 0))) {
+            PassiveDumpRequest request;
+            request.pid = passiveDumpPopup_.launchMode ? 0 : passiveDumpPopup_.selectedPid;
+            bool sourceValid = true;
+            if (passiveDumpPopup_.launchMode) {
+                if (!wideFromUtf8(passiveDumpPopup_.launchPath, request.executable)) {
+                    passiveDumpPopup_.error = "The executable path is not valid UTF-8.";
+                    sourceValid = false;
+                }
+                std::vector<std::string> parsedArguments;
+                std::string argumentError;
+                if (sourceValid && !splitWindowsUserArguments(
+                        passiveDumpPopup_.launchArguments, parsedArguments, argumentError)) {
+                    passiveDumpPopup_.error = argumentError;
+                    sourceValid = false;
+                }
+                if (sourceValid && parsedArguments.size() > 256) {
+                    passiveDumpPopup_.error = "The launch command contains more than 256 arguments.";
+                    sourceValid = false;
+                }
+                if (sourceValid) {
+                    request.arguments.reserve(parsedArguments.size());
+                    for (const std::string& argument : parsedArguments) {
+                        std::wstring wide;
+                        if (!wideFromUtf8(argument, wide)) {
+                            passiveDumpPopup_.error = "A parsed launch argument is not valid UTF-8.";
+                            sourceValid = false;
+                            break;
+                        }
+                        request.arguments.push_back(std::move(wide));
+                    }
+                }
+                if (sourceValid && passiveDumpPopup_.workingDirectory[0]) {
+                    if (!wideFromUtf8(passiveDumpPopup_.workingDirectory,
+                                      request.workingDirectory)) {
+                        passiveDumpPopup_.error = "The working directory is not valid UTF-8.";
+                        sourceValid = false;
+                    } else {
+                        const DWORD attrs = GetFileAttributesW(request.workingDirectory.c_str());
+                        if (attrs == INVALID_FILE_ATTRIBUTES ||
+                            !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                            passiveDumpPopup_.error = "The working directory does not exist or is not a directory.";
+                            sourceValid = false;
+                        }
+                    }
+                }
+            }
+            if (sourceValid) {
+                request.timing = static_cast<PassiveTiming>(passiveDumpPopup_.timing);
+                request.sampleIntervalMs = static_cast<uint32_t>(passiveDumpPopup_.sampleIntervalMs);
+                request.settle.maxWatchMs = static_cast<uint64_t>(passiveDumpPopup_.maxWatchMs);
+                request.settle.stableSamplesRequired = static_cast<uint32_t>(passiveDumpPopup_.stableSamples);
+                request.suspendDuringFinalCapture = passiveDumpPopup_.suspendFinal;
+                request.observeExactExportImports = passiveDumpPopup_.rebuildImports;
+                request.normalizeRelocations = passiveDumpPopup_.normalizeRelocations;
+                // A launch created by this modal is our owned, contained analysis
+                // target. Cancelling the observation should not strand it running
+                // invisibly after the result has no artifact/stop controls.
+                request.terminateLaunchedOnCancel = passiveDumpPopup_.launchMode;
+                bool optionsValid = true;
+                uint64_t oep = 0;
+                if (passiveDumpPopup_.manualOep[0]) {
+                    if (!parseHexU64(passiveDumpPopup_.manualOep, oep)) {
+                        passiveDumpPopup_.error =
+                            "The optional OEP must be a complete hexadecimal virtual address.";
+                        optionsValid = false;
+                    } else {
+                        request.hasManualOep = true;
+                        request.manualOepVA = oep;
+                    }
+                }
+                if (optionsValid) {
+                    std::string error;
+                    passiveDumpPopup_.result = {};
+                    passiveDumpPopup_.error.clear();
+                    if (!passiveDumpService_.start(std::move(request), &error))
+                        passiveDumpPopup_.error = error;
+                }
+            }
+        }
+        ImGui::EndDisabled();
+    } else {
+        ImGui::SeparatorText("Capture progress");
+        ImGui::Text("%s", progress.status.c_str());
+        const float fraction = passiveDumpPopup_.maxWatchMs > 0
+            ? std::clamp(static_cast<float>(progress.elapsedMs) /
+                         static_cast<float>(passiveDumpPopup_.maxWatchMs), 0.0f, 1.0f) : 0.0f;
+        ImGui::ProgressBar(fraction, ImVec2(-1, 0));
+        ImGui::Text("PID %u | samples %u | stable %u | readable %u/%u pages | changed %.3f%% | entropy %.3f",
+                    progress.pid, progress.samples, progress.stableSamples,
+                    progress.readablePages, progress.totalPages,
+                    progress.changedPageRatio * 100.0, progress.entropy);
+        if (passiveDumpPopup_.timing == static_cast<int>(PassiveTiming::Manual) &&
+            progress.phase == PassiveDumpPhase::Watching) {
+            if (ImGui::Button("Capture now")) passiveDumpService_.requestCapture();
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Cancel")) passiveDumpService_.cancel();
+    }
+
+    if (!passiveDumpPopup_.error.empty())
+        ImGui::TextColored(theme::col::bad(), "%s", passiveDumpPopup_.error.c_str());
+    if (!passiveDumpPopup_.result.capture.bytes.empty()) {
+        ImGui::SeparatorText("Result");
+        const PassiveDumpResult& result = passiveDumpPopup_.result;
+        const bool rebuilt = result.rebuilt.success && !result.rebuilt.image.empty();
+        const bool manualOepValidated = rebuilt &&
+            result.oep.trust == PassiveOepTrust::ManualOepValidated;
+        const bool runnable = rebuilt &&
+            result.artifactAssessment == PassiveArtifactAssessment::RebuiltRunnable;
+        const char* outcome = !rebuilt ? "Raw mapped capture retained"
+                            : runnable ? "Runnable reconstructed PE (manual OEP validated)"
+                            : manualOepValidated
+                                ? "Reconstructed analysis PE (manual OEP validated; disk backfill used)"
+                                : "Reconstructed analysis PE (OEP unverified)";
+        ImGui::TextColored(runnable ? theme::col::good() : theme::col::warn(), "%s", outcome);
+        ImGui::Text("PID %u | image 0x%llX + 0x%llX | readable/unreadable pages %u/%u | imports observed %zu",
+                    result.pid, static_cast<unsigned long long>(result.module.base),
+                    static_cast<unsigned long long>(result.module.size),
+                    result.capture.readablePages, result.capture.unreadablePages,
+                    result.observedImports.size());
+        if (result.importObservationRequested) {
+            ImGui::TextColored(result.importObservationCoherent ? theme::col::good()
+                                                                : theme::col::warn(),
+                               "Import snapshot: %s",
+                               result.importObservationCoherent
+                                   ? "remote exports captured in the final suspension window"
+                                   : "best-effort live metadata (target was not suspended)");
+        }
+        if (result.memory.estimatedPeakBytes) {
+            ImGui::TextDisabled("Admitted peak estimate %.1f MiB / %.1f MiB budget",
+                static_cast<double>(result.memory.estimatedPeakBytes) / (1024.0 * 1024.0),
+                static_cast<double>(result.memory.budgetBytes) / (1024.0 * 1024.0));
+        }
+        if (rebuilt) {
+            ImGui::TextColored(manualOepValidated ? theme::col::good() : theme::col::warn(),
+                               "Entry RVA 0x%08X | OEP %s", result.oep.entryRVA,
+                               manualOepValidated ? "validated" : "UNVERIFIED");
+            if (manualOepValidated && !runnable)
+                ImGui::TextWrapped("The manual OEP remains validated, but identity-checked disk backfill was used for missing discardable pages, so this artifact is analysis-only.");
+            else if (!manualOepValidated)
+                ImGui::TextWrapped("The unchanged PE-header entry may still be a loader/protector stub. Supply a validated OEP to produce output labelled runnable.");
+        }
+        for (const std::string& warning : result.warnings)
+            ImGui::TextColored(theme::col::warn(), "%s", warning.c_str());
+        for (const PeUnpackIssue& issue : result.rebuilt.issues) {
+            const ImVec4 col = issue.severity == PeUnpackSeverity::Error ? theme::col::bad() :
+                               issue.severity == PeUnpackSeverity::Warning ? theme::col::warn() :
+                               theme::col::muted();
+            ImGui::TextColored(col, "%s: %s", issue.code.c_str(), issue.message.c_str());
+        }
+        if (rebuilt)
+            ImGui::Checkbox("Load saved PE into analysis", &passiveDumpPopup_.loadAfterSave);
+        const char* saveLabel = !rebuilt ? "Save raw capture + report"
+                              : runnable ? "Save runnable reconstructed PE + report"
+                              : manualOepValidated
+                                  ? "Save analysis PE (disk backfill) + report"
+                                  : "Save analysis PE (OEP unverified) + report";
+        if (ImGui::Button(saveLabel))
+            savePassiveDumpArtifacts(passiveDumpPopup_.loadAfterSave);
+        if (result.launched && result.launchContained) {
+            ImGui::SameLine();
+            if (ImGui::Button("Terminate contained launch")) {
+                passiveDumpService_.terminateContainedLaunch();
+                passiveDumpPopup_.result.launchContained = false;
+                ui::Toast(ui::ToastKind::Info, "Contained launch terminated.");
+            }
+        }
+    }
+    ImGui::Separator();
+    ImGui::BeginDisabled(busy);
+    const bool ownedLaunch = passiveDumpPopup_.result.launched &&
+                             passiveDumpPopup_.result.launchContained;
+    if (ImGui::Button(ownedLaunch ? "Close and terminate launch" : "Close")) {
+        if (ownedLaunch) {
+            passiveDumpService_.terminateContainedLaunch();
+            passiveDumpPopup_.result.launchContained = false;
+        }
+        passiveDumpPopup_.result = {};
+        passiveDumpPopup_.error.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
+// Compact shell bands. The toolbar still has room for the existing 30px controls,
+// while the document and workbench strips use local, denser tab metrics.
+static float DocumentStripHeight() {
+    const float k = theme::UiScale();
+    const float h = 38.0f * k;
+    const float m = ImGui::GetFrameHeight() + 10.0f * k;
+    return h > m ? h : m;
+}
+
 static float ToolbarHeight() {
     const float k = theme::UiScale();
-    const float h = 44.0f * k;
-    const float m = ImGui::GetFrameHeight() + 14.0f * k;
+    const float h = 46.0f * k;
+    const float m = ImGui::GetFrameHeight() + 16.0f * k;
     return h > m ? h : m;
 }
 
-// Tab-card strip height: room for a section label + a small mono sub-text line
-// (wireframe wf-vtab cards). Sits as its own full-width band below the toolbar.
+// One flat label row, roughly one third shorter than the former two-line cards.
 static float TabStripHeight() {
     const float k = theme::UiScale();
-    const float h = 54.0f * k;
-    const float m = ImGui::GetFrameHeight() + 26.0f * k;
+    const float h = 36.0f * k;
+    const float m = ImGui::GetFrameHeight() + 8.0f * k;
     return h > m ? h : m;
 }
 
-void App::renderDebugToolbar(const DbgSnapshot& s) {
-    const float k    = theme::UiScale();
-    const float barH = ToolbarHeight();
+static float StatusStripHeight() {
+    const float k = theme::UiScale();
+    const float h = 30.0f * k;
+    const float m = ImGui::GetFrameHeight() + 4.0f * k;
+    return h > m ? h : m;
+}
+
+void App::renderDocumentStrip() {
+    const float k = theme::UiScale();
+    const float stripH = DocumentStripHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y));
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, barH));
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking;
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, stripH));
+    const ImGuiWindowFlags windowFlags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * k, (barH - 30.0f * k) * 0.5f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panel());
-    if (ImGui::Begin("##debugbar", nullptr, flags)) {
-        // Bottom border line (wireframe panel chrome).
-        ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(vp->WorkPos.x, vp->WorkPos.y + barH - 1.0f),
-            ImVec2(vp->WorkPos.x + vp->WorkSize.x, vp->WorkPos.y + barH - 1.0f),
-            ImGui::GetColorU32(theme::col::line()));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panelHeader());
+    if (ImGui::Begin("##document-strip", nullptr, windowFlags)) {
+        std::optional<DocumentId> activate;
+        std::optional<DocumentId> close;
+        const std::vector<AppContext::StaticDocumentSummary> documents =
+            ctx_.staticDocuments();
+        // The strip's own context menu must remain interactive on subsequent
+        // frames. Other editors still keep ownership of the active document.
+        bool documentMenuOpen = false;
+        for (const auto& document : documents) {
+            ImGui::PushID((int)document.id.value);
+            documentMenuOpen |= ImGui::IsPopupOpen("##document_context");
+            ImGui::PopID();
+        }
+        const bool topologyBlocked = ctx_.documentCommandPending() ||
+            palette_.isOpen() || (!documentMenuOpen &&
+            ImGui::IsPopupOpen(nullptr,
+                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 win = ImGui::GetWindowPos();
+        const ImVec4 accent = theme::col::accent();
+        const float sidePad = 8.0f * k;
+        const float topPad = 4.0f * k;
+        const float tabH = stripH - topPad;
+        const float addW = 42.0f * k;
+        const float usableW = (std::max)(1.0f,
+            vp->WorkSize.x - sidePad * 2.0f - addW);
 
-        Debugger& d = ctx_.debug;
-        const bool attached = s.attached();
-        const bool paused   = s.state == DbgState::Paused;
-        const bool running  = s.state == DbgState::Running;
-        const bool loaded   = ctx_.binary.loaded();
-        // Inline (non-button) items center against the 30px tool buttons.
-        auto centerY = [&](float itemH) {
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (30.0f * k - itemH) * 0.5f);
-        };
+        dl->AddLine(ImVec2(win.x, win.y + stripH - 1.0f),
+                    ImVec2(win.x + vp->WorkSize.x, win.y + stripH - 1.0f),
+                    ImGui::GetColorU32(theme::col::line()));
 
-        // File group.
-        if (ui::ToolButton("open", DS_ICON_FOLDER, "O", "Open Binary... (Ctrl+O)")) openFileDialog();
-        ImGui::SameLine(0.0f, 4.0f * k);
-        if (ui::ToolButton("save", DS_ICON_SAVE, "S", "Save Binary As... (apply patches)", false, loaded))
-            saveBinaryAs();
-        ImGui::SameLine(0.0f, 8.0f * k);
-        ui::ToolbarDivider();
-        ImGui::SameLine(0.0f, 8.0f * k);
+        std::vector<float> naturalWidths;
+        naturalWidths.reserve(documents.size());
+        float naturalTotal = 0.0f;
+        for (const auto& document : documents) {
+            std::string visible = document.title.empty() ? "Untitled" : document.title;
+            if (document.mapped && visible.rfind("[LIVE]", 0) != 0)
+                visible = "[LIVE] " + visible;
+            const float width = (std::min)(230.0f * k, (std::max)(
+                150.0f * k, ImGui::CalcTextSize(visible.c_str()).x + 70.0f * k));
+            naturalWidths.push_back(width);
+            naturalTotal += width;
+        }
+        const float fit = naturalTotal > usableW && naturalTotal > 0.0f
+                        ? usableW / naturalTotal : 1.0f;
 
-        // Debug control group - the same actions/hotkeys as before, square icon buttons now.
-        if (!attached) {
-            const bool canLaunch = ctx_.binaryLaunchable();
-            const char* launchTip = (canLaunch || !loaded)
-                ? "Launch & Debug - launch the loaded binary and break at its entry point"
-                : "Launch & Debug - this image can't be started directly (only a PE .exe opened\n"
-                  "from disk can); attach to a running process in the Communications tab instead";
-            if (ui::ToolButton("launch", DS_ICON_PLAY, ">", launchTip, canLaunch, canLaunch)) {
-                std::string err;
-                if (!ctx_.launchAndDebug(err)) ui::Toast(ui::ToastKind::Error, "Launch failed: " + err);
-            }
-            // Java wrapper detected: suggest (never auto-enable) the JVM-init break,
-            // which must be armed before launch to catch jvm.dll's load event.
-            if (loaded && ctx_.javaInfo.kind != JavaWrapKind::None) {
-                ImGui::SameLine(0.0f, 10.0f * k);
-                centerY(ImGui::GetFrameHeight());
-                bool jvmInit = ctx_.debug.breakOnJvmInit();
-                if (ImGui::Checkbox("Break on JVM init", &jvmInit)) ctx_.debug.setBreakOnJvmInit(jvmInit);
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Java wrapper detected (%s): one-shot breakpoint on jvm.dll!JNI_CreateJavaVM\nwhen the VM module loads. Arm it before Launch & Debug.",
-                                      JavaWrapKindName(ctx_.javaInfo.kind));
-            }
-            if (!loaded) {
-                ImGui::SameLine(0.0f, 10.0f * k);
-                centerY(ImGui::GetTextLineHeight());
-                ImGui::TextDisabled("Open a binary, or attach a process in Communications.");
-            }
-        } else {
-            if (ui::ToolButton("detach", DS_ICON_STOP, "X", "Stop debugging and detach from the process"))
-                d.detach();
-            ImGui::SameLine(0.0f, 4.0f * k);
-            if (running) {
-                if (ui::ToolButton("pause", DS_ICON_PAUSE, "||", "Pause - break into the running process (F5)", true))
-                    d.pause();
-            } else {
-                if (ui::ToolButton("cont", DS_ICON_PLAY, ">", "Continue - resume until the next breakpoint (F5)", true))
-                    d.cont();
-            }
-            ImGui::SameLine(0.0f, 8.0f * k);
-            ui::ToolbarDivider();
-            ImGui::SameLine(0.0f, 8.0f * k);
-            if (ui::ToolButton("stepin", DS_ICON_DOWN, "v", "Step Into (F11) - one instruction, following calls", false, paused))
-                d.stepInto();
-            ImGui::SameLine(0.0f, 4.0f * k);
-            if (ui::ToolButton("stepover", DS_ICON_REDO, ">>", "Step Over (F10) - one instruction, stepping over calls", false, paused))
-                d.stepOver();
-            ImGui::SameLine(0.0f, 4.0f * k);
-            if (ui::ToolButton("stepout", DS_ICON_UP, "^", "Step Out (Shift+F11) - run until the current function returns", false, paused))
-                d.stepOut();
-            ImGui::SameLine(0.0f, 4.0f * k);
-            if (ui::ToolButton("runcur", DS_ICON_PIN, "rc",
-                               "Run to Cursor (Ctrl+F9) - run until the Binary View cursor address",
-                               false, paused && ctx_.runtimeCursorVA != 0))
-                if (ctx_.runtimeCursorVA) d.runToCursor(ctx_.runtimeCursorVA);
+        ImGui::BeginDisabled(topologyBlocked);
+        float x = win.x + sidePad;
+        for (size_t i = 0; i < documents.size(); ++i) {
+            const auto& document = documents[i];
+            std::string visible = document.title.empty() ? "Untitled" : document.title;
+            if (document.mapped && visible.rfind("[LIVE]", 0) != 0)
+                visible = "[LIVE] " + visible;
+            float tabW = naturalWidths[i] * fit;
+            if (fit < 1.0f && i + 1 == documents.size())
+                tabW = win.x + sidePad + usableW - x;
+            tabW = (std::max)(72.0f * k, tabW);
+            const ImVec2 a(x, win.y + topPad);
+            const ImVec2 b(x + tabW, win.y + stripH);
 
-            if (!ImGui::GetIO().WantTextInput) {
-                if (ImGui::IsKeyPressed(ImGuiKey_F5)) { if (running) d.pause(); else d.cont(); }
-                if (paused && ImGui::IsKeyPressed(ImGuiKey_F11) && ImGui::GetIO().KeyShift) d.stepOut();
-                else if (paused && ImGui::IsKeyPressed(ImGuiKey_F11)) d.stepInto();
-                if (paused && ImGui::IsKeyPressed(ImGuiKey_F10)) d.stepOver();
-                if (paused && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F9) && ctx_.runtimeCursorVA)
-                    d.runToCursor(ctx_.runtimeCursorVA);
+            ImGui::PushID((int)document.id.value);
+            ImGui::SetCursorScreenPos(a);
+            // The close button is drawn inside this hit area. Let that later
+            // item receive the pointer instead of the full tab swallowing it.
+            ImGui::SetNextItemAllowOverlap();
+            const bool clicked = ImGui::InvisibleButton("##document", ImVec2(tabW, tabH));
+            const bool hovered = ImGui::IsItemHovered();
+            const bool documentTooltipReady = hovered && ImGui::IsItemHovered(
+                ImGuiHoveredFlags_DelayNormal |
+                ImGuiHoveredFlags_NoSharedDelay |
+                ImGuiHoveredFlags_AllowWhenDisabled);
+            const bool focused = ImGui::IsItemFocused();
+            const bool held = ImGui::IsItemActive();
+            if (clicked && !document.active) activate = document.id;
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+                close = document.id;
+            if (ImGui::BeginPopupContextItem("##document_context")) {
+                if (!document.active && ImGui::MenuItem("Switch to document"))
+                    activate = document.id;
+                if (!document.path.empty() && ImGui::MenuItem("Copy full path"))
+                    ImGui::SetClipboardText(document.path.c_str());
+                if (ImGui::MenuItem("Close", "Ctrl+W")) close = document.id;
+                ImGui::EndPopup();
             }
+
+            ImVec4 body = document.active ? theme::col::panel()
+                                          : theme::col::menubar();
+            if ((hovered || focused || held) && !document.active) {
+                const float amount = held ? 0.18f : focused ? 0.14f : 0.10f;
+                body.x = body.x * (1.0f - amount) + accent.x * amount;
+                body.y = body.y * (1.0f - amount) + accent.y * amount;
+                body.z = body.z * (1.0f - amount) + accent.z * amount;
+            }
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(body));
+            dl->AddRect(a, b, ImGui::GetColorU32(
+                (document.active || focused) ? accent : theme::col::lineSoft()),
+                0.0f, 0, focused ? 2.0f : 1.0f);
+            if (document.active)
+                dl->AddRectFilled(a, ImVec2(b.x, a.y + 2.0f * k),
+                                  ImGui::GetColorU32(accent));
+
+            const float iconW = ui::IconsLoaded() ? 18.0f * k : 0.0f;
+            const float closeW = 20.0f * k;
+            const float dirtyW = document.dirty ? 10.0f * k : 0.0f;
+            const float textLeft = a.x + 11.0f * k + iconW;
+            const float textRight = b.x - 8.0f * k - closeW - dirtyW;
+            const float textAvail = (std::max)(1.0f, textRight - textLeft);
+            if (ui::IconsLoaded()) {
+                const char* glyph = document.mapped ? DS_ICON_NETWORK : DS_ICON_CODE;
+                const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
+                dl->AddText(ImVec2(a.x + 10.0f * k,
+                    a.y + (tabH - glyphSize.y) * 0.5f),
+                    ImGui::GetColorU32(document.active ? accent : theme::col::muted()),
+                    glyph);
+            }
+            std::string shown = visible;
+            while (shown.size() > 1 &&
+                   ImGui::CalcTextSize((shown + "...").c_str()).x > textAvail)
+                shown.pop_back();
+            if (shown != visible) shown += "...";
+            const ImVec2 textSize = ImGui::CalcTextSize(shown.c_str());
+            dl->AddText(ImVec2(textLeft, a.y + (tabH - textSize.y) * 0.5f),
+                        ImGui::GetColorU32(document.active
+                            ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
+                            : theme::col::muted()), shown.c_str());
+
+            const float closeSize = 16.0f * k;
+            const ImVec2 closePos(b.x - 8.0f * k - closeSize,
+                                  a.y + (tabH - closeSize) * 0.5f);
+            // Once the close item owns hover, the overlapping document item is
+            // no longer hovered. Keep the close item present under the pointer
+            // so an inactive tab's button cannot blink away before release.
+            const bool pointerOverDocument = ImGui::IsWindowHovered(
+                ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                ImGui::IsMouseHoveringRect(a, b);
+            const bool showClose = document.active || hovered || focused ||
+                                   pointerOverDocument;
+            bool closeHovered = false;
+            if (showClose) {
+                ImGui::SetCursorScreenPos(closePos);
+                const bool closeClicked = ImGui::InvisibleButton(
+                    "##close", ImVec2(closeSize, closeSize));
+                closeHovered = ImGui::IsItemHovered();
+                const bool closeFocused = ImGui::IsItemFocused();
+                const ImU32 closeCol = ImGui::GetColorU32(
+                    (closeHovered || closeFocused) ? theme::col::bad()
+                                                   : theme::col::muted());
+                const float inset = 4.0f * k;
+                dl->AddLine(ImVec2(closePos.x + inset, closePos.y + inset),
+                            ImVec2(closePos.x + closeSize - inset,
+                                   closePos.y + closeSize - inset), closeCol, 1.4f * k);
+                dl->AddLine(ImVec2(closePos.x + closeSize - inset, closePos.y + inset),
+                            ImVec2(closePos.x + inset,
+                                   closePos.y + closeSize - inset), closeCol, 1.4f * k);
+                if (closeClicked) close = document.id;
+            }
+            if (document.dirty) {
+                const float dirtyX = showClose ? closePos.x - 4.0f * k
+                                               : closePos.x + closeSize * 0.5f;
+                dl->AddCircleFilled(ImVec2(dirtyX, a.y + tabH * 0.5f),
+                                    2.5f * k, ImGui::GetColorU32(theme::col::warn()));
+            }
+
+            if (closeHovered) {
+                ui::ItemTooltip("Close document (Ctrl+W)", false);
+            } else if (documentTooltipReady) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(visible.c_str());
+                if (!document.path.empty()) ImGui::TextWrapped("%s", document.path.c_str());
+                if (!document.format.empty())
+                    ImGui::TextDisabled("%s%s", document.format.c_str(),
+                                        document.dirty ? "  -  unsaved" : "");
+                ImGui::EndTooltip();
+            }
+            ImGui::PopID();
+            x += tabW;
         }
 
-        // Right-aligned group: [JVM badge] [arch/engine pill] [state pill]
-        // (wireframe wf-arch / wf-state). Widths measured first to right-align.
-        char archTxt[64];
-        std::snprintf(archTxt, sizeof(archTxt), "%s \xC2\xB7 %s", ArchName(ctx_.arch),
-                      ctx_.disasm ? ctx_.disasm->engineName() : "-");
-        const char* st = !attached ? "STATIC"
-                       : running   ? "RUNNING"
-                       : paused    ? "PAUSED"
-                       : s.state == DbgState::Terminated ? "TERMINATED" : "ATTACHED";
-        const ImVec4 stc = !attached ? theme::col::muted()
-                         : running   ? theme::col::good()
-                         : paused    ? theme::col::warn()
-                         : s.state == DbgState::Terminated ? theme::col::bad() : theme::col::accent();
-        char detail[192] = {0};
-        if (attached)
-            std::snprintf(detail, sizeof(detail), "pid %u%s  %s %llX%s%s",
-                          s.pid, s.is32 ? " (32)" : "",
-                          s.is32 ? "eip" : "rip", (unsigned long long)s.regs.rip,
-                          s.lastEvent.empty() ? "" : "  \xC2\xB7 ",
-                          s.lastEvent.c_str());
-        auto monoW = [](const char* t) {
-            ui::PushMono();
-            float w = ImGui::CalcTextSize(t).x;
-            ui::PopMono();
-            return w;
-        };
-        const float wArch  = monoW(archTxt) + 20.0f * k;
-        const float wState = monoW(st) + (detail[0] ? monoW(detail) + 8.0f * k : 0.0f) + 24.0f * k;
-        const float wJvm   = s.jvmLoaded ? monoW("JVM") + 20.0f * k + 8.0f * k : 0.0f;
-        const float xRight = ImGui::GetWindowContentRegionMax().x - (wJvm + wArch + 8.0f * k + wState);
-        ImGui::SameLine();
-        if (ImGui::GetCursorPosX() < xRight) ImGui::SetCursorPosX(xRight);
-        if (s.jvmLoaded) {
-            // The debuggee loaded a Java VM module; tooltip = module path + passed faults.
-            char jtip[320];
-            std::snprintf(jtip, sizeof(jtip), "%s\n%llu JVM-internal exception(s) passed through silently",
-                          s.jvmPath.c_str(), (unsigned long long)s.jvmExceptionsPassed);
-            ImVec4 acc = theme::col::accent();
-            ui::Pill("##jvmbadge", "JVM", &acc, jtip);
-            ImGui::SameLine(0.0f, 8.0f * k);
+        const ImVec2 addA(x + 5.0f * k, win.y + topPad);
+        const ImVec2 addB(addA.x + 34.0f * k, win.y + stripH);
+        ImGui::SetCursorScreenPos(addA);
+        const bool addClicked = ImGui::InvisibleButton(
+            "##open-document", ImVec2(addB.x - addA.x, tabH));
+        const bool addHovered = ImGui::IsItemHovered();
+        const bool addFocused = ImGui::IsItemFocused();
+        const bool addHeld = ImGui::IsItemActive();
+        ImVec4 addBody = (addHovered || addFocused || addHeld)
+            ? theme::col::panel() : theme::col::menubar();
+        dl->AddRectFilled(addA, addB, ImGui::GetColorU32(addBody));
+        dl->AddRect(addA, addB, ImGui::GetColorU32(
+            addFocused ? accent : theme::col::lineSoft()), 0.0f, 0,
+            addFocused ? 2.0f : 1.0f);
+        const char* plus = ui::IconsLoaded() ? DS_ICON_ADD : "+";
+        const ImVec2 plusSize = ImGui::CalcTextSize(plus);
+        dl->AddText(ImVec2(addA.x + (addB.x - addA.x - plusSize.x) * 0.5f,
+                           addA.y + (tabH - plusSize.y) * 0.5f),
+                    ImGui::GetColorU32((addHovered || addFocused)
+                        ? accent : theme::col::muted()), plus);
+        if (addClicked) openFileDialog();
+        if (addHovered) {
+            char tip[96];
+            std::snprintf(tip, sizeof(tip),
+                          "Open another binary (up to %u documents)",
+                          (unsigned)DocumentManager::kMaxDocuments);
+            ui::ItemTooltip(tip, false);
         }
-        if (ui::Pill("##archpill", archTxt, nullptr, "Architecture / decode engine - click to change"))
-            ImGui::OpenPopup("##archpopup");
-        if (ImGui::BeginPopup("##archpopup")) {
-            // Mirrors the Engine menu exactly (incl. the non-x86 Zydis gating).
-            const bool nonX86 = !ArchIsX86(ctx_.arch);
-            const Engine effective = ctx_.disasm ? ctx_.disasm->engine() : ctx_.engine;
-            ImGui::TextDisabled("Engine");
-            ImGui::BeginDisabled(nonX86);
-            if (ImGui::MenuItem("Zydis", nullptr, effective == Engine::Zydis)) { ctx_.engine = Engine::Zydis; ctx_.rebuildDisassembler(); }
-            ImGui::EndDisabled();
-            if (ImGui::MenuItem("Capstone", nullptr, effective == Engine::Capstone)) { ctx_.engine = Engine::Capstone; ctx_.rebuildDisassembler(); }
-            ImGui::Separator();
-            ImGui::TextDisabled("Architecture");
-            auto archItem = [&](const char* label, Arch a) {
-                if (ImGui::MenuItem(label, nullptr, ctx_.arch == a)) { ctx_.arch = a; ctx_.rebuildDisassembler(); }
-            };
-            archItem("x86",       Arch::X86);
-            archItem("x64",       Arch::X64);
-            archItem("ARM",       Arch::ARM);
-            archItem("ARM64",     Arch::ARM64);
-            archItem("MIPS",      Arch::MIPS);
-            archItem("MIPS64",    Arch::MIPS64);
-            archItem("PowerPC",   Arch::PPC);
-            archItem("PowerPC64", Arch::PPC64);
-            archItem("RISC-V 32", Arch::RISCV32);
-            archItem("RISC-V 64", Arch::RISCV64);
-            ImGui::EndPopup();
+        ImGui::EndDisabled();
+
+        // A close wins over an activation generated by the same tab click. Both
+        // remain queued until the frame has released every rendered document.
+        if (close) {
+            if (!ctx_.queueCloseStaticDocument(*close))
+                ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+        } else if (activate) {
+            if (!ctx_.queueActivateStaticDocument(*activate))
+                ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
         }
-        ImGui::SameLine(0.0f, 8.0f * k);
-        ui::StatePill(st, stc, detail[0] ? detail : nullptr);
     }
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 }
 
-// Horizontal tab-card strip (wireframe wf-vtabs): one bordered card per section,
-// each a section label over a small mono sub-text. The active card gets an ink/
-// accent border, panel-2 background, an accent underline, and a soft drop shadow.
-// Tabs stay identified by their name() string, so the ITab interface and every
-// requestedTab call site are untouched. Drawn as its own full-width band below
-// the toolbar; cards are painted with the window draw list + InvisibleButton hit
-// targets (like the old rail), so the look matches the wireframe exactly.
+void App::renderDebugToolbar(const DbgSnapshot& s) {
+    const float k    = theme::UiScale();
+    const float docH = DocumentStripHeight();
+    const float barH = ToolbarHeight();
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + docH));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, barH));
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(8.0f * k, (barH - 30.0f * k) * 0.5f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panel());
+    if (ImGui::Begin("##debugbar", nullptr, flags)) {
+        // Bottom border line (wireframe panel chrome).
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(vp->WorkPos.x, vp->WorkPos.y + docH + barH - 1.0f),
+            ImVec2(vp->WorkPos.x + vp->WorkSize.x,
+                   vp->WorkPos.y + docH + barH - 1.0f),
+            ImGui::GetColorU32(theme::col::line()));
+
+        Debugger& d = ctx_.debug;
+        const bool attached = s.attached();
+        const bool paused   = s.state == DbgState::Paused;
+        const bool running  = s.state == DbgState::Running;
+        const DebugTargetIdentity frameTarget{ s.pid, s.sessionGeneration };
+        const auto gml = d.gameMakerSnapshot();
+        const bool gmlTarget = DebugTargetIdentityMatches(gml.target, frameTarget);
+        const bool gmlPaused = gmlTarget && paused && gml.state == GameMakerSessionState::Paused &&
+            gml.stop && gml.stop->identity.tid == s.activeTid;
+        auto executionCommand = [&](GmlControlCommand command) {
+            if (ctx_.gmlExecutionMode) {
+                std::string error;
+                if (!d.gameMakerCommand(command, gmlPaused ? gml.stop->identity : GmlPauseIdentity{}, error))
+                    ui::Toast(ui::ToastKind::Warn, error);
+            } else {
+                switch (command) {
+                case GmlControlCommand::Continue: d.continueForSession(frameTarget); break;
+                case GmlControlCommand::Pause: d.pauseForSession(frameTarget); break;
+                case GmlControlCommand::StepInto: d.stepIntoForSession(frameTarget); break;
+                case GmlControlCommand::StepOver: d.stepOverForSession(frameTarget); break;
+                case GmlControlCommand::StepOut: d.stepOutForSession(frameTarget); break;
+                default: break;
+                }
+            }
+        };
+        if (gmlPaused && ctx_.gmlExecutionMode && ctx_.gmlAutoFollow &&
+            ctx_.gmlFollowedStop != gml.stop->identity && gml.archive &&
+            ctx_.staticBinary().gameMakerArchive() && ctx_.staticBinary().contentHash() == gml.archiveHash &&
+            gml.stop->location.codeIndex < gml.archive->code.size()) {
+            const auto& code = gml.archive->code[gml.stop->location.codeIndex];
+            const uint64_t offset = code.bytecodeOffset + gml.stop->location.byteOffset;
+            if (gml.archive->isInstructionOffset(offset)) {
+                ctx_.gotoAddress(offset);
+                ctx_.gmlFollowedStop = gml.stop->identity;
+            }
+        }
+        const bool loaded   = ctx_.staticBinary().loaded();
+        const float commandH = 30.0f * k;
+        const bool compactCommands = vp->WorkSize.x < 1120.0f * k;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        auto commandWidth = [&](const char* icon, const char* fallback,
+                                const char* label, bool keepLabel) {
+            const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
+            const bool showLabel = keepLabel || !compactCommands;
+            const float glyphW = (glyph && glyph[0])
+                ? ImGui::CalcTextSize(glyph).x : 0.0f;
+            const float labelW = showLabel ? ImGui::CalcTextSize(label).x : 0.0f;
+            const float gap = showLabel && glyphW > 0.0f ? 8.0f * k : 0.0f;
+            return showLabel ? 23.0f * k + glyphW + gap + labelW
+                             : (std::max)(30.0f * k, glyphW + 12.0f * k);
+        };
+        auto commandButton = [&](const char* id, const char* icon,
+                                 const char* fallback, const char* label,
+                                 const char* tip, bool hot, bool enabled,
+                                 bool keepLabel = false) {
+            const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
+            const bool showLabel = keepLabel || !compactCommands;
+            const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
+            const ImVec2 labelSize = showLabel
+                ? ImGui::CalcTextSize(label) : ImVec2(0, 0);
+            const float gap = showLabel && glyph && glyph[0] ? 8.0f * k : 0.0f;
+            const float width = commandWidth(icon, fallback, label, keepLabel);
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            if (!enabled) ImGui::BeginDisabled();
+            const bool clicked = ImGui::InvisibleButton(id, ImVec2(width, commandH));
+            const bool hovered = ImGui::IsItemHovered(
+                ImGuiHoveredFlags_AllowWhenDisabled);
+            const bool focused = ImGui::IsItemFocused();
+            const bool held = ImGui::IsItemActive();
+            if (!enabled) ImGui::EndDisabled();
+
+            if (hot || ((hovered || focused || held) && enabled)) {
+                ImVec4 fill = theme::col::accent();
+                fill.w = hot ? (held ? 0.30f : 0.18f)
+                             : held ? 0.20f : focused ? 0.14f : 0.10f;
+                dl->AddRectFilled(p, ImVec2(p.x + width, p.y + commandH),
+                                  ImGui::GetColorU32(fill));
+            }
+            if (focused)
+                dl->AddRect(ImVec2(p.x + 1.0f * k, p.y + 1.0f * k),
+                            ImVec2(p.x + width - 1.0f * k,
+                                   p.y + commandH - 1.0f * k),
+                            ImGui::GetColorU32(theme::col::accent()),
+                            2.0f * k, 0, 1.0f * k);
+            const ImVec4 glyphCol = !enabled ? theme::col::muted()
+                                  : hot ? theme::col::accent()
+                                        : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            const ImVec4 labelCol = enabled
+                ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : theme::col::muted();
+            const float glyphY = p.y + (commandH - glyphSize.y) * 0.5f;
+            const float labelY = p.y + (commandH - labelSize.y) * 0.5f;
+            dl->AddText(ImVec2(p.x + 11.0f * k, glyphY),
+                        ImGui::GetColorU32(glyphCol), glyph);
+            if (showLabel)
+                dl->AddText(ImVec2(p.x + 11.0f * k + glyphSize.x + gap, labelY),
+                            ImGui::GetColorU32(labelCol), label);
+            if (hovered) ui::ItemTooltip(tip);
+            return clicked && enabled;
+        };
+        auto commandDivider = [&] {
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            dl->AddLine(ImVec2(p.x, p.y + 3.0f * k),
+                        ImVec2(p.x, p.y + commandH - 3.0f * k),
+                        ImGui::GetColorU32(theme::col::line()), 1.0f * k);
+            ImGui::Dummy(ImVec2(1.0f * k, commandH));
+        };
+        auto nextGroup = [&] {
+            ImGui::SameLine(0.0f, 9.0f * k);
+            commandDivider();
+            ImGui::SameLine(0.0f, 9.0f * k);
+        };
+        auto nextCommand = [&] { ImGui::SameLine(0.0f, 3.0f * k); };
+
+        ImGui::SetNextItemWidth(98.0f * k);
+        int executionMode = ctx_.gmlExecutionMode ? 1 : 0;
+        if (ImGui::Combo("##execution_mode", &executionMode, "Native\0GML\0"))
+            ctx_.gmlExecutionMode = executionMode == 1;
+        ui::ItemTooltip("Select native CPU instructions or verified GameMaker VM instructions for execution controls.");
+        nextGroup();
+        const bool modePaused = ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused;
+        const bool modeRunning = running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
+
+        const bool canLaunch = ctx_.binaryLaunchable();
+        const bool canDebugDll = ctx_.binaryDllDebuggable();
+        const bool canRun = canLaunch || canDebugDll;
+        const char* launchTip = canDebugDll
+            ? "Debug DLL - choose a compatible host, export, and DLL breakpoint"
+            : (loaded && !ctx_.binaryDebugArchitectureMatches())
+            ? "Launch & Debug requires a matching x86/x64 PE machine and decoder mode"
+            : (canLaunch || !loaded)
+            ? "Launch & Debug - launch the loaded binary and break at its entry point"
+            : "This image cannot be started directly; attach a process in Communications.";
+        if (attached) {
+            if (running) {
+                if (commandButton("##cmd_primary", DS_ICON_PAUSE, "||", "Pause",
+                                  "Pause - break into the running process (F5)",
+                                  true, modeRunning, true)) executionCommand(GmlControlCommand::Pause);
+            } else if (commandButton("##cmd_primary", DS_ICON_PLAY, ">", "Continue",
+                                     "Continue - resume until the next breakpoint (F5)",
+                                     true, modePaused, true)) {
+                executionCommand(GmlControlCommand::Continue);
+            }
+        } else {
+            const char* primaryLabel = canDebugDll ? "Debug DLL" : "Launch & Debug";
+            if (commandButton("##cmd_primary", DS_ICON_PLAY, ">", primaryLabel,
+                              launchTip, canRun, canRun, true)) {
+                if (canDebugDll) ctx_.requestedDebugDll = true;
+                else {
+                    std::string error;
+                    if (!ctx_.launchAndDebug(error))
+                        ui::Toast(ui::ToastKind::Error, "Launch failed: " + error);
+                }
+            }
+        }
+
+        nextGroup();
+        if (commandButton("##cmd_step_into", DS_ICON_DOWN, "v", "Step Into",
+                          "Step Into (F11) - one instruction, following calls",
+                           false, modePaused)) executionCommand(GmlControlCommand::StepInto);
+        nextCommand();
+        if (commandButton("##cmd_step_over", DS_ICON_REDO, ">>", "Step Over",
+                          "Step Over (F10) - one instruction, stepping over calls",
+                           false, modePaused)) executionCommand(GmlControlCommand::StepOver);
+        nextCommand();
+        if (commandButton("##cmd_step_out", DS_ICON_UP, "^", "Step Out",
+                          "Step Out (Shift+F11) - run until the current function returns",
+                           false, modePaused)) executionCommand(GmlControlCommand::StepOut);
+
+        const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
+        const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
+        uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
+        const bool exactTraceImage = ctx_.frameDebugSnapshot &&
+            ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
+                                      traceRuntimeBase, traceRuntimeSize);
+        const bool traceStartEnabled = traceOn ||
+            (modePaused && !ctx_.gmlExecutionMode && loaded && exactTraceImage);
+        nextGroup();
+        if (commandButton("##cmd_trace", DS_ICON_LIGHTNING, "tr", "Trace",
+                          traceOn
+                              ? "Stop Trace Coverage; collected coverage remains"
+                              : exactTraceImage
+                                  ? "Start one-shot basic-block Trace Coverage"
+                                  : "Trace requires a paused matching x86/x64 module",
+                          traceOn, traceStartEnabled)) {
+            ctx_.requestedTraceToggle = true;
+            ctx_.requestedTraceTarget = frameTarget;
+            ctx_.requestedTab = "Binary View";
+        }
+
+        nextGroup();
+        bool mirrorValid = false;
+        bool mirrorLive = false;
+        uint64_t mirrorAddress = 0;
+        DebugTargetIdentity mirrorTarget{};
+        const bool cursorOwnerCurrent = !ctx_.cursorLive ||
+            (attached && ctx_.cursorTarget.valid() &&
+             DebugTargetIdentityMatches(frameTarget, ctx_.cursorTarget));
+        if (ctx_.hasCursor && cursorOwnerCurrent) {
+            mirrorAddress = ctx_.cursorVA;
+            mirrorValid = true;
+            mirrorLive = ctx_.cursorLive;
+            if (mirrorLive) mirrorTarget = frameTarget;
+        } else if (loaded && ctx_.staticBinary().hasEntryPoint()) {
+            mirrorAddress = ctx_.staticBinary().entryPointVA();
+            mirrorValid = true;
+        } else if (loaded) {
+            mirrorAddress = ctx_.staticBinary().imageBase();
+            mirrorValid = true;
+        }
+        if (!toolbarAddressEditing_ &&
+            (mirrorValid != toolbarAddressMirrorValid_ ||
+             (mirrorValid && (mirrorAddress != toolbarAddressMirror_ ||
+                              mirrorLive != toolbarAddressMirrorLive_ ||
+                              mirrorTarget.pid != toolbarAddressMirrorTarget_.pid ||
+                              mirrorTarget.sessionGeneration !=
+                                  toolbarAddressMirrorTarget_.sessionGeneration)))) {
+            if (mirrorValid)
+                std::snprintf(toolbarAddress_, sizeof(toolbarAddress_), "0x%llX",
+                              (unsigned long long)mirrorAddress);
+            else
+                toolbarAddress_[0] = 0;
+            toolbarAddressMirror_ = mirrorAddress;
+            toolbarAddressMirrorValid_ = mirrorValid;
+            toolbarAddressMirrorLive_ = mirrorValid && mirrorLive;
+            toolbarAddressMirrorTarget_ = toolbarAddressMirrorLive_
+                ? mirrorTarget : DebugTargetIdentity{};
+        }
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(10.0f * k, 6.0f * k));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::col::panelHeader());
+        ImGui::PushStyleColor(ImGuiCol_Border, theme::col::line());
+        float trailingReserve = 0.0f;
+        if (attached) {
+            trailingReserve = 12.0f * k + commandWidth(
+                DS_ICON_STOP, "X", "Detach", true);
+        } else if (loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
+            trailingReserve = ImGui::CalcTextSize("Break on JVM init").x +
+                              ImGui::GetFrameHeight() + 18.0f * k;
+        }
+        const float addressWidth = (std::min)(190.0f * k, (std::max)(
+            82.0f * k, ImGui::GetContentRegionAvail().x - trailingReserve -
+                         ImGui::GetFrameHeight() - 8.0f * k));
+        ImGui::SetNextItemWidth(addressWidth);
+        const bool gotoSubmitted = ImGui::InputTextWithHint(
+            "##toolbar_address", "address (hex)", toolbarAddress_,
+            sizeof(toolbarAddress_),
+            ImGuiInputTextFlags_EnterReturnsTrue |
+            ImGuiInputTextFlags_AutoSelectAll);
+        toolbarAddressEditing_ = ImGui::IsItemActive();
+        ui::ItemTooltip(toolbarAddressMirrorLive_
+                            ? "Go to this live runtime address (Enter); editing it creates a static FILE-address request"
+                            : "Go to a static virtual address (Enter)",
+                        false);
+        if (gotoSubmitted) {
+            uint64_t address = 0;
+            if (parseHexU64(toolbarAddress_, address)) {
+                const bool submitLive = toolbarAddressMirrorValid_ &&
+                    toolbarAddressMirrorLive_ && address == toolbarAddressMirror_ &&
+                    attached && toolbarAddressMirrorTarget_.valid() &&
+                    DebugTargetIdentityMatches(frameTarget,
+                                               toolbarAddressMirrorTarget_);
+                toolbarAddressMirror_ = address;
+                toolbarAddressMirrorValid_ = true;
+                toolbarAddressMirrorLive_ = submitLive;
+                toolbarAddressMirrorTarget_ = submitLive
+                    ? frameTarget : DebugTargetIdentity{};
+                if (submitLive) ctx_.gotoAddressLive(address, frameTarget);
+                else            ctx_.gotoAddress(address);
+            } else {
+                ui::Toast(ui::ToastKind::Error,
+                          "The command-bar address must be hexadecimal.");
+            }
+        }
+        ImGui::SameLine(0.0f, 0.0f);
+        if (ImGui::ArrowButton("##toolbar_address_presets", ImGuiDir_Down))
+            ImGui::OpenPopup("##toolbar_address_popup");
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(3);
+
+        auto chooseAddress = [&](const char* label, uint64_t address, bool live) {
+            if (!ImGui::MenuItem(label)) return;
+            std::snprintf(toolbarAddress_, sizeof(toolbarAddress_), "0x%llX",
+                          (unsigned long long)address);
+            toolbarAddressMirror_ = address;
+            toolbarAddressMirrorValid_ = true;
+            toolbarAddressMirrorLive_ = live;
+            toolbarAddressMirrorTarget_ = live
+                ? frameTarget : DebugTargetIdentity{};
+            if (live) ctx_.gotoAddressLive(address, frameTarget);
+            else ctx_.gotoAddress(address);
+        };
+        if (ImGui::BeginPopup("##toolbar_address_popup")) {
+            char label[96];
+            if (ctx_.hasCursor && cursorOwnerCurrent) {
+                std::snprintf(label, sizeof(label), "Cursor   0x%llX",
+                              (unsigned long long)ctx_.cursorVA);
+                chooseAddress(label, ctx_.cursorVA, ctx_.cursorLive);
+            }
+            if (loaded && ctx_.staticBinary().hasEntryPoint()) {
+                std::snprintf(label, sizeof(label), "Entry point   0x%llX",
+                              (unsigned long long)ctx_.staticBinary().entryPointVA());
+                chooseAddress(label, ctx_.staticBinary().entryPointVA(), false);
+            }
+            if (loaded) {
+                std::snprintf(label, sizeof(label), "Image base   0x%llX",
+                              (unsigned long long)ctx_.staticBinary().imageBase());
+                chooseAddress(label, ctx_.staticBinary().imageBase(), false);
+            }
+            if (attached) {
+                std::snprintf(label, sizeof(label), "Live RIP   0x%llX",
+                              (unsigned long long)s.regs.rip);
+                chooseAddress(label, s.regs.rip, true);
+                std::snprintf(label, sizeof(label), "Inspect RIP in Memory Tools   0x%llX",
+                              (unsigned long long)s.regs.rip);
+                if (ImGui::MenuItem(label))
+                    ctx_.openMemoryToolsAt(s.regs.rip, s.pid,
+                                           s.sessionGeneration);
+            }
+            ImGui::EndPopup();
+        }
+
+        const bool shortcutOverlayOpen = palette_.isOpen() ||
+            ImGui::IsPopupOpen(nullptr,
+                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        if (!ImGui::GetIO().WantTextInput && !shortcutOverlayOpen && attached) {
+            if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+                if (modeRunning) executionCommand(GmlControlCommand::Pause);
+                else if (modePaused) executionCommand(GmlControlCommand::Continue);
+            }
+            if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F11) &&
+                ImGui::GetIO().KeyShift) executionCommand(GmlControlCommand::StepOut);
+            else if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F11)) executionCommand(GmlControlCommand::StepInto);
+            if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F10)) executionCommand(GmlControlCommand::StepOver);
+            const bool runtimeCursorCurrent = ctx_.runtimeCursorTarget.valid() &&
+                DebugTargetIdentityMatches(frameTarget, ctx_.runtimeCursorTarget);
+            if (modePaused && !ctx_.gmlExecutionMode && ImGui::GetIO().KeyCtrl &&
+                ImGui::IsKeyPressed(ImGuiKey_F9) && ctx_.runtimeCursorVA &&
+                runtimeCursorCurrent)
+                d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
+        }
+
+        // Less-common controls stay at the end of the command band instead of
+        // displacing the stable Continue / Step / Trace / address composition.
+        if (attached) {
+            ImGui::SameLine(0.0f, 12.0f * k);
+            if (commandButton("##cmd_detach", DS_ICON_STOP, "X", "Detach",
+                              "Stop debugging and detach from the process",
+                              false, true, true)) d.detachForSession(frameTarget);
+        } else if (loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
+            ImGui::SameLine(0.0f, 12.0f * k);
+            bool jvmInit = ctx_.debug.breakOnJvmInit();
+            if (ImGui::Checkbox("Break on JVM init", &jvmInit))
+                ctx_.debug.setBreakOnJvmInit(jvmInit);
+            if (ImGui::IsItemHovered()) {
+                char tip[192];
+                std::snprintf(tip, sizeof(tip),
+                              "Arm a one-shot breakpoint on jvm.dll!JNI_CreateJavaVM before launch (%s wrapper).",
+                              JavaWrapKindName(ctx_.staticJavaInfo().kind));
+                ui::ItemTooltip(tip, false);
+            }
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+void App::resolveWorkbenchNavigation() {
+    const bool popupOpen = ImGui::IsPopupOpen(
+        nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+
+    // Resolve routed navigation before the workbench strip is drawn. This keeps
+    // the selected cell and the rendered section in lockstep on the first frame
+    // of a cross-tab action (including Ctrl+K results).
+    if (!ctx_.requestedTab.empty() && !popupOpen) {
+        for (int i = 0; i < static_cast<int>(tabs_.size()); ++i) {
+            if (ctx_.requestedTab == tabs_[i]->name()) {
+                activeTab_ = i;
+                break;
+            }
+        }
+        ctx_.requestedTab.clear();
+    }
+
+    if (!ImGui::GetIO().WantTextInput && !popupOpen && !palette_.isOpen() &&
+        ImGui::GetIO().KeyCtrl) {
+        for (int i = 0; i < static_cast<int>(tabs_.size()) && i < 9; ++i) {
+            if (ImGui::IsKeyPressed(static_cast<ImGuiKey>(ImGuiKey_1 + i))) {
+                activeTab_ = i;
+                break;
+            }
+        }
+    }
+    if (activeTab_ < 0 || activeTab_ >= static_cast<int>(tabs_.size()))
+        activeTab_ = 0;
+}
+
+// Compact, flat workbench tabs. The full labels stay on one line and retain their
+// existing IDs, shortcuts, status dots, and click targets; transient sublabels
+// move into the tooltip instead of consuming a second row of permanent chrome.
 void App::renderTabCardStrip(const DbgSnapshot& dbg) {
     const float k = theme::UiScale();
+    const float docH    = DocumentStripHeight();
     const float barH    = ToolbarHeight();
     const float stripH  = TabStripHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + barH));
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x,
+                                   vp->WorkPos.y + docH + barH));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, stripH));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -1084,38 +4864,20 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panel());
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panelHeader());
     if (ImGui::Begin("##tabstrip", nullptr, flags)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 win = ImGui::GetWindowPos();
-        // Bottom border line (wireframe panel chrome).
+        // One shared baseline keeps this a tab row rather than a row of cards.
         dl->AddLine(ImVec2(win.x, win.y + stripH - 1.0f),
                     ImVec2(win.x + vp->WorkSize.x, win.y + stripH - 1.0f),
                     ImGui::GetColorU32(theme::col::line()));
 
-        // Section icon by tab name.
-        struct CardIcon { const char* name; const char* icon; };
-        static const CardIcon kIcons[] = {
-            { "Projects",       DS_ICON_FOLDER  },
-            { "Communications", DS_ICON_NETWORK },
-            { "Connections",    DS_ICON_LIGHTNING },
-            { "Sig Scanner",    DS_ICON_SEARCH  },
-            { "Binary View",    DS_ICON_CODE    },
-            { "Memory Tools",   DS_ICON_MEMORY  },
-            { "Binary Diff",    DS_ICON_SWITCH  },
-            { "Binary Tech",    DS_ICON_SHIELD  },
-            { "Cortex",         DS_ICON_INFO    },
-            { "Prism",          DS_ICON_LIGHTNING },
-        };
-        auto iconFor = [&](const char* nm) -> const char* {
-            for (const auto& ki : kIcons) if (std::strcmp(ki.name, nm) == 0) return ki.icon;
-            return nullptr;
-        };
-
-        // Mono sub-text per section. Binary View shows the loaded basename.
+        // Binary View's tooltip carries the loaded basename; live tabs expose
+        // their current state there as well.
         std::string binBase;
         {
-            const std::string& bp = ctx_.binary.path();
+            const std::string& bp = ctx_.staticBinary().path();
             if (!bp.empty()) {
                 size_t slash = bp.find_last_of("/\\");
                 binBase = (slash == std::string::npos) ? bp : bp.substr(slash + 1);
@@ -1138,47 +4900,66 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             return "";
         };
 
-        const ImVec4 acc      = theme::col::accent();
-        const float  pad      = 6.0f * k;       // wf-vtab vertical padding (6px)
-        const float  sidePad  = 10.0f * k;
-        const float  roomyGap = 8.0f * k;
-        const float  compactGap = 4.0f * k;
-        const float  roomyCard = 120.0f * k;
-        const bool   compact  = vp->WorkSize.x < sidePad * 2.0f +
-                                roomyCard * (float)tabs_.size() +
-                                roomyGap * (float)(tabs_.empty() ? 0 : tabs_.size() - 1);
-        const float  hpad     = (compact ? 8.0f : 14.0f) * k;
-        const float  gap      = compact ? compactGap : roomyGap;
-        const float  rounding = 5.0f * k;
-        const float  cardH    = stripH - 2.0f * pad;
-        const float  cardTop  = win.y + pad;
-        const float  iconSz   = 16.0f * k;      // sub-glyph drawn to the card's left
-        const float  usableW  = (std::max)(1.0f, vp->WorkSize.x - sidePad * 2.0f -
-                                          gap * (float)(tabs_.empty() ? 0 : tabs_.size() - 1));
-        const float  fitCardW = tabs_.empty() ? usableW : usableW / (float)tabs_.size();
-        // New sections must not disappear beyond the right edge. Cards share the
-        // available strip width on compact windows and stop growing on wide ones.
-        const float  cardW    = (std::max)(1.0f, (std::min)(190.0f * k, fitCardW));
-        float        x        = win.x + sidePad;
+        const ImVec4 acc = theme::col::accent();
+        const float sidePad = 8.0f * k;
+        const float hpad = 14.0f * k;
+        const float cardTop = win.y + 1.0f * k;
+        const float cardH = (std::max)(1.0f, stripH - 2.0f * k);
+        const float usableW = (std::max)(1.0f, vp->WorkSize.x - sidePad * 2.0f);
+
+        auto compactName = [](const char* name) -> const char* {
+            if (std::strcmp(name, "Communications") == 0) return "Comms";
+            if (std::strcmp(name, "Sig Scanner") == 0)    return "Sig Scan";
+            if (std::strcmp(name, "Binary View") == 0)    return "Binary";
+            if (std::strcmp(name, "Memory Tools") == 0)   return "Memory";
+            if (std::strcmp(name, "Binary Diff") == 0)    return "Diff";
+            if (std::strcmp(name, "Binary Tech") == 0)    return "Tech";
+            return name;
+        };
+
+        // Keep descriptive labels at normal sizes, then switch to familiar short
+        // names before squeezing cells. This preserves readable targets at the
+        // minimum supported window size instead of reducing labels to ellipses.
+        std::vector<float> naturalWidths;
+        naturalWidths.reserve(tabs_.size());
+        float naturalTotal = 0.0f;
+        for (const auto& tab : tabs_) {
+            const char* nm = tab->name();
+            const bool reservesBadge = std::strcmp(nm, "Communications") == 0 ||
+                                       std::strcmp(nm, "Binary View") == 0;
+            const float width = (std::max)(
+                62.0f * k, ImGui::CalcTextSize(nm).x + hpad * 2.0f +
+                           (reservesBadge ? 14.0f * k : 0.0f));
+            naturalWidths.push_back(width);
+            naturalTotal += width;
+        }
+        const bool compactLabels = naturalTotal > usableW;
+        if (compactLabels) {
+            naturalWidths.clear();
+            naturalTotal = 0.0f;
+            for (const auto& tab : tabs_) {
+                const char* nm = tab->name();
+                const bool reservesBadge = std::strcmp(nm, "Communications") == 0 ||
+                                           std::strcmp(nm, "Binary View") == 0;
+                const float width = (std::max)(
+                    54.0f * k, ImGui::CalcTextSize(compactName(nm)).x +
+                               20.0f * k + (reservesBadge ? 14.0f * k : 0.0f));
+                naturalWidths.push_back(width);
+                naturalTotal += width;
+            }
+        }
+        const float fit = naturalTotal > usableW && naturalTotal > 0.0f
+                        ? usableW / naturalTotal : 1.0f;
+        float x = win.x + sidePad;
 
         for (int i = 0; i < (int)tabs_.size(); ++i) {
             const char* nm = tabs_[i]->name();
             const bool active = (i == activeTab_);
-            const char* ic = ui::IconsLoaded() ? iconFor(nm) : nullptr;
-            const bool drawIcon = (ic && ui::gIconFontLarge && cardW >= 104.0f * k);
-
-            // Measure: label (normal font) over mono sub-text. Card width fits both.
-            ImVec2 labelSz = ImGui::CalcTextSize(nm);
             std::string sub = subFor(nm);
-            ui::PushMono();
-            const float subScale = 0.82f;       // smaller mono sub-line (wf-vtab-sub ~9.5px)
-            ImFont* monoFont = ImGui::GetFont();
-            const float subFontSz = ImGui::GetFontSize() * subScale;
-            ImVec2 subSz = monoFont->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, sub.c_str());
-            ui::PopMono();
-
-            const float iconW    = drawIcon ? (iconSz + 8.0f * k) : 0.0f;
-
+            float cardW = naturalWidths[(size_t)i] * fit;
+            if (fit < 1.0f && i + 1 == (int)tabs_.size())
+                cardW = win.x + sidePad + usableW - x; // absorb FP rounding
+            cardW = (std::max)(1.0f, cardW);
             const ImVec2 a(x, cardTop);
             const ImVec2 b(x + cardW, cardTop + cardH);
 
@@ -1186,109 +4967,86 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             ImGui::SetCursorScreenPos(a);
             bool clicked = ImGui::InvisibleButton("##tabcard", ImVec2(cardW, cardH));
             bool hovered = ImGui::IsItemHovered();
+            const bool focused = ImGui::IsItemFocused();
+            const bool held = ImGui::IsItemActive();
 
-            // Soft drop shadow (wf-vtab.is-active box-shadow: 2px 2px lineSoft) under
-            // the active card.
-            if (active) {
-                ImVec4 sh = theme::col::lineSoft();
-                dl->AddRectFilled(ImVec2(a.x + 2.0f * k, a.y + 2.0f * k),
-                                  ImVec2(b.x + 2.0f * k, b.y + 2.0f * k),
-                                  ImGui::GetColorU32(sh), rounding);
-            }
-
-            // Card body: active = panel-2-ish (brighter panel), inactive = panelHeader.
+            // Flat cells share edges. Active/hovered states brighten the fill;
+            // the active section gets the mockup's crisp cyan overline.
             ImVec4 bodyCol = active ? theme::col::panel() : theme::col::panelHeader();
-            if (active) { bodyCol.x *= 1.10f; bodyCol.y *= 1.10f; bodyCol.z *= 1.10f; }
-            else if (hovered) { bodyCol.x *= 1.06f; bodyCol.y *= 1.06f; bodyCol.z *= 1.06f; }
-            dl->AddRectFilled(a, b, ImGui::GetColorU32(bodyCol), rounding);
-
-            // Border: ink line; accent when active (wf-vtab.is-active border-color:ink,
-            // brought toward accent for the workbench palette).
-            ImU32 border = active ? ImGui::GetColorU32(acc)
-                                  : ImGui::GetColorU32(theme::col::line());
-            dl->AddRect(a, b, border, rounding, 0, (active ? 1.5f : 1.0f) * k);
-
-            // Accent underline along the card bottom for the active section.
-            if (active)
-                dl->AddRectFilled(ImVec2(a.x + rounding, b.y - 2.0f * k),
-                                  ImVec2(b.x - rounding, b.y),
-                                  ImGui::GetColorU32(acc));
-
-            // Content origin (after the left icon column).
-            const float contentX = a.x + hpad + iconW;
-            const float blockH   = labelSz.y + 2.0f * k + subSz.y;
-            const float blockY   = a.y + (cardH - blockH) * 0.5f;
-
-            // Left icon glyph, vertically centered in the card.
-            if (drawIcon) {
-                ImVec2 gsz = ui::gIconFontLarge->CalcTextSizeA(iconSz, FLT_MAX, 0.0f, ic);
-                const ImVec4 igc = active ? acc : theme::col::muted();
-                dl->AddText(ui::gIconFontLarge, iconSz,
-                            ImVec2(a.x + hpad, a.y + (cardH - gsz.y) * 0.5f),
-                            ImGui::GetColorU32(igc), ic);
+            if (active) {
+                bodyCol.x = bodyCol.x * 0.86f + acc.x * 0.14f;
+                bodyCol.y = bodyCol.y * 0.86f + acc.y * 0.14f;
+                bodyCol.z = bodyCol.z * 0.86f + acc.z * 0.14f;
+            } else if (hovered || focused || held) {
+                bodyCol.x = bodyCol.x * 0.92f + acc.x * 0.08f;
+                bodyCol.y = bodyCol.y * 0.92f + acc.y * 0.08f;
+                bodyCol.z = bodyCol.z * 0.92f + acc.z * 0.08f;
             }
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(bodyCol));
+            dl->AddLine(ImVec2(b.x, a.y), ImVec2(b.x, b.y),
+                        ImGui::GetColorU32(theme::col::lineSoft()));
+            if (active)
+                dl->AddRectFilled(a, ImVec2(b.x, a.y + 2.0f * k),
+                                  ImGui::GetColorU32(acc));
+            if (focused)
+                dl->AddRect(ImVec2(a.x + 2.0f * k, a.y + 3.0f * k),
+                            ImVec2(b.x - 2.0f * k, b.y - 2.0f * k),
+                            ImGui::GetColorU32(acc), 2.0f * k, 0, 1.0f * k);
 
-            // Label (bold-ish: normal text color when active, muted otherwise).
-            // Ellipsize in compact mode so long labels never paint over neighbours.
-            const ImVec4 labCol = active ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
-                                         : theme::col::muted();
-            const float labelAvail = (std::max)(1.0f, (b.x - hpad) - contentX);
-            std::string label = nm;
-            if (ImGui::CalcTextSize(label.c_str()).x > labelAvail) {
-                if (ImGui::CalcTextSize("...").x > labelAvail) label.clear();
+            bool badge = false;
+            ImVec4 badgeCol(0, 0, 0, 1);
+            if (std::strcmp(nm, "Communications") == 0 && dbg.attached()) {
+                badge = true;
+                badgeCol = dbg.state == DbgState::Paused
+                         ? theme::col::warn() : theme::col::good();
+            } else if (std::strcmp(nm, "Binary View") == 0 &&
+                       (ctx_.staticAnalysis().bulkPending() ||
+                        ctx_.moduleAnalysisPending() || ctx_.livescan.busy())) {
+                badge = true;
+                badgeCol = acc;
+                badgeCol.w = 0.45f + 0.55f *
+                    (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.0f));
+            }
+            const bool reservesBadge = std::strcmp(nm, "Communications") == 0 ||
+                                       std::strcmp(nm, "Binary View") == 0;
+            const float badgeSlot = reservesBadge ? 14.0f * k : 0.0f;
+            const float textLeft = a.x + 8.0f * k;
+            const float textRight = b.x - 8.0f * k - badgeSlot;
+            const float textAvail = (std::max)(1.0f, textRight - textLeft);
+            const ImVec4 labCol = active || hovered || focused
+                ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : theme::col::muted();
+            std::string label = compactLabels ? compactName(nm) : nm;
+            if (ImGui::CalcTextSize(label.c_str()).x > textAvail) {
+                if (ImGui::CalcTextSize("...").x > textAvail) label.clear();
                 else {
                     while (label.size() > 1 &&
-                           ImGui::CalcTextSize((label + "...").c_str()).x > labelAvail)
+                           ImGui::CalcTextSize((label + "...").c_str()).x > textAvail)
                         label.pop_back();
                     label += "...";
                 }
             }
-            dl->AddText(ImVec2(contentX, blockY), ImGui::GetColorU32(labCol), label.c_str());
-
-            // Mono sub-text, ellipsized to the card width.
-            {
-                const float subAvail = (std::max)(1.0f, (b.x - hpad) - contentX);
-                std::string st = sub;
-                ui::PushMono();
-                ImFont* mf = ImGui::GetFont();
-                if (monoFont->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, st.c_str()).x > subAvail) {
-                    if (mf->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, "...").x > subAvail) st.clear();
-                    else {
-                        while (st.size() > 1 &&
-                               mf->CalcTextSizeA(subFontSz, FLT_MAX, 0.0f, (st + "...").c_str()).x > subAvail)
-                            st.pop_back();
-                        st += "...";
-                    }
-                }
-                dl->AddText(mf, subFontSz, ImVec2(contentX, blockY + labelSz.y + 2.0f * k),
-                            ImGui::GetColorU32(theme::col::muted()), st.c_str());
-                ui::PopMono();
-            }
-
-            // Status badge at the card's top-right corner.
-            bool   badge = false;
-            ImVec4 bc(0, 0, 0, 1);
-            if (std::strcmp(nm, "Communications") == 0 && dbg.attached()) {
-                badge = true;
-                bc = dbg.state == DbgState::Paused ? theme::col::warn() : theme::col::good();
-            } else if (std::strcmp(nm, "Binary View") == 0 &&
-                       (ctx_.analysis.bulkPending() || ctx_.livescan.busy())) {
-                badge = true;   // pulsing "analysis running" dot (redraw already continuous)
-                bc = acc;
-                bc.w = 0.45f + 0.55f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.0f));
-            }
+            const ImVec2 labelSize = ImGui::CalcTextSize(label.c_str());
+            const float labelX = textLeft + (textAvail - labelSize.x) * 0.5f;
+            const float labelY = a.y + (cardH - labelSize.y) * 0.5f;
+            dl->AddText(ImVec2(labelX, labelY), ImGui::GetColorU32(labCol),
+                        label.c_str());
             if (badge)
-                dl->AddCircleFilled(ImVec2(b.x - 9.0f * k, a.y + 9.0f * k),
-                                    4.0f * k, ImGui::GetColorU32(bc));
+                dl->AddCircleFilled(ImVec2(b.x - 10.0f * k,
+                                           a.y + cardH * 0.5f),
+                                    3.0f * k, ImGui::GetColorU32(badgeCol));
 
             if (clicked) activeTab_ = i;
             if (hovered) {
-                if (i < 9) ImGui::SetTooltip("%s  (Ctrl+%d)", nm, i + 1);
-                else       ImGui::SetTooltip("%s", nm);
+                char tip[256];
+                if (i < 9) std::snprintf(tip, sizeof(tip), "%s\n%s  |  Ctrl+%d",
+                                         nm, sub.c_str(), i + 1);
+                else       std::snprintf(tip, sizeof(tip), "%s\n%s",
+                                         nm, sub.c_str());
+                ui::ItemTooltip(tip, false);
             }
             ImGui::PopID();
 
-            x += cardW + gap;
+            x += cardW;
         }
     }
     ImGui::End();
@@ -1297,16 +5055,20 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
 }
 
 void App::renderMainWindow(const DbgSnapshot& dbg) {
-    // One fixed, full-size window: the horizontal tab-card strip above selects the
+    // One fixed, full-size window: the contiguous workbench strip above selects the
     // section, the content fills the rest. No docking, no floating panels - every
     // section always lives in the same place.
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    float barH    = ToolbarHeight();                           // toolbar at top
-    float stripH  = TabStripHeight();                          // tab-card strip below it
-    float statusH = ImGui::GetFrameHeight() + 8.0f;            // status bar at bottom
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + barH + stripH));
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, vp->WorkSize.y - barH - stripH - statusH));
-    (void)dbg;   // section switching now lives in the tab-card strip band above
+    float docH    = DocumentStripHeight();                     // static-document tabs
+    float barH    = ToolbarHeight();                           // debug toolbar below them
+    float stripH  = TabStripHeight();                          // primary workbench strip
+    float statusH = StatusStripHeight();                       // compact status strip
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x,
+                                   vp->WorkPos.y + docH + barH + stripH));
+    const float contentHeight = (std::max)(
+        1.0f, vp->WorkSize.y - docH - barH - stripH - statusH);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, contentHeight));
+    (void)dbg;   // section switching lives in the primary strip band above
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
                              ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -1318,19 +5080,6 @@ void App::renderMainWindow(const DbgSnapshot& dbg) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("##main", nullptr, flags);
     ImGui::PopStyleVar();   // WindowPadding (only matters at Begin)
-
-    // Cross-tab navigation: consume requestedTab BEFORE drawing, so menu items,
-    // gotoAddress(), and scan-result clicks switch sections exactly as before.
-    if (!ctx_.requestedTab.empty()) {
-        for (int i = 0; i < (int)tabs_.size(); ++i)
-            if (ctx_.requestedTab == tabs_[i]->name()) { activeTab_ = i; break; }
-        ctx_.requestedTab.clear();
-    }
-    // Ctrl+1..9 jumps straight to a section (mirrors the tab-card tooltips).
-    if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl)
-        for (int i = 0; i < (int)tabs_.size() && i < 9; ++i)
-            if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_1 + i))) activeTab_ = i;
-    if (activeTab_ < 0 || activeTab_ >= (int)tabs_.size()) activeTab_ = 0;
 
     // PushID is load-bearing: BeginTabItem used to scope each tab's
     // "##tabcontent" ID (scroll position, child state); keep that per-section.
@@ -1346,7 +5095,7 @@ void App::renderMainWindow(const DbgSnapshot& dbg) {
 
 void App::renderStatusBar(const DbgSnapshot& d) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    float statusH = ImGui::GetFrameHeight() + 8.0f;
+    float statusH = StatusStripHeight();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + vp->WorkSize.y - statusH));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, statusH));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -1354,54 +5103,139 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(12.0f * theme::UiScale(),
+                               (statusH - ImGui::GetFrameHeight()) * 0.5f));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::menubar());   // on-palette (incl. Light)
     if (ImGui::Begin("##status", nullptr, flags)) {
-        // Mono segments with thin dividers (wireframe wf-statusbar).
-        ui::PushMono();
-        // Colored state dot.
-        ImVec4 dot = !d.attached()        ? theme::col::muted()
-                   : d.state == DbgState::Running ? theme::col::good()
-                   : d.state == DbgState::Paused  ? theme::col::warn()
-                   : theme::col::bad();
-        const char* st = !d.attached()    ? "detached"
-                   : d.state == DbgState::Running ? "running"
-                   : d.state == DbgState::Paused  ? "paused"
-                   : d.state == DbgState::Terminated ? "terminated" : "attached";
-        // Draw a status dot with the draw list (no font-glyph dependency).
-        ImVec2 cp = ImGui::GetCursorScreenPos();
-        float  lh = ImGui::GetTextLineHeight();
-        ImGui::GetWindowDrawList()->AddCircleFilled(
-            ImVec2(cp.x + 6.0f, cp.y + lh * 0.5f), 5.0f, ImGui::ColorConvertFloat4ToU32(dot));
-        ImGui::Dummy(ImVec2(16.0f, lh));
-        ImGui::SameLine(); ImGui::TextUnformatted(st);
-        if (d.attached()) { ImGui::SameLine(); ImGui::TextDisabled("pid %u  rip 0x%llX", d.pid, (unsigned long long)d.regs.rip); }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 statusPos = ImGui::GetWindowPos();
+        dl->AddLine(statusPos,
+                    ImVec2(statusPos.x + ImGui::GetWindowSize().x, statusPos.y),
+                    ImGui::GetColorU32(theme::col::line()),
+                    (std::max)(1.0f, theme::UiScale()));
 
-        ui::StatusDivider();
-        ImGui::Text("%s", ctx_.disasm ? ctx_.disasm->engineName() : "-");
-        ui::StatusDivider();
-        ImGui::Text("%s", ArchName(ctx_.arch));
-        ui::StatusDivider();
-        if (ctx_.binary.loaded()) {
-            const std::string& p = ctx_.binary.path();
-            size_t slash = p.find_last_of("/\\");
-            ImGui::Text("%s  (%s)", slash == std::string::npos ? p.c_str() : p.c_str() + slash + 1,
-                        ctx_.binary.formatName());
+        ImGui::AlignTextToFramePadding();
+        // Stable left-to-right summary from the reference: architecture, format,
+        // execution state, then document. Activity is appended only when present.
+        ui::PushMono();
+        const float lh = ImGui::GetTextLineHeight();
+        auto statusDot = [&] {
+            ImGui::SameLine(0.0f, 9.0f * theme::UiScale());
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            dl->AddCircleFilled(ImVec2(p.x + 2.5f * theme::UiScale(),
+                                       p.y + lh * 0.5f),
+                                2.0f * theme::UiScale(),
+                                ImGui::GetColorU32(theme::col::accent()));
+            ImGui::Dummy(ImVec2(6.0f * theme::UiScale(), lh));
+            ImGui::SameLine(0.0f, 9.0f * theme::UiScale());
+        };
+
+        const bool hasBinary = ctx_.staticBinary().loaded();
+        if (!hasBinary && !d.attached()) {
+            ImGui::TextDisabled("Ready");
+            statusDot();
+            ImGui::TextDisabled("Open a binary (Ctrl+O) or attach from Communications");
         } else {
-            ImGui::TextDisabled("no binary loaded");
-        }
-        if (ctx_.hasCursor) {
-            ui::StatusDivider();
-            if (!ctx_.cursorFuncName.empty())
-                ImGui::Text("cursor 0x%llX  (%s)", (unsigned long long)ctx_.cursorVA, ctx_.cursorFuncName.c_str());
+            const char* architecture = hasBinary
+                ? ArchName(ctx_.staticArch()) : (d.is32 ? "x86" : "x64");
+            ImGui::Text("%s", architecture);
+            if (hasBinary) {
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Architecture: %s\nDecoder: %s", architecture,
+                                      ctx_.staticDisassembler()
+                                          ? ctx_.staticDisassembler()->engineName() : "-");
+                }
+            } else {
+                ui::ItemTooltip("Architecture inferred from the attached process", false);
+            }
+            statusDot();
+            if (hasBinary)
+                ImGui::TextUnformatted(ctx_.staticBinary().formatName());
             else
-                ImGui::Text("cursor 0x%llX", (unsigned long long)ctx_.cursorVA);
+                ImGui::TextDisabled("Live process");
+
+            statusDot();
+            const char* stateText = !d.attached() ? "Static"
+                                  : d.state == DbgState::Running ? "Running"
+                                  : d.state == DbgState::Paused ? "Paused"
+                                  : d.state == DbgState::Terminated ? "Terminated"
+                                  : "Attached";
+            const ImVec4 stateCol = !d.attached() ? theme::col::muted()
+                                  : d.state == DbgState::Running ? theme::col::good()
+                                  : d.state == DbgState::Paused ? theme::col::accent()
+                                  : d.state == DbgState::Terminated ? theme::col::bad()
+                                  : theme::col::warn();
+            ImGui::TextColored(stateCol, "%s", stateText);
+            if (ImGui::IsItemHovered() && d.attached()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("PID %u  %s 0x%llX", d.pid, d.is32 ? "EIP" : "RIP",
+                            (unsigned long long)d.regs.rip);
+                if (!d.lastEvent.empty()) ImGui::TextWrapped("%s", d.lastEvent.c_str());
+                if (!d.dllTargetError.empty())
+                    ImGui::TextColored(theme::col::bad(), "%s", d.dllTargetError.c_str());
+                if (d.jvmLoaded) ImGui::Text("JVM: %s", d.jvmPath.c_str());
+                ImGui::EndTooltip();
+            }
+
+            statusDot();
+            if (hasBinary) {
+                const std::string& p = ctx_.staticBinary().path();
+                const size_t slash = p.find_last_of("/\\");
+                ImGui::TextUnformatted(slash == std::string::npos
+                    ? p.c_str() : p.c_str() + slash + 1);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", p.c_str());
+            } else {
+                ImGui::Text("PID %u", d.pid);
+            }
+        }
+
+        if (ctx_.staticBinary().loaded() && !ctx_.staticBinary().isMappedImage() &&
+            (ctx_.projectSaveState != AppContext::ProjectSaveState::Clean ||
+             !ctx_.projectSaveWarning.empty())) {
+            statusDot();
+            switch (ctx_.projectSaveState) {
+                case AppContext::ProjectSaveState::Dirty:
+                    ImGui::TextColored(theme::col::warn(), "Project: unsaved");
+                    break;
+                case AppContext::ProjectSaveState::Saving:
+                    ImGui::TextColored(theme::col::accent(), "Project: saving...");
+                    break;
+                case AppContext::ProjectSaveState::Failed:
+                    ImGui::TextColored(theme::col::bad(), "Project: save failed");
+                    if (ImGui::IsItemHovered() && !ctx_.projectSaveError.empty())
+                        ImGui::SetTooltip("%s", ctx_.projectSaveError.c_str());
+                    break;
+                case AppContext::ProjectSaveState::Clean: break;
+            }
+            if (!ctx_.projectSaveWarning.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(theme::col::warn(), "(recents warning)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", ctx_.projectSaveWarning.c_str());
+            }
+        }
+
+        if (prefsSaveFailed_) {
+            statusDot();
+            ImGui::TextColored(theme::col::bad(), "Prefs: save failed");
+            if (ImGui::IsItemHovered() && !prefsSaveError_.empty())
+                ImGui::SetTooltip("%s", prefsSaveError_.c_str());
+        }
+
+        if (ctx_.binaryLoadPending()) {
+            statusDot();
+            ImGui::TextColored(theme::col::accent(), "Opening binary...");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel##binary-load"))
+                ctx_.cancelBinaryLoad();
         }
 
         // Background analysis progress (worker pool): phase label + bar + cancel. The
         // module counters drive the bar during an "analyze all modules" batch; otherwise
         // the per-pass byte/instruction count does, falling back to an indeterminate bar.
-        if (ctx_.analysis.bulkPending()) {
-            ProgressSnapshot pr = ctx_.analysis.progress();
+        if (ctx_.staticAnalysis().bulkPending()) {
+            ProgressSnapshot pr = ctx_.staticAnalysis().progress();
             char lbl[64];
             if (pr.modulesTotal > 0)
                 std::snprintf(lbl, sizeof(lbl), "Modules %u/%u", pr.modulesDone, pr.modulesTotal);
@@ -1409,11 +5243,13 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                 const char* ph = pr.phase == AnalysisPhase::Strings   ? "Scanning strings"
                                : pr.phase == AnalysisPhase::Functions ? "Discovering functions"
                                : pr.phase == AnalysisPhase::Listing   ? "Building listing"
+                               : pr.phase == AnalysisPhase::ListingPrefix ? "Resolving code boundaries"
                                : pr.phase == AnalysisPhase::Xref      ? "Building xrefs"
+                               : pr.phase == AnalysisPhase::CrackmeTriage ? "Correlating network trail"
                                : "Analyzing";
                 std::snprintf(lbl, sizeof(lbl), "%s", ph);
             }
-            ui::StatusDivider();
+            statusDot();
             ImGui::TextColored(theme::col::accent(), "%s", lbl);
             ImGui::SameLine();
             float frac = (pr.modulesTotal > 0) ? (float)pr.modulesDone / (float)pr.modulesTotal
@@ -1429,7 +5265,58 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             }
             ImGui::PopStyleColor();
             ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel")) ctx_.analysis.cancelPending();
+            if (ImGui::SmallButton("Cancel")) ctx_.staticAnalysis().cancelPending();
+        }
+
+        const ProgressSnapshot analysisHealth = ctx_.staticAnalysis().progress();
+        if (analysisHealth.jobsFailed || analysisHealth.resultsDropped) {
+            statusDot();
+            ImGui::TextColored(analysisHealth.jobsFailed ? theme::col::bad() : theme::col::warn(),
+                               "Analysis: %llu failed, %llu dropped",
+                               (unsigned long long)analysisHealth.jobsFailed,
+                               (unsigned long long)analysisHealth.resultsDropped);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%llu pending request(s) coalesced. Dropped results mean the bounded UI result queue filled.",
+                                  (unsigned long long)analysisHealth.requestsCoalesced);
+        }
+
+        // Registry-module analysis has independent ownership from the active
+        // static document. Keep its progress and cancellation visible even after
+        // switching documents or leaving Binary View.
+        if (ctx_.moduleAnalysisPending()) {
+            const ProgressSnapshot progress = ctx_.moduleAnalysisProgress();
+            const size_t modulesInFlight = ctx_.moduleAnalysesInFlight();
+            statusDot();
+            ImGui::TextColored(theme::col::accent(), "Analyzing %zu live module%s",
+                               modulesInFlight, modulesInFlight == 1 ? "" : "s");
+            ImGui::SameLine();
+            const float fraction = progress.total > 0
+                                 ? (float)progress.current / (float)progress.total
+                                 : -1.0f;
+            const float width = 150.0f * theme::UiScale();
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::accent());
+            if (fraction >= 0.0f)
+                ImGui::ProgressBar(fraction, ImVec2(width, 0.0f));
+            else {
+                const float t = (float)ImGui::GetTime();
+                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(width, 0.0f), "");
+            }
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel##module-analysis"))
+                ctx_.cancelModuleAnalysisPending();
+        }
+
+        const ProgressSnapshot moduleHealth = ctx_.moduleAnalysisProgress();
+        if (moduleHealth.jobsFailed || moduleHealth.resultsDropped) {
+            statusDot();
+            ImGui::TextColored(moduleHealth.jobsFailed ? theme::col::bad() : theme::col::warn(),
+                               "Modules: %llu failed, %llu dropped",
+                               (unsigned long long)moduleHealth.jobsFailed,
+                               (unsigned long long)moduleHealth.resultsDropped);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%llu module request(s) coalesced. Incomplete modules remain retryable.",
+                                  (unsigned long long)moduleHealth.requestsCoalesced);
         }
 
         // Live-memory scan progress (process string scan / xref sweep / "analyze all
@@ -1444,7 +5331,7 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                             lp.kind == LiveKind::Strings ? "Scanning process strings"
                           : lp.kind == LiveKind::Xref    ? "Searching references"
                           : "Reading module image");
-            ui::StatusDivider();
+            statusDot();
             ImGui::TextColored(theme::col::good(), "%s", lbl);
             ImGui::SameLine();
             float frac = (bt > 0) ? (float)bd / (float)bt
@@ -1461,48 +5348,284 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             ImGui::SameLine();
             if (ImGui::SmallButton("Cancel##live")) ctx_.livescan.cancelPending();
         }
+
+        // Trace coverage has two bounded asynchronous-looking phases: the Binary
+        // View incrementally derives block entries from its listing, then the
+        // debugger thread plants private one-shot sites. Both remain visible and
+        // cancellable after the user leaves the code pane.
+        const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
+        const size_t plantedDone = tr ? tr->armedSites + tr->hitSites + tr->skippedSites + tr->retiredSites : 0;
+        const bool planting = tr && tr->active && tr->plannedSites > plantedDone;
+        if (ctx_.traceSeedPlanning || planting) {
+            statusDot();
+            ImGui::TextColored(theme::col::good(), "%s",
+                               ctx_.traceSeedPlanning ? "Finding trace blocks" : "Planting trace sites");
+            ImGui::SameLine();
+            const size_t cur = ctx_.traceSeedPlanning ? ctx_.traceSeedCurrent : plantedDone;
+            const size_t total = ctx_.traceSeedPlanning ? ctx_.traceSeedTotal : tr->plannedSites;
+            const float frac = total ? (float)cur / (float)total : -1.0f;
+            const float w = 150.0f * theme::UiScale();
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::good());
+            if (frac >= 0.0f) ImGui::ProgressBar(std::min(frac, 1.0f), ImVec2(w, 0.0f));
+            else {
+                float t = (float)ImGui::GetTime();
+                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), "");
+            }
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ctx_.traceSeedPlanning)
+                ImGui::TextDisabled("%zu block(s)", ctx_.traceSeedFound);
+            else
+                ImGui::TextDisabled("%zu/%zu", plantedDone, tr->plannedSites);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel##trace")) {
+                ctx_.requestedTraceCancel = true;
+                ctx_.requestedTraceCancelTarget = ctx_.frameDebugSnapshot
+                    ? DebugTargetIdentity{ ctx_.frameDebugSnapshot->pid,
+                                           ctx_.frameDebugSnapshot->sessionGeneration }
+                    : DebugTargetIdentity{};
+            }
+        } else if (tr && (tr->active || tr->blockHitTotal > 0)) {
+            statusDot();
+            ImGui::TextColored(theme::col::good(), "Trace %s  %zu blocks / %llu hits",
+                               tr->active ? "on" : "stopped", tr->hitSites,
+                               (unsigned long long)tr->blockHitTotal);
+        }
+
+        // Source export has its own single worker and remains visible/cancellable even
+        // after the user leaves Binary View's options/progress modal.
+        if (ctx_.staticCodeExport().pending()) {
+            CodeExportProgress ep = ctx_.staticCodeExport().progress();
+            statusDot();
+            ImGui::TextColored(theme::col::warn(), "%s", CodeExportPhaseName(ep.phase));
+            ImGui::SameLine();
+            float frac = ep.total > 0 ? (float)ep.current / (float)ep.total : -1.0f;
+            float w = 150.0f * theme::UiScale();
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::warn());
+            if (frac >= 0.0f) ImGui::ProgressBar(std::min(frac, 1.0f), ImVec2(w, 0.0f));
+            else {
+                float t = (float)ImGui::GetTime();
+                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), "");
+            }
+            ImGui::PopStyleColor();
+            if (ep.bytesWritten) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%llu B", (unsigned long long)ep.bytesWritten);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel##export")) ctx_.staticCodeExport().cancel();
+        }
+
+        // Keep the analyst's current location anchored at the far edge when
+        // there is room. It disappears before colliding with progress/status
+        // content and doubles as a one-click copy target.
+        if (ctx_.hasCursor) {
+            char cursorText[40];
+            std::snprintf(cursorText, sizeof(cursorText), "Cursor 0x%llX",
+                          (unsigned long long)ctx_.cursorVA);
+            const float cursorW = ImGui::CalcTextSize(cursorText).x;
+            const float rightX = statusPos.x + ImGui::GetWindowSize().x -
+                                 12.0f * theme::UiScale() - cursorW;
+            const float contentEnd = ImGui::GetItemRectMax().x;
+            if (contentEnd + 24.0f * theme::UiScale() < rightX) {
+                const ImVec2 cursorPos(
+                    rightX, statusPos.y + (statusH - lh) * 0.5f);
+                ImGui::SetCursorScreenPos(cursorPos);
+                if (ImGui::InvisibleButton("##status_cursor",
+                                           ImVec2(cursorW, lh))) {
+                    ImGui::SetClipboardText(cursorText + 7); // address only
+                    ui::Toast(ui::ToastKind::Success,
+                              "Cursor address copied to the clipboard.");
+                }
+                const bool hovered = ImGui::IsItemHovered();
+                dl->AddText(cursorPos,
+                            ImGui::GetColorU32(hovered ? theme::col::accent()
+                                                      : theme::col::muted()),
+                            cursorText);
+                if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ui::ItemTooltip("Click to copy the cursor virtual address", false);
+            }
+        }
         ui::PopMono();
     }
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
 }
 
 void App::renderRawLoadPopup() {
     if (openRawPopup_) { ImGui::OpenPopup("Open as Raw"); openRawPopup_ = false; }
     ImVec2 c = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(680.0f * theme::UiScale(), 0), ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("Open as Raw", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
 
-    ImGui::TextDisabled("Map a flat code blob (shellcode / firmware) with no header parsing.");
+    ImGui::TextDisabled("Map a flat code blob with an explicit architecture and analysis entry.");
     size_t slash = rawPendingPath_.find_last_of("/\\");
     ImGui::Text("File: %s", slash == std::string::npos ? rawPendingPath_.c_str() : rawPendingPath_.c_str() + slash + 1);
-    ImGui::SetNextItemWidth(200);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%llu bytes)", (unsigned long long)rawPendingSize_);
+
+    auto applyDetectedDefaults = [&] {
+        if (!rawFirmware_.detected() && rawFirmware_.architecture.mode == FirmwareCpuMode::Unknown)
+            return;
+        const FirmwareCpuMode m = rawFirmware_.entry.mode != FirmwareCpuMode::Unknown
+                                ? rawFirmware_.entry.mode : rawFirmware_.architecture.mode;
+        const Arch detectedArch = rawArchFromSelection(rawArchForFirmwareMode(m));
+        uint64_t base = rawFirmware_.recommendedImageBaseValid
+                      ? rawFirmware_.recommendedImageBase
+                      : ((detectedArch == Arch::ARM || detectedArch == Arch::THUMB)
+                            ? 0 : 0x140000000ull);
+        if (!ArchMappingRangeFits(detectedArch, base, rawPendingSize_) &&
+            (detectedArch == Arch::ARM || detectedArch == Arch::THUMB))
+            base = 0;
+        uint64_t entry = base;
+        if (rawFirmware_.entry.detected && rawFirmware_.entry.location.valid &&
+            rawFirmware_.entry.location.fileOffset < rawPendingSize_ &&
+            rawFirmware_.entry.location.fileOffset <=
+                (std::numeric_limits<uint64_t>::max)() - base)
+            entry = base + rawFirmware_.entry.location.fileOffset;
+        // Architecture-only evidence never changes a manually edited mapping.
+        if (rawFirmware_.detected()) {
+            formatHexU64(rawBaseBuf_, sizeof(rawBaseBuf_), base);
+            formatHexU64(rawEntryBuf_, sizeof(rawEntryBuf_), entry);
+        }
+        rawArchSel_ = rawArchForFirmwareMode(m);
+    };
+
+    if (rawFirmware_.detected() || rawFirmware_.architecture.mode != FirmwareCpuMode::Unknown) {
+        ImGui::SeparatorText(rawFirmware_.detected() ? "Firmware detector" : "Raw architecture probe");
+        if (rawFirmware_.detected())
+            ImGui::TextColored(theme::col::good(), "%s (%s confidence)",
+                               FirmwareKindName(rawFirmware_.primaryKind),
+                               FirmwareConfidenceName(rawFirmware_.confidence));
+        else
+            ImGui::TextColored(theme::col::warn(), "Instruction-set preselection (editable)");
+        if (!rawFirmware_.mappingEvidence.empty())
+            ImGui::TextWrapped("Mapping: %s", rawFirmware_.mappingEvidence.c_str());
+        if (rawFirmware_.architecture.mode != FirmwareCpuMode::Unknown)
+            ImGui::TextWrapped("Architecture: %s (%s confidence) - %s",
+                               FirmwareCpuModeName(rawFirmware_.architecture.mode),
+                               FirmwareConfidenceName(rawFirmware_.architecture.confidence),
+                               rawFirmware_.architecture.evidence.c_str());
+        if (rawFirmware_.entry.detected)
+            ImGui::TextWrapped("Recovered entry: file +0x%llX (%s confidence) - %s",
+                               (unsigned long long)rawFirmware_.entry.location.fileOffset,
+                               FirmwareConfidenceName(rawFirmware_.entry.confidence),
+                               rawFirmware_.entry.evidence.c_str());
+        if (rawFirmware_.detected())
+            ImGui::TextDisabled("%zu firmware volume(s), %zu option ROM(s), %zu flash descriptor(s)",
+                                rawFirmware_.firmwareVolumes.size(), rawFirmware_.optionRoms.size(),
+                                rawFirmware_.flashDescriptors.size());
+        if (ImGui::SmallButton(rawFirmware_.detected()
+                ? "Restore detected mapping / entry / architecture"
+                : "Restore detected architecture"))
+            applyDetectedDefaults();
+        size_t codeLandmarks = 0;
+        for (const FirmwareLandmark& lm : rawFirmware_.landmarks) if (lm.code) ++codeLandmarks;
+        if (codeLandmarks) {
+            ImGui::SameLine();
+            ImGui::Checkbox("Seed named code landmarks", &rawSeedFirmwareLandmarks_);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Seed %zu bounded reset/boot/firmware-image root(s) into function discovery.", codeLandmarks);
+        }
+        if (ImGui::TreeNode("Detector evidence")) {
+            const size_t shown = std::min<size_t>(rawFirmware_.evidence.size(), 12);
+            for (size_t i = 0; i < shown; ++i) {
+                const FirmwareEvidence& e = rawFirmware_.evidence[i];
+                ImGui::BulletText("+0x%llX [%s] %s", (unsigned long long)e.fileOffset,
+                                  FirmwareConfidenceName(e.confidence), e.summary.c_str());
+            }
+            if (shown < rawFirmware_.evidence.size())
+                ImGui::TextDisabled("... %zu more evidence record(s)", rawFirmware_.evidence.size() - shown);
+            ImGui::TreePop();
+        }
+    } else if (!rawFirmwareNote_.empty()) {
+        ImGui::SeparatorText("Firmware detector");
+        ImGui::TextColored(theme::col::muted(), "%s", rawFirmwareNote_.c_str());
+    }
+    if (rawFirmware_.detected() && !rawFirmwareNote_.empty())
+        ImGui::TextColored(theme::col::warn(), "%s", rawFirmwareNote_.c_str());
+
+    ImGui::SeparatorText("Raw mapping");
+    ImGui::SetNextItemWidth(230.0f * theme::UiScale());
     ImGui::InputText("Base address", rawBaseBuf_, sizeof(rawBaseBuf_));
+    ImGui::SetNextItemWidth(230.0f * theme::UiScale());
+    ImGui::InputText("Entry point", rawEntryBuf_, sizeof(rawEntryBuf_));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Editable mapped VA used as the first authoritative function root (VA 0 is valid).");
     ImGui::TextUnformatted("Architecture:");
-    ImGui::RadioButton("x86", &rawArchSel_, 0);   ImGui::SameLine();
-    ImGui::RadioButton("x64", &rawArchSel_, 1);   ImGui::SameLine();
-    ImGui::RadioButton("ARM", &rawArchSel_, 2);   ImGui::SameLine();
-    ImGui::RadioButton("ARM64", &rawArchSel_, 3);
+    ImGui::RadioButton("x86-16 real mode", &rawArchSel_, 0); ImGui::SameLine();
+    ImGui::RadioButton("x86", &rawArchSel_, 1); ImGui::SameLine();
+    ImGui::RadioButton("x64", &rawArchSel_, 2); ImGui::SameLine();
+    ImGui::RadioButton("ARM", &rawArchSel_, 3); ImGui::SameLine();
+    ImGui::RadioButton("Thumb/Thumb-2", &rawArchSel_, 4); ImGui::SameLine();
+    ImGui::RadioButton("ARM64", &rawArchSel_, 5);
+    ImGui::RadioButton("MIPS", &rawArchSel_, 6); ImGui::SameLine();
+    ImGui::RadioButton("MIPS64", &rawArchSel_, 7); ImGui::SameLine();
+    ImGui::RadioButton("PowerPC", &rawArchSel_, 8); ImGui::SameLine();
+    ImGui::RadioButton("PowerPC64", &rawArchSel_, 9);
+    ImGui::RadioButton("RISC-V 32", &rawArchSel_, 10); ImGui::SameLine();
+    ImGui::RadioButton("RISC-V 64", &rawArchSel_, 11);
+    const Arch selectedArch = rawArchFromSelection(rawArchSel_);
+    const bool rawCanBeBigEndian = !ArchIsX86(selectedArch) &&
+                                   selectedArch != Arch::RISCV32 &&
+                                   selectedArch != Arch::RISCV64;
+    if (!rawCanBeBigEndian) rawBigEndian_ = false;
+    ImGui::BeginDisabled(!rawCanBeBigEndian);
+    ImGui::Checkbox("Big-endian byte order", &rawBigEndian_);
+    ImGui::EndDisabled();
+    if (selectedArch == Arch::RISCV32 || selectedArch == Arch::RISCV64)
+        ImGui::Checkbox("Enable compressed (RVC) instructions", &rawRiscvCompressed_);
+    if (rawArchSel_ == 0)
+        ImGui::TextDisabled("16-bit defaults: real-mode addressing, SP stack width, rel16 near transfers.");
 
     ImGui::Separator();
     if (ImGui::Button("Load", ImVec2(120, 0))) {
-        const char* begin = rawBaseBuf_;
-        while (*begin && std::isspace((unsigned char)*begin)) ++begin;
-        errno = 0;
-        char* end = nullptr;
-        const unsigned long long base = std::strtoull(begin, &end, 16); // accepts 0x-prefixed or bare hex
-        while (end && *end && std::isspace((unsigned char)*end)) ++end;
-        if (begin == end || errno == ERANGE || !end || *end != '\0') {
+        uint64_t base = 0, entry = 0;
+        const Arch a = rawArchFromSelection(rawArchSel_);
+        if (!parseHexU64(rawBaseBuf_, base)) {
             ui::Toast(ui::ToastKind::Error, "Open Raw failed: enter a valid 64-bit hexadecimal base address.");
+        } else if (!parseHexU64(rawEntryBuf_, entry)) {
+            ui::Toast(ui::ToastKind::Error, "Open Raw failed: enter a valid 64-bit hexadecimal entry point.");
+        } else if (!rawPendingSize_ || rawPendingSize_ - 1 >
+                   (std::numeric_limits<uint64_t>::max)() - base) {
+            ui::Toast(ui::ToastKind::Error, "Open Raw failed: base + file size overflows the 64-bit address space.");
+        } else if (!ArchMappingRangeFits(a, base, rawPendingSize_)) {
+            ui::Toast(ui::ToastKind::Error,
+                      "Open Raw failed: ARM/Thumb mappings must fit entirely in the 32-bit address space.");
+        } else if (entry < base || entry - base >= rawPendingSize_) {
+            ui::Toast(ui::ToastKind::Error, "Open Raw failed: the entry point must be backed by the mapped file.");
         } else {
-            Arch a = rawArchSel_ == 0 ? Arch::X86 : rawArchSel_ == 1 ? Arch::X64 : rawArchSel_ == 2 ? Arch::ARM : Arch::ARM64;
-            if (ctx_.loadRawPath(rawPendingPath_, (uint64_t)base, a)) {
+            std::vector<AnalysisLandmark> seeds;
+            if (rawSeedFirmwareLandmarks_ && rawFirmware_.detected()) {
+                for (const FirmwareLandmark& lm : rawFirmware_.landmarks) {
+                    if (!lm.code || !lm.location.valid || lm.location.fileOffset >= rawPendingSize_)
+                        continue;
+                    const uint64_t va = base + lm.location.fileOffset; // mapping overflow checked above
+                    auto existing = std::find_if(seeds.begin(), seeds.end(),
+                        [&](const AnalysisLandmark& x) { return x.address == va; });
+                    AnalysisLandmark candidate{va, lm.name, lm.evidence};
+                    if (existing == seeds.end()) seeds.push_back(std::move(candidate));
+                    else if (lm.kind == FirmwareLandmarkKind::BootEntry) *existing = std::move(candidate);
+                }
+            }
+            if (std::none_of(seeds.begin(), seeds.end(),
+                             [&](const AnalysisLandmark& x) { return x.address == entry; }))
+                seeds.push_back({entry, rawFirmware_.detected() ? "firmware_entry" : "raw_entry",
+                                 "analyst-selected raw entry point"});
+
+            if (ctx_.beginRawLoadPath(rawPendingPath_, base, a, entry, std::move(seeds),
+                                     rawFirmware_, true,
+                                     rawBigEndian_ ? ByteOrder::Big : ByteOrder::Little,
+                                     rawRiscvCompressed_)) {
                 ctx_.requestedTab = "Binary View";
                 ImGui::CloseCurrentPopup();
             } else {
                 ui::Toast(ui::ToastKind::Error,
-                          "Open Raw failed: check the file and ensure base + file size fits the 64-bit address space.");
+                          ctx_.documentCommandError().empty()
+                              ? "Open Raw failed: the background load could not start."
+                              : ctx_.documentCommandError());
             }
         }
     }
@@ -1511,16 +5634,948 @@ void App::renderRawLoadPopup() {
     ImGui::EndPopup();
 }
 
-// Build the Ctrl+K command palette: app actions (gated on the current state,
-// mirroring the menu/toolbar handlers exactly) + a snapshot of the Binary
-// View's symbol index for fuzzy goto.
+void App::browseDllCustomHost() {
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = ::GetActiveWindow();
+    ofn.lpstrFilter = L"Executable files (*.exe)\0*.exe\0All Files\0*.*\0";
+    ofn.lpstrFile = file.data();
+    ofn.nMaxFile = static_cast<DWORD>(file.size());
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    std::string path;
+    if (!utf8FromWide(file.data(), path)) {
+        dllDebugPopup_.error = "The custom-host path could not be encoded as UTF-8.";
+        return;
+    }
+    if (path.size() >= sizeof(dllDebugPopup_.customHost)) {
+        dllDebugPopup_.error = "The selected custom-host path is too long for this dialog.";
+        return;
+    }
+    std::snprintf(dllDebugPopup_.customHost, sizeof(dllDebugPopup_.customHost), "%s", path.c_str());
+    dllDebugPopup_.customBitness = 0;
+    dllDebugPopup_.error.clear();
+
+    BinaryFile host;
+    if (!host.load(path) || host.isDll() ||
+        (host.format() != BinFormat::PE32 && host.format() != BinFormat::PE32Plus)) {
+        dllDebugPopup_.error =
+            "The selected custom host is not a launchable PE executable; its bitness could not be validated.";
+        return;
+    }
+    if (host.format() == BinFormat::PE32 && host.machine() == MachineArch::X86)
+        dllDebugPopup_.customBitness = 1;
+    else if (host.format() == BinFormat::PE32Plus && host.machine() == MachineArch::X64)
+        dllDebugPopup_.customBitness = 2;
+    else
+        dllDebugPopup_.error = "Only x86 and x64 custom PE hosts are supported by this workflow.";
+}
+
+void App::renderDllDebugPopup() {
+    if (ctx_.requestedDebugDll) {
+        ctx_.requestedDebugDll = false;
+        dllDebugPopup_ = {};
+        dllDebugPopup_.inspection = InspectDllForDebug(ctx_.staticBinary());
+        if (!dllDebugPopup_.inspection.callableExports.empty())
+            dllDebugPopup_.selectedExport = 0;
+        dllDebugPopup_.breakOnDllMain = dllDebugPopup_.inspection.dllMainRva.has_value();
+        dllDebugPopup_.breakOnExport = !dllDebugPopup_.inspection.callableExports.empty();
+        dllDebugPopup_.open = true;
+    }
+    if (dllDebugPopup_.open) {
+        ImGui::OpenPopup("Debug DLL");
+        dllDebugPopup_.open = false;
+    }
+
+    const float scale = theme::UiScale();
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(720.0f * scale, 610.0f * scale), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Debug DLL", nullptr, 0)) return;
+
+    const DllInspection& inspection = dllDebugPopup_.inspection;
+    const std::string& targetPath = ctx_.staticBinary().path();
+    const size_t slash = targetPath.find_last_of("/\\");
+    const char* targetName = slash == std::string::npos ? targetPath.c_str()
+                                                         : targetPath.c_str() + slash + 1;
+    ImGui::Text("%s", targetName);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s PE DLL", dllBitnessName(inspection.bitness));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", targetPath.c_str());
+    ImGui::TextWrapped("A DLL needs a compatible host process. DisasmStudio will debug the host, match the target module at LOAD_DLL, then retarget the disassembly to its ASLR base.");
+
+    if (!inspection.errors.empty()) {
+        for (const std::string& value : inspection.errors)
+            ImGui::TextColored(theme::col::bad(), "%s", value.c_str());
+    }
+
+    ImGui::SeparatorText("Callable export");
+    const bool haveExports = !inspection.callableExports.empty();
+    const bool validSelection = dllDebugPopup_.selectedExport >= 0 &&
+                                dllDebugPopup_.selectedExport < (int)inspection.callableExports.size();
+    // Keep the preview string alive across BeginCombo (dllExportLabel returns a temporary).
+    const std::string selectedLabel = validSelection
+        ? dllExportLabel(inspection.callableExports[dllDebugPopup_.selectedExport])
+        : std::string("No callable export");
+    ImGui::BeginDisabled(!haveExports);
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo("##dllexport", selectedLabel.c_str())) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(inspection.callableExports.size()));
+        while (clipper.Step()) {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                const DllCallableExport& value = inspection.callableExports[i];
+                const std::string label = dllExportLabel(value);
+                char row[768];
+                std::snprintf(row, sizeof(row), "%s   (#%llu, RVA %08X)", label.c_str(),
+                              (unsigned long long)value.ordinal, value.rva);
+                ImGui::PushID(i);
+                if (ImGui::Selectable(row, dllDebugPopup_.selectedExport == i))
+                    dllDebugPopup_.selectedExport = i;
+                if (label != value.name && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Raw export name used for invocation: %s", value.name.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (!haveExports)
+        ImGui::TextColored(theme::col::warn(),
+                           "No non-forwarded, file-backed code export can be invoked by a host.");
+
+    ImGui::SeparatorText("Host process");
+    ImGui::RadioButton("Bitness-matched system rundll32", &dllDebugPopup_.hostMode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Custom executable", &dllDebugPopup_.hostMode, 1);
+    if (dllDebugPopup_.hostMode == 0) {
+        const DllBitness native = nativeWindowsDllBitness();
+        const DllSystemHostPath policy = inspection.bitness == DllBitness::X86 && native == DllBitness::X64
+                                       ? DllSystemHostPath::Wow64SysWOW64
+                                       : DllSystemHostPath::NativeSystem32;
+        const auto systemHost = systemRundll32Path(policy);
+        if (systemHost)
+            ImGui::TextDisabled("Host: %s", systemHost->c_str());
+        else
+            ImGui::TextColored(theme::col::bad(),
+                               "A trusted bitness-compatible system rundll32.exe was not found.");
+        ImGui::TextColored(theme::col::warn(),
+                           "The export must implement rundll32's callback ABI; executable code alone cannot prove its signature.");
+    } else {
+        ImGui::SetNextItemWidth(-108.0f * scale);
+        if (ImGui::InputText("##dllcustomhost", dllDebugPopup_.customHost,
+                             sizeof(dllDebugPopup_.customHost))) {
+            dllDebugPopup_.customBitness = 0;
+            dllDebugPopup_.error.clear();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Browse...")) browseDllCustomHost();
+        const char* customBits = dllDebugPopup_.customBitness == 1 ? "x86"
+                               : dllDebugPopup_.customBitness == 2 ? "x64" : "unknown";
+        ImGui::TextDisabled("Host bitness: %s. Arguments: <DLL path> <export> [user arguments]",
+                            customBits);
+        if (dllDebugPopup_.customBitness == 0)
+            ImGui::TextColored(theme::col::warn(),
+                               "Host bitness is unverified; it must match the target DLL.");
+    }
+
+    ImGui::SeparatorText("Arguments and breakpoints");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##dllargs", dllDebugPopup_.userArguments,
+                     sizeof(dllDebugPopup_.userArguments));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Optional Windows command-line arguments. Quotes and backslashes use CommandLineToArgvW rules.");
+    ImGui::BeginDisabled(!inspection.dllMainRva.has_value());
+    ImGui::Checkbox("Break at DllMain", &dllDebugPopup_.breakOnDllMain);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!validSelection);
+    ImGui::Checkbox("Break at selected export", &dllDebugPopup_.breakOnExport);
+    ImGui::EndDisabled();
+    if (!inspection.dllMainRva)
+        ImGui::TextDisabled("This DLL has no validated executable entry point, so DllMain cannot be armed.");
+
+    std::vector<std::string> userArguments;
+    std::string argumentError;
+    const bool argsOk = splitWindowsUserArguments(dllDebugPopup_.userArguments,
+                                                   userArguments, argumentError);
+    DllDebugLaunchRequest request;
+    request.dllPath = targetPath;
+    request.hostMode = dllDebugPopup_.hostMode == 0 ? DllHostMode::SystemRundll32
+                                                    : DllHostMode::CustomExecutable;
+    if (validSelection) {
+        const DllCallableExport& selected = inspection.callableExports[dllDebugPopup_.selectedExport];
+        request.exportToInvoke = selected.name.empty()
+            ? DllExportSelector::ByOrdinal(selected.ordinal)
+            : DllExportSelector::ByName(selected.name);
+    }
+    request.userArguments = std::move(userArguments);
+    request.breakOnDllMain = dllDebugPopup_.breakOnDllMain;
+    request.breakOnExport = dllDebugPopup_.breakOnExport;
+    if (request.hostMode == DllHostMode::CustomExecutable) {
+        request.customHost.executable = dllDebugPopup_.customHost;
+        request.customHost.bitness = dllDebugPopup_.customBitness == 1 ? DllBitness::X86
+                                   : dllDebugPopup_.customBitness == 2 ? DllBitness::X64
+                                                                      : DllBitness::Unknown;
+        request.customHost.arguments = {DllCustomArgument::DllPath(), DllCustomArgument::Export(),
+                                        DllCustomArgument::UserArguments()};
+    }
+    DllHostEnvironment environment;
+    environment.nativeWindowsBitness = nativeWindowsDllBitness();
+    environment.resolveSystemRundll32 = [](DllSystemHostPath policy) {
+        return systemRundll32Path(policy);
+    };
+    DllDebugLaunchPlan plan = BuildDllDebugLaunchPlan(ctx_.staticBinary(), request, environment);
+    if (!argsOk) {
+        plan.errors.push_back(argumentError);
+        plan.valid = false;
+    }
+    if (request.hostMode == DllHostMode::CustomExecutable && *dllDebugPopup_.customHost) {
+        std::wstring customHostWide;
+        const DWORD attrs = wideFromUtf8(dllDebugPopup_.customHost, customHostWide)
+                          ? GetFileAttributesW(customHostWide.c_str()) : INVALID_FILE_ATTRIBUTES;
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            plan.errors.emplace_back("The custom host executable does not exist or is not a file.");
+            plan.valid = false;
+        }
+    }
+
+    if (!dllDebugPopup_.error.empty())
+        ImGui::TextColored(theme::col::bad(), "%s", dllDebugPopup_.error.c_str());
+    if (ImGui::BeginChild("##dllplanmessages", ImVec2(0, 86.0f * scale),
+                          ImGuiChildFlags_Borders)) {
+        for (const std::string& value : plan.errors)
+            ImGui::TextColored(theme::col::bad(), "%s", value.c_str());
+        for (const std::string& value : plan.warnings)
+            ImGui::TextColored(theme::col::warn(), "%s", value.c_str());
+        if (plan.errors.empty() && plan.warnings.empty())
+            ImGui::TextColored(theme::col::good(), "Launch plan is valid.");
+    }
+    ImGui::EndChild();
+
+    const bool alreadyAttached = ctx_.frameDebugSnapshot && ctx_.frameDebugSnapshot->attached();
+    ImGui::BeginDisabled(!plan.valid || alreadyAttached);
+    if (ImGui::Button("Debug DLL", ImVec2(130.0f * scale, 0))) {
+        std::string error;
+        dllRetargetPid_ = 0;
+        dllRetargetGeneration_ = 0;
+        dllRetargetBase_ = 0;
+        dllRetargetPending_.clear();
+        dllRetargetFailure_.clear();
+        if (ctx_.debug.launchAndAttachDll(plan, error)) {
+            ctx_.openLiveAssemblyView();
+            ui::Toast(ui::ToastKind::Success,
+                      "DLL host launched; waiting for the target module to load.");
+            ImGui::CloseCurrentPopup();
+        } else {
+            dllDebugPopup_.error = "Launch failed: " + error;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f * scale, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void App::beginUnpackObservation() {
+    unpackPopup_.error.clear();
+    if (!ctx_.binaryLaunchable()) {
+        unpackPopup_.error = !ctx_.binaryDebugArchitectureMatches()
+            ? std::string("Adaptive Unpack requires a matching x86/x64 PE machine and decoder mode (active: ") +
+              ArchName(ctx_.staticArch()) + "). Use Static Packed-PE Recovery for this architecture."
+            : "Adaptive Unpack requires a launchable on-disk PE executable.";
+        return;
+    }
+    unpackPopup_.result = {};
+    unpackPopup_.previousImage.clear();
+    unpackPopup_.previousValidPages.clear();
+    unpackPopup_.writtenPages.clear();
+    unpackPopup_.executablePages.clear();
+    unpackPopup_.moduleBase = unpackPopup_.moduleSize = 0;
+    unpackPopup_.startedTick = unpackPopup_.lastProbeTick = 0;
+    unpackPopup_.runStartedTick = unpackPopup_.accumulatedRunMs = 0;
+    unpackPopup_.previousRip = 0;
+    unpackPopup_.hasPreviousRip = false;
+    unpackPopup_.pauseRequested = false;
+    unpackEngine_.reset();
+
+    DbgSnapshot snap = ctx_.debug.snapshot();
+    if (!snap.attached()) {
+        std::string err;
+        if (!ctx_.debug.launchAndAttach(ctx_.staticBinary().path(), err,
+                                       /*breakAtEntry=*/false,
+                                       unpackPopup_.containedLaunch)) {
+            unpackPopup_.error = "Launch failed: " + err;
+            return;
+        }
+        ctx_.openLiveAssemblyView();
+        unpackPopup_.waitingForInitialBreak = true;
+        unpackPopup_.observing = false;
+        return;
+    }
+    if (snap.state != DbgState::Paused) {
+        unpackPopup_.error = "Pause the debuggee before starting unpack observation.";
+        return;
+    }
+    unpackPopup_.waitingForInitialBreak = true; // initialized by the common sampler path
+}
+
+void App::sampleUnpackObservation() {
+    DbgSnapshot snap = ctx_.debug.snapshot();
+    if (unpackPopup_.waitingForInitialBreak) {
+        if (!snap.attached()) {
+            unpackPopup_.error = "The debug session ended before the unpack probe initialized.";
+            unpackPopup_.waitingForInitialBreak = false;
+            return;
+        }
+        if (snap.state != DbgState::Paused) return;
+        const DbgModule* main = unpackMainModule(snap, ctx_.staticBinary().path());
+        if (!main || !main->base) {
+            unpackPopup_.error = "The paused process main module does not match the loaded target.";
+            unpackPopup_.waitingForInitialBreak = false;
+            return;
+        }
+        uint64_t size = main->size;
+        if (!size) {
+            for (const auto& s : ctx_.staticBinary().sections())
+                size = std::max<uint64_t>(size, s.virtualAddress + std::max(s.virtualSize, s.rawSize));
+        }
+        size = std::min<uint64_t>(size, 512ull * 1024ull * 1024ull);
+        if (!size || main->base > UINT64_MAX - size) {
+            unpackPopup_.error = "The main module has no safe mapped image range.";
+            unpackPopup_.waitingForInitialBreak = false;
+            return;
+        }
+        Registers regs = snap.regs;
+        if (!regs.rip) ctx_.debug.sampleExecutionContext(regs);
+        unpackPopup_.moduleBase = main->base;
+        unpackPopup_.moduleSize = size;
+        const uint64_t probeSize = std::min<uint64_t>(size, 64ull * 1024ull * 1024ull);
+        if (!readMappedImage(ctx_.debug, main->base, probeSize,
+                             unpackPopup_.previousImage, 64ull * 1024ull * 1024ull,
+                             &unpackPopup_.previousValidPages)) {
+            unpackPopup_.error = "No readable bytes were captured from the main module.";
+            unpackPopup_.waitingForInitialBreak = false;
+            return;
+        }
+        const size_t pages = (unpackPopup_.previousImage.size() + 0xfff) / 0x1000;
+        unpackPopup_.writtenPages.assign(pages, 0);
+        unpackPopup_.executablePages.assign(pages, 0);
+        for (const auto& rg : ctx_.debug.regions()) if (rg.exec && rg.size && rg.base <= UINT64_MAX - rg.size) {
+            const uint64_t lo = std::max(main->base, rg.base);
+            const uint64_t hi = std::min(main->base + probeSize, rg.base + rg.size);
+            for (uint64_t at = lo; at < hi; at += 0x1000)
+                unpackPopup_.executablePages[static_cast<size_t>((at - main->base) / 0x1000)] = 1;
+        }
+        unpackEngine_.begin(static_cast<UnpackStrategy>(unpackPopup_.strategy),
+                            { main->base, size }, regs.rsp);
+        const uint64_t now = GetTickCount64();
+        UnpackObservation first;
+        first.timestampMs = 0;
+        first.rip = regs.rip;
+        first.rsp = regs.rsp;
+        first.imageEntropy = sampledEntropy(unpackPopup_.previousImage,
+                                            &unpackPopup_.previousValidPages);
+        for (const auto& rg : ctx_.debug.regions())
+            if (regs.rip >= rg.base && regs.rip - rg.base < rg.size) {
+                first.executionRegion = { rg.base, rg.size };
+                first.regionExecutable = rg.exec;
+                first.regionPrivate = rg.type == MEM_PRIVATE;
+                first.regionImageBacked = rg.type == MEM_IMAGE;
+                break;
+            }
+        unpackEngine_.observe(first);
+        unpackPopup_.startedTick = unpackPopup_.lastProbeTick = now;
+        unpackPopup_.previousRip = regs.rip;
+        unpackPopup_.baselineRsp = regs.rsp;
+        unpackPopup_.hasPreviousRip = true;
+        unpackPopup_.lastExceptionSequence = snap.exceptionSequence;
+        unpackPopup_.waitingForInitialBreak = false;
+        unpackPopup_.observing = unpackPopup_.autoRun;
+        if (regs.rip >= main->base && regs.rip - main->base < size)
+            formatHexU64(unpackPopup_.manualOep, sizeof(unpackPopup_.manualOep), regs.rip);
+        else
+            unpackPopup_.manualOep[0] = '\0'; // the initial system break is normally in ntdll
+        if (unpackPopup_.autoRun) {
+            unpackPopup_.runStartedTick = now;
+            ctx_.debug.cont();
+        }
+        return;
+    }
+
+    if (!unpackPopup_.observing) return;
+    if (!snap.attached() || snap.state == DbgState::Terminated) {
+        unpackEngine_.cancel();
+        unpackPopup_.observing = false;
+        unpackPopup_.result = {};
+        unpackPopup_.result.rawMappedImage = unpackPopup_.previousImage;
+        unpackPopup_.result.repairs.failureArtifactOnly = true;
+        unpackPopup_.result.issues.push_back({ PeUnpackSeverity::Error, "process-exit",
+            "The debuggee exited before a final paused capture could be reconstructed." });
+        unpackPopup_.result.report =
+            "Adaptive unpack capture\nresult: raw failure artifact only\n"
+            "reason: process exited before final reconstruction\n";
+        unpackPopup_.error = "The process exited. The last readable probe remains available as a failure artifact.";
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    const bool finalPausedSample = snap.state != DbgState::Running;
+    if (finalPausedSample) {
+        if (unpackPopup_.runStartedTick) {
+            unpackPopup_.accumulatedRunMs += now - unpackPopup_.runStartedTick;
+            unpackPopup_.runStartedTick = 0;
+        }
+        unpackPopup_.pauseRequested = false;
+        unpackPopup_.observing = false;
+    }
+    const uint64_t runningMs = unpackPopup_.accumulatedRunMs +
+        (unpackPopup_.runStartedTick ? now - unpackPopup_.runStartedTick : 0);
+    if (!finalPausedSample && unpackPopup_.autoPause &&
+        runningMs >= static_cast<uint64_t>(unpackPopup_.timeoutMs) &&
+        !unpackPopup_.pauseRequested) {
+        // Enforce the run-free bound before any context or memory operation that
+        // can fail. A target must not run forever merely because sampling failed.
+        unpackPopup_.pauseRequested = true;
+        ctx_.debug.pause();
+    }
+    if (!finalPausedSample &&
+        now - unpackPopup_.lastProbeTick < static_cast<uint64_t>(unpackPopup_.intervalMs)) return;
+    unpackPopup_.lastProbeTick = now;
+
+    std::vector<Registers> contexts = ctx_.debug.sampleExecutionContexts(32);
+    if (contexts.empty()) return;
+    const Registers regs = contexts.front();
+    std::vector<uint8_t> current;
+    std::vector<uint8_t> currentValidPages;
+    const uint64_t probeSize = std::min<uint64_t>(unpackPopup_.moduleSize, 64ull * 1024ull * 1024ull);
+    if (!readMappedImage(ctx_.debug, unpackPopup_.moduleBase, probeSize, current,
+                         64ull * 1024ull * 1024ull, &currentValidPages)) return;
+    const size_t pages = (current.size() + 0xfff) / 0x1000;
+    if (unpackPopup_.writtenPages.size() != pages) unpackPopup_.writtenPages.assign(pages, 0);
+    std::vector<uint8_t> nowExec(pages, 0);
+    UnpackRange executionRegion{};
+    bool regionExec = false, regionPrivate = false, regionImage = false;
+    const std::vector<MemRegion> currentRegions = ctx_.debug.regions();
+    for (const auto& rg : currentRegions) {
+        if (regs.rip >= rg.base && regs.rip - rg.base < rg.size) {
+            executionRegion = { rg.base, rg.size };
+            regionExec = rg.exec; regionPrivate = rg.type == MEM_PRIVATE; regionImage = rg.type == MEM_IMAGE;
+        }
+        if (!rg.exec || !rg.size || rg.base > UINT64_MAX - rg.size) continue;
+        const uint64_t lo = std::max(unpackPopup_.moduleBase, rg.base);
+        const uint64_t hi = std::min(unpackPopup_.moduleBase + probeSize, rg.base + rg.size);
+        for (uint64_t at = lo; at < hi; at += 0x1000)
+            nowExec[static_cast<size_t>((at - unpackPopup_.moduleBase) / 0x1000)] = 1;
+    }
+    uint64_t changed = 0;
+    uint32_t changedPages = 0;
+    for (size_t page = 0; page < pages; ++page) {
+        if (page >= currentValidPages.size() || !currentValidPages[page] ||
+            page >= unpackPopup_.previousValidPages.size() || !unpackPopup_.previousValidPages[page])
+            continue;
+        const size_t lo = page * 0x1000;
+        const size_t hi = std::min(current.size(), lo + 0x1000);
+        bool dirty = false;
+        for (size_t i = lo; i < hi; ++i) if (i >= unpackPopup_.previousImage.size() ||
+                                               current[i] != unpackPopup_.previousImage[i]) {
+            dirty = true; ++changed;
+        }
+        if (dirty) { ++changedPages; unpackPopup_.writtenPages[page] = 1; }
+    }
+    const bool ripInProbe = regs.rip >= unpackPopup_.moduleBase &&
+                            regs.rip - unpackPopup_.moduleBase < probeSize;
+    const size_t ripPage = ripInProbe ? static_cast<size_t>((regs.rip - unpackPopup_.moduleBase) / 0x1000) : 0;
+    const bool newExec = ripInProbe && ripPage < nowExec.size() && nowExec[ripPage] &&
+                         (ripPage >= unpackPopup_.executablePages.size() || !unpackPopup_.executablePages[ripPage]);
+    const bool wasWritten = ripInProbe && ripPage < unpackPopup_.writtenPages.size() && unpackPopup_.writtenPages[ripPage];
+
+    UnpackObservation obs;
+    obs.timestampMs = runningMs;
+    obs.rip = regs.rip; obs.rsp = regs.rsp;
+    obs.imageEntropy = sampledEntropy(current, &currentValidPages);
+    obs.changedBytes = changed; obs.changedPages = changedPages;
+    obs.executionRegion = executionRegion;
+    obs.regionExecutable = regionExec;
+    obs.regionPrivate = regionPrivate;
+    obs.regionImageBacked = regionImage;
+    obs.pageWasWritten = wasWritten;
+    obs.protectionBecameExecutable = newExec;
+    const uint64_t stackDistance = regs.rsp >= unpackPopup_.baselineRsp
+        ? regs.rsp - unpackPopup_.baselineRsp : unpackPopup_.baselineRsp - regs.rsp;
+    obs.stackNearBaseline = stackDistance <= 0x1000;
+    const bool sampledReturn = unpackPopup_.hasPreviousRip &&
+        !(unpackPopup_.previousRip >= unpackPopup_.moduleBase &&
+          unpackPopup_.previousRip - unpackPopup_.moduleBase < unpackPopup_.moduleSize) &&
+        regs.rip >= unpackPopup_.moduleBase && regs.rip - unpackPopup_.moduleBase < unpackPopup_.moduleSize;
+    obs.controlTransfer = unpackPopup_.hasPreviousRip && ((unpackPopup_.previousRip >> 12) != (regs.rip >> 12));
+    // Classic ESP/RSP unpacking stubs often remain in the same PE image, so the
+    // meaningful return signal is a restored stack plus a transfer into bytes
+    // seen changing—not merely an outside-to-inside module transition.
+    obs.returnedToOriginalImage = sampledReturn ||
+        (obs.stackNearBaseline && obs.controlTransfer && wasWritten);
+    // Periodic samples are not exact branch edges; feeding adjacent samples as
+    // source/target pairs would invent VM loops. Exact transition producers can
+    // use these fields, while this sampler contributes honest hot-RIP evidence.
+    obs.hasTransitionSource = false;
+    // The debug event identifies a fault site, not the eventual SEH/VEH handler
+    // entry. Keep the sequence for diagnostics but do not mislabel a later polled
+    // RIP as an exact handler.
+    obs.exceptionHandlerEntry = false;
+    unpackPopup_.lastExceptionSequence = snap.exceptionSequence;
+    obs.runFreeStop = runningMs >= static_cast<uint64_t>(unpackPopup_.timeoutMs);
+    unpackEngine_.observe(obs);
+    // Packers commonly hand off to a worker. Sample every live thread (bounded)
+    // against the same bounded page probe; only the primary carries interval
+    // deltas/run-free state so aggregate entropy/write counters are not multiplied.
+    for (size_t ci = 1; ci < contexts.size(); ++ci) {
+        UnpackObservation worker = obs;
+        worker.rip = contexts[ci].rip;
+        // A worker thread has a different stack origin; zero RSP prevents the
+        // engine from comparing it with the main thread's initial baseline.
+        worker.rsp = 0;
+        worker.changedBytes = 0;
+        worker.changedPages = 0;
+        worker.executionRegion = {};
+        worker.regionExecutable = worker.regionPrivate = worker.regionImageBacked = false;
+        for (const auto& rg : currentRegions)
+            if (worker.rip >= rg.base && worker.rip - rg.base < rg.size) {
+                worker.executionRegion = { rg.base, rg.size };
+                worker.regionExecutable = rg.exec;
+                worker.regionPrivate = rg.type == MEM_PRIVATE;
+                worker.regionImageBacked = rg.type == MEM_IMAGE;
+                break;
+            }
+        const bool inProbe = worker.rip >= unpackPopup_.moduleBase &&
+                             worker.rip - unpackPopup_.moduleBase < probeSize;
+        const size_t page = inProbe ? static_cast<size_t>((worker.rip - unpackPopup_.moduleBase) / 0x1000) : 0;
+        worker.pageWasWritten = inProbe && page < unpackPopup_.writtenPages.size() && unpackPopup_.writtenPages[page];
+        worker.protectionBecameExecutable = inProbe && page < nowExec.size() && nowExec[page] &&
+            (page >= unpackPopup_.executablePages.size() || !unpackPopup_.executablePages[page]);
+        worker.stackNearBaseline = false;
+        worker.returnedToOriginalImage = false;
+        worker.controlTransfer = false;
+        worker.hasTransitionSource = false;
+        worker.exceptionHandlerEntry = false;
+        worker.runFreeStop = false;
+        unpackEngine_.observe(worker);
+    }
+    unpackPopup_.previousImage.swap(current);
+    unpackPopup_.previousValidPages.swap(currentValidPages);
+    unpackPopup_.executablePages.swap(nowExec);
+    unpackPopup_.previousRip = regs.rip;
+    unpackPopup_.hasPreviousRip = true;
+
+    const UnpackReport report = unpackEngine_.report();
+    const bool confident = report.status.hasBestOep && report.status.bestConfidence == UnpackConfidence::High;
+    if (!finalPausedSample && unpackPopup_.autoPause && (confident || obs.runFreeStop)) {
+        unpackPopup_.pauseRequested = true;
+        ctx_.debug.pause();
+    }
+}
+
+void App::rebuildUnpackImage(uint64_t oep, bool hasOep) {
+    unpackPopup_.error.clear();
+    DbgSnapshot snap = ctx_.debug.snapshot();
+    uint64_t dumpBase = unpackPopup_.moduleBase;
+    uint64_t dumpSize = unpackPopup_.moduleSize;
+    bool originalLayout = true;
+    if (hasOep && !(oep >= dumpBase && oep - dumpBase < dumpSize)) {
+        originalLayout = false;
+        dumpBase = dumpSize = 0;
+        const std::vector<MemRegion> regions = ctx_.debug.regions();
+        for (const auto& region : regions) {
+            if (!region.read || !region.size || region.type == MEM_IMAGE ||
+                oep < region.base || oep - region.base >= region.size) continue;
+            dumpBase = region.allocationBase ? region.allocationBase : region.base;
+            uint64_t allocationEnd = dumpBase;
+            for (const auto& part : regions) {
+                const uint64_t partAllocation = part.allocationBase ? part.allocationBase : part.base;
+                if (partAllocation != dumpBase || !part.size || part.base > UINT64_MAX - part.size) continue;
+                allocationEnd = std::max(allocationEnd, part.base + part.size);
+            }
+            if (allocationEnd <= dumpBase || allocationEnd - dumpBase > 512ull * 1024ull * 1024ull) {
+                dumpBase = dumpSize = 0;
+                break;
+            }
+            dumpSize = allocationEnd - dumpBase;
+            // A private/manual-mapped payload often carries a complete PE at the
+            // allocation base. Prefer its declared SizeOfImage so neighboring
+            // allocations are not swept into the dump; non-PE allocations still
+            // fall through to a useful raw failure artifact.
+            uint8_t dos[0x40]{};
+            if (ctx_.debug.readMemory(dumpBase, dos, sizeof(dos)) == sizeof(dos) &&
+                dos[0] == 'M' && dos[1] == 'Z') {
+                uint32_t pe = 0; std::memcpy(&pe, dos + 0x3c, 4);
+                uint32_t sig = 0, sizeImage = 0;
+                if (pe < 0x100000 && ctx_.debug.readMemory(dumpBase + pe, &sig, 4) == 4 &&
+                    sig == 0x00004550 &&
+                    ctx_.debug.readMemory(dumpBase + pe + 24 + 56, &sizeImage, 4) == 4 &&
+                    sizeImage && sizeImage <= dumpSize)
+                    dumpSize = sizeImage;
+            }
+            break;
+        }
+    }
+    if (!originalLayout && (!dumpBase || !dumpSize)) {
+        unpackPopup_.result = {};
+        unpackPopup_.error =
+            "The external OEP is not inside a bounded readable private/mapped allocation; image modules are intentionally rejected.";
+        return;
+    }
+    std::vector<uint8_t> mapped;
+    std::vector<uint8_t> validPages;
+    if (snap.attached() && dumpBase && dumpSize)
+        readMappedImage(ctx_.debug, dumpBase, dumpSize,
+                        mapped, 512ull * 1024ull * 1024ull, &validPages);
+    if (mapped.empty() && originalLayout) {
+        mapped = unpackPopup_.previousImage;
+        validPages = unpackPopup_.previousValidPages;
+    }
+    PeUnpackOptions options;
+    options.runtimeImageBase = dumpBase;
+    options.oepVA = oep;
+    options.hasOep = hasOep;
+    options.observedImports = recoverLiveImports(ctx_, dumpBase, mapped, snap, originalLayout);
+    unpackPopup_.result = RebuildMappedPe(mapped, options);
+    std::string coverageReason;
+    if (unpackPopup_.result.success && !mappedPeCoverageComplete(mapped, validPages, coverageReason)) {
+        unpackPopup_.result.success = false;
+        unpackPopup_.result.repairs.failureArtifactOnly = true;
+        unpackPopup_.result.issues.push_back({ PeUnpackSeverity::Error, "partial-capture",
+            coverageReason + "; refusing to label the rebuilt file runnable." });
+        unpackPopup_.result.report += "\nresult downgraded: raw failure artifact only\nreason: " +
+                                      coverageReason + "\n";
+    }
+    if (unpackPopup_.result.success && hasOep &&
+        (oep < dumpBase || oep - dumpBase >= mapped.size() ||
+         (oep - dumpBase) / 0x1000 >= validPages.size() ||
+         !validPages[static_cast<size_t>((oep - dumpBase) / 0x1000)])) {
+        unpackPopup_.result.success = false;
+        unpackPopup_.result.repairs.failureArtifactOnly = true;
+        unpackPopup_.result.issues.push_back({ PeUnpackSeverity::Error, "unreadable-oep",
+            "The selected OEP page was not fully readable; refusing to label the rebuilt file runnable." });
+        unpackPopup_.result.report +=
+            "\nresult downgraded: raw failure artifact only\nreason: selected OEP page was unreadable\n";
+    }
+    if (unpackPopup_.result.success) {
+        if (hasOep) {
+            if (originalLayout) {
+                unpackEngine_.selectManualOep(oep, unpackPopup_.accumulatedRunMs,
+                                              "Analyst-approved dump entry");
+            } else {
+                unpackEngine_.selectValidatedExternalOep(
+                    oep, { dumpBase, dumpSize }, unpackPopup_.accumulatedRunMs,
+                    "Analyst-approved OEP in a fully captured and reconstructed private image");
+            }
+        }
+        unpackEngine_.complete(oep, hasOep);
+        ui::Toast(unpackPopup_.result.issues.empty() ? ui::ToastKind::Success : ui::ToastKind::Warn,
+                  "Mapped PE rebuilt; review the repair report before saving.");
+    } else {
+        unpackPopup_.error = "Runnable PE reconstruction was refused. Save the raw capture and report for manual recovery.";
+    }
+}
+
+bool App::saveUnpackArtifacts(bool loadAfterSave) {
+    const bool success = unpackPopup_.result.success;
+    const std::vector<uint8_t>& bytes = success ? unpackPopup_.result.image
+                                                : unpackPopup_.result.rawMappedImage;
+    if (bytes.empty()) return false;
+    std::vector<wchar_t> file(kDialogPathChars, L'\0');
+    std::string leaf = pathLeafLower(ctx_.staticBinary().path());
+    size_t dot = leaf.find_last_of('.');
+    if (dot != std::string::npos) leaf.resize(dot);
+    leaf += success ? ".unpacked.exe" : ".unpack-failure.mapped.bin";
+    std::wstring def; if (wideFromUtf8(leaf, def)) wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFilter = success ? L"PE executable\0*.exe\0All Files\0*.*\0"
+                              : L"Raw mapped image\0*.bin\0All Files\0*.*\0";
+    ofn.lpstrFile = file.data(); ofn.nMaxFile = static_cast<DWORD>(file.size());
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return false;
+    const std::filesystem::path path(file.data());
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out || !out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+        unpackPopup_.error = "Could not write the unpack artifact."; return false;
+    }
+    std::filesystem::path reportPath = path;
+    reportPath += L".unpack-report.txt";
+    std::ofstream reportFile(reportPath, std::ios::binary | std::ios::trunc);
+    bool reportSaved = false;
+    if (reportFile) {
+        reportFile << unpackPopup_.result.report;
+        const UnpackReport telemetry = unpackEngine_.report();
+        reportFile << "\ntelemetry samples: " << telemetry.status.totalSamples
+                   << "\nOEP candidates: " << telemetry.candidates.size()
+                   << "\nentropy settled: " << (telemetry.entropy.settled ? "yes" : "no")
+                   << "\nVM-like trace: " << (telemetry.vmTrace.vmLike ? "yes" : "no")
+                   << " (score " << telemetry.vmTrace.score << ")\n";
+        reportFile << "entropy window: " << telemetry.entropy.windowStartMs << ".."
+                   << telemetry.entropy.windowEndMs << " ms, spread " << telemetry.entropy.spread
+                   << ", changed bytes/pages " << telemetry.entropy.changedBytes << "/"
+                   << telemetry.entropy.changedPages << "\n";
+        for (const auto& candidate : telemetry.candidates) {
+            reportFile << "OEP 0x" << std::hex << candidate.va << std::dec
+                       << ": score " << candidate.score << " ("
+                       << UnpackConfidenceName(candidate.confidence) << "), observations "
+                       << candidate.observations << "\n";
+            for (const auto& evidence : candidate.evidence)
+                reportFile << "  +" << evidence.score << " " << OepEvidenceName(evidence.kind)
+                           << " x" << evidence.occurrences << ": " << evidence.detail << "\n";
+        }
+        for (const auto& evidence : telemetry.vmTrace.evidence)
+            reportFile << "VM evidence: " << evidence << "\n";
+        for (const auto& rip : telemetry.vmTrace.hotRips)
+            reportFile << "hot RIP 0x" << std::hex << rip.rip << std::dec
+                       << ": " << rip.hits << " hit(s)\n";
+        for (const auto& handler : telemetry.vmTrace.handlers)
+            reportFile << "handler 0x" << std::hex << handler.rip << std::dec
+                       << ": " << handler.hits << " hit(s), fan-in " << handler.fanIn << "\n";
+        for (const auto& loop : telemetry.vmTrace.loops)
+            reportFile << "loop 0x" << std::hex << loop.from << " -> 0x" << loop.to
+                       << std::dec << ": " << loop.hits << " hit(s)\n";
+        reportFile.flush();
+        reportSaved = static_cast<bool>(reportFile);
+    }
+    if (!reportSaved) {
+        unpackPopup_.error = "The unpack artifact was saved, but its repair/telemetry report could not be written.";
+        ui::Toast(ui::ToastKind::Warn, unpackPopup_.error);
+        return false;
+    }
+    ui::Toast(ui::ToastKind::Success, "Saved unpack artifact and repair/telemetry report.");
+    if (success && loadAfterSave) {
+        std::string utf8;
+        if (utf8FromWide(file.data(), utf8) && ctx_.beginBinaryLoadPath(utf8)) {
+            ctx_.requestedTab = "Binary View";
+            pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::AdaptiveUnpack;
+        }
+    }
+    return true;
+}
+
+void App::renderUnpackPopup() {
+    if (unpackPopup_.open) {
+        const bool contained = unpackPopup_.containedLaunch;
+        unpackPopup_ = {};
+        unpackPopup_.containedLaunch = contained;
+        unpackPopup_.autoRun = unpackPopup_.autoPause = unpackPopup_.loadAfterSave = true;
+        unpackPopup_.intervalMs = 300; unpackPopup_.timeoutMs = 30000;
+        unpackEngine_.reset();
+        ImGui::OpenPopup("Adaptive Unpacker");
+    }
+    sampleUnpackObservation();
+    ImGui::SetNextWindowSize(ImVec2(760.0f * theme::UiScale(), 680.0f * theme::UiScale()),
+                             ImGuiCond_FirstUseEver);
+    if (!ImGui::BeginPopupModal("Adaptive Unpacker", nullptr, ImGuiWindowFlags_NoSavedSettings)) {
+        if ((unpackPopup_.observing || unpackPopup_.waitingForInitialBreak) &&
+            !ImGui::IsPopupOpen("Adaptive Unpacker")) {
+            const DbgSnapshot snap = ctx_.debug.snapshot();
+            if (snap.state == DbgState::Running) ctx_.debug.pause();
+            unpackPopup_.observing = unpackPopup_.waitingForInitialBreak = false;
+            unpackEngine_.cancel();
+        }
+        return;
+    }
+    if (unpackPopup_.closeAfterDocumentLoad) {
+        unpackPopup_.closeAfterDocumentLoad = false;
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    const DbgSnapshot snap = ctx_.debug.snapshot();
+    const bool active = unpackPopup_.observing || unpackPopup_.waitingForInitialBreak;
+    ImGui::TextWrapped("Adaptive live unpacking fuses stack-return, write-to-execute, entropy-settle and run-free evidence. OEP choices remain scored hypotheses until you approve a dump.");
+    ImGui::Spacing();
+    const char* strategies[] = { "Hybrid (adaptive)", "Stack return (ESP/RSP)", "Write -> execute (NX)",
+                                 "Entropy settle", "Run free", "Manual OEP" };
+    ImGui::BeginDisabled(active);
+    ImGui::Combo("Strategy", &unpackPopup_.strategy, strategies, IM_ARRAYSIZE(strategies));
+    ImGui::Checkbox("Contain new launch in a Windows job", &unpackPopup_.containedLaunch);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("One process, kill-on-close containment. This limits child-process escape and lifetime; it does not virtualize filesystem or network access.");
+    ImGui::Checkbox("Continue automatically after initial loader capture", &unpackPopup_.autoRun);
+    ImGui::Checkbox("Pause on high-confidence evidence / timeout", &unpackPopup_.autoPause);
+    ImGui::SetNextItemWidth(180.0f * theme::UiScale());
+    ImGui::InputInt("Probe interval (ms)", &unpackPopup_.intervalMs, 50, 250);
+    unpackPopup_.intervalMs = std::clamp(unpackPopup_.intervalMs, 100, 5000);
+    ImGui::SetNextItemWidth(180.0f * theme::UiScale());
+    ImGui::InputInt("Run-free timeout (ms)", &unpackPopup_.timeoutMs, 1000, 5000);
+    unpackPopup_.timeoutMs = std::clamp(unpackPopup_.timeoutMs, 1000, 10 * 60 * 1000);
+    ImGui::EndDisabled();
+
+    const bool targetOk = ctx_.binaryLaunchable();
+    const UnpackState engineState = unpackEngine_.state();
+    const bool canStartFresh = engineState == UnpackState::Idle ||
+        engineState == UnpackState::Completed || engineState == UnpackState::Failed ||
+        engineState == UnpackState::Cancelled;
+    ImGui::BeginDisabled(active || !canStartFresh || !targetOk ||
+                         (snap.attached() && snap.state == DbgState::Running));
+    if (ImGui::Button("Start observation", ImVec2(150.0f * theme::UiScale(), 0))) beginUnpackObservation();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (unpackPopup_.observing && !unpackPopup_.pauseRequested) {
+        if (ImGui::Button("Pause and review")) { unpackPopup_.pauseRequested = true; ctx_.debug.pause(); }
+    } else if (!active && snap.state == DbgState::Paused && unpackEngine_.state() != UnpackState::Idle &&
+               unpackEngine_.state() != UnpackState::Completed) {
+        if (ImGui::Button("Resume observation")) {
+            unpackPopup_.observing = true;
+            unpackPopup_.runStartedTick = unpackPopup_.lastProbeTick = GetTickCount64();
+            ctx_.debug.cont();
+        }
+    }
+    if (!targetOk) {
+        if (!ctx_.binaryDebugArchitectureMatches())
+            ImGui::TextColored(theme::col::warn(),
+                "Adaptive Unpack requires a matching x86/x64 PE machine/mode (active: %s). Static recovery remains available.",
+                ArchName(ctx_.staticArch()));
+        else
+            ImGui::TextColored(theme::col::warn(), "Open an on-disk PE executable (not a DLL) to use this workflow.");
+    }
+    if (snap.containedJob) ImGui::TextColored(theme::col::good(), "Target is running in the unpack containment job.");
+    if (!unpackPopup_.error.empty()) ImGui::TextColored(theme::col::bad(), "%s", unpackPopup_.error.c_str());
+
+    const UnpackReport telemetry = unpackEngine_.report();
+    ImGui::SeparatorText("Evidence");
+    ImGui::Text("State: %s   Samples: %llu   Candidates: %zu", UnpackStateName(telemetry.status.state),
+                static_cast<unsigned long long>(telemetry.status.totalSamples), telemetry.candidates.size());
+    ImGui::Text("Entropy %.3f..%.3f (spread %.3f)   %s", telemetry.entropy.minimum,
+                telemetry.entropy.maximum, telemetry.entropy.spread,
+                telemetry.entropy.settled ? "SETTLED" : "changing");
+    if (telemetry.vmTrace.vmLike)
+        ImGui::TextColored(theme::col::warn(), "VM-like dispatcher/handler behavior: score %d/100", telemetry.vmTrace.score);
+    uint64_t selectedCandidateVa = 0;
+    const bool hasSelectedCandidate = parseHexU64(unpackPopup_.manualOep, selectedCandidateVa);
+    if (ImGui::BeginChild("##unpackCandidates", ImVec2(0, 190.0f * theme::UiScale()), ImGuiChildFlags_Borders)) {
+        for (int i = 0; i < static_cast<int>(telemetry.candidates.size()); ++i) {
+            const auto& c = telemetry.candidates[i];
+            char label[160];
+            std::snprintf(label, sizeof(label), "0x%llX  score %d  %s##oep%d",
+                          static_cast<unsigned long long>(c.va), c.score,
+                          UnpackConfidenceName(c.confidence), i);
+            if (ImGui::Selectable(label, hasSelectedCandidate && selectedCandidateVa == c.va)) {
+                formatHexU64(unpackPopup_.manualOep, sizeof(unpackPopup_.manualOep), c.va);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                for (const auto& e : c.evidence)
+                    ImGui::Text("+%d %s (%u): %s", e.score, OepEvidenceName(e.kind), e.occurrences, e.detail.c_str());
+                ImGui::EndTooltip();
+            }
+        }
+        if (telemetry.candidates.empty()) ImGui::TextDisabled("No OEP candidate yet. Keep running, or enter one manually.");
+    }
+    ImGui::EndChild();
+
+    ImGui::SetNextItemWidth(220.0f * theme::UiScale());
+    ImGui::InputText("OEP VA", unpackPopup_.manualOep, sizeof(unpackPopup_.manualOep), ImGuiInputTextFlags_CharsHexadecimal);
+    uint64_t oep = 0;
+    const bool hasOep = parseHexU64(unpackPopup_.manualOep, oep);
+    const bool oepInOriginal = hasOep && oep >= unpackPopup_.moduleBase &&
+        oep - unpackPopup_.moduleBase < unpackPopup_.moduleSize;
+    if (hasOep && !oepInOriginal)
+        ImGui::TextColored(theme::col::warn(),
+            "OEP is outside the original image; only its containing private/mapped allocation will be probed for a PE (otherwise saved raw). ");
+    ImGui::BeginDisabled(active || snap.state != DbgState::Paused || !unpackPopup_.moduleBase || !hasOep);
+    if (ImGui::Button("Rebuild process image", ImVec2(180.0f * theme::UiScale(), 0))) {
+        rebuildUnpackImage(oep, true);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(active || snap.state != DbgState::Paused || !unpackPopup_.moduleBase);
+    if (ImGui::Button("Dump with current entry")) rebuildUnpackImage(0, false);
+    ImGui::EndDisabled();
+
+    if (!unpackPopup_.result.image.empty() || !unpackPopup_.result.rawMappedImage.empty()) {
+        ImGui::SeparatorText("Reconstruction");
+        const auto& rr = unpackPopup_.result.repairs;
+        ImGui::TextColored(unpackPopup_.result.success ? theme::col::good() : theme::col::bad(),
+                           "%s", unpackPopup_.result.success ? "Runnable disk-layout PE rebuilt" : "Raw failure artifact only");
+        ImGui::Text("Sections %u | relocs %u | imports %u (+%u restored) | load-config fixed/cleared %u/%u",
+                    rr.sectionsRebuilt, rr.relocationEntriesNormalized, rr.importsRebuilt,
+                    rr.importSlotsRestored, rr.loadConfigPointersRepaired, rr.loadConfigPointersCleared);
+        for (const auto& issue : unpackPopup_.result.issues) {
+            ImVec4 col = issue.severity == PeUnpackSeverity::Error ? theme::col::bad() :
+                         issue.severity == PeUnpackSeverity::Warning ? theme::col::warn() : theme::col::muted();
+            ImGui::TextColored(col, "%s: %s", issue.code.c_str(), issue.message.c_str());
+        }
+        if (unpackPopup_.result.success)
+            ImGui::Checkbox("Load saved unpacked PE into analysis", &unpackPopup_.loadAfterSave);
+        if (ImGui::Button(unpackPopup_.result.success ? "Save unpacked PE + report" : "Save failure capture + report"))
+            saveUnpackArtifacts(unpackPopup_.loadAfterSave);
+    }
+    ImGui::Separator();
+    if (ImGui::Button("Close")) {
+        if (active) {
+            if (snap.state == DbgState::Running) ctx_.debug.pause();
+            unpackEngine_.cancel();
+        }
+        unpackPopup_.observing = unpackPopup_.waitingForInitialBreak = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void App::rememberInvestigationQuery(std::string query,
+                                     InvestigationIdentity identity) {
+    const size_t first = query.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return;
+    const size_t last = query.find_last_not_of(" \t\r\n");
+    query = query.substr(first, last - first + 1);
+    if (query.size() > 512) query.resize(512);
+
+    investigationRecentQueries_.erase(
+        std::remove_if(investigationRecentQueries_.begin(),
+                       investigationRecentQueries_.end(),
+                       [&](const InvestigationRecentQuery& item) {
+                           return item.identity == identity &&
+                                  queryEqualsInsensitive(item.query, query);
+                       }),
+        investigationRecentQueries_.end());
+    investigationRecentQueries_.insert(investigationRecentQueries_.begin(),
+                                       { identity, std::move(query) });
+    if (investigationRecentQueries_.size() > 32)
+        investigationRecentQueries_.resize(32);
+    ++investigationRecentRevision_;
+    if (!investigationRecentRevision_) ++investigationRecentRevision_;
+    savePrefs();
+}
+
+void App::maintainInvestigationWorkspace() {
+    if (!binaryView_) return;
+    binaryView_->advanceInvestigationSnapshot(
+        ctx_, investigationRecentQueries_, investigationRecentRevision_);
+
+    const uint64_t generation = binaryView_->investigationSnapshotGeneration();
+    const auto snapshot = binaryView_->investigationSnapshot();
+    if (generation && snapshot && generation != investigationSubmittedGeneration_) {
+        investigation_.beginSession(generation, snapshot);
+        investigationSubmittedGeneration_ = generation;
+        investigationSubmittedLiveTarget_ = snapshot->liveTarget;
+    }
+    palette_.updateInvestigationSession(&investigation_,
+                                        investigationSubmittedGeneration_,
+                                        investigationSubmittedLiveTarget_);
+
+    const InvestigationServicePending pending = investigation_.pending();
+    if (binaryView_->investigationSnapshotBuilding() || pending.buildQueued ||
+        pending.searchQueued || pending.building || pending.searching)
+        ctx_.wantContinuousRedraw = true;
+}
+
+// Build the Ctrl+K command palette. App actions stay immediate; all target-data
+// matching comes from the worker-owned unified investigation index.
 void App::openCommandPalette(const DbgSnapshot& dbg) {
     using ui::PaletteItem;
     std::vector<PaletteItem> items;
-    auto add = [&](const char* icon, const char* label, const char* detail, std::function<void()> fn) {
+    const DebugTargetIdentity paletteTarget{ dbg.pid, dbg.sessionGeneration };
+    auto add = [&](const char* icon, const char* label, const char* detail,
+                   std::function<void()> fn, const char* searchAliases = nullptr) {
         PaletteItem it;
         it.label  = label;
         it.detail = detail ? detail : "";
+        it.searchAliases = searchAliases ? searchAliases : "";
         it.icon   = icon;
         it.run    = std::move(fn);
         items.push_back(std::move(it));
@@ -1529,42 +6584,193 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
     // File
     add(DS_ICON_FOLDER, "Open Binary...", "Ctrl+O", [this] { openFileDialog(); });
     add(DS_ICON_FOLDER, "Open as Raw...", "shellcode / firmware", [this] { openRawFileDialog(); });
-    if (ctx_.binary.loaded()) {
+    if (ctx_.staticBinary().loaded()) {
+        add(DS_ICON_SEARCH, "Open Crackme Triage", "auto-search endpoints / server trail", [this] {
+            ctx_.openCrackmeTriage(TriageWorkspaceView::StartHere);
+        });
+        add(DS_ICON_SEARCH, "Open Validation / Pro-State Checks",
+            "authorization / existing license", [this] {
+                ctx_.openCrackmeStartupEntitlementLead();
+            },
+            "premium already validated registered existing license entitlement activation remembered access");
         add(DS_ICON_SAVE, "Save Binary As (apply patches)...", "File", [this] { saveBinaryAs(); });
+        if (!ctx_.staticCodeExport().pending()) {
+            add(DS_ICON_SAVE, "Save ASM...", "whole program / current function", [this] {
+                ctx_.requestedCodeExport = true;
+                ctx_.requestedCodeExportFormat = CodeExportFormat::Assembly;
+                ctx_.requestedTab = "Binary View";
+            });
+            if (ArchIsX86_32Or64(ctx_.staticArch()))
+                add(DS_ICON_SAVE, "Save C...", "readable / self-contained compilable C", [this] {
+                    ctx_.requestedCodeExport = true;
+                    ctx_.requestedCodeExportFormat = CodeExportFormat::C;
+                    ctx_.requestedTab = "Binary View";
+                });
+        }
         add(nullptr, "Export Analysis (Markdown / HTML)...", "File", [this] {
             ctx_.requestedExportAnalysis = true;
             ctx_.requestedTab = "Binary View";
         });
-        add(DS_ICON_CANCEL, "Close Binary", "File", [this] { closeBinary(); });
-        if (ctx_.javaInfo.jarSize > 0) {
-            add(DS_ICON_SAVE, ctx_.javaInfo.isJar ? "Extract Embedded JAR..." : "Extract Embedded ZIP...",
+        add(DS_ICON_CANCEL, "Close Document", "File", [this] { closeBinary(); });
+        if (ctx_.staticJavaInfo().jarSize > 0) {
+            add(DS_ICON_SAVE, ctx_.staticJavaInfo().isJar ? "Extract Embedded JAR..." : "Extract Embedded ZIP...",
                 "Java wrapper", [this] { extractEmbeddedJar(); });
         }
-        if (!ctx_.javaInfo.entries.empty()) {
+        if (!ctx_.staticJavaInfo().entries.empty()) {
             add(DS_ICON_FOLDER, "Browse Embedded Archive...", "open / extract entries",
                 [this] { ctx_.requestedBrowseArchive = true; });
         }
+    }
+
+    // Capture the selected source once. Commands opened for one document or
+    // debugger session must not silently act on a later cursor/owner.
+    if (binaryView_) {
+        using Action = BinaryViewTab::ContextAction;
+        const auto target = binaryView_->cursorActionTarget(ctx_);
+        auto addContext = [&](const char* label, Action action, const char* aliases) {
+            std::string reason;
+            if (!binaryView_->contextualActionAvailable(ctx_, action, target, reason)) return;
+            add(nullptr, label, target.live ? "selected LIVE address" : "selected FILE address",
+                [this, target, action] {
+                    if (binaryView_) binaryView_->dispatchContextAction(ctx_, action, target);
+                }, aliases);
+        };
+        addContext("Rename selected symbol...", Action::Rename, "name annotation N");
+        addContext("Comment on selected address...", Action::Comment, "annotation semicolon");
+        addContext("Bookmark selected address", Action::Bookmark, "bookmark annotation");
+        addContext("Show selected address in Live Assembly", Action::ShowLive, "runtime ASLR debugger");
+        addContext("Show selected address in Assembly", Action::ShowStatic, "static FILE ASLR");
+        addContext("Run to cursor", Action::RunToCursor, "Ctrl F9 continue selected instruction");
     }
 
     // Debug (gated on the snapshot, reusing the toolbar's exact calls)
     const bool attached = dbg.attached();
     const bool paused   = dbg.state == DbgState::Paused;
     const bool running  = dbg.state == DbgState::Running;
+    add(nullptr, "Hide Debugger / Anti-Anti-Debug...", "Debug policy", [this] {
+        antiDebugPopupOpen_ = true;
+    });
+    add(nullptr, "Passive Process Dump...", "read-only capture", [this] {
+        passiveDumpPopup_.open = true;
+    });
+    add(DS_ICON_LIGHTNING, "Open Live Observation", "Communications / Server Watch", [this] {
+        ctx_.openLiveObservation();
+    });
+    add(nullptr, "Open GameMaker / GML connection", "Communications", [this] {
+        ctx_.requestedGameMakerConnection = true;
+        ctx_.requestedTab = "Communications";
+    }, "gamemaker vm data.win bytecode nubby");
+    add(nullptr, ctx_.gmlExecutionMode ? "Use Native execution controls" : "Use GML execution controls",
+        "Toolbar / F5 / F10 / F11", [this] { ctx_.gmlExecutionMode = !ctx_.gmlExecutionMode; });
+    if (ctx_.staticBinary().loaded() && !ctx_.staticBinary().isMappedImage() &&
+        (ctx_.staticBinary().format() == BinFormat::PE32 || ctx_.staticBinary().format() == BinFormat::PE32Plus)) {
+        add(DS_ICON_LIGHTNING, "Static Packed-PE Recovery...", "PACKER_INFO / LZMA", [this] {
+            staticUnpackPopup_.open = true;
+        });
+    }
+    if (ctx_.staticBinary().loaded() && !ctx_.staticBinary().isMappedImage() && !ctx_.staticBinary().isDll() &&
+        (ctx_.staticBinary().format() == BinFormat::PE32 || ctx_.staticBinary().format() == BinFormat::PE32Plus) &&
+        ArchSupportsDebugger(ctx_.staticArch())) {
+        add(DS_ICON_LIGHTNING, "Adaptive Unpack...", "OEP / dump / IAT repair",
+            [this] { unpackPopup_.open = true; });
+    }
     if (!attached && ctx_.binaryLaunchable()) {
         add(DS_ICON_PLAY, "Launch & Debug", "break at entry", [this] {
             std::string err;
             if (!ctx_.launchAndDebug(err)) ui::Toast(ui::ToastKind::Error, "Launch failed: " + err);
         });
     }
+    if (!attached && ctx_.binaryDllDebuggable()) {
+        add(DS_ICON_PLAY, "Debug DLL...", "hosted launch", [this] {
+            ctx_.requestedDebugDll = true;
+        });
+    }
     if (attached) {
-        add(DS_ICON_STOP, "Detach", "Debug", [this] { ctx_.debug.detach(); });
-        if (running) add(DS_ICON_PAUSE, "Pause", "F5", [this] { ctx_.debug.pause(); });
-        else         add(DS_ICON_PLAY, "Continue", "F5", [this] { ctx_.debug.cont(); });
-        if (paused) {
-            add(nullptr, "Step Into", "F11", [this] { ctx_.debug.stepInto(); });
-            add(nullptr, "Step Over", "F10", [this] { ctx_.debug.stepOver(); });
-            add(nullptr, "Step Out", "Shift+F11", [this] { ctx_.debug.stepOut(); });
+        add(DS_ICON_MEMORY, "Inspect Live RIP in Memory Tools",
+            "hex editor / regions / pointer scan",
+            [this, rip = dbg.regs.rip, pid = dbg.pid,
+             generation = dbg.sessionGeneration] {
+                ctx_.openMemoryToolsAt(rip, pid, generation);
+            }, "memory viewer hex process address cheat engine");
+        add(DS_ICON_STOP, "Detach", "Debug", [this, paletteTarget] {
+            ctx_.debug.detachForSession(paletteTarget);
+        });
+        const auto gml = ctx_.debug.gameMakerSnapshot();
+        const bool gmlOwner = DebugTargetIdentityMatches(gml.target, paletteTarget);
+        const bool gmlPaused = paused && gmlOwner && gml.state == GameMakerSessionState::Paused &&
+            gml.stop && gml.stop->identity.tid == dbg.activeTid;
+        if (ctx_.gmlExecutionMode && gmlOwner && gml.ready()) {
+            auto addGml = [&](const char* label, const char* hotkey, GmlControlCommand command) {
+                const GmlPauseIdentity owner = gmlPaused ? gml.stop->identity : GmlPauseIdentity{};
+                add(nullptr, label, hotkey, [this, owner, command] {
+                    std::string error;
+                    if (!ctx_.debug.gameMakerCommand(command, owner, error)) ui::Toast(ui::ToastKind::Warn, error);
+                });
+            };
+            if (running) addGml("Pause GML", "F5", GmlControlCommand::Pause);
+            if (gmlPaused) {
+                addGml("Continue GML", "F5", GmlControlCommand::Continue);
+                addGml("Step Into GML", "F11", GmlControlCommand::StepInto);
+                addGml("Step Over GML", "F10", GmlControlCommand::StepOver);
+                addGml("Step Out GML", "Shift+F11", GmlControlCommand::StepOut);
+            }
+        } else if (!ctx_.gmlExecutionMode) {
+            if (running) add(DS_ICON_PAUSE, "Pause Native", "F5", [this, paletteTarget] {
+                ctx_.debug.pauseForSession(paletteTarget);
+            });
+            else if (!gmlPaused) add(DS_ICON_PLAY, "Continue Native", "F5", [this, paletteTarget] {
+                ctx_.debug.continueForSession(paletteTarget);
+            });
         }
+        if (paused && !gmlPaused && !ctx_.gmlExecutionMode) {
+            add(nullptr, "Step Into", "F11", [this, paletteTarget] {
+                ctx_.debug.stepIntoForSession(paletteTarget);
+            });
+            add(nullptr, "Step Over", "F10", [this, paletteTarget] {
+                ctx_.debug.stepOverForSession(paletteTarget);
+            });
+            add(nullptr, "Step Out", "Shift+F11", [this, paletteTarget] {
+                ctx_.debug.stepOutForSession(paletteTarget);
+            });
+        }
+        const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
+        const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
+        uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
+        const bool exactTraceImage = ctx_.frameDebugSnapshot &&
+            ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
+                                      traceRuntimeBase, traceRuntimeSize);
+        if (traceOn || (paused && !gmlPaused && !ctx_.gmlExecutionMode && ctx_.staticBinary().loaded() && exactTraceImage)) {
+            add(DS_ICON_LIGHTNING, traceOn ? "Stop Trace Coverage" : "Start Trace Coverage",
+                "Debug", [this, paletteTarget] {
+                    ctx_.requestedTraceToggle = true;
+                    ctx_.requestedTraceTarget = paletteTarget;
+                    ctx_.requestedTab = "Binary View";
+                });
+        }
+        if (tr && (!tr->instructions.empty() || !tr->blocks.empty())) {
+            add(DS_ICON_CANCEL, "Clear Trace Coverage", "Debug", [this, paletteTarget] {
+                ctx_.requestedTraceClear = true;
+                ctx_.requestedTraceClearTarget = paletteTarget;
+                ctx_.requestedTab = "Binary View";
+            });
+        }
+    }
+
+    // Open documents are first-class palette destinations as well as tabs. This
+    // keeps every target reachable when the window is narrow or the analyst is
+    // already working keyboard-first.
+    for (const AppContext::StaticDocumentSummary& document :
+         ctx_.staticDocuments()) {
+        std::string title = document.title.empty() ? "Untitled" : document.title;
+        std::string label = "Switch document: " + title;
+        std::string detail = document.active ? "active"
+            : document.format.empty() ? "document" : document.format;
+        const DocumentId id = document.id;
+        add(document.mapped ? DS_ICON_NETWORK : DS_ICON_CODE,
+            label.c_str(), detail.c_str(), [this, id] {
+                if (!ctx_.queueActivateStaticDocument(id))
+                    ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+            }, document.path.c_str());
     }
 
     // Sections (same switch the rail / Ctrl+N does)
@@ -1600,21 +6806,34 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
         }
     }
 
-    // Symbol snapshot (palette owns the copies while open).
-    std::vector<ui::PaletteSymbol> syms;
-    if (binaryView_) {
-        const auto& src = binaryView_->paletteSymbols(ctx_);
-        syms.reserve(src.size());
-        for (const auto& e : src) syms.push_back({ e.addr, e.name, e.lower, e.live });
-    }
-    palette_.open(std::move(items), std::move(syms));
+    palette_.open(std::move(items), &investigation_,
+                  investigationSubmittedGeneration_, investigationRecentQueries_,
+                  investigationSubmittedLiveTarget_,
+                  [this](std::string query, InvestigationIdentity identity) {
+                      rememberInvestigationQuery(std::move(query), identity);
+                  });
 }
 
 bool App::wantsContinuousRedraw() {
     // Toasts fade out on a timer - freeze-frames would strand them on screen.
     if (ui::ToastsActive()) return true;
+    // Keep ticking through the short debounce interval so autosave fires even
+    // when the user stops interacting immediately after an edit.
+    if (ctx_.projectDirty() ||
+        ctx_.projectSaveState == AppContext::ProjectSaveState::Saving) return true;
     // Background work in flight: progress spinners animate and results stream in.
-    if (ctx_.analysis.bulkPending() || ctx_.livescan.busy()) return true;
+    if (ctx_.binaryLoadPending() || ctx_.staticAnalysis().bulkPending() || ctx_.moduleAnalysisPending() ||
+        ctx_.livescan.busy() || ctx_.staticCodeExport().pending() ||
+        staticUnpackService_.pending() || passiveDumpService_.busy() ||
+        ctx_.traceSeedPlanning) return true;
+    {
+        const InvestigationServicePending pending = investigation_.pending();
+        if (pending.buildQueued || pending.searchQueued || pending.building || pending.searching)
+            return true;
+    }
+    TraceCoverageSnapshot trace = ctx_.debug.traceCoverageSnapshot();
+    const size_t traceDone = trace.armedSites + trace.hitSites + trace.skippedSites + trace.retiredSites;
+    if (trace.active && trace.plannedSites > traceDone) return true;
     // An active debug session: the debug thread mutates the snapshot asynchronously
     // (breakpoint hits, steps) and the live view pulses the RIP/selection row.
     if (ctx_.debug.snapshot().attached()) return true;
@@ -1664,6 +6883,10 @@ void App::renderHelpWindow() {
             { "Ctrl+O",         "Open a binary." },
             { "Ctrl+K",         "Open or close the command palette." },
             { "Ctrl+1 ... 9",   "Switch directly to one of the first nine workbench tabs." },
+            { "Ctrl+Tab",       "Switch to the next open document." },
+            { "Ctrl+Shift+Tab", "Switch to the previous open document." },
+            { "Ctrl+W",         "Close the active document." },
+            { "Middle-click document tab", "Close that document without switching first." },
             { "Alt+F4",         "Save the current project sidecar and exit." },
             { "Palette Up/Down", "Move through command-palette matches; Enter runs one and Escape closes it." },
         });
@@ -1673,6 +6896,7 @@ void App::renderHelpWindow() {
             { "F11",            "Step into the current instruction." },
             { "Shift+F11",      "Step out of the current function." },
             { "Ctrl+F9",        "Run to the Binary View cursor." },
+            { "Trace toolbar / Debug menu", "Start or stop one-shot basic-block coverage; Clear Trace removes the retained green execution map." },
         });
         group("##help_nav", "Navigation", {
             { "Ctrl+G",         "Open the fuzzy address/symbol picker." },
@@ -1723,7 +6947,9 @@ void App::renderHelpWindow() {
             { "Click pseudo line", "Navigate the assembly cursor to the line's mapped source address." },
             { "Click asm row",  "Navigate from the compact synchronized assembly pane." },
             { "Hover either pane", "Cross-highlight the corresponding pseudo/assembly location." },
-            { "Language",       "Switch the display instantly between Pseudo-C and Python." },
+            { "Language",       "Switch instantly between Pseudo-C and source-oriented, non-executable Python." },
+            { "Scope",          "Shows the exact analyzed function and owned chunks; an unowned address requires explicit bounded-range decompilation." },
+            { "Python legend",  "Hover the approximation badge for native-memory, integer-width, division, and unresolved-flow notation." },
             { "Copy",           "Copy the complete current decompilation." },
             { "Right-click line", "Copy one pseudo line or show its mapped source in the listing." },
         });
@@ -1740,6 +6966,24 @@ void App::render() {
     // Cleared each frame; a tab rendered this frame may set it to request that the
     // idle throttle keep redrawing (e.g. the live connection monitor's auto-refresh).
     ctx_.wantContinuousRedraw = false;
+    const AppContext::BinaryLoadPoll binaryLoad = ctx_.pollBinaryLoad();
+    if (binaryLoad.completed) {
+        if (binaryLoad.success)
+            ui::Toast(ui::ToastKind::Info, "Loaded binary; opening document: " + binaryLoad.path);
+        else if (binaryLoad.cancelled)
+            ui::Toast(ui::ToastKind::Info, "Binary load cancelled.");
+        else if (binaryLoad.offerRaw) {
+            ui::Toast(ui::ToastKind::Warn,
+                      binaryLoad.error.empty() ? "Structured load rejected; opening explicit Raw options."
+                                               : binaryLoad.error);
+            if (!prepareRawLoadPath(binaryLoad.path))
+                ui::Toast(ui::ToastKind::Error,
+                          "The structured file was rejected and its Raw options could not be prepared.");
+        } else
+            ui::Toast(ui::ToastKind::Error,
+                      binaryLoad.error.empty() ? "The binary could not be loaded."
+                                               : binaryLoad.error);
+    }
     // One lock-guarded debug snapshot per frame, shared by the toolbar and status bar
     // (each used to take its own deep copy of registers/threads/breakpoints).
     DbgSnapshot dbg = ctx_.debug.snapshot();
@@ -1755,10 +6999,149 @@ void App::render() {
         ui::Toast(ui::ToastKind::Info, "Debuggee exited - debug session ended");
         dbg = ctx_.debug.snapshot();
     }
+    ctx_.synchronizeModuleSession(dbg);
+    if (!dbg.attached()) {
+        dllRetargetPid_ = 0;
+        dllRetargetGeneration_ = 0;
+        dllRetargetBase_ = 0;
+        dllRetargetPending_.clear();
+        dllRetargetFailure_.clear();
+        attachMainDocumentSessionValid_ = false;
+        attachMainDocumentPid_ = 0;
+        attachMainDocumentGeneration_ = 0;
+        attachMainDocumentPending_.clear();
+        attachMainDocumentFailure_.clear();
+    } else if (dbg.dllTargetMatched && dbg.dllTargetBase) {
+        const bool retargetHandled = dllRetargetPid_ == dbg.pid &&
+            dllRetargetGeneration_ == dbg.sessionGeneration &&
+            dllRetargetBase_ == dbg.dllTargetBase;
+        const bool retargetPending = dllRetargetPending_.matches(
+            dbg.pid, dbg.sessionGeneration, dbg.dllTargetBase);
+        const bool retargetFailedWithoutRecovery = dllRetargetFailure_.matches(
+            dbg.pid, dbg.sessionGeneration, dbg.dllTargetBase) &&
+            dllRetargetFailure_.retryRevision == ctx_.documentRetryRevision();
+        if (!retargetHandled && !retargetPending &&
+            !retargetFailedWithoutRecovery && !ctx_.documentCommandPending()) {
+            const std::string modulePath = dbg.dllTargetPath;
+            const size_t slash = modulePath.find_last_of("/\\");
+            const std::string moduleName = modulePath.empty()
+                ? std::string("target.dll")
+                : (slash == std::string::npos
+                    ? modulePath : modulePath.substr(slash + 1));
+            if (ctx_.loadLiveModule(
+                    dbg.dllTargetBase, dbg.dllTargetSize,
+                    moduleName, modulePath,
+                    LiveDocumentOpenOrigin::HostedDll)) {
+                dllRetargetPending_ = {
+                    true, dbg.pid, dbg.sessionGeneration,
+                    dbg.dllTargetBase, 0
+                };
+            } else {
+                dllRetargetFailure_ = {
+                    true, dbg.pid, dbg.sessionGeneration,
+                    dbg.dllTargetBase, ctx_.documentRetryRevision()
+                };
+                ui::Toast(ui::ToastKind::Error,
+                          "The target DLL loaded, but its mapped image could not be read for analysis.");
+            }
+        }
+    }
+
+    // Reconcile the analysis document once per exact debugger session. A normal
+    // attach keeps a matching on-disk PE (its full static analysis is richer),
+    // while an empty, unrelated, or prior-session mapped document gets a fresh
+    // ephemeral capture. The queued open retains the old document and is applied
+    // only after this frame releases every tab-local reference.
+    const bool mainDocumentSessionHandled = attachMainDocumentSessionValid_ &&
+        SameAttachSession(
+            {attachMainDocumentPid_, attachMainDocumentGeneration_},
+            {dbg.pid, dbg.sessionGeneration});
+    const bool mainDocumentPending = attachMainDocumentPending_.matches(
+        dbg.pid, dbg.sessionGeneration);
+    const bool mainDocumentFailedWithoutRecovery =
+        attachMainDocumentFailure_.matches(dbg.pid, dbg.sessionGeneration) &&
+        attachMainDocumentFailure_.retryRevision == ctx_.documentRetryRevision();
+    if (liveDocumentSessionState(dbg) && !mainDocumentSessionHandled &&
+        !mainDocumentPending && !mainDocumentFailedWithoutRecovery) {
+        if (dbg.dllHostedLaunch) {
+            // The host is only a loader. The exact LOAD_DLL retarget path above
+            // owns the analysis-document handoff for this session.
+            attachMainDocumentSessionValid_ = true;
+            attachMainDocumentPid_ = dbg.pid;
+            attachMainDocumentGeneration_ = dbg.sessionGeneration;
+            attachMainDocumentPending_.clear();
+            attachMainDocumentFailure_.clear();
+        } else if (!ctx_.documentCommandPending() && !dbg.modules.empty()) {
+            const DbgModule& main = dbg.modules.front();
+            if (main.base) {
+                if (LoadedModule* registryMain = ctx_.modules.addOrUpdate(
+                        main.name, main.base, main.size, main.path))
+                    registryMain->isMain = true;
+                const BinaryFile& active = ctx_.staticBinary();
+                AttachMainImageState state;
+                state.activeLoaded = active.loaded();
+                state.activeMapped = active.loaded() && active.isMappedImage();
+                state.activePe = active.loaded() &&
+                    (active.format() == BinFormat::PE32 ||
+                     active.format() == BinFormat::PE32Plus);
+                state.activeArchitectureMatchesSession = active.loaded() &&
+                    ctx_.binaryDebugArchitectureMatches() &&
+                    ((active.machine() == MachineArch::X86 && dbg.is32) ||
+                     (active.machine() == MachineArch::X64 && !dbg.is32));
+                state.activeFullPathMatchesMain = active.loaded() &&
+                    AttachedImagePathsMatch(active.path(), main.path);
+                AttachedFileIdentity activeBackingIdentity;
+                state.activeBackingFileMatchesMain =
+                    state.activeFullPathMatchesMain &&
+                    !hasEnabledProjectPatches(ctx_.staticProject()) &&
+                    loadedBytesStillMatchDisk(active,
+                                              &activeBackingIdentity) &&
+                    SameAttachedFileIdentity(activeBackingIdentity,
+                                             main.fileIdentity);
+
+                const AttachMainImageAction action = DecideAttachMainImage(state);
+                const bool handled =
+                    action == AttachMainImageAction::KeepMatchingFileDocument;
+                if (action == AttachMainImageAction::OpenEphemeralMainImage) {
+                    if (ctx_.loadLiveModule(
+                            main.base, main.size, main.name, main.path,
+                            LiveDocumentOpenOrigin::AttachMain)) {
+                        attachMainDocumentPending_ = {
+                            true, dbg.pid, dbg.sessionGeneration,
+                            main.base, 0
+                        };
+                    } else {
+                        attachMainDocumentFailure_ = {
+                            true, dbg.pid, dbg.sessionGeneration,
+                            main.base, ctx_.documentRetryRevision()
+                        };
+                        ui::Toast(ui::ToastKind::Warn,
+                                  "Attached to the process, but its main image could not be opened for static analysis.");
+                    }
+                }
+                if (handled) {
+                    ctx_.setStaticDebugImageIdentity(
+                        debugImageIdentity(dbg, main));
+                    attachMainDocumentSessionValid_ = true;
+                    attachMainDocumentPid_ = dbg.pid;
+                    attachMainDocumentGeneration_ = dbg.sessionGeneration;
+                }
+            }
+        }
+    }
+    // Module results are app-global and must be adopted regardless of which
+    // workbench tab is currently visible. This also retires incomplete spinners
+    // after cancellation or bounded result loss.
+    ctx_.drainModuleAnalysisResults();
+    TraceCoverageSnapshot trace = ctx_.debug.traceCoverageSnapshot();
     ctx_.frameDebugSnapshot = &dbg;
+    ctx_.frameTraceCoverageSnapshot = &trace;
     struct ResetFrameDebugSnapshot {
         AppContext& ctx;
-        ~ResetFrameDebugSnapshot() { ctx.frameDebugSnapshot = nullptr; }
+        ~ResetFrameDebugSnapshot() {
+            ctx.frameDebugSnapshot = nullptr;
+            ctx.frameTraceCoverageSnapshot = nullptr;
+        }
     } resetFrameDebugSnapshot{ ctx_ };
 
     // Application-wide shortcuts live here so they work regardless of the
@@ -1769,16 +7152,59 @@ void App::render() {
     if (ImGui::IsKeyPressed(ImGuiKey_F1)) showHelp_ = true;
     const bool popupOpen = ImGui::IsPopupOpen(nullptr,
         ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-    if (!ImGui::GetIO().WantTextInput && !popupOpen &&
-        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O))
-        openFileDialog();
+    if (!ImGui::GetIO().WantTextInput && !popupOpen && !palette_.isOpen()) {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O))
+            openFileDialog();
+
+        // Browser-style document controls match the visual document strip. All
+        // transitions still go through the existing frame-boundary queue, so a
+        // shortcut cannot invalidate a tab that is rendering this frame.
+        const std::vector<AppContext::StaticDocumentSummary> documents =
+            ctx_.staticDocuments();
+        if (!ctx_.documentCommandPending() && !documents.empty()) {
+            const bool previous = ImGui::IsKeyChordPressed(
+                ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Tab);
+            const bool next = !previous && ImGui::IsKeyChordPressed(
+                ImGuiMod_Ctrl | ImGuiKey_Tab);
+            if (previous || next) {
+                size_t active = 0;
+                for (size_t i = 0; i < documents.size(); ++i) {
+                    if (documents[i].active) {
+                        active = i;
+                        break;
+                    }
+                }
+                const size_t target = previous
+                    ? (active + documents.size() - 1) % documents.size()
+                    : (active + 1) % documents.size();
+                if (!ctx_.queueActivateStaticDocument(documents[target].id))
+                    ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+            } else if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_W)) {
+                auto active = std::find_if(documents.begin(), documents.end(),
+                    [](const AppContext::StaticDocumentSummary& document) {
+                        return document.active;
+                    });
+                if (active != documents.end() &&
+                    !ctx_.queueCloseStaticDocument(active->id))
+                    ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+            }
+        }
+    }
 
     renderMenuBar();
+    renderDocumentStrip();
     renderDebugToolbar(dbg);
+    resolveWorkbenchNavigation();
     renderTabCardStrip(dbg);
     renderMainWindow(dbg);
     renderStatusBar(dbg);
     renderRawLoadPopup();
+    renderDllDebugPopup();
+    renderUnpackPopup();
+    renderStaticUnpackPopup();
+    renderAntiDebugPopup();
+    renderPassiveDumpPopup();
+    renderSymbolSettingsPopup();
 
     // Binary View's Java banner can't open the Save dialog itself (it has no
     // access to App); it raises this flag instead (same pattern as
@@ -1797,12 +7223,41 @@ void App::render() {
     renderArchiveBrowser();
     renderHelpWindow();
 
-    // Ctrl+K command palette (toggle; safe unguarded - the chord types nothing).
+    ctx_.pollProjectSave();
+
+    // Debounced autosave. All serialized state has already been mirrored by the
+    // active tab this frame; the atomic Project writer makes each attempt crash-
+    // recoverable. A failure stays dirty and is retried after another debounce
+    // interval while remaining visible in the global status bar.
+    if (ctx_.projectDirty() && ctx_.staticBinary().loaded() && !ctx_.staticBinary().isMappedImage()) {
+        constexpr auto kAutosaveDelay = std::chrono::milliseconds(1500);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - ctx_.projectDirtySince >= kAutosaveDelay) {
+            ctx_.beginProjectSave();
+            if (ctx_.projectSaveState == AppContext::ProjectSaveState::Failed)
+                ctx_.projectDirtySince = now;
+        }
+    }
+
+    // Run after every target-mutating menu/tab/modal workflow. A replacement or
+    // close retires the previous generation before Ctrl+K can open in this same
+    // frame; the collector itself is bounded to a small render-time slice.
+    maintainInvestigationWorkspace();
+
+    // Modal editors retain ownership of their document and address. Opening the
+    // palette above one would expose actions that replace that editor's target.
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_K)) {
         if (palette_.isOpen()) palette_.close();
-        else                   openCommandPalette(dbg);
+        else if (!ImGui::IsPopupOpen(nullptr,
+                     ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+            openCommandPalette(dbg);
     }
     palette_.render(ctx_);
+
+    // Commit at the last safe point of the frame: every tab/popup which could
+    // have borrowed the active BinaryFile has returned, while toasts and the
+    // remaining diagnostic windows do not retain document references.
+    applyPendingDocumentCommand();
 
     // Toast stack, bottom-right just above the status bar.
     ui::RenderToasts(ImGui::GetFrameHeight() + 8.0f);
@@ -1821,8 +7276,8 @@ void App::render() {
             ImGui::BulletText("Multi-architecture disassembly, CFGs, xrefs, decompilation, and patching");
             ImGui::BulletText("Live Win32 and JVM/JDWP debugging plus process-memory tools");
             ImGui::SeparatorText("Runtime");
-            ImGui::Text("Disassembly   Zydis (x86/x64) + Capstone (ARM/ARM64/MIPS/PPC/RISC-V)");
-            ImGui::Text("Assembler     Keystone (x86/x64/ARM/ARM64)");
+            ImGui::Text("Disassembly   Zydis (x86 family) + Capstone (A32/Thumb/A64/MIPS/PPC/RISC-V)");
+            ImGui::Text("Assembler     Keystone (x86/x64/A32/Thumb/A64)");
             ImGui::Text("UI            Dear ImGui + Direct3D 11");
 #ifdef _DEBUG
             ImGui::Text("Build         Debug, Windows x64, C++20");

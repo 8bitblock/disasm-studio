@@ -11,6 +11,7 @@
 #include "Core/Prism.h"
 
 #include <cstdio>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,11 @@ static PrismSample sample(uint32_t tid, std::initializer_list<const char*> syms)
 
 static const PrismFuncStat* fn(const PrismReport& r, const char* sym) {
     for (const PrismFuncStat& f : r.functions) if (f.symbol == sym) return &f;
+    return nullptr;
+}
+
+static const PrismFlameNode* flame(const PrismReport& r, const char* sym) {
+    for (const PrismFlameNode& node : r.flame) if (node.symbol == sym) return &node;
     return nullptr;
 }
 
@@ -114,11 +120,89 @@ int main() {
 
     // ---- Over-time timeline ----
     CHECK(rep.spanMs == 90);                 // 1090 - 1000
+    CHECK(rep.firstTimestampMs == 1000);
+    CHECK(rep.lastTimestampMs == 1090);
     CHECK(rep.timeline.size() == 30);
     { int tl = 0; for (const auto& sl : rep.timeline) tl += sl.samples; CHECK(tl == 10); }  // every sample bucketed
 
     // ---- Verdict per-thread context ----
     CHECK(ihas(rep.verdict, "threads"));
+
+    // ---- Deterministic flame layout (root -> leaf, bounded normalized spans) ----
+    CHECK(!rep.flame.empty());
+    CHECK(rep.flame.front().symbol == "(all samples)");
+    CHECK(rep.flame.front().samples == 10);
+    const PrismFlameNode* mainFlame = flame(rep, "app!main");
+    const PrismFlameNode* crunchFlame = flame(rep, "app!crunch_pixels");
+    CHECK(mainFlame && mainFlame->samples == 10);
+    CHECK(crunchFlame && crunchFlame->samples == 3 && crunchFlame->selfSamples == 3);
+    CHECK(mainFlame && mainFlame->x0 >= 0.0f && mainFlame->x1 <= 1.0f &&
+          mainFlame->x1 > mainFlame->x0);
+    CHECK(crunchFlame && mainFlame && crunchFlame->x0 >= mainFlame->x0 &&
+          crunchFlame->x1 <= mainFlame->x1);
+    PrismReport repeat = BuildPrismReport(samples);
+    CHECK(repeat.flame.size() == rep.flame.size());
+    if (repeat.flame.size() == rep.flame.size()) {
+        for (size_t i = 0; i < rep.flame.size(); ++i) {
+            CHECK(repeat.flame[i].symbol == rep.flame[i].symbol);
+            CHECK(repeat.flame[i].x0 == rep.flame[i].x0);
+            CHECK(repeat.flame[i].x1 == rep.flame[i].x1);
+        }
+    }
+
+    // ---- Normalized ETW event/quality evidence ----
+    {
+        PrismCollectionQuality starting;
+        starting.collector = PrismCollectorKind::Etw;
+        CHECK(!FinalizePrismQuality(std::move(starting)).degraded);
+
+        PrismCollectionQuality q;
+        q.collector = PrismCollectorKind::Etw;
+        q.stackTracingConfigured = true;
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::SampledProfile, 4, 3);
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::SampledProfile, 1, 0);
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::Image);
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::Thread);
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::ContextSwitch);
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::Wait);
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::IO);
+        q.lostEvents = 2;
+        q.lostBuffers = 1;
+        q = FinalizePrismQuality(std::move(q));
+        CHECK(q.sampledEvents == 2 && q.samplesWithStacks == 1);
+        CHECK(q.totalFrames == 5 && q.resolvedFrames == 3);
+        CHECK(q.stackCoveragePct > 49.0f && q.stackCoveragePct < 51.0f);
+        CHECK(q.frameResolutionPct > 59.0f && q.frameResolutionPct < 61.0f);
+        CHECK(q.imageEvents == 1 && q.threadEvents == 1 && q.contextSwitchEvents == 1);
+        CHECK(q.waitEvents == 1 && q.ioEvents == 1);
+        CHECK(q.degraded);
+        CHECK(ihas(q.summary, "lost") && ihas(q.summary, "degraded"));
+
+        PrismReport withQuality = BuildPrismReport(samples, q);
+        CHECK(withQuality.quality.collector == PrismCollectorKind::Etw);
+        CHECK(withQuality.quality.lostEvents == 2);
+    }
+
+    // Fallback labels WOW64 honestly and does not claim ETW evidence.
+    {
+        PrismCollectionQuality q;
+        q.collector = PrismCollectorKind::SuspendWalk;
+        q.wow64Target = true;
+        q.stackTracingConfigured = true;
+        AccumulatePrismTraceEvent(q, PrismTraceEventKind::SampledProfile, 3, 2);
+        q = FinalizePrismQuality(std::move(q));
+        CHECK(ihas(PrismCollectorName(q.collector), "fallback"));
+        CHECK(ihas(q.summary, "wow64"));
+        CHECK(!q.degraded);
+    }
+
+    // Cancellation is explicit and never publishes a partially authoritative report.
+    {
+        std::stop_source source;
+        source.request_stop();
+        PrismReport cancelled = BuildPrismReport(samples, {}, source.get_token());
+        CHECK(cancelled.cancelled);
+    }
 
     // ---- CPU-bound profile ----
     {

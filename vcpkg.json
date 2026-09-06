@@ -1,7 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "disasm-studio",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "builtin-baseline": "cbb38f7824373004154d678b0eb54bff4e5466ea",
   "description": "ImGui + DirectX11 disassembler / reverse-engineering workbench.",
   "dependencies": [
     {
@@ -13,7 +14,17 @@
       ]
     },
     "zydis",
-    "capstone",
+    {
+      "name": "capstone",
+      "features": [
+        "x86",
+        "arm",
+        "arm64",
+        "mips",
+        "ppc",
+        "riscv"
+      ]
+    },
     "keystone"
   ],
   "features": {
@@ -22,12 +33,6 @@
       "dependencies": [
         "z3",
         "triton"
-      ]
-    },
-    "embed-python": {
-      "description": "Embed CPython for the F2 hot-patch Python tier (a snippet sets `patch = bytes([...])`). Enable with the 'embed-python' manifest feature AND /p:DsPython=true (defines DS_HAVE_PYTHON). Adds ~25MB to the exe; the Asm tier needs none of this.",
-      "dependencies": [
-        "python3"
       ]
     }
   }

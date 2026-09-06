@@ -16,6 +16,11 @@
 
 namespace ds {
 
+struct DecompileTarget {
+    Arch         architecture = Arch::X64;
+    DecompileABI abi = DecompileABI::Unknown;
+};
+
 struct DecompileOptions {
     // Resolve a call/jump target VA to a display name (e.g. "kernel32.CreateFileW"
     // or a user rename). Return "" to fall back to sub_<addr>.
@@ -37,12 +42,11 @@ struct DecompileOptions {
     // legacy register-level lift.
     bool deepDataFlow = true;
 
-    // The argument detection (Win64 register / x86 stack-slot) assumes x86/x64
-    // semantics; on other arches an ARM/MIPS register name can collide with the x86
-    // register table and produce spurious parameters. The caller sets this false for
-    // non-x86 targets so the emitted header doesn't list bogus args. Default true keeps
-    // the common (x86/x64) path and existing tests unchanged.
-    bool x86 = true;
+    // Exact architecture + ABI contract. Production derives this from the loaded
+    // format (PE Win64, ELF/Mach-O SysV, Raw Unknown). Tests that do not care about
+    // a platform ABI retain an explicit x64/Auto default. Deep data flow is enabled
+    // only for Arch::X86 and Arch::X64.
+    DecompileTarget target{ Arch::X64, DecompileABI::Auto };
 
     // Readability post-passes that run on the emitted line/VA vectors AFTER
     // structuring + for-reconstruction and BEFORE the result is returned (deep
@@ -74,30 +78,86 @@ struct DecompileOptions {
     bool callArgs        = true;
 };
 
-// Decompilation result with a per-line source map. `lineVA[i]` is the VA of the
-// instruction (legacy lift) or basic block (deep data-flow path, which merges /
-// eliminates statements so only block granularity survives) that produced line i
-// of `text`; 0 marks synthetic lines (function header, braces, declarations).
+enum class SourceOriginGranularity : uint8_t {
+    Synthetic,
+    Instruction,
+    BasicBlock
+};
+
+struct SourceOrigin {
+    uint64_t va = 0;
+    bool     valid = false;
+    SourceOriginGranularity granularity = SourceOriginGranularity::Synthetic;
+};
+
+enum class DecompileDiagnosticKind : uint8_t {
+    ClippedInput,
+    InstructionLimit,
+    DecodeFailure,
+    MissingChunk,
+    TruncatedOwnership,
+    Other,
+};
+
+struct DecompileDiagnostic {
+    DecompileDiagnosticKind kind = DecompileDiagnosticKind::Other;
+    std::string message;
+};
+
+// Decompilation result with a per-line source map. `lineVA[i]` is retained for
+// compatibility; `lineOrigins[i]` is authoritative and can distinguish an
+// instruction at VA zero from a synthetic line. An origin identifies the
+// instruction that produced line i. Deep propagation/folding/DCE carries the
+// surviving statement's instruction origin; structural labels/gotos may retain
+// basic-block granularity, and generated scaffolding is explicitly synthetic.
+// of `text`; legacy lineVA still uses 0 for both synthetic lines and real VA zero.
 // Lines are `text` split on '\n'; the empty segment after the trailing '\n' is
 // not counted, so lineVA.size() == the number of real lines.
 struct DecompResult {
     std::string           text;
     std::vector<uint64_t> lineVA;
+    std::vector<SourceOrigin> lineOrigins;
+    bool                  complete = true;
+    std::string           incompleteReason;
+    std::vector<DecompileDiagnostic> diagnostics;
 };
 
 // Produce structured pseudo-C for the function described by `g`, with the
 // per-line VA map (backs pseudocode <-> assembly navigation in the UI).
 DecompResult DecompileWithMap(const ControlFlowGraph& g, const DecompileOptions& opt = {});
 
+DecompResult DecompileWithMap(const std::vector<CFGCodeChunk>& chunks,
+                              IDisassembler& dis,
+                              const DecompileOptions& opt = {},
+                              size_t maxInsns = 2000,
+                              const JumpTableResolver& resolveTable = {},
+                              const NoreturnCallResolver& isNoreturnCall = {},
+                              const DirectTargetResolver& resolveDirectTarget = {});
+
 // Produce structured pseudo-C for the function described by `g`.
 // Exactly DecompileWithMap(g, opt).text.
 std::string Decompile(const ControlFlowGraph& g, const DecompileOptions& opt = {});
 
-// Translate a pseudo-C DecompResult (from DecompileWithMap) into Python-style
-// pseudocode: def/if/elif/else/while True/match with `:` + indentation instead
-// of braces, `#` comments, `and`/`or`/`not`, `//` integer division, `mem[...]`
-// for dereferences, x += 1 for x++, swap -> tuple assignment. Unstructurable
-// flow keeps explicit `goto loc_X` pseudo-statements (labels become `# loc_X:`).
+std::string Decompile(const std::vector<CFGCodeChunk>& chunks,
+                      IDisassembler& dis,
+                      const DecompileOptions& opt = {},
+                      size_t maxInsns = 2000,
+                      const JumpTableResolver& resolveTable = {},
+                      const NoreturnCallResolver& isNoreturnCall = {},
+                      const DirectTargetResolver& resolveDirectTarget = {});
+
+// Translate a pseudo-C DecompResult (from DecompileWithMap) into source-oriented
+// Python pseudocode: def/if/elif/else/while True/match with indentation, `range`
+// for conservatively proven induction loops, Python Boolean/None identity,
+// `#` comments, `and`/`or`/`not`, fixed-width sN/uN integer conversions,
+// `mem[...]` for native dereferences, x += 1 for x++, and tuple assignment for
+// swaps. Native TEST/CMP zero comparisons stay explicit (`x == 0` / `x != 0`)
+// so branch intent remains visible. Partial-register writes become full-variable
+// mask/shift assignments.
+// Unstructurable direct flow keeps a `goto_label("loc_X")` placeholder (the
+// target label is a `# loc_X:` marker); computed flow uses
+// `indirect_jump(expression)`. Both remain valid Python syntax without
+// pretending that Python has native goto semantics.
 // A pure text transform over the structured C output — the C emission (and its
 // byte-identical guarantee) is untouched — that preserves the per-line VA map:
 // the result carries its own parallel lineVA (lines are added/dropped, e.g.

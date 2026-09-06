@@ -29,10 +29,29 @@ bool safeSmallText(const std::string& s, size_t cap) {
 
 bool validAddressString(const std::string& s) {
     if (s.empty()) return true;
-    const char* p = s.c_str();
-    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) p += 2;
-    if (!*p) return false;
-    for (; *p; ++p) if (!std::isxdigit((unsigned char)*p)) return false;
+    size_t first = 0;
+    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) first = 2;
+    const size_t digits = s.size() - first;
+    // Project addresses are exact uint64 values, not arbitrary-width foreign
+    // identifiers. Enforce the same full-token rule as the other sidecar fields.
+    if (!digits || digits > 16) return false;
+    for (size_t i = first; i < s.size(); ++i)
+        if (!std::isxdigit(static_cast<unsigned char>(s[i]))) return false;
+    return true;
+}
+
+bool optionalStringField(const json::Value& object, const char* key,
+                         std::string& out, std::string* err) {
+    const json::Value* value = object.find(key);
+    if (!value) {
+        out.clear();
+        return true;
+    }
+    if (!value->isStr()) {
+        if (err) *err = std::string(key) + " must be a string";
+        return false;
+    }
+    out = value->str;
     return true;
 }
 
@@ -116,13 +135,14 @@ bool ConnectionEnvelopeFromJsonValue(const json::Value& v, ConnectionEnvelope& o
         return false;
     }
     ConnectionEnvelope msg;
-    msg.type       = v.getStr("type");
-    msg.source     = v.getStr("source");
-    msg.projectId  = v.getStr("project_id");
-    msg.artifactId = v.getStr("artifact_id");
-    msg.address    = v.getStr("address");
-    msg.method     = v.getStr("method");
-    msg.timestamp  = v.getStr("timestamp");
+    if (!optionalStringField(v, "type", msg.type, err) ||
+        !optionalStringField(v, "source", msg.source, err) ||
+        !optionalStringField(v, "project_id", msg.projectId, err) ||
+        !optionalStringField(v, "artifact_id", msg.artifactId, err) ||
+        !optionalStringField(v, "address", msg.address, err) ||
+        !optionalStringField(v, "method", msg.method, err) ||
+        !optionalStringField(v, "timestamp", msg.timestamp, err))
+        return false;
     if (const json::Value* p = v.find("payload")) {
         if (!p->isObj()) {
             setErr(err, "payload must be a JSON object");

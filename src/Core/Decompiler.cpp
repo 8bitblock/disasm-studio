@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -25,11 +27,95 @@ static std::string trim(const std::string& x) {
     return s == std::string::npos ? std::string() : x.substr(s, e - s + 1);
 }
 
-// Turn [mem] into *(mem) so operands read like C.
+static std::string stripOperandSize(const std::string& operand) {
+    std::string value = trim(operand);
+    std::string lowered = value;
+    for (char& c : lowered) c = static_cast<char>(std::tolower((unsigned char)c));
+    static const char* prefixes[] = {
+        "zmmword ptr ", "ymmword ptr ", "xmmword ptr ", "tbyte ptr ",
+        "qword ptr ", "dword ptr ", "word ptr ", "byte ptr ",
+    };
+    for (const char* prefix : prefixes) {
+        const size_t length = std::strlen(prefix);
+        if (lowered.compare(0, length, prefix) == 0)
+            return trim(value.substr(length));
+    }
+    return value;
+}
+
+static uint16_t textualOperandWidth(const std::string& operand) {
+    std::string value = trim(operand);
+    for (char& c : value) c = static_cast<char>(std::tolower((unsigned char)c));
+    if (value.rfind("qword ptr ", 0) == 0) return 64;
+    if (value.rfind("dword ptr ", 0) == 0) return 32;
+    if (value.rfind("word ptr ", 0) == 0) return 16;
+    if (value.rfind("byte ptr ", 0) == 0) return 8;
+    static const char* r8[] = { "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+                                "sil", "dil", "bpl", "spl" };
+    static const char* r16[] = { "ax", "bx", "cx", "dx", "si", "di", "bp", "sp" };
+    static const char* r32[] = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp" };
+    for (const char* reg : r8) if (value == reg) return 8;
+    for (const char* reg : r16) if (value == reg) return 16;
+    for (const char* reg : r32) if (value == reg) return 32;
+    if (value.size() > 2 && value[0] == 'r') {
+        if (value.back() == 'b') return 8;
+        if (value.back() == 'w') return 16;
+        if (value.back() == 'd') return 32;
+    }
+    return 64;
+}
+
+// Turn [mem] into *(mem) so operands read like C. Decoder size qualifiers are
+// type metadata, not expression text; leaving `byte ptr` in Python is invalid.
 static std::string cOperand(const std::string& s) {
+    const std::string value = stripOperandSize(s);
     std::string o;
-    for (char c : s) { if (c == '[') o += "*("; else if (c == ']') o += ')'; else o += c; }
+    for (char c : value) { if (c == '[') o += "*("; else if (c == ']') o += ')'; else o += c; }
     return o;
+}
+
+// Canonical dependency key for the integer-register aliases used by the raw
+// (non-data-flow) lifter. EAX/AX/AL/AH all name the same mutable storage for
+// provenance purposes; keeping their formatted spellings separate can reuse a
+// comparison expression after a partial-register write.
+static std::string rawRegisterDependency(std::string token) {
+    for (char& c : token) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const char* aliases[8][5] = {
+        {"rax","eax","ax","al","ah"}, {"rcx","ecx","cx","cl","ch"},
+        {"rdx","edx","dx","dl","dh"}, {"rbx","ebx","bx","bl","bh"},
+        {"rsp","esp","sp","spl",nullptr}, {"rbp","ebp","bp","bpl",nullptr},
+        {"rsi","esi","si","sil",nullptr}, {"rdi","edi","di","dil",nullptr}
+    };
+    for (int reg = 0; reg < 8; ++reg)
+        for (int alias = 0; alias < 5 && aliases[reg][alias]; ++alias)
+            if (token == aliases[reg][alias]) return "REG:" + std::to_string(reg);
+    if (token.size() >= 2 && token[0] == 'r' && std::isdigit(static_cast<unsigned char>(token[1]))) {
+        size_t end = 1;
+        while (end < token.size() && std::isdigit(static_cast<unsigned char>(token[end]))) ++end;
+        const int reg = std::atoi(token.substr(1, end - 1).c_str());
+        const std::string suffix = token.substr(end);
+        if (reg >= 8 && reg <= 15 && (suffix.empty() || suffix == "d" || suffix == "w" || suffix == "b"))
+            return "REG:" + std::to_string(reg);
+    }
+    return {};
+}
+
+static std::vector<std::string> rawOperandDependencies(const std::string& operand) {
+    std::vector<std::string> result;
+    std::string token;
+    auto flush = [&]() {
+        if (token.empty()) return;
+        std::string dependency = rawRegisterDependency(token);
+        if (!dependency.empty() && std::find(result.begin(), result.end(), dependency) == result.end())
+            result.push_back(std::move(dependency));
+        token.clear();
+    };
+    for (size_t i = 0; i <= operand.size(); ++i) {
+        const char c = i < operand.size() ? operand[i] : ' ';
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') token.push_back(c);
+        else flush();
+    }
+    return result;
 }
 
 // Split "a, b" at the first top-level comma (ignoring commas inside []/()).
@@ -53,6 +139,12 @@ static bool split2(const std::string& ops, std::string& a, std::string& b) {
 // (which read the flags a preceding cmp/test set) as real conditions.
 static std::string condString(const std::string& mnem, const FlagState& fl, bool negate);
 
+static uint16_t conditionWidth(const Instruction& instruction) {
+    for (const TypedOperand& operand : instruction.typedOperands)
+        if (operand.widthBits) return operand.widthBits;
+    return 0;
+}
+
 // Defined in the Python section below; forward-declared so the Structurer's
 // condition-gloss post-pass can match an `if (...)` condition's parentheses.
 static size_t pyMatchParen(const std::string& s, size_t open);
@@ -66,6 +158,30 @@ static std::string liftStmt(const Instruction& in, FlagState& fl,
     std::string a, b;
     bool two = split2(in.operands, a, b);
     std::string A = cOperand(a), B = cOperand(b);
+    auto flagDependencies = [&]() {
+        std::vector<std::string> dependencies;
+        auto append = [&](const std::string& operand) {
+            for (std::string dependency : rawOperandDependencies(operand))
+                if (std::find(dependencies.begin(), dependencies.end(), dependency) == dependencies.end())
+                    dependencies.push_back(std::move(dependency));
+        };
+        append(a); if (two) append(b);
+        if (a.find('[') != std::string::npos || b.find('[') != std::string::npos)
+            dependencies.push_back("MEM");
+        return dependencies;
+    };
+    auto invalidateDestination = [&](const std::string& destination, bool memory) {
+        if (memory) { fl.invalidateDependency("MEM"); return; }
+        for (const std::string& dependency : rawOperandDependencies(destination))
+            fl.invalidateDependency(dependency);
+    };
+    auto destinationAliasesSource = [&]() {
+        if (!two || a.find('[') != std::string::npos || b.find('[') != std::string::npos)
+            return false;
+        const std::vector<std::string> left = rawOperandDependencies(a);
+        const std::vector<std::string> right = rawOperandDependencies(b);
+        return left.size() == 1 && right.size() == 1 && left.front() == right.front();
+    };
 
     auto callName = [&](uint64_t t) -> std::string {
         if (nameFor) { std::string n = nameFor(t); if (!n.empty()) return n; }
@@ -74,39 +190,77 @@ static std::string liftStmt(const Instruction& in, FlagState& fl,
 
     // The implicit accumulator:remainder pair for one-operand mul/imul/div/idiv,
     // picked from the operand's width (defaults to the 64-bit rdx:rax pair).
+    auto accumulatorWidth = [&]() -> uint16_t {
+        const uint16_t typed = conditionWidth(in);
+        if (typed <= 8 && typed) return 8;
+        if (typed <= 16 && typed) return 16;
+        if (typed <= 32 && typed) return 32;
+        if (typed) return 64;
+
+        std::string t = a;
+        for (char& c : t) c = (char)std::tolower((unsigned char)c);
+        if (t.find("qword ptr") != std::string::npos) return 64;
+        if (t.find("dword ptr") != std::string::npos) return 32;
+        if (t.find("word ptr")  != std::string::npos) return 16;
+        if (t.find("byte ptr")  != std::string::npos) return 8;
+        const bool re = t.size() > 2 && t[0] == 'r';
+        if (t=="eax"||t=="ebx"||t=="ecx"||t=="edx"||t=="esi"||t=="edi"||
+            t=="ebp"||t=="esp"||(re && t.back()=='d')) return 32;
+        if (t=="ax"||t=="bx"||t=="cx"||t=="dx"||t=="si"||t=="di"||
+            t=="bp"||t=="sp"||(re && t.back()=='w')) return 16;
+        if (t=="al"||t=="bl"||t=="cl"||t=="dl"||t=="ah"||t=="bh"||
+            t=="ch"||t=="dh"||t=="sil"||t=="dil"||t=="bpl"||t=="spl"||
+            (re && t.back()=='b')) return 8;
+        return 64;
+    };
     auto accPair = [&](std::string& lo, std::string& hi) {
-        std::string t = a; for (char& c : t) c = (char)std::tolower((unsigned char)c);
-        bool re = t.size() > 2 && t[0] == 'r';                         // r8d / r8w / r8b extended forms
-        if (t=="eax"||t=="ebx"||t=="ecx"||t=="edx"||t=="esi"||t=="edi"||t=="ebp"||t=="esp"||(re && t.back()=='d'))
-            { lo = "eax"; hi = "edx"; }
-        else if (t=="ax"||t=="bx"||t=="cx"||t=="dx"||t=="si"||t=="di"||t=="bp"||t=="sp"||(re && t.back()=='w'))
-            { lo = "ax"; hi = "dx"; }
-        else if (t=="al"||t=="bl"||t=="cl"||t=="dl"||t=="ah"||t=="bh"||t=="ch"||t=="dh"||
-                 t=="sil"||t=="dil"||t=="bpl"||t=="spl"||(re && t.back()=='b'))
-            { lo = "al"; hi = "ah"; }
-        else { lo = "rax"; hi = "rdx"; }
+        switch (accumulatorWidth()) {
+            case 8:  lo = "al";  hi = "ah";  break;
+            case 16: lo = "ax";  hi = "dx";  break;
+            case 32: lo = "eax"; hi = "edx"; break;
+            default: lo = "rax"; hi = "rdx"; break;
+        }
     };
 
     if (m == "mov" || m == "movzx" || m == "movsx" || m == "movsxd" || m == "movabs" ||
-        m == "movdqu" || m == "movdqa" || m == "movaps" || m == "movups" || m == "movq" || m == "movd")
-        return two ? (A + " = " + B + ";") : std::string();
+        m == "movdqu" || m == "movdqa" || m == "movaps" || m == "movups" || m == "movq" || m == "movd") {
+        invalidateDestination(A, a.find('[') != std::string::npos);
+        if (!two) return {};
+        std::string rhs = B;
+        if (m == "movzx" || m == "movsx" || m == "movsxd") {
+            uint16_t width = 0;
+            if (in.typedOperands.size() > 1) width = in.typedOperands[1].widthBits;
+            if (!width) width = m == "movsxd" ? 32 : textualOperandWidth(b);
+            width = width <= 8 ? 8 : width <= 16 ? 16 : width <= 32 ? 32 : 64;
+            const bool zeroExtend = m == "movzx";
+            std::string cast;
+            if (zeroExtend) cast = "(unsigned __int" + std::to_string(width) + ")";
+            else if (width == 32) cast = "(int)";
+            else cast = "(__int" + std::to_string(width) + ")";
+            rhs = cast + rhs;
+        }
+        return A + " = " + rhs + ";";
+    }
     if (m == "lea") {
+        invalidateDestination(A, false);
         std::string rhs = cOperand(b);
         if (rhs.size() > 3 && rhs.rfind("*(", 0) == 0 && rhs.back() == ')') rhs = rhs.substr(2, rhs.size() - 3);
         return A + " = &(" + rhs + ");";
     }
-    if (m == "add")  { fl = { CmpKind::ArithZero, A, "" }; return A + " += " + B + ";"; }
-    if (m == "sub")  { fl = { CmpKind::ArithZero, A, "" }; return A + " -= " + B + ";"; }
-    if (m == "and")  { fl = { CmpKind::ArithZero, A, "" }; return A + " &= " + B + ";"; }
-    if (m == "or")   { fl = { CmpKind::ArithZero, A, "" }; return A + " |= " + B + ";"; }
-    if (m == "xor")  { fl = { CmpKind::ArithZero, A, "" }; return (two && a == b) ? (A + " = 0;") : (A + " ^= " + B + ";"); }
-    if (m == "shl" || m == "sal") return A + " <<= " + B + ";";
-    if (m == "shr" || m == "sar") return A + " >>= " + B + ";";
+    if (m == "add")  { fl.clear(); fl.write(destinationAliasesSource() ? static_cast<uint8_t>(kX86FlagZF | kX86FlagSF) : static_cast<uint8_t>(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF), CmpKind::AddResult, A, B, {}, conditionWidth(in), flagDependencies()); return A + " += " + B + ";"; }
+    if (m == "sub")  { fl.clear(); fl.write(destinationAliasesSource() ? static_cast<uint8_t>(kX86FlagZF | kX86FlagSF) : static_cast<uint8_t>(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF), CmpKind::SubResult, A, B, {}, conditionWidth(in), flagDependencies()); return A + " -= " + B + ";"; }
+    if (m == "and")  { fl.clear(); fl.write(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::LogicResult, A, B, {}, conditionWidth(in), flagDependencies()); return A + " &= " + B + ";"; }
+    if (m == "or")   { fl.clear(); fl.write(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::LogicResult, A, B, {}, conditionWidth(in), flagDependencies()); return A + " |= " + B + ";"; }
+    if (m == "xor")  { fl.clear(); fl.write(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::LogicResult, A, B, {}, conditionWidth(in), flagDependencies()); return (two && a == b) ? (A + " = 0;") : (A + " ^= " + B + ";"); }
+    if (m == "shl" || m == "sal") { fl.clear(); return A + " <<= " + B + ";"; }
+    if (m == "shr" || m == "sar") { fl.clear(); return A + " >>= " + B + ";"; }
     if (m == "rol" || m == "ror") {
+        fl.clear(); // count-dependent CF/OF are not modeled yet
         std::string amt = two ? B : "1";   // single-operand form rotates by 1
         return A + " = " + (m == "rol" ? "_rotl(" : "_rotr(") + A + ", " + amt + ");";
     }
     if (m == "imul") {
+        fl.clear(); // Only CF/OF are defined and need a product-width model.
         // 3-operand: imul dst, src, imm  ->  dst = src * imm;  2-operand: dst *= src.
         std::string s1, s2;
         if (two && split2(b, s1, s2)) return A + " = " + cOperand(s1) + " * " + cOperand(s2) + ";";
@@ -114,76 +268,70 @@ static std::string liftStmt(const Instruction& in, FlagState& fl,
         std::string lo, hi; accPair(lo, hi);                 // 1-operand: rdx:rax = rax * src
         return hi + ":" + lo + " = " + lo + " * " + A + ";";
     }
-    if (m == "mul") { std::string lo, hi; accPair(lo, hi); return hi + ":" + lo + " = " + lo + " * " + A + ";"; }
+    if (m == "mul") { fl.clear(); std::string lo, hi; accPair(lo, hi); return hi + ":" + lo + " = " + lo + " * " + A + ";"; }
     if (m == "div" || m == "idiv") {                         // rdx:rax / src -> quotient rax, remainder rdx
+        fl.clear();
         std::string lo, hi; accPair(lo, hi);
-        return lo + " = " + hi + ":" + lo + " / " + A + "; " + hi + " = " + hi + ":" + lo + " % " + A + ";";
+        const std::string width = std::to_string(accumulatorWidth());
+        const std::string kind = m == "idiv" ? "s" : "u";
+        char address[24];
+        std::snprintf(address, sizeof(address), "%llX", (unsigned long long)in.address);
+        const std::string suffix = "_" + std::string(address);
+        const std::string highSnapshot = "local_div_hi" + suffix;
+        const std::string lowSnapshot = "local_div_lo" + suffix;
+        const std::string sourceSnapshot = "local_div_src" + suffix;
+        const std::string args = highSnapshot + ", " + lowSnapshot + ", " + sourceSnapshot;
+        // Snapshot every input before either architectural output changes. This
+        // is essential for DIV AL/AH, whose outputs share AX, and when the
+        // divisor aliases an accumulator register.
+        return highSnapshot + " = " + hi + "; " + lowSnapshot + " = " + lo + "; " +
+               sourceSnapshot + " = " + A + "; " +
+               lo + " = " + kind + "div" + width + "(" + args + "); " +
+               hi + " = " + kind + "rem" + width + "(" + args + ");";
     }
-    if (m == "xchg" && two) return "swap(" + A + ", " + B + ");";
-    if (m == "bswap")       return A + " = bswap(" + A + ");";
-    if (m == "inc")  { fl = { CmpKind::ArithZero, A, "" }; return A + "++;"; }
-    if (m == "dec")  { fl = { CmpKind::ArithZero, A, "" }; return A + "--;"; }
-    if (m == "neg")  return A + " = -" + A + ";";
-    if (m == "not")  return A + " = ~" + A + ";";
-    if (m == "push" || m == "pop" || m == "nop" || m == "endbr64" || m == "endbr32" ||
-        m == "leave" || m == "hlt" || m == "int3" || m == "cdqe" || m == "cdq" || m == "cqo")
+    if (m == "xchg" && two) { invalidateDestination(A, a.find('[') != std::string::npos); invalidateDestination(B, b.find('[') != std::string::npos); return "swap(" + A + ", " + B + ");"; }
+    if (m == "bswap")       { invalidateDestination(A, false); return A + " = bswap(" + A + ");"; }
+    if (m == "inc")  { invalidateDestination(A, a.find('[') != std::string::npos); fl.clear(kX86FlagZF | kX86FlagSF | kX86FlagOF | kX86FlagPF); fl.write(kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::IncResult, A, "", {}, conditionWidth(in), flagDependencies()); return A + "++;"; }
+    if (m == "dec")  { invalidateDestination(A, a.find('[') != std::string::npos); fl.clear(kX86FlagZF | kX86FlagSF | kX86FlagOF | kX86FlagPF); fl.write(kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::DecResult, A, "", {}, conditionWidth(in), flagDependencies()); return A + "--;"; }
+    if (m == "neg")  { fl.clear(); fl.write(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::NegResult, A, "", {}, conditionWidth(in), flagDependencies()); return A + " = -" + A + ";"; }
+    if (m == "not")  { invalidateDestination(A, a.find('[') != std::string::npos); return A + " = ~" + A + ";"; }
+    if (m == "nop" || m == "endbr64" || m == "endbr32")
         return std::string();
-    if (m == "cmp")  { fl = { CmpKind::Cmp, A, B }; return std::string(); }
-    if (m == "test") { fl = (two && a == b) ? FlagState{ CmpKind::TestZero, A, "" } : FlagState{ CmpKind::TestAnd, A, B }; return std::string(); }
+    if (m == "cmp")  { fl.clear(); fl.write(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF, CmpKind::Cmp, A, B, {}, conditionWidth(in), flagDependencies()); return std::string(); }
+    if (m == "test") {
+        fl.clear();
+        fl.write(kX86FlagCF | kX86FlagZF | kX86FlagSF | kX86FlagOF,
+                 (two && a == b) ? CmpKind::TestZero : CmpKind::TestAnd,
+                 A, (two && a == b) ? std::string() : B, {}, conditionWidth(in), flagDependencies());
+        return std::string();
+    }
     if (m == "call") {
+        fl = {}; // x86 calls do not preserve condition flags
         if (HasBranchTarget(in)) return callName(in.branchTarget) + "();";
         return "(*" + cOperand(in.operands) + ")();";
     }
     // Flag-consuming forms: render against the condition the preceding cmp/test set.
-    if (m.size() > 3 && m.rfind("set", 0) == 0)            // setcc:  dst = (condition)
-        return A + " = (" + condString("j" + m.substr(3), fl, false) + ");";
-    if (m.size() > 4 && two && m.rfind("cmov", 0) == 0)    // cmovcc: if (cond) dst = src
-        return "if (" + condString("j" + m.substr(4), fl, false) + ") " + A + " = " + B + ";";
+    if (m.size() > 3 && m.rfind("set", 0) == 0) {          // setcc:  dst = (condition)
+        const std::string condition = condString("j" + m.substr(3), fl, false);
+        invalidateDestination(A, a.find('[') != std::string::npos);
+        return A + " = (" + condition + ");";
+    }
+    if (m.size() > 4 && two && m.rfind("cmov", 0) == 0) {  // cmovcc: if (cond) dst = src
+        const std::string condition = condString("j" + m.substr(4), fl, false);
+        invalidateDestination(A, a.find('[') != std::string::npos);
+        return "if (" + condition + ") " + A + " = " + B + ";";
+    }
     // Anything not modelled: keep it as an inline-asm comment so nothing is lost.
+    fl = {}; // an unmodelled instruction may have overwritten flag provenance
     if (in.operands.empty()) return "__asm { " + m + " };";
     return "__asm { " + m + " " + in.operands + " };";
 }
 
 // Map a Jcc mnemonic to a C comparison operator (and its negation). Returns
 // false for branches we don't model as a relational test.
-static bool condOp(const std::string& m, const char*& op, const char*& neg) {
-    if (m == "je"  || m == "jz")  { op = "=="; neg = "!="; return true; }
-    if (m == "jne" || m == "jnz") { op = "!="; neg = "=="; return true; }
-    if (m == "jg"  || m == "jnle" || m == "ja"  || m == "jnbe") { op = ">";  neg = "<="; return true; }
-    if (m == "jge" || m == "jnl"  || m == "jae" || m == "jnb" || m == "jnc") { op = ">="; neg = "<"; return true; }
-    if (m == "jl"  || m == "jnge" || m == "jb"  || m == "jc" || m == "jnae") { op = "<";  neg = ">="; return true; }
-    if (m == "jle" || m == "jng"  || m == "jbe" || m == "jna") { op = "<="; neg = ">";  return true; }
-    return false;
-}
-
 // Render the condition under which block `m`'s conditional branch is TAKEN.
 static std::string condString(const std::string& mnem, const FlagState& fl, bool negate) {
-    const char* op; const char* neg;
-    if (mnem == "js" || mnem == "jns") {
-        // SF reflects the sign of the result. After `cmp a,b` that result is (a-b),
-        // so js == signed a<b; for test/arith the value tested is the result itself.
-        bool sign = (mnem == "js");
-        if (negate) sign = !sign;
-        std::string lhs = fl.lhs.empty() ? "flags" : fl.lhs;
-        if (fl.kind == CmpKind::Cmp)
-            return "(int64_t)" + lhs + (sign ? " < " : " >= ") + "(int64_t)" + fl.rhs;
-        std::string v = (fl.kind == CmpKind::TestAnd) ? "(" + lhs + " & " + fl.rhs + ")" : lhs;
-        return "(int64_t)" + v + (sign ? " < 0" : " >= 0");
-    }
-    if (!condOp(mnem, op, neg)) {
-        // Unmodelled branch (jp, jo, loop, jcxz, ...): expose the raw predicate.
-        std::string base = mnem + "_cc";
-        return negate ? "!" + base : base;
-    }
-    const char* o = negate ? neg : op;
-    std::string lhs = fl.lhs.empty() ? "flags" : fl.lhs;
-    switch (fl.kind) {
-        case CmpKind::Cmp:       return lhs + " " + o + " " + fl.rhs;
-        case CmpKind::TestZero:  return lhs + " " + o + " 0";
-        case CmpKind::TestAnd:   return "(" + lhs + " & " + fl.rhs + ") " + o + " 0";
-        case CmpKind::ArithZero: return lhs + " " + o + " 0";
-        default:                 return lhs + " " + o + " 0";
-    }
+    return RenderX86Condition(mnem, fl, negate);
 }
 
 // ------------------------------------------------------------- dominators ---
@@ -266,7 +414,7 @@ static std::string switchVar(const Instruction& in) {
 
 // ---------------------------------------------------------- the structurer --
 
-struct Term { enum Kind { Return, Uncond, Cond, Fall, External, Switch } kind = Fall; };
+struct Term { enum Kind { Return, NoReturnCall, Uncond, Cond, Fall, External, Indirect, Switch } kind = Fall; };
 
 struct Structurer {
     const ControlFlowGraph& g;
@@ -274,18 +422,26 @@ struct Structurer {
 
     int N;
     std::unordered_map<uint64_t, int> startToIdx;
-    // Lifted body statements per block, each tagged with its source VA: the
-    // instruction address in the legacy lift, the block start in the deep
-    // data-flow path (whose const-prop/DCE merges statements, so only block
-    // granularity survives). Feeds DecompResult::lineVA.
-    std::vector<std::vector<std::pair<std::string, uint64_t>>> stmts;
+    struct LiftedStatement {
+        std::string text;
+        uint64_t sourceVA = 0;
+        SourceOriginGranularity granularity = SourceOriginGranularity::Synthetic;
+    };
+    // Propagation and DCE retain/eliminate the instruction origin with each
+    // statement. This keeps deep pseudocode navigation exact, including VA 0.
+    std::vector<std::vector<LiftedStatement>> stmts;
     std::vector<FlagState>  flag;                  // flag state feeding the terminator
     std::vector<std::string> condMnem;             // terminator Jcc mnemonic (cond blocks)
     std::vector<Term::Kind>  term;
     std::vector<int> trueIdx, falseIdx, uncondIdx, fallIdx;   // successor block indices (-1 = none/external)
     std::vector<uint64_t> extTarget;               // external branch VA when a target is out of range
     std::vector<std::vector<int>> caseIdx;         // switch blocks: case target block indices (-1 = external)
+    std::vector<std::vector<int64_t>> caseValue;   // exact switch keys (sparse JVM keys included)
+    std::vector<int> switchDefaultIdx;              // default target block, -1 when external/absent
+    std::vector<uint64_t> switchDefaultTarget;
+    std::vector<char> switchDefaultValid;
     std::vector<std::string>      switchExpr;      // switch blocks: recovered selector expression
+    std::vector<std::string>      indirectExpr;    // unresolved indirect branch operand
 
     std::vector<std::vector<int>> succ;            // forward adjacency (block indices)
     std::vector<int> idom, ipdom;
@@ -302,16 +458,26 @@ struct Structurer {
     // emitted line; va 0 = synthetic) and joined into the final text by run().
     std::vector<std::string> lines_;
     std::vector<uint64_t>    lineVAs_;
+    std::vector<SourceOrigin> lineOrigins_;
     bool collecting = false;     // pass 1: discover labels; pass 2: emit
     int  emitted = 0;            // guard against pathological blow-up
 
     bool           deep_ = false;   // data-flow pass active
+    bool           rawUnsupported_ = false;
     DataFlowResult df_;             // per-block named/propagated statements + flags + decls
+    bool           outputTruncated_ = false;
 
     Structurer(const ControlFlowGraph& cfg, const DecompileOptions& o) : g(cfg), opt(o) {
         N = (int)g.blocks.size();
-        deep_ = o.deepDataFlow;
-        if (deep_) { df_ = AnalyzeDataFlow(cfg, o.nameFor, o.dataRefFor, o.callArgs); if (!df_.ok) deep_ = false; }
+        const Arch targetArch = o.target.architecture;
+        const DecompileABI targetABI = o.target.abi;
+        deep_ = o.deepDataFlow && (targetArch == Arch::X86 || targetArch == Arch::X64);
+        rawUnsupported_ = targetArch != Arch::X86 && targetArch != Arch::X64;
+        if (deep_) {
+            df_ = AnalyzeDataFlow(cfg, o.nameFor, o.dataRefFor, o.callArgs,
+                                  targetArch, targetABI);
+            if (!df_.ok) deep_ = false;
+        }
         build();
     }
 
@@ -321,58 +487,88 @@ struct Structurer {
         stmts.resize(N); flag.resize(N); condMnem.resize(N); term.resize(N);
         trueIdx.assign(N, -1); falseIdx.assign(N, -1); uncondIdx.assign(N, -1); fallIdx.assign(N, -1);
         extTarget.assign(N, 0); succ.resize(N);
-        caseIdx.resize(N); switchExpr.resize(N);
+        caseIdx.resize(N); caseValue.resize(N); switchExpr.resize(N); indirectExpr.resize(N);
+        switchDefaultIdx.assign(N, -1); switchDefaultTarget.assign(N, 0); switchDefaultValid.assign(N, 0);
         for (int i = 0; i < N; ++i) startToIdx[g.blocks[i].start] = i;
 
         for (int i = 0; i < N; ++i) {
             const BasicBlock& b = g.blocks[i];
             if (b.insns.empty()) { term[i] = Term::Fall; continue; }
-            const Instruction& last = b.insns.back();
+            const Instruction& transfer = BlockTransferInstruction(b);
             // Body statements + terminator flag come from the data-flow pass (named,
             // propagated, dead-code-eliminated) when it ran; otherwise fall back to
             // the per-instruction string lift. The terminator (ret/jmp/jcc) is
             // handled by the structuring below in both cases.
             if (deep_) {
-                // Data-flow statements have no 1:1 instruction origin (const-prop /
-                // DCE rewrote them); tag each with the block start.
                 stmts[i].reserve(df_.blockStmts[i].size());
-                for (auto& s : df_.blockStmts[i]) stmts[i].emplace_back(s, b.start);
+                for (const DataFlowStatement& s : df_.blockStmts[i])
+                    stmts[i].push_back({s.text, s.sourceValid ? s.sourceVA : b.start,
+                                        s.sourceValid ? SourceOriginGranularity::Instruction
+                                                      : SourceOriginGranularity::BasicBlock});
                 flag[i]  = df_.termFlag[i];
             } else {
                 FlagState fl;
-                size_t bodyCount = b.insns.size();
-                // A trailing CALL is NOT a terminator, so keep it as a statement.
-                bool isTerm = b.isReturn || b.isUncond || (last.isBranch && !last.isCall);
-                if (isTerm && bodyCount > 0) --bodyCount;  // exclude terminator
-                for (size_t k = 0; k < bodyCount; ++k) {
-                    std::string s = liftStmt(b.insns[k], fl, opt.nameFor);
-                    if (!s.empty()) stmts[i].emplace_back(std::move(s), b.insns[k].address);
+                for (size_t k = 0; k < b.insns.size(); ++k) {
+                    if (k == b.transferIndex && !b.isNoReturnCall) continue; // retain noreturn call + delay-slot work
+                    std::string s = rawUnsupported_
+                        ? "__asm { " + InstructionText(b.insns[k]) + " };"
+                        : liftStmt(b.insns[k], fl, opt.nameFor);
+                    if (!s.empty()) stmts[i].push_back({std::move(s), b.insns[k].address,
+                                                        SourceOriginGranularity::Instruction});
                 }
                 flag[i] = fl;
             }
 
-            uint64_t fallVA = last.address + last.length;
+            uint64_t fallVA = b.end;
             int fall = idxOf(fallVA);
+            // The CFG is authoritative about fallthrough. In particular, two
+            // noncontiguous input chunks may be numerically adjacent but must not
+            // acquire an edge unless the caller supplied an explicit transfer.
+            if (fall >= 0 && std::find(b.succ.begin(), b.succ.end(), static_cast<size_t>(fall)) == b.succ.end())
+                fall = -1;
             if (b.isSwitch) {
                 term[i] = Term::Switch;
-                for (uint64_t t : b.caseTargets) caseIdx[i].push_back(idxOf(t));
-                switchExpr[i] = switchVar(last);
+                if (!b.switchCases.empty()) {
+                    for (const auto& c : b.switchCases) {
+                        caseValue[i].push_back(c.value);
+                        caseIdx[i].push_back(c.targetValid ? idxOf(c.target) : -1);
+                    }
+                } else {
+                    for (size_t c = 0; c < b.caseTargets.size(); ++c) {
+                        caseValue[i].push_back(static_cast<int64_t>(c));
+                        caseIdx[i].push_back(idxOf(b.caseTargets[c]));
+                    }
+                }
+                switchDefaultValid[i] = b.switchDefaultTargetValid;
+                switchDefaultTarget[i] = b.switchDefaultTarget;
+                if (b.switchDefaultTargetValid) switchDefaultIdx[i] = idxOf(b.switchDefaultTarget);
+                switchExpr[i] = switchVar(transfer);
             } else if (b.isReturn) {
                 term[i] = Term::Return;
+            } else if (b.isNoReturnCall) {
+                term[i] = Term::NoReturnCall;
             } else if (b.isUncond) {
-                int t = HasBranchTarget(last) ? idxOf(last.branchTarget) : -1;
-                if (t < 0) { term[i] = Term::External; extTarget[i] = last.branchTarget; }
-                else       { term[i] = Term::Uncond;   uncondIdx[i] = t; }
-            } else if (last.isBranch && !last.isCall) {
-                // Conditional jump.
-                if (HasBranchTarget(last)) {
-                    term[i] = Term::Cond;
-                    condMnem[i] = last.mnemonic;
-                    trueIdx[i]  = idxOf(last.branchTarget);
-                    falseIdx[i] = fall;
-                    if (trueIdx[i] < 0) extTarget[i] = last.branchTarget;
+                uint64_t directTarget = 0;
+                if (!TryGetDirectTarget(transfer, directTarget)) {
+                    term[i] = Term::Indirect;
+                    indirectExpr[i] = cOperand(transfer.operands);
                 } else {
-                    term[i] = Term::External; // unresolved indirect control transfer
+                    int t = idxOf(directTarget);
+                    if (t < 0) { term[i] = Term::External; extTarget[i] = directTarget; }
+                    else       { term[i] = Term::Uncond;   uncondIdx[i] = t; }
+                }
+            } else if (InstructionEndsBlock(transfer)) {
+                // Conditional jump.
+                uint64_t directTarget = 0;
+                if (TryGetDirectTarget(transfer, directTarget)) {
+                    term[i] = Term::Cond;
+                    condMnem[i] = transfer.mnemonic;
+                    trueIdx[i]  = idxOf(directTarget);
+                    falseIdx[i] = fall;
+                    if (trueIdx[i] < 0) extTarget[i] = directTarget;
+                } else {
+                    term[i] = Term::Indirect; // unresolved indirect control transfer
+                    indirectExpr[i] = cOperand(transfer.operands);
                 }
             } else {
                 // Straight-line (incl. ending in a call): fall through.
@@ -385,7 +581,10 @@ struct Structurer {
                 case Term::Cond:   add(trueIdx[i]); add(falseIdx[i]); break;
                 case Term::Uncond: add(uncondIdx[i]); break;
                 case Term::Fall:   add(fallIdx[i]); break;
-                case Term::Switch: for (int t : caseIdx[i]) add(t); break;
+                case Term::Switch:
+                    for (int t : caseIdx[i]) add(t);
+                    add(switchDefaultIdx[i]);
+                    break;
                 default: break;    // Return / External: no in-range successors
             }
         }
@@ -398,7 +597,8 @@ struct Structurer {
         std::vector<std::vector<int>> rsucc(N + 1);
         int exit = N;
         for (int u = 0; u < N; ++u) {
-            bool isExit = (term[u] == Term::Return || term[u] == Term::External || succ[u].empty());
+            bool isExit = (term[u] == Term::Return || term[u] == Term::NoReturnCall ||
+                           term[u] == Term::External || term[u] == Term::Indirect || succ[u].empty());
             if (isExit) { rsucc[exit].push_back(u); rsucc[u].push_back(exit); }
             for (int v : succ[u]) rsucc[v].push_back(u);   // reverse edge
         }
@@ -468,20 +668,36 @@ struct Structurer {
     std::string locLabel(int idx) const {
         char b[32]; std::snprintf(b, sizeof(b), "loc_%llX", (unsigned long long)g.blocks[idx].start); return b;
     }
-    void line(int depth, const std::string& s, uint64_t va = 0) {
+    void line(int depth, const std::string& s) {
+        if (collecting) return;
+        std::string l((size_t)depth * 4, ' '); l += s;
+        lines_.push_back(std::move(l)); lineVAs_.push_back(0);
+        lineOrigins_.push_back({ 0, false, SourceOriginGranularity::Synthetic });
+    }
+    void line(int depth, const std::string& s, uint64_t va,
+              SourceOriginGranularity granularity = SourceOriginGranularity::Instruction) {
         if (collecting) return;
         std::string l((size_t)depth * 4, ' '); l += s;
         lines_.push_back(std::move(l)); lineVAs_.push_back(va);
+        lineOrigins_.push_back({ va, true, granularity });
     }
-    void rawline(const std::string& s, uint64_t va = 0) {
+    void rawline(const std::string& s) {
+        if (collecting) return;
+        lines_.push_back(s); lineVAs_.push_back(0);
+        lineOrigins_.push_back({ 0, false, SourceOriginGranularity::Synthetic });
+    }
+    void rawline(const std::string& s, uint64_t va,
+                 SourceOriginGranularity granularity = SourceOriginGranularity::Instruction) {
         if (collecting) return;
         lines_.push_back(s); lineVAs_.push_back(va);
+        lineOrigins_.push_back({ va, true, granularity });
     }
     // Source VA for block n's terminator lines (return/goto/if/switch/while):
     // its last instruction, or the block start for an empty block.
     uint64_t termVA(int n) const {
         if (n < 0 || n >= N) return 0;
-        return g.blocks[n].insns.empty() ? g.blocks[n].start : g.blocks[n].insns.back().address;
+        if (g.blocks[n].insns.empty()) return g.blocks[n].start;
+        return BlockTransferInstruction(g.blocks[n]).address;
     }
 
     // A control transfer to block t from inside the current context: returns a
@@ -508,11 +724,15 @@ struct Structurer {
         return "";
     }
 
-    void emitStmts(int n, int depth) { for (auto& s : stmts[n]) line(depth, s.first, s.second); }
+    void emitStmts(int n, int depth) {
+        for (const LiftedStatement& s : stmts[n])
+            line(depth, s.text, s.sourceVA, s.granularity);
+    }
 
     void emitFrom(int n, int stop, int depth) {
         while (n >= 0 && n != stop) {
-            if (visited[n]) { needLabel[n] = 1; line(depth, "goto " + locLabel(n) + ";", g.blocks[n].start); return; }
+            if (visited[n]) { needLabel[n] = 1; line(depth, "goto " + locLabel(n) + ";", g.blocks[n].start,
+                                                    SourceOriginGranularity::BasicBlock); return; }
             if (isHeader[n] && (loopStack.empty() || loopStack.back().header != n)) {
                 emitLoop(n, depth);
                 int f = loopFollow[n];
@@ -521,8 +741,12 @@ struct Structurer {
                 continue;
             }
             visited[n] = 1;
-            if (++emitted > 100000) { line(depth, "/* output truncated */"); return; }
-            if (needLabel[n]) rawline(locLabel(n) + ":", g.blocks[n].start);
+            if (++emitted > 100000) {
+                outputTruncated_ = true;
+                line(depth, "/* output truncated */");
+                return;
+            }
+            if (needLabel[n]) rawline(locLabel(n) + ":", g.blocks[n].start, SourceOriginGranularity::BasicBlock);
             emitStmts(n, depth);
             n = emitTerminator(n, depth);
         }
@@ -541,9 +765,18 @@ struct Structurer {
                 } else
                     line(depth, "return;", tva);
                 return -1;
+            case Term::NoReturnCall:
+                line(depth, "__builtin_unreachable(); /* noreturn */", tva);
+                return -1;
             case Term::External: {
                 char b[40]; std::snprintf(b, sizeof(b), "goto loc_%llX; /* tail */", (unsigned long long)extTarget[n]);
                 line(depth, b, tva); return -1;
+            }
+            case Term::Indirect: {
+                std::string operand = trim(indirectExpr[n]);
+                if (operand.empty()) operand = "unknown_target";
+                line(depth, "goto *(" + operand + "); /* unresolved indirect */", tva);
+                return -1;
             }
             case Term::Uncond: {
                 int t = uncondIdx[n];
@@ -553,18 +786,18 @@ struct Structurer {
                 line(depth, a, tva); return -1;
             }
             case Term::Switch: {
-                // Recovered jump table -> switch/case. Cases are labelled by table
-                // index; each body runs to the switch's post-dominator (the join),
+                // Recovered jump table -> switch/case. Cases retain their decoded
+                // key (including sparse/negative JVM keys); each body runs to the switch's post-dominator (the join),
                 // then breaks. Already-emitted targets become goto/continue/break.
                 int join = ipdom[n];
                 line(depth, "switch (" + (switchExpr[n].empty() ? std::string("switch_index") : switchExpr[n]) + ") {", tva);
                 for (size_t c = 0; c < caseIdx[n].size(); ++c) {
-                    char cl[32]; std::snprintf(cl, sizeof(cl), "case %zu:", c);
-                    line(depth, cl, tva);
+                    const int64_t value = c < caseValue[n].size() ? caseValue[n][c] : static_cast<int64_t>(c);
+                    line(depth, "case " + std::to_string(value) + ":", tva);
                     int t = caseIdx[n][c];
                     if (t < 0) { line(depth + 1, "break; /* unresolved case */", tva); continue; }
                     std::string a = goTo(t);
-                    if (!a.empty()) { line(depth + 1, a, g.blocks[t].start); continue; }
+                    if (!a.empty()) { line(depth + 1, a, g.blocks[t].start, SourceOriginGranularity::BasicBlock); continue; }
                     // Stop bound for this case body: the post-dominator join when one
                     // exists, else (no reconvergence; join == -1) the NEAREST distinct
                     // sibling-case entry by address. A -1 ("run to exit") stop would let
@@ -586,6 +819,23 @@ struct Structurer {
                     emitFrom(t, stop, depth + 1);
                     line(depth + 1, "break;", tva);
                 }
+                if (switchDefaultValid[n]) {
+                    line(depth, "default:", tva);
+                    const int t = switchDefaultIdx[n];
+                    if (t < 0) {
+                        char target[32];
+                        std::snprintf(target, sizeof(target), "goto loc_%llX; /* external default */",
+                                      (unsigned long long)switchDefaultTarget[n]);
+                        line(depth + 1, target, tva);
+                    } else {
+                        std::string a = goTo(t);
+                        if (!a.empty()) line(depth + 1, a, g.blocks[t].start, SourceOriginGranularity::BasicBlock);
+                        else {
+                            emitFrom(t, join, depth + 1);
+                            line(depth + 1, "break;", tva);
+                        }
+                    }
+                }
                 line(depth, "}", tva);
                 return join;
             }
@@ -602,10 +852,23 @@ struct Structurer {
                 // External taken target.
                 if (ct < 0) {
                     char tgt[24]; std::snprintf(tgt, sizeof(tgt), "%llX", (unsigned long long)extTarget[n]);
-                    line(depth, "if (" + cond + ") goto loc_" + tgt + ";", tva);  // don't truncate an unbounded condition
-                    std::string af = goTo(cf);
-                    if (af.empty()) return cf;
-                    line(depth, af, tva); return -1;
+                    // Keep both branch arms explicit.  The taken edge leaves the
+                    // supplied function, so every in-function fallthrough block is
+                    // controlled by the inverse condition and belongs inside the
+                    // else arm.  A one-line guard followed by inline fallthrough is
+                    // equivalent in C, but loses that relationship in source-oriented
+                    // Python because goto_label() is only an explicit flow placeholder.
+                    line(depth, "if (" + cond + ") {", tva);
+                    line(depth + 1, "goto loc_" + std::string(tgt) + ";", tva);
+                    line(depth, "}", tva);
+                    if (cf >= 0) {
+                        line(depth, "else {", tva);
+                        std::string af = goTo(cf);
+                        if (af.empty()) emitFrom(cf, -1, depth + 1);
+                        else line(depth + 1, af, tva);
+                        line(depth, "}", tva);
+                    }
+                    return -1;
                 }
                 std::string at = goTo(ct), af = goTo(cf);
                 if (!at.empty() && !af.empty()) {                 // both branches exit
@@ -658,7 +921,7 @@ struct Structurer {
 
     void emitLoop(int h, int depth) {
         visited[h] = 1;
-        if (needLabel[h]) rawline(locLabel(h) + ":", g.blocks[h].start);
+        if (needLabel[h]) rawline(locLabel(h) + ":", g.blocks[h].start, SourceOriginGranularity::BasicBlock);
         int follow = loopFollow[h];
 
         // Pre-tested if the header itself is the 2-way test with one arm leaving
@@ -684,12 +947,23 @@ struct Structurer {
             line(depth, "while (" + cond + ") {", termVA(h));
             emitFrom(bodyEntry, h, depth + 1);
             line(depth, "}", termVA(h));
+            // When the header's taken arm leaves the supplied function, loop
+            // recovery consumes that Jcc while choosing the in-loop fallthrough
+            // as the body.  Preserve the destination after the reconstructed
+            // loop; otherwise a polling/retry loop silently loses its exit edge.
+            // `trueIdx < 0` is the validity bit here (VA zero is a valid target).
+            if (!bodyIsTrue && trueIdx[h] < 0) {
+                char target[24];
+                std::snprintf(target, sizeof(target), "%llX",
+                              static_cast<unsigned long long>(extTarget[h]));
+                line(depth, "goto loc_" + std::string(target) + ";", termVA(h));
+            }
         } else {
-            line(depth, "while (1) {", g.blocks[h].start);
+            line(depth, "while (1) {", g.blocks[h].start, SourceOriginGranularity::BasicBlock);
             emitStmts(h, depth + 1);
             int nxt = emitTerminator(h, depth + 1);
             emitFrom(nxt, h, depth + 1);
-            line(depth, "}", g.blocks[h].start);
+            line(depth, "}", g.blocks[h].start, SourceOriginGranularity::BasicBlock);
         }
         loopStack.pop_back();
     }
@@ -700,7 +974,8 @@ struct Structurer {
     // any loop that doesn't match the exact shape is left as a while. Operates on
     // the line/VA vectors in place (the rewritten `for` keeps the while header's
     // VA; the hoisted step line's VA entry is erased with it).
-    static void reconstructForLoops(std::vector<std::string>& L, std::vector<uint64_t>& V) {
+    static void reconstructForLoops(std::vector<std::string>& L, std::vector<uint64_t>& V,
+                                    std::vector<SourceOrigin>& O) {
         auto indentOf = [](const std::string& l) { size_t i = 0; while (i < l.size() && (l[i] == ' ' || l[i] == '\t')) ++i; return l.substr(0, i); };
         auto trimd = [](const std::string& l) { size_t a = l.find_first_not_of(" \t"); size_t b = l.find_last_not_of(" \t"); return a == std::string::npos ? std::string() : l.substr(a, b - a + 1); };
         auto isIdent = [](const std::string& s) {
@@ -760,6 +1035,7 @@ struct Structurer {
             L[i] = ind + "for (; " + cond + "; " + step + ") {";
             L.erase(L.begin() + s);
             V.erase(V.begin() + s);
+            O.erase(O.begin() + s);
         }
     }
 
@@ -852,7 +1128,8 @@ struct Structurer {
     //
     // Both refuse to cross a call/store-bearing RHS into a position that would
     // change evaluation order, and never touch args (a<N>) or stack locals.
-    static void foldTempsPass(std::vector<std::string>& L, std::vector<uint64_t>& V) {
+    static void foldTempsPass(std::vector<std::string>& L, std::vector<uint64_t>& V,
+                              std::vector<SourceOrigin>& O) {
         auto rhsHasCall = [](const std::string& rhs) {
             for (size_t k = 0; k + 1 < rhs.size(); ++k)
                 if (rhs[k] == '(' && k > 0 && identCh(rhs[k - 1])) return true;
@@ -921,6 +1198,7 @@ struct Structurer {
                         L[i] = ind + lhs1 + " = " + E + " " + op2 + " " + rhs2 + ";";
                         L.erase(L.begin() + j);
                         V.erase(V.begin() + j);
+                        O.erase(O.begin() + j);
                         continue;     // re-examine in case of a longer chain
                     }
                 }
@@ -937,14 +1215,32 @@ struct Structurer {
             if (parseAssign(a, lhs, op, rhs) && op.empty() && isTempVar(lhs) && !rhsHasCall(rhs)) {
                 size_t j = i + 1; while (j < L.size() && trim_(L[j]).empty()) ++j;
                 if (j < L.size() && ind_of(L[j]) == ind) {
-                    int total = 0; for (const std::string& l : L) total += wordCount(l, lhs);
+                    auto isDeclaration = [&](const std::string& l) {
+                        const std::string t = trim_(l);
+                        return (t.rfind("int " + lhs, 0) == 0 ||
+                                t.rfind("__int64 " + lhs, 0) == 0 ||
+                                t.rfind("void *" + lhs, 0) == 0) && t.back() == ';';
+                    };
+                    int total = 0;
+                    for (size_t k = 0; k < L.size(); ++k)
+                        if (k != i && !isDeclaration(L[k])) total += wordCount(L[k], lhs);
                     int onJ = wordCount(L[j], lhs);
                     std::string ut = trim_(L[j]);
                     bool destOk = !ut.empty() && (ut.back() == ';' || ut.back() == '{');
-                    if (total == 2 && onJ == 1 && destOk) {
+                    if (total == 1 && onJ == 1 && destOk) {
                         L[j] = wordReplace(L[j], lhs, "(" + rhs + ")");
                         L.erase(L.begin() + i);
                         V.erase(V.begin() + i);
+                        O.erase(O.begin() + i);
+                        // The folded temporary no longer exists; remove its now-
+                        // stale declaration as well (and the matching source map).
+                        for (size_t d = 0; d < L.size(); ++d) {
+                            if (!isDeclaration(L[d])) continue;
+                            L.erase(L.begin() + d);
+                            V.erase(V.begin() + d);
+                            O.erase(O.begin() + d);
+                            break;
+                        }
                         advanced = true;
                     }
                 }
@@ -1016,24 +1312,32 @@ struct Structurer {
         if (opt.nameFor) fname = opt.nameFor(funcStart);
         if (fname.empty()) { char b[32]; std::snprintf(b, sizeof(b), "sub_%llX", (unsigned long long)funcStart); fname = b; }
 
-        if (N == 0) return { "// nothing decoded at this address\n", { 0 } };
+        if (N == 0) {
+            DecompResult empty;
+            empty.text = "// nothing decoded at this address\n";
+            empty.lineVA = { 0 };
+            empty.lineOrigins = { { 0, false } };
+            empty.complete = g.complete;
+            empty.incompleteReason = g.incompleteReason;
+            return empty;
+        }
 
         // Pass 1: discover which blocks need labels (goto targets).
         needLabel.assign(N, 0);
         visited.assign(N, 0);
-        loopStack.clear(); collecting = true; emitted = 0; lines_.clear(); lineVAs_.clear();
+        loopStack.clear(); collecting = true; emitted = 0; lines_.clear(); lineVAs_.clear(); lineOrigins_.clear();
         emitFrom(0, -1, 1);
 
         // Pass 2: emit for real with labels in place.
         visited.assign(N, 0);
-        loopStack.clear(); collecting = false; emitted = 0; lines_.clear(); lineVAs_.clear();
+        loopStack.clear(); collecting = false; emitted = 0; lines_.clear(); lineVAs_.clear(); lineOrigins_.clear();
         // Header: when the data-flow pass detected parameters, list exactly those (the
         // body names them a1..aN, so the header matches the body) — this surfaces the
         // x86 cdecl/stdcall + Win64 register args. Keep guessSignature's inferred return
         // type when it gave one. Otherwise fall back to the inferred "<ret> (args)"
         // signature (name spliced in) or a plain nullary header (legacy path unchanged).
         std::string header;
-        if (deep_ && opt.x86 && !df_.args.empty()) {
+        if (deep_ && !df_.args.empty()) {
             std::string ret = "__int64";
             if (!opt.signature.empty()) {
                 size_t p = opt.signature.find('(');
@@ -1062,12 +1366,12 @@ struct Structurer {
         emitFrom(0, -1, 1);
         rawline("}");
         if (deep_) {
-            reconstructForLoops(lines_, lineVAs_);
+            reconstructForLoops(lines_, lineVAs_, lineOrigins_);
             // Readability post-passes A -> B -> C (deep path only). Order matters:
             // rename counters first (so folding/gloss see the friendly names), then
             // fold single-use temps, then gloss the surviving conditions.
             if (opt.prettyNames)    prettyNamesPass(lines_, lineVAs_);
-            if (opt.foldTemps)      foldTempsPass(lines_, lineVAs_);
+            if (opt.foldTemps)      foldTempsPass(lines_, lineVAs_, lineOrigins_);
             if (opt.conditionGloss) conditionGlossPass(lines_, lineVAs_);
         }
 
@@ -1076,6 +1380,13 @@ struct Structurer {
         DecompResult r;
         for (const std::string& l : lines_) { r.text += l; r.text += '\n'; }
         r.lineVA = std::move(lineVAs_);
+        r.lineOrigins = std::move(lineOrigins_);
+        r.complete = g.complete && !outputTruncated_;
+        r.incompleteReason = g.incompleteReason;
+        if (outputTruncated_) {
+            if (!r.incompleteReason.empty()) r.incompleteReason += "; ";
+            r.incompleteReason += "decompiler output statement budget exhausted";
+        }
         return r;
     }
 };
@@ -1102,6 +1413,7 @@ static size_t pyMatchParen(const std::string& s, size_t open) {
 
 static bool pyIdentChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
 static bool pyKeyword(const std::string& s);
+static bool pyTypeWord(const std::string& s);
 static std::string pyIdentifier(const std::string& raw, const char* fallback);
 
 static bool pyDottedIdentifier(const std::string& s) {
@@ -1117,6 +1429,112 @@ static bool pyDottedIdentifier(const std::string& s) {
         b = e + 1;
     }
     return true;
+}
+
+// Remove syntax that is valid on C literals but not on Python literals. Native
+// instruction operands commonly retain ULL/i64/f suffixes, and data references
+// may be rendered as wide C strings. The value itself is unchanged.
+static std::string pyLiteralSyntax(const std::string& s) {
+    static const char* kSuffixes[] = {
+        "ui64", "i64", "ull", "llu", "ul", "lu", "ll", "u", "l", "f",
+    };
+    std::string out;
+    out.reserve(s.size());
+    char quote = 0;
+    for (size_t i = 0; i < s.size();) {
+        const char c = s[i];
+        if (quote) {
+            out += c;
+            if (c == '\\' && i + 1 < s.size()) {
+                out += s[i + 1];
+                i += 2;
+                continue;
+            }
+            if (c == quote) quote = 0;
+            ++i;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            quote = c;
+            out += c;
+            ++i;
+            continue;
+        }
+
+        // L"...", u8"...", U'...' -> ordinary Python str literals. Python's
+        // `u` prefix would be legal, but dropping every C width prefix produces
+        // one stable spelling and avoids the invalid `u8`/`L` variants.
+        const bool boundary = i == 0 || !pyIdentChar(s[i - 1]);
+        size_t prefix = 0;
+        if (boundary && i + 2 < s.size() && s[i] == 'u' && s[i + 1] == '8' &&
+            (s[i + 2] == '"' || s[i + 2] == '\''))
+            prefix = 2;
+        else if (boundary && i + 1 < s.size() &&
+                 (s[i] == 'L' || s[i] == 'u' || s[i] == 'U') &&
+                 (s[i + 1] == '"' || s[i + 1] == '\''))
+            prefix = 1;
+        if (prefix) {
+            i += prefix;
+            continue;
+        }
+
+        if (std::isdigit((unsigned char)c) && boundary) {
+            size_t j = i;
+            bool decimalFloat = false;
+            if (j + 2 <= s.size() && s[j] == '0' && j + 1 < s.size() &&
+                (s[j + 1] == 'x' || s[j + 1] == 'X')) {
+                j += 2;
+                while (j < s.size() && std::isxdigit((unsigned char)s[j])) ++j;
+            } else if (j + 2 <= s.size() && s[j] == '0' && j + 1 < s.size() &&
+                       (s[j + 1] == 'b' || s[j + 1] == 'B')) {
+                j += 2;
+                while (j < s.size() && (s[j] == '0' || s[j] == '1')) ++j;
+            } else {
+                while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
+                if (j < s.size() && s[j] == '.') {
+                    decimalFloat = true;
+                    ++j;
+                    while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
+                }
+                if (j < s.size() && (s[j] == 'e' || s[j] == 'E')) {
+                    decimalFloat = true;
+                    size_t exponent = j++;
+                    if (j < s.size() && (s[j] == '+' || s[j] == '-')) ++j;
+                    size_t digits = j;
+                    while (j < s.size() && std::isdigit((unsigned char)s[j])) ++j;
+                    if (digits == j) j = exponent; // malformed exponent: leave it alone
+                }
+            }
+
+            size_t suffixLen = 0;
+            for (const char* suffix : kSuffixes) {
+                const size_t n = std::strlen(suffix);
+                if (j + n > s.size()) continue;
+                bool equal = true;
+                for (size_t k = 0; k < n; ++k)
+                    if (std::tolower((unsigned char)s[j + k]) != suffix[k]) { equal = false; break; }
+                if (equal && (j + n == s.size() || !pyIdentChar(s[j + n]))) {
+                    suffixLen = n;
+                    break;
+                }
+            }
+            bool legacyOctal = !decimalFloat && j > i + 1 && s[i] == '0';
+            for (size_t k = i + 1; legacyOctal && k < j; ++k)
+                if (s[k] < '0' || s[k] > '7') legacyOctal = false;
+            if (legacyOctal) {
+                out += "0o";
+                out.append(s, i + 1, j - i - 1);
+            } else {
+                out.append(s, i, j - i);
+            }
+            i = j + suffixLen;
+            continue;
+        }
+
+        out += c;
+        ++i;
+    }
+    return out;
 }
 
 // nameFor deliberately accepts analyst-authored labels. When one is used as a
@@ -1143,7 +1561,9 @@ static std::string pyCallNames(std::string s) {
                 bool right = pos + 1 < s.size() && pyIdentChar(s[pos + 1]);
                 if (!left || !right) break;
             }
-            if (std::string("+-*/%&|^<>").find(x) != std::string::npos) {
+            // Include bitwise NOT: ~(value) is a unary expression, while a
+            // tilde embedded in an analyst label still needs name sanitation.
+            if (std::string("+-*/%&|^<>~").find(x) != std::string::npos) {
                 size_t pos = b - 1;
                 bool leftIdent = pos > 0 && pyIdentChar(s[pos - 1]);
                 bool rightIdent = pos + 1 < s.size() && pyIdentChar(s[pos + 1]);
@@ -1190,11 +1610,359 @@ static std::string pyCallNames(std::string s) {
     return s;
 }
 
-// Expression rewrite: *(X) -> mem[X], &(X) -> addr(X), strip C casts, ! -> not,
-// && / || -> and / or, " / " -> " // " (integer division), hi:lo -> (hi, lo).
+static bool pyLooksLikeCast(const std::string& inside) {
+    bool signal = false;
+    bool token = false;
+    for (size_t i = 0; i < inside.size();) {
+        while (i < inside.size() && std::isspace((unsigned char)inside[i])) ++i;
+        if (i == inside.size()) break;
+        if (inside[i] == '*' || inside[i] == '&') {
+            signal = true;
+            ++i;
+            continue;
+        }
+        if (!(std::isalpha((unsigned char)inside[i]) || inside[i] == '_')) return false;
+        size_t b = i++;
+        while (i < inside.size() && pyIdentChar(inside[i])) ++i;
+        std::string word = inside.substr(b, i - b);
+        token = true;
+        const bool suffixType = word.size() > 2 && word.compare(word.size() - 2, 2, "_t") == 0;
+        const bool namedType = std::isupper((unsigned char)word[0]) || word.rfind("__", 0) == 0;
+        signal = signal || pyTypeWord(word) || suffixType || namedType;
+        if (i + 1 < inside.size() && inside[i] == ':' && inside[i + 1] == ':') {
+            signal = true;
+            i += 2;
+        }
+    }
+    return token && signal;
+}
+
+static bool pyCallableValue(const std::string& raw) {
+    const std::string s = trim(raw);
+    if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    size_t i = 1;
+    while (i < s.size() && pyIdentChar(s[i])) ++i;
+    while (i < s.size()) {
+        if (s[i] == '.') {
+            if (++i >= s.size() || !(std::isalpha((unsigned char)s[i]) || s[i] == '_')) return false;
+            while (i < s.size() && pyIdentChar(s[i])) ++i;
+            continue;
+        }
+        if (s[i] == '[') {
+            int depth = 1;
+            char quote = 0;
+            for (++i; i < s.size() && depth; ++i) {
+                const char c = s[i];
+                if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+                if (c == '"' || c == '\'') quote = c;
+                else if (c == '[') ++depth;
+                else if (c == ']') --depth;
+            }
+            if (depth) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// `(*fp)(x)` becomes `(fp)(x)` during dereference lowering. Parenthesized
+// callables are legal Python, but the native spelling is simply `fp(x)` (and
+// likewise `mem[address](x)` for an indirect call through memory).
+static std::string pyUnwrapCallableGroups(std::string s) {
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c != '(') continue;
+        const size_t close = pyMatchParen(s, i);
+        if (close == std::string::npos || close + 1 >= s.size() || s[close + 1] != '(' ||
+            !pyCallableValue(s.substr(i + 1, close - i - 1)))
+            continue;
+        s.erase(close, 1);
+        s.erase(i, 1);
+        if (i) --i;
+    }
+    return s;
+}
+
+static bool pyNoneTokenAt(const std::string& s, size_t p) {
+    return p + 4 <= s.size() && s.compare(p, 4, "None") == 0 &&
+           (p == 0 || !pyIdentChar(s[p - 1])) &&
+           (p + 4 == s.size() || !pyIdentChar(s[p + 4]));
+}
+
+// Equality against a null pointer is identity in source-level Python. Canonical
+// spacing also repairs compact C forms such as `p!=NULL` after NULL -> None.
+static std::string pyNoneComparisons(std::string s) {
+    char quote = 0;
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+        const char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        const bool equal = s[i] == '=' && s[i + 1] == '=';
+        const bool unequal = s[i] == '!' && s[i + 1] == '=';
+        if (!equal && !unequal) continue;
+
+        size_t leftEnd = i;
+        while (leftEnd > 0 && std::isspace((unsigned char)s[leftEnd - 1])) --leftEnd;
+        const bool leftNone = leftEnd >= 4 && pyNoneTokenAt(s, leftEnd - 4);
+        size_t right = i + 2;
+        while (right < s.size() && std::isspace((unsigned char)s[right])) ++right;
+        const bool rightNone = pyNoneTokenAt(s, right);
+        if (!leftNone && !rightNone) continue;
+
+        size_t replaceBegin = i;
+        while (replaceBegin > 0 && std::isspace((unsigned char)s[replaceBegin - 1])) --replaceBegin;
+        size_t replaceEnd = i + 2;
+        while (replaceEnd < s.size() && std::isspace((unsigned char)s[replaceEnd])) ++replaceEnd;
+        const std::string replacement = unequal ? " is not " : " is ";
+        s.replace(replaceBegin, replaceEnd - replaceBegin, replacement);
+        i = replaceBegin + replacement.size() - 1;
+    }
+    return s;
+}
+
+static size_t pyUnaryOperandEnd(const std::string& s, size_t start) {
+    while (start < s.size() && std::isspace((unsigned char)s[start])) ++start;
+    if (start >= s.size()) return std::string::npos;
+    if ((s[start] == '!' && start + 1 < s.size() && s[start + 1] != '=') ||
+        s[start] == '~' || s[start] == '+' || s[start] == '-')
+        return pyUnaryOperandEnd(s, start + 1);
+    if (s[start] == '(') {
+        const size_t close = pyMatchParen(s, start);
+        return close == std::string::npos ? close : close + 1;
+    }
+    if (s[start] == '*' && start + 1 < s.size() && s[start + 1] == '(') {
+        const size_t close = pyMatchParen(s, start + 1);
+        return close == std::string::npos ? close : close + 1;
+    }
+    if (!(std::isalpha((unsigned char)s[start]) || s[start] == '_' ||
+          std::isdigit((unsigned char)s[start])))
+        return start + 1;
+
+    size_t end = start + 1;
+    while (end < s.size() && (pyIdentChar(s[end]) || s[end] == '.')) ++end;
+    for (;;) {
+        if (end < s.size() && s[end] == '(') {
+            const size_t close = pyMatchParen(s, end);
+            if (close == std::string::npos) return close;
+            end = close + 1;
+            continue;
+        }
+        if (end < s.size() && s[end] == '[') {
+            int depth = 1;
+            char quote = 0;
+            size_t i = end + 1;
+            for (; i < s.size() && depth; ++i) {
+                const char c = s[i];
+                if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+                if (c == '"' || c == '\'') quote = c;
+                else if (c == '[') ++depth;
+                else if (c == ']') --depth;
+            }
+            if (depth) return std::string::npos;
+            end = i;
+            continue;
+        }
+        break;
+    }
+    return end;
+}
+
+struct PyIntegerCast {
+    const char* spelling;
+    const char* intrinsic;
+};
+
+// Python integers have unbounded precision, so dropping a native integer cast
+// changes both truncation and sign interpretation. Rewrite every fixed-width C
+// spelling the lift emits into an explicit pseudo-intrinsic. Work from right to
+// left so nested casts retain their original order.
+static std::string pyIntegerCasts(std::string s) {
+    static constexpr PyIntegerCast kIntegerCasts[] = {
+        { "(unsigned __int8)", "u8" },   { "(unsigned __int16)", "u16" },
+        { "(unsigned __int32)", "u32" }, { "(unsigned __int64)", "u64" },
+        { "(signed __int8)", "s8" },     { "(signed __int16)", "s16" },
+        { "(signed __int32)", "s32" },   { "(signed __int64)", "s64" },
+        { "(__int8)", "s8" },            { "(__int16)", "s16" },
+        { "(__int32)", "s32" },          { "(__int64)", "s64" },
+        { "(uint8_t)", "u8" },           { "(uint16_t)", "u16" },
+        { "(uint32_t)", "u32" },         { "(uint64_t)", "u64" },
+        { "(int8_t)", "s8" },            { "(int16_t)", "s16" },
+        { "(int32_t)", "s32" },          { "(int64_t)", "s64" },
+        { "(std::uint8_t)", "u8" },      { "(std::uint16_t)", "u16" },
+        { "(std::uint32_t)", "u32" },    { "(std::uint64_t)", "u64" },
+        { "(std::int8_t)", "s8" },       { "(std::int16_t)", "s16" },
+        { "(std::int32_t)", "s32" },     { "(std::int64_t)", "s64" },
+        { "(unsigned char)", "u8" },     { "(signed char)", "s8" },
+        { "(char)", "s8" },              { "(unsigned short int)", "u16" },
+        { "(signed short int)", "s16" }, { "(short int)", "s16" },
+        { "(unsigned short)", "u16" },   { "(signed short)", "s16" },
+        { "(short)", "s16" },            { "(unsigned int)", "u32" },
+        { "(signed int)", "s32" },       { "(int)", "s32" },
+        { "(unsigned)", "u32" },         { "(signed)", "s32" },
+        { "(unsigned long long int)", "u64" },
+        { "(signed long long int)", "s64" }, { "(long long int)", "s64" },
+        { "(unsigned long long)", "u64" }, { "(signed long long)", "s64" },
+        { "(long long)", "s64" },
+        { "(BYTE)", "u8" },              { "(WORD)", "u16" },
+        { "(DWORD)", "u32" },            { "(QWORD)", "u64" },
+        { "(BOOL)", "s32" },             { "(WCHAR)", "u16" },
+        { "(HRESULT)", "s32" },          { "(bool)", "bool" },
+    };
+
+    for (size_t pass = 0; pass <= s.size(); ++pass) {
+        size_t found = std::string::npos;
+        const PyIntegerCast* cast = nullptr;
+        char quote = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            const char c = s[i];
+            if (quote) {
+                if (c == '\\') ++i;
+                else if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            if (c != '(') continue;
+            for (const PyIntegerCast& candidate : kIntegerCasts) {
+                const size_t n = std::strlen(candidate.spelling);
+                if (s.compare(i, n, candidate.spelling) == 0) {
+                    found = i;
+                    cast = &candidate;
+                    break;
+                }
+            }
+        }
+        if (!cast) break;
+
+        size_t operand = found + std::strlen(cast->spelling);
+        while (operand < s.size() && std::isspace((unsigned char)s[operand])) ++operand;
+        const size_t end = pyUnaryOperandEnd(s, operand);
+        if (end == std::string::npos || end <= operand) break;
+        std::string value = trim(s.substr(operand, end - operand));
+        while (value.size() >= 2 && value.front() == '(' &&
+               pyMatchParen(value, 0) == value.size() - 1)
+            value = trim(value.substr(1, value.size() - 2));
+        const std::string replacement = std::string(cast->intrinsic) + "(" + value + ")";
+        s.replace(found, end - found, replacement);
+    }
+    return s;
+}
+
+// Python's `not` binds less tightly than comparisons and arithmetic, while C's
+// `!` is a unary operator. Parenthesize only when text follows the operand that
+// would otherwise change the grouping (`!x == y` -> `(not x) == y`).
+static std::string pyProtectLogicalNot(std::string s) {
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c != '!' || (i + 1 < s.size() && s[i + 1] == '=')) continue;
+        size_t operand = i + 1;
+        while (operand < s.size() && std::isspace((unsigned char)s[operand])) ++operand;
+        const size_t end = pyUnaryOperandEnd(s, operand);
+        if (end == std::string::npos) continue;
+        size_t next = end;
+        while (next < s.size() && std::isspace((unsigned char)s[next])) ++next;
+        const bool logicalBoundary = next + 1 < s.size() &&
+            (s.compare(next, 2, "&&") == 0 || s.compare(next, 2, "||") == 0);
+        const bool safe = next == s.size() || logicalBoundary ||
+            (next < s.size() && std::string(")],;").find(s[next]) != std::string::npos);
+        if (safe) continue;
+        const std::string replacement = "(not " + s.substr(operand, end - operand) + ")";
+        s.replace(i, end - i, replacement);
+        i += replacement.size() - 1;
+    }
+    return s;
+}
+
+// C logical operators produce integer 0/1; Python and/or return an operand.
+// Keep their lazy evaluation, but normalize any logical expression used as a
+// value. Delimiter frames handle arguments, indices, assignments, and grouped
+// arithmetic without recursively parsing arbitrary expression nesting. A direct
+// if/while condition needs only truthiness and can keep its shorter spelling.
+static std::string pyLogicalValues(const std::string& s, bool topLevelValue) {
+    struct Frame { size_t start; bool logical; };
+    struct Event { size_t position; bool open; };
+    std::vector<Frame> frames{{0, false}};
+    std::vector<Event> events;
+    auto finish = [&](size_t end) {
+        Frame& frame = frames.back();
+        if (frame.logical && (topLevelValue || frames.size() > 1)) {
+            size_t begin = frame.start;
+            while (begin < end && std::isspace((unsigned char)s[begin])) ++begin;
+            while (end > begin && std::isspace((unsigned char)s[end - 1])) --end;
+            if (begin < end) {
+                events.push_back({begin, true});
+                events.push_back({end, false});
+            }
+        }
+        frame.logical = false;
+    };
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '(' || c == '[' || c == '{') {
+            frames.push_back({i + 1, false});
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}') {
+            if (frames.size() > 1) {
+                finish(i);
+                frames.pop_back();
+            }
+            continue;
+        }
+        const bool assignment = c == '=' &&
+            (i == 0 || std::string("=!<>").find(s[i - 1]) == std::string::npos) &&
+            (i + 1 == s.size() || s[i + 1] != '=');
+        if (c == ',' || assignment) {
+            finish(i);
+            frames.back().start = i + 1;
+            continue;
+        }
+        if (std::isalpha((unsigned char)c) || c == '_') {
+            size_t end = i + 1;
+            while (end < s.size() && pyIdentChar(s[end])) ++end;
+            if ((end - i == 3 && s.compare(i, 3, "and") == 0) ||
+                (end - i == 2 && s.compare(i, 2, "or") == 0))
+                frames.back().logical = true;
+            i = end - 1;
+        }
+    }
+    if (frames.size() != 1) return s; // Leave malformed expressions unchanged.
+    finish(s.size());
+    if (events.empty()) return s;
+    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
+        if (a.position != b.position) return a.position < b.position;
+        return a.open < b.open; // Close a finished value before the next begins.
+    });
+    std::string out;
+    out.reserve(s.size() + events.size() * 6);
+    size_t copied = 0;
+    for (const Event& event : events) {
+        out.append(s, copied, event.position - copied);
+        out += event.open ? "int(bool(" : "))";
+        copied = event.position;
+    }
+    out.append(s, copied, s.size() - copied);
+    return out;
+}
+
+// Expression rewrite: fixed-width integer casts -> sN/uN, *(X) -> mem[X],
+// &(X) -> addr(X), strip pointer/display casts, ! -> not, && / || -> and / or,
+// hi:lo -> (hi, lo).
 // Quote-aware so string literals inlined by dataRefFor pass through untouched.
-static std::string pyExpr(std::string s) {
+static std::string pyExpr(std::string s, bool logicalValue = true) {
+    s = pyLiteralSyntax(s);
     s = pyCallNames(std::move(s));
+    s = pyProtectLogicalNot(std::move(s));
+    s = pyIntegerCasts(std::move(s));
     // A C indirect call spells a callable value as `(*fp)(args)` (or
     // `(**(addr))(args)` for a pointer loaded from memory). Python calls the
     // value directly. Remove exactly the call-site dereference here; the normal
@@ -1225,18 +1993,10 @@ static std::string pyExpr(std::string s) {
         }
     }
     static const char* kCasts[] = {
-        // Microsoft-width spellings are emitted by the deep data-flow lift for
-        // movzx/movsx, so keep these in sync with DataFlow.cpp.
-        "(unsigned __int8)", "(unsigned __int16)", "(unsigned __int32)", "(unsigned __int64)",
-        "(signed __int8)",   "(signed __int16)",   "(signed __int32)",   "(signed __int64)",
-        "(__int8)", "(__int16)", "(__int32)", "(__int64)",
-        "(int64_t)", "(uint64_t)", "(int32_t)", "(uint32_t)", "(int16_t)", "(uint16_t)",
-        "(int8_t)", "(uint8_t)", "(unsigned long long)", "(signed long long)", "(long long)",
-        "(unsigned int)", "(signed int)", "(int)", "(unsigned)", "(signed)",
         "(const void *)", "(const char *)", "(const wchar_t *)", "(unsigned char *)",
         "(void *)", "(char *)", "(wchar_t *)",
         "(size_t)", "(ssize_t)", "(intptr_t)", "(uintptr_t)",
-        "(float)", "(double)", "(bool)", "(char)", "(short)", "(long)",
+        "(float)", "(double)", "(long)",
     };
     std::string o; o.reserve(s.size());
     quote = 0;
@@ -1281,13 +2041,34 @@ static std::string pyExpr(std::string s) {
         if (c == ':' && i + 1 < s.size() && s[i + 1] == ':') { o += '.'; i += 2; continue; }
         if (c == '&' && i + 1 < s.size() && s[i + 1] == '(') { o += "addr"; ++i; continue; }   // lea: &(X) -> addr(X)
         if (c == '!' && (i + 1 >= s.size() || s[i + 1] != '=')) { o += "not "; ++i; continue; }
-        if (c == '/' && i > 0 && s[i - 1] == ' ' && i + 1 < s.size() && s[i + 1] == ' '
-            && (i < 2 || s[i - 2] != '/')) { o += "//"; ++i; continue; }   // " / " -> " // "
         if (c == '(') {   // strip C casts
             bool stripped = false;
             for (const char* cast : kCasts) {
                 size_t n = std::strlen(cast);
                 if (s.compare(i, n, cast) == 0) { i += n; stripped = true; break; }
+            }
+            if (!stripped) {
+                const size_t close = pyMatchParen(s, i);
+                size_t next = close == std::string::npos ? close : close + 1;
+                while (next != std::string::npos && next < s.size() &&
+                       std::isspace((unsigned char)s[next])) ++next;
+                const bool spaced = close != std::string::npos && next > close + 1;
+                const bool binaryAfterSpace = next < s.size() && spaced &&
+                    std::string("+-*/%&|^<>=?").find(s[next]) != std::string::npos;
+                // A cast must be followed by an operand. Closing delimiters
+                // and separators instead mean this was a grouped value, e.g.
+                // helper((MAGIC)) or table[(value_t)]. Uppercase/suffix-based
+                // type guesses alone must not erase those expressions.
+                const bool operandFollows = next < s.size() &&
+                    (pyIdentChar(s[next]) ||
+                     std::string("(\"'!~+-*&").find(s[next]) != std::string::npos ||
+                     (s[next] == '.' && next + 1 < s.size() &&
+                      std::isdigit((unsigned char)s[next + 1])));
+                if (close != std::string::npos && operandFollows && !binaryAfterSpace &&
+                    pyLooksLikeCast(s.substr(i + 1, close - i - 1))) {
+                    i = close + 1;
+                    stripped = true;
+                }
             }
             if (stripped) continue;
         }
@@ -1303,7 +2084,210 @@ static std::string pyExpr(std::string s) {
         }
         o += c; ++i;
     }
-    return o;
+    return pyLogicalValues(pyUnwrapCallableGroups(pyNoneComparisons(std::move(o))),
+                           logicalValue);
+}
+
+static std::string pyStripOuterParens(std::string s) {
+    s = trim(s);
+    while (s.size() >= 2 && s.front() == '(' && pyMatchParen(s, 0) == s.size() - 1)
+        s = trim(s.substr(1, s.size() - 2));
+    return s;
+}
+
+static bool pyTopLevelComparison(const std::string& input, std::string& lhs,
+                                 std::string& op, std::string& rhs) {
+    const std::string s = pyStripOuterParens(input);
+    int paren = 0, bracket = 0;
+    char quote = 0;
+    size_t found = std::string::npos;
+    size_t width = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '(') { ++paren; continue; }
+        if (c == ')') { --paren; continue; }
+        if (c == '[') { ++bracket; continue; }
+        if (c == ']') { --bracket; continue; }
+        if (paren || bracket) continue;
+        size_t n = 0;
+        if (i + 1 < s.size() &&
+            (s.compare(i, 2, "==") == 0 || s.compare(i, 2, "!=") == 0 ||
+             s.compare(i, 2, "<=") == 0 || s.compare(i, 2, ">=") == 0))
+            n = 2;
+        else if (c == '<' || c == '>')
+            n = 1;
+        if (!n) continue;
+        if (found != std::string::npos) return false;
+        found = i;
+        width = n;
+        i += n - 1;
+    }
+    if (found == std::string::npos) return false;
+    lhs = trim(s.substr(0, found));
+    op = s.substr(found, width);
+    rhs = trim(s.substr(found + width));
+    return !lhs.empty() && !rhs.empty();
+}
+
+static uint16_t pyNativeRegisterWidth(std::string reg) {
+    reg = trim(reg);
+    for (char& c : reg) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static constexpr const char* k8[] = {
+        "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+        "sil", "dil", "bpl", "spl"
+    };
+    static constexpr const char* k16[] = {
+        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp"
+    };
+    static constexpr const char* k32[] = {
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"
+    };
+    static constexpr const char* k64[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"
+    };
+    for (const char* candidate : k8)  if (reg == candidate) return 8;
+    for (const char* candidate : k16) if (reg == candidate) return 16;
+    for (const char* candidate : k32) if (reg == candidate) return 32;
+    for (const char* candidate : k64) if (reg == candidate) return 64;
+
+    if (reg.size() >= 2 && reg[0] == 'r' && std::isdigit(static_cast<unsigned char>(reg[1]))) {
+        size_t end = 1;
+        while (end < reg.size() && std::isdigit(static_cast<unsigned char>(reg[end]))) ++end;
+        const int number = std::atoi(reg.substr(1, end - 1).c_str());
+        if (number < 8 || number > 15) return 0;
+        const std::string suffix = reg.substr(end);
+        if (suffix.empty()) return 64;
+        if (suffix == "d") return 32;
+        if (suffix == "w") return 16;
+        if (suffix == "b") return 8;
+    }
+    return 0;
+}
+
+static bool pyRedundantRegisterWidthCast(const std::string& value, std::string& reg) {
+    const std::string candidate = pyStripOuterParens(value);
+    static constexpr struct { const char* prefix; uint16_t width; } kCasts[] = {
+        { "u8(", 8 }, { "s8(", 8 }, { "u16(", 16 }, { "s16(", 16 },
+        { "u32(", 32 }, { "s32(", 32 }, { "u64(", 64 }, { "s64(", 64 },
+    };
+    for (const auto& cast : kCasts) {
+        const size_t prefixLength = std::strlen(cast.prefix);
+        if (candidate.size() <= prefixLength || candidate.compare(0, prefixLength, cast.prefix) != 0 ||
+            candidate.back() != ')' || pyMatchParen(candidate, prefixLength - 1) != candidate.size() - 1)
+            continue;
+        const std::string inner = pyStripOuterParens(
+            candidate.substr(prefixLength, candidate.size() - prefixLength - 1));
+        if (pyNativeRegisterWidth(inner) != cast.width) return false;
+        reg = inner;
+        return true;
+    }
+    return false;
+}
+
+// Preserve the comparison emitted from native flag provenance, including an
+// explicit == 0 / != 0.  Python truthiness is shorter, but it hides the TEST/CMP
+// relationship the pseudocode is meant to explain and can make a goto arm look
+// less directly connected to its machine-code predicate.  A width conversion
+// around the matching architectural register is redundant for equality with
+// zero, so `test eax, eax` remains the more direct `eax != 0`.
+static std::string pyCondition(const std::string& c) {
+    const std::string expr = pyExpr(c, false);
+    std::string lhs, op, rhs;
+    if (!pyTopLevelComparison(expr, lhs, op, rhs) || (op != "==" && op != "!="))
+        return expr;
+    if (lhs == "0") std::swap(lhs, rhs);
+    if (rhs != "0") return expr;
+    std::string reg;
+    return pyRedundantRegisterWidthCast(lhs, reg) ? reg + " " + op + " 0" : expr;
+}
+
+// LOBYTE/LOWORD/BYTE1 are readable C lvalues, but function-call syntax cannot
+// appear on the left side of a Python assignment. Preserve the untouched bits
+// of the full register variable and explicitly narrow the replacement value.
+static bool pyPartialWrite(const std::string& input, std::string& output) {
+    std::string t = trim(input);
+    int delta = 0;
+    if (t.rfind("++", 0) == 0 || t.rfind("--", 0) == 0) {
+        delta = t[0] == '+' ? 1 : -1;
+        t = trim(t.substr(2));
+    }
+
+    struct PartialSpec {
+        const char* macro;
+        const char* intrinsic;
+        const char* mask;
+        unsigned shift;
+    };
+    static constexpr PartialSpec kPartial[] = {
+        { "LOBYTE", "u8",  "0xFF",   0 },
+        { "LOWORD", "u16", "0xFFFF", 0 },
+        { "BYTE1",  "u8",  "0xFF00", 8 },
+    };
+
+    const PartialSpec* spec = nullptr;
+    for (const PartialSpec& candidate : kPartial) {
+        const size_t n = std::strlen(candidate.macro);
+        if (t.compare(0, n, candidate.macro) == 0 && t.size() > n && t[n] == '(') {
+            spec = &candidate;
+            break;
+        }
+    }
+    if (!spec) return false;
+
+    const size_t open = std::strlen(spec->macro);
+    const size_t close = pyMatchParen(t, open);
+    if (close == std::string::npos) return false;
+    const std::string base = pyExpr(trim(t.substr(open + 1, close - open - 1)));
+    if (base.empty()) return false;
+    std::string tail = trim(t.substr(close + 1));
+
+    if (!delta && (tail == "++" || tail == "--")) {
+        delta = tail[0] == '+' ? 1 : -1;
+        tail.clear();
+    }
+
+    std::string current = std::string(spec->intrinsic) + "(" + base;
+    if (spec->shift) current += " >> " + std::to_string(spec->shift);
+    current += ")";
+
+    std::string narrowed;
+    if (delta) {
+        if (!tail.empty()) return false;
+        narrowed = std::string(spec->intrinsic) + "(" + current +
+                   (delta > 0 ? " + 1)" : " - 1)");
+    } else {
+        struct AssignmentOp { const char* spelling; const char* binary; };
+        static constexpr AssignmentOp kOps[] = {
+            { "<<=", "<<" }, { ">>=", ">>" }, { "+=", "+" }, { "-=", "-" },
+            { "*=", "*" },   { "/=", "/" },  { "%=", "%" }, { "&=", "&" },
+            { "|=", "|" },   { "^=", "^" },  { "=",  nullptr },
+        };
+        const AssignmentOp* assignment = nullptr;
+        for (const AssignmentOp& candidate : kOps) {
+            const size_t n = std::strlen(candidate.spelling);
+            if (tail.compare(0, n, candidate.spelling) == 0) {
+                assignment = &candidate;
+                tail = trim(tail.substr(n));
+                break;
+            }
+        }
+        if (!assignment || tail.empty()) return false;
+        const std::string rhs = pyExpr(tail);
+        if (rhs.empty()) return false;
+        narrowed = std::string(spec->intrinsic) + "(";
+        if (assignment->binary)
+            narrowed += current + " " + assignment->binary + " ";
+        narrowed += rhs + ")";
+    }
+
+    output = base + " = (" + base + " & ~" + spec->mask + ") | ";
+    if (spec->shift)
+        output += "(" + narrowed + " << " + std::to_string(spec->shift) + ")";
+    else
+        output += narrowed;
+    return true;
 }
 
 // One C statement (trailing ';' already removed) -> a Python statement.
@@ -1333,13 +2317,37 @@ static std::string pyStmt(const std::string& tin) {
                 return pyStmt(t.substr(0, i)) + "; " + pyStmt(t.substr(i + 2));
         }
     }
+    std::string partial;
+    if (pyPartialWrite(t, partial)) return partial;
     if (t == "return")               return "return";
     if (t.rfind("return ", 0) == 0)  return "return " + pyExpr(t.substr(7));
-    if (t == "break" || t == "continue" || t.rfind("goto ", 0) == 0) return t;   // goto stays a pseudo-statement
+    if (t == "break" || t == "continue") return t;
+    if (t.rfind("goto ", 0) == 0) {
+        std::string target = trim(t.substr(5));
+        if (!target.empty() && target[0] == '*') {
+            std::string expression = trim(target.substr(1));
+            if (expression.size() >= 2 && expression.front() == '(' &&
+                pyMatchParen(expression, 0) == expression.size() - 1)
+                expression = expression.substr(1, expression.size() - 2);
+            return "indirect_jump(" + pyExpr(expression) + ")";
+        }
+        std::string quoted = "\"";
+        for (char c : target) { if (c == '\\' || c == '"') quoted += '\\'; quoted += c; }
+        return "goto_label(" + quoted + "\")"; // explicit placeholder for irreducible direct flow
+    }
     if (t.rfind("swap(", 0) == 0 && t.back() == ')') {
         std::string inner = t.substr(5, t.size() - 6), a, b;
         if (split2(inner, a, b)) {
             std::string A = pyExpr(a), B = pyExpr(b);
+            // Tuple RHS values are captured together, but Python assigns the
+            // targets left-to-right. Store through the original address before
+            // replacing a register which may participate in that address:
+            // xchg rax, [rax] -> mem[rax], rax = rax, mem[rax].
+            const bool simpleA = !A.empty() &&
+                (std::isalpha((unsigned char)A.front()) || A.front() == '_') &&
+                std::all_of(A.begin(), A.end(), pyIdentChar);
+            if (simpleA && B.rfind("mem[", 0) == 0 && B.back() == ']')
+                return B + ", " + A + " = " + A + ", " + B;
             return A + ", " + B + " = " + B + ", " + A;
         }
     }
@@ -1529,7 +2537,10 @@ static PyDecl pyDeclaration(const std::string& t, std::string& statement) {
     if (wb == we) return PyDecl::NotDeclaration;
     std::string first = t.substr(wb, we - wb);
     bool suffixType = first.size() > 2 && first.compare(first.size() - 2, 2, "_t") == 0;
-    if (!pyTypeWord(first) && !suffixType) return PyDecl::NotDeclaration;
+    const bool separated = we < t.size() &&
+        (std::isspace((unsigned char)t[we]) || t[we] == '*' || t[we] == '&');
+    const bool namedType = separated && !first.empty() && std::isupper((unsigned char)first[0]);
+    if (!pyTypeWord(first) && !suffixType && !namedType) return PyDecl::NotDeclaration;
 
     // Split comma-separated declarators at top level (`int x = 1, *p = f(a,b)`).
     // The shared type stays on the first segment; pyParamName also accepts the
@@ -1617,10 +2628,337 @@ static size_t pyIndentOf(const std::string& s) {
     return n;
 }
 
+static std::vector<std::string> pySplitStatements(const std::string& s) {
+    std::vector<std::string> out;
+    int paren = 0, bracket = 0, brace = 0;
+    char quote = 0;
+    size_t begin = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        const char c = i < s.size() ? s[i] : ';';
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') quote = c;
+        else if (c == '(') ++paren;
+        else if (c == ')') --paren;
+        else if (c == '[') ++bracket;
+        else if (c == ']') --bracket;
+        else if (c == '{') ++brace;
+        else if (c == '}') --brace;
+        else if (c == ';' && paren == 0 && bracket == 0 && brace == 0) {
+            std::string part = trim(s.substr(begin, i - begin));
+            if (!part.empty()) out.push_back(std::move(part));
+            begin = i + 1;
+        }
+    }
+    return out;
+}
+
+static bool pySimpleAssignment(const std::string& line, std::string& lhs, std::string& rhs) {
+    const std::string s = pyCodePart(line);
+    int paren = 0, bracket = 0;
+    char quote = 0;
+    size_t equal = std::string::npos;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '(') { ++paren; continue; }
+        if (c == ')') { --paren; continue; }
+        if (c == '[') { ++bracket; continue; }
+        if (c == ']') { --bracket; continue; }
+        if (c != '=' || paren || bracket) continue;
+        const char prev = i ? s[i - 1] : 0;
+        const char next = i + 1 < s.size() ? s[i + 1] : 0;
+        if (next == '=' || std::string("=!<>+-*/%&|^").find(prev) != std::string::npos)
+            continue;
+        if (equal != std::string::npos) return false;
+        equal = i;
+    }
+    if (equal == std::string::npos) return false;
+    lhs = trim(s.substr(0, equal));
+    rhs = trim(s.substr(equal + 1));
+    if (lhs.empty() || rhs.empty() || !(std::isalpha((unsigned char)lhs[0]) || lhs[0] == '_'))
+        return false;
+    for (char c : lhs) if (!pyIdentChar(c)) return false;
+    return true;
+}
+
+static bool pyCodeContainsWord(const std::string& line, const std::string& word) {
+    char quote = 0;
+    for (size_t i = 0; i < line.size();) {
+        const char c = line[i];
+        if (quote) {
+            if (c == '\\' && i + 1 < line.size()) { i += 2; continue; }
+            if (c == quote) quote = 0;
+            ++i;
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; ++i; continue; }
+        if (c == '/' && i + 1 < line.size() && (line[i + 1] == '/' || line[i + 1] == '*')) break;
+        if (i + word.size() <= line.size() && line.compare(i, word.size(), word) == 0 &&
+            (i == 0 || !pyIdentChar(line[i - 1])) &&
+            (i + word.size() == line.size() || !pyIdentChar(line[i + word.size()])))
+            return true;
+        ++i;
+    }
+    return false;
+}
+
+static bool pyCodeWritesWord(const std::string& line, const std::string& word) {
+    if (!pyCodeContainsWord(line, word)) return false;
+    if (line.find("swap(") != std::string::npos) return true;
+    for (size_t p = line.find(word); p != std::string::npos; p = line.find(word, p + 1)) {
+        if ((p && pyIdentChar(line[p - 1])) ||
+            (p + word.size() < line.size() && pyIdentChar(line[p + word.size()])))
+            continue;
+        size_t left = p;
+        while (left > 0 && std::isspace((unsigned char)line[left - 1])) --left;
+        if (left >= 2 && (line.compare(left - 2, 2, "++") == 0 ||
+                          line.compare(left - 2, 2, "--") == 0))
+            return true;
+        size_t right = p + word.size();
+        while (right < line.size() && std::isspace((unsigned char)line[right])) ++right;
+        if (right + 1 < line.size() && (line.compare(right, 2, "++") == 0 ||
+                                        line.compare(right, 2, "--") == 0))
+            return true;
+        if (right < line.size() && line[right] == '=' &&
+            (right + 1 == line.size() || line[right + 1] != '='))
+            return true;
+        if (right + 1 < line.size() && line[right + 1] == '=' &&
+            std::string("+-*/%&|^<>").find(line[right]) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+static bool pyCodeTakesAddressOf(const std::string& line, const std::string& word) {
+    for (size_t p = line.find(word); p != std::string::npos; p = line.find(word, p + 1)) {
+        if ((p && pyIdentChar(line[p - 1])) ||
+            (p + word.size() < line.size() && pyIdentChar(line[p + word.size()])))
+            continue;
+        size_t marker = p;
+        while (marker > 0 && std::isspace((unsigned char)line[marker - 1])) --marker;
+        if (marker > 0 && line[marker - 1] == '(') {
+            --marker;
+            while (marker > 0 && std::isspace((unsigned char)line[marker - 1])) --marker;
+        }
+        if (marker == 0 || line[marker - 1] != '&') continue;
+        size_t before = marker - 1;
+        while (before > 0 && std::isspace((unsigned char)line[before - 1])) --before;
+        if (before == 0 || std::string("=(,[{!?:+-*/%&|^<>").find(line[before - 1]) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+static std::string pyCStructurePart(const std::string& line) {
+    char quote = 0;
+    for (size_t i = 0; i + 1 < line.size(); ++i) {
+        const char c = line[i];
+        if (quote) { if (c == '\\') ++i; else if (c == quote) quote = 0; continue; }
+        if (c == '"' || c == '\'') { quote = c; continue; }
+        if (c == '/' && (line[i + 1] == '/' || line[i + 1] == '*'))
+            return trim(line.substr(0, i));
+    }
+    return trim(line);
+}
+
+static size_t pyMatchingBlockClose(const std::vector<std::string>& lines, size_t opener) {
+    int depth = 0;
+    for (size_t i = opener; i < lines.size(); ++i) {
+        const std::string t = pyCStructurePart(lines[i]);
+        if (t == "{" || (t.size() >= 2 && t.compare(t.size() - 2, 2, " {") == 0)) ++depth;
+        if (t == "}" && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+struct PyRangeParts {
+    std::string variable;
+    std::string stop;
+    std::string comparisonCast;
+    long long step = 0;
+    bool inclusive = false;
+};
+
+static bool pyPositiveInteger(const std::string& input, long long& value) {
+    const std::string s = pyLiteralSyntax(trim(input));
+    if (s.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    value = std::strtoll(s.c_str(), &end, 0);
+    return end != s.c_str() && *end == '\0' && errno != ERANGE && value > 0;
+}
+
+static bool pyParseRangeParts(const std::string& condition, const std::string& stepText,
+                              PyRangeParts& out) {
+    const std::string step = trim(stepText);
+    long long stride = 0;
+    std::string variable;
+    if (step.size() > 2 && (step.compare(step.size() - 2, 2, "++") == 0 ||
+                            step.compare(step.size() - 2, 2, "--") == 0)) {
+        variable = trim(step.substr(0, step.size() - 2));
+        stride = step.back() == '+' ? 1 : -1;
+    } else {
+        size_t op = step.find(" += ");
+        bool subtract = false;
+        if (op == std::string::npos) { op = step.find(" -= "); subtract = true; }
+        if (op == std::string::npos) return false;
+        variable = trim(step.substr(0, op));
+        long long magnitude = 0;
+        if (!pyPositiveInteger(step.substr(op + 4), magnitude)) return false;
+        stride = subtract ? -magnitude : magnitude;
+    }
+    if (variable.empty() || !(std::isalpha((unsigned char)variable[0]) || variable[0] == '_')) return false;
+    for (char c : variable) if (!pyIdentChar(c)) return false;
+
+    std::string lhs, op, rhs;
+    if (!pyTopLevelComparison(pyExpr(condition), lhs, op, rhs)) return false;
+    auto stripRedundantParens = [](std::string value) {
+        value = trim(value);
+        while (value.size() >= 2 && value.front() == '(' &&
+               pyMatchParen(value, 0) == value.size() - 1)
+            value = trim(value.substr(1, value.size() - 2));
+        return value;
+    };
+    lhs = stripRedundantParens(lhs);
+    rhs = stripRedundantParens(rhs);
+    auto unwrapFixedCast = [&](const std::string& value, std::string& intrinsic,
+                               std::string& inner) {
+        const size_t open = value.find('(');
+        if (open == std::string::npos || pyMatchParen(value, open) != value.size() - 1)
+            return false;
+        intrinsic = value.substr(0, open);
+        if (intrinsic != "u8" && intrinsic != "u16" && intrinsic != "u32" &&
+            intrinsic != "u64" && intrinsic != "s8" && intrinsic != "s16" &&
+            intrinsic != "s32" && intrinsic != "s64")
+            return false;
+        inner = stripRedundantParens(value.substr(open + 1, value.size() - open - 2));
+        return !inner.empty();
+    };
+    std::string lhsCast, rhsCast, lhsInner, rhsInner;
+    if (unwrapFixedCast(lhs, lhsCast, lhsInner) &&
+        unwrapFixedCast(rhs, rhsCast, rhsInner) && lhsCast == rhsCast) {
+        // Keep the cast contract until the start, bound, and terminal step have
+        // been proved in range. Otherwise range() would silently erase native
+        // signedness or make a wrapping loop appear finite.
+        out.comparisonCast = lhsCast;
+        lhs = lhsInner;
+        rhs = rhsInner;
+    }
+    if (rhs == variable) {
+        std::swap(lhs, rhs);
+        if (op == "<") op = ">";
+        else if (op == ">") op = "<";
+        else if (op == "<=") op = ">=";
+        else if (op == ">=") op = "<=";
+    }
+    if (lhs != variable) return false;
+    if (stride > 0 && op != "<" && op != "<=") return false;
+    if (stride < 0 && op != ">" && op != ">=") return false;
+    out.variable = variable;
+    out.stop = rhs;
+    out.step = stride;
+    out.inclusive = op == "<=" || op == ">=";
+    return true;
+}
+
+static std::string pyAdjustedRangeStop(const std::string& stop, int delta) {
+    char* end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(stop.c_str(), &end, 0);
+    if (end != stop.c_str() && *end == '\0' && errno != ERANGE &&
+        !((delta > 0 && value == LLONG_MAX) || (delta < 0 && value == LLONG_MIN)))
+        return std::to_string(value + delta);
+
+    bool atomic = !stop.empty() && (std::isalnum((unsigned char)stop[0]) || stop[0] == '_');
+    for (char c : stop) if (!(pyIdentChar(c) || c == '.')) { atomic = false; break; }
+    const std::string base = atomic ? stop : "(" + stop + ")";
+    return base + (delta > 0 ? " + 1" : " - 1");
+}
+
+static bool pyRangeSemanticsSafe(const std::vector<std::string>& lines, size_t opener,
+                                 const PyRangeParts& range, const std::string& start,
+                                 size_t& close) {
+    if (!range.comparisonCast.empty()) {
+        auto integer = [](const std::string& input, long long& value) {
+            std::string text = pyLiteralSyntax(trim(input));
+            while (text.size() >= 2 && text.front() == '(' &&
+                   pyMatchParen(text, 0) == text.size() - 1)
+                text = trim(text.substr(1, text.size() - 2));
+            // pyLiteralSyntax spells C octal in Python's 0o form.
+            const size_t prefix = !text.empty() && (text[0] == '-' || text[0] == '+') ? 1 : 0;
+            if (text.compare(prefix, 2, "0o") == 0) text.erase(prefix + 1, 1);
+            char* end = nullptr;
+            errno = 0;
+            value = std::strtoll(text.c_str(), &end, 0);
+            return end != text.c_str() && *end == '\0' && errno != ERANGE;
+        };
+        long long first = 0, stop = 0;
+        if (!integer(start, first) || !integer(range.stop, stop)) return false;
+        const bool isSigned = range.comparisonCast[0] == 's';
+        const unsigned bits = static_cast<unsigned>(std::strtoul(range.comparisonCast.c_str() + 1,
+                                                               nullptr, 10));
+        const long long minimum = !isSigned ? 0 : bits == 64 ? LLONG_MIN : -(1LL << (bits - 1));
+        // Values beyond LLONG_MAX are intentionally unproved, including u64
+        // bounds; retaining while is preferable to lossy range reconstruction.
+        const long long maximum = bits == 64 ? LLONG_MAX :
+            (1LL << (isSigned ? bits - 1 : bits)) - 1;
+        if (first < minimum || first > maximum || stop < minimum || stop > maximum)
+            return false;
+        const bool enters = range.step > 0 ?
+            (range.inclusive ? first <= stop : first < stop) :
+            (range.inclusive ? first >= stop : first > stop);
+        if (enters) {
+            // Account for the step executed after the last body iteration. A
+            // strict bound permits one less unit of overshoot than an inclusive
+            // bound. These conservative limits avoid any signed host overflow.
+            const long long magnitude = range.step > 0 ? range.step : -range.step;
+            const long long overshoot = magnitude - (range.inclusive ? 0 : 1);
+            if (range.step > 0 ? stop > maximum - overshoot : stop < minimum + overshoot)
+                return false;
+        }
+    }
+    close = pyMatchingBlockClose(lines, opener);
+    if (close == std::string::npos) return false;
+    for (size_t i = opener + 1; i < close; ++i) {
+        if (pyCodeWritesWord(lines[i], range.variable) ||
+            pyCodeTakesAddressOf(lines[i], range.variable) ||
+            pyCodeContainsWord(lines[i], "goto"))
+            return false;
+    }
+
+    // range() snapshots its stop once. Reject call/subscript bounds and any
+    // simple bound variable that the loop body writes.
+    if (range.stop.find('(') != std::string::npos || range.stop.find('[') != std::string::npos)
+        return false;
+    for (size_t p = 0; p < range.stop.size();) {
+        if (!(std::isalpha((unsigned char)range.stop[p]) || range.stop[p] == '_')) { ++p; continue; }
+        size_t e = p + 1;
+        while (e < range.stop.size() && pyIdentChar(range.stop[e])) ++e;
+        const std::string name = range.stop.substr(p, e - p);
+        for (size_t i = opener + 1; i < close; ++i)
+            if (pyCodeWritesWord(lines[i], name) || pyCodeTakesAddressOf(lines[i], name)) return false;
+        p = e;
+    }
+    for (size_t i = close + 1; i < lines.size(); ++i)
+        if (pyCodeContainsWord(lines[i], range.variable)) return false;
+    return true;
+}
+
+static std::string pyRangeCall(const std::string& start, const PyRangeParts& range) {
+    std::string stop = range.stop;
+    if (range.inclusive) stop = pyAdjustedRangeStop(stop, range.step > 0 ? 1 : -1);
+    if (range.step == 1 && start == "0") return "range(" + stop + ")";
+    std::string call = "range(" + start + ", " + stop;
+    if (range.step != 1) call += ", " + std::to_string(range.step);
+    return call + ")";
+}
+
 // The C structurer represents an else-if as an `else` containing one nested
 // `if`. Collapse only when that if/else chain is the outer else's sole executable
 // child, so Python gets the natural `elif` spelling without changing semantics.
-static void pyFoldElif(std::vector<std::string>& lines, std::vector<uint64_t>& vas) {
+static void pyFoldElif(std::vector<std::string>& lines, std::vector<uint64_t>& vas,
+                       std::vector<SourceOrigin>& origins) {
     for (size_t i = 0; i + 1 < lines.size(); ++i) {
         if (trim(lines[i]) != "else:") continue; // keep a commented else untouched
         const size_t outerIndent = pyIndentOf(lines[i]);
@@ -1651,8 +2989,10 @@ static void pyFoldElif(std::vector<std::string>& lines, std::vector<uint64_t>& v
         std::string nestedText = trim(lines[nested]);
         lines[i] = std::string(outerIndent, ' ') + "elif " + nestedText.substr(3);
         if (i < vas.size() && nested < vas.size()) vas[i] = vas[nested];
+        if (i < origins.size() && nested < origins.size()) origins[i] = origins[nested];
         lines.erase(lines.begin() + nested);
         if (nested < vas.size()) vas.erase(vas.begin() + nested);
+        if (nested < origins.size()) origins.erase(origins.begin() + nested);
         --end;
         for (size_t k = i + 1; k < end; ++k) {
             size_t ind = pyIndentOf(lines[k]);
@@ -1661,11 +3001,39 @@ static void pyFoldElif(std::vector<std::string>& lines, std::vector<uint64_t>& v
     }
 }
 
+// Consecutive C case labels share one body. Python match has no fallthrough, so
+// represent that exact shape as an OR-pattern instead of inventing an empty first
+// case (`case 0 | 1:` is the source-level Python equivalent).
+static void pyMergeEmptyCases(std::vector<std::string>& lines, std::vector<uint64_t>& vas,
+                              std::vector<SourceOrigin>& origins) {
+    auto pattern = [](const std::string& line, std::string& value) {
+        const std::string code = pyCodePart(line);
+        if (trim(line) != code || code.rfind("case ", 0) != 0 || code.back() != ':') return false;
+        value = trim(code.substr(5, code.size() - 6));
+        return !value.empty() && value != "_";
+    };
+    for (size_t i = 0; i + 1 < lines.size();) {
+        size_t next = i + 1;
+        while (next < lines.size() && trim(lines[next]).empty()) ++next;
+        std::string first, second;
+        if (next == lines.size() || !pattern(lines[i], first) || !pattern(lines[next], second) ||
+            pyIndentOf(lines[i]) != pyIndentOf(lines[next])) {
+            ++i;
+            continue;
+        }
+        lines[i] = std::string(pyIndentOf(lines[i]), ' ') + "case " + first + " | " + second + ":";
+        lines.erase(lines.begin() + next);
+        if (next < vas.size()) vas.erase(vas.begin() + next);
+        if (next < origins.size()) origins.erase(origins.begin() + next);
+    }
+}
+
 // Dropping C declarations/braces and match-ending breaks can expose genuinely
 // empty Python suites (an empty spin loop and a break-only switch case are common
 // binary shapes). Insert a mapped `pass`; an empty match needs a wildcard case
 // because Python's match grammar does not accept a plain statement as its suite.
-static void pyEnsureNonEmptySuites(std::vector<std::string>& lines, std::vector<uint64_t>& vas) {
+static void pyEnsureNonEmptySuites(std::vector<std::string>& lines, std::vector<uint64_t>& vas,
+                                   std::vector<SourceOrigin>& origins) {
     const size_t n = lines.size();
     std::vector<size_t> nextCode(n + 1, n);
     for (size_t i = n; i-- > 0;)
@@ -1673,11 +3041,14 @@ static void pyEnsureNonEmptySuites(std::vector<std::string>& lines, std::vector<
 
     std::vector<std::string> rebuilt;
     std::vector<uint64_t> rebuiltVA;
+    std::vector<SourceOrigin> rebuiltOrigins;
     rebuilt.reserve(n + n / 8 + 2);
     rebuiltVA.reserve(rebuilt.capacity());
+    rebuiltOrigins.reserve(rebuilt.capacity());
     for (size_t i = 0; i < lines.size(); ++i) {
         rebuilt.push_back(lines[i]);
         rebuiltVA.push_back(i < vas.size() ? vas[i] : 0);
+        rebuiltOrigins.push_back(i < origins.size() ? origins[i] : SourceOrigin{});
         std::string code = pyCodePart(lines[i]);
         if (code.empty() || code.back() != ':') continue;   // not a compound-statement header
         size_t ind = pyIndentOf(lines[i]);
@@ -1688,33 +3059,95 @@ static void pyEnsureNonEmptySuites(std::vector<std::string>& lines, std::vector<
         if (code.rfind("match ", 0) == 0) {
             rebuilt.push_back(std::string(ind + 4, ' ') + "case _:");
             rebuiltVA.push_back(va);
+            rebuiltOrigins.push_back(SourceOrigin{});
             rebuilt.push_back(std::string(ind + 8, ' ') + "pass");
             rebuiltVA.push_back(va);
+            rebuiltOrigins.push_back(SourceOrigin{});
         } else {
             rebuilt.push_back(std::string(ind + 4, ' ') + "pass");
             rebuiltVA.push_back(va);
+            rebuiltOrigins.push_back(SourceOrigin{});
         }
     }
     lines.swap(rebuilt);
     vas.swap(rebuiltVA);
+    origins.swap(rebuiltOrigins);
 }
 
 } // namespace
 
+static DecompileDiagnosticKind diagnosticKindForReason(std::string_view reason) {
+    if (reason.find("budget") != std::string_view::npos)
+        return DecompileDiagnosticKind::InstructionLimit;
+    if (reason.find("decoder") != std::string_view::npos ||
+        reason.find("decode") != std::string_view::npos)
+        return DecompileDiagnosticKind::DecodeFailure;
+    if (reason.find("chunk") != std::string_view::npos ||
+        reason.find("supplied") != std::string_view::npos ||
+        reason.find("target") != std::string_view::npos)
+        return DecompileDiagnosticKind::MissingChunk;
+    if (reason.find("clamp") != std::string_view::npos ||
+        reason.find("address range") != std::string_view::npos)
+        return DecompileDiagnosticKind::ClippedInput;
+    return DecompileDiagnosticKind::Other;
+}
+
+static void ensureCompletenessDiagnostic(DecompResult& result) {
+    if (!result.complete && result.diagnostics.empty()) {
+        const std::string message = result.incompleteReason.empty()
+                                  ? "decompilation input was incomplete"
+                                  : result.incompleteReason;
+        result.diagnostics.push_back({diagnosticKindForReason(message), message});
+    }
+}
+
 DecompResult DecompileWithMap(const ControlFlowGraph& g, const DecompileOptions& opt) {
-    if (g.blocks.empty()) return { "// no code\n", { 0 } };
+    if (g.blocks.empty()) {
+        DecompResult r;
+        r.text = "// no code\n";
+        r.lineVA = { 0 };
+        r.lineOrigins = { { 0, false } };
+        r.complete = g.complete;
+        r.incompleteReason = g.incompleteReason;
+        ensureCompletenessDiagnostic(r);
+        return r;
+    }
     Structurer s(g, opt);
-    return s.run(g.funcStart);
+    DecompResult result = s.run(g.funcStart);
+    ensureCompletenessDiagnostic(result);
+    return result;
+}
+
+DecompResult DecompileWithMap(const std::vector<CFGCodeChunk>& chunks,
+                              IDisassembler& dis,
+                              const DecompileOptions& opt,
+                              size_t maxInsns,
+                              const JumpTableResolver& resolveTable,
+                              const NoreturnCallResolver& isNoreturnCall,
+                              const DirectTargetResolver& resolveDirectTarget) {
+    return DecompileWithMap(BuildCFG(chunks, dis, maxInsns, resolveTable,
+                                     isNoreturnCall, resolveDirectTarget), opt);
 }
 
 std::string Decompile(const ControlFlowGraph& g, const DecompileOptions& opt) {
     return DecompileWithMap(g, opt).text;
 }
 
+std::string Decompile(const std::vector<CFGCodeChunk>& chunks,
+                      IDisassembler& dis,
+                      const DecompileOptions& opt,
+                      size_t maxInsns,
+                      const JumpTableResolver& resolveTable,
+                      const NoreturnCallResolver& isNoreturnCall,
+                      const DirectTargetResolver& resolveDirectTarget) {
+    return DecompileWithMap(chunks, dis, opt, maxInsns, resolveTable,
+                            isNoreturnCall, resolveDirectTarget).text;
+}
+
 DecompResult DecompileToPython(const DecompResult& c) {
     // Split into lines (DecompResult convention: no entry for the empty segment
     // after the trailing '\n').
-    std::vector<std::string> L; std::vector<uint64_t> V;
+    std::vector<std::string> L; std::vector<uint64_t> V; std::vector<SourceOrigin> O;
     for (size_t s = 0, i = 0; i <= c.text.size(); ++i)
         if (i == c.text.size() || c.text[i] == '\n') {
             if (i == c.text.size() && s == i) break;
@@ -1722,11 +3155,21 @@ DecompResult DecompileToPython(const DecompResult& c) {
             s = i + 1;
         }
     V = c.lineVA; V.resize(L.size(), 0);
+    O = c.lineOrigins;
+    if (O.size() != L.size()) {
+        O.assign(L.size(), {});
+        for (size_t i = 0; i < L.size(); ++i)
+            O[i] = { V[i], V[i] != 0,
+                     V[i] != 0 ? SourceOriginGranularity::Instruction
+                               : SourceOriginGranularity::Synthetic };
+    }
 
     DecompResult r;
-    std::vector<std::string> out; std::vector<uint64_t> outVA;
-    struct Blk { size_t indent; int kind; std::string step; uint64_t stepVA; };   // kind 0=other 1=loop 2=switch
+    std::vector<std::string> out; std::vector<uint64_t> outVA; std::vector<SourceOrigin> outOrigins;
+    struct Blk { size_t indent; int kind; std::string step; uint64_t stepVA; SourceOrigin stepOrigin; }; // kind 0=other 1=loop 2=switch
     std::vector<Blk> stack;
+    SourceOrigin activeOrigin;
+    bool sawHeaderCandidate = false;
     auto switchDepth = [&]() { size_t n = 0; for (const Blk& b : stack) if (b.kind == 2) ++n; return n; };
     auto currentLoop = [&]() -> const Blk* {
         for (auto it = stack.rbegin(); it != stack.rend(); ++it)
@@ -1736,16 +3179,28 @@ DecompResult DecompileToPython(const DecompResult& c) {
     auto emitAt = [&](size_t indent, const std::string& s, uint64_t va) {
         out.push_back(std::string(indent + 4 * switchDepth(), ' ') + s);
         outVA.push_back(va);
+        outOrigins.push_back(activeOrigin);
+    };
+    auto emitStatementsAt = [&](size_t indent, const std::string& statements,
+                                const std::string& comment, uint64_t va) {
+        std::vector<std::string> parts = pySplitStatements(statements);
+        if (parts.empty()) {
+            if (!comment.empty()) emitAt(indent, comment.substr(2), va);
+            return;
+        }
+        for (size_t part = 0; part < parts.size(); ++part)
+            emitAt(indent, parts[part] + (part + 1 == parts.size() ? comment : std::string()), va);
     };
 
     for (size_t i = 0; i < L.size(); ++i) {
         const std::string& raw = L[i];
         const uint64_t va = V[i];
+        activeOrigin = O[i];
         size_t ind = 0; while (ind < raw.size() && raw[ind] == ' ') ++ind;
         std::string t = raw.substr(ind);
         while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
 
-        if (t.empty()) { out.push_back(""); outVA.push_back(va); continue; }
+        if (t.empty()) { out.push_back(""); outVA.push_back(va); outOrigins.push_back(activeOrigin); continue; }
 
         // Split a trailing /* ... */ into a Python # comment suffix.
         std::string cmt;
@@ -1763,7 +3218,8 @@ DecompResult DecompileToPython(const DecompResult& c) {
         if (t.rfind("//", 0) == 0) { emitAt(ind, "#" + t.substr(2), va); continue; }   // comment line
         if (t.empty()) { if (!cmt.empty()) emitAt(ind, cmt.substr(2), va); continue; } // comment-only /* */ line
 
-        if (i == 0) {   // function header: "<ret> name(args)" -> "def name(args):"
+        if (!sawHeaderCandidate) { // first non-comment line is the function header candidate
+            sawHeaderCandidate = true;
             size_t p = t.find('(');
             size_t close = (p == std::string::npos) ? std::string::npos : pyMatchParen(t, p);
             if (p != std::string::npos && close != std::string::npos) {
@@ -1796,11 +3252,14 @@ DecompResult DecompileToPython(const DecompResult& c) {
             }
         }
 
-        if (t == "{") { stack.push_back({ ind, 0, "", 0 }); continue; }
+        if (t == "{") { stack.push_back({ ind, 0, "", 0, {} }); continue; }
         if (t == "}") {
             if (!stack.empty()) {
                 Blk b = stack.back(); stack.pop_back();
-                if (b.kind == 1 && !b.step.empty()) emitAt(b.indent + 4, b.step, b.stepVA);   // for-loop step
+                if (b.kind == 1 && !b.step.empty()) {
+                    SourceOrigin saved = activeOrigin; activeOrigin = b.stepOrigin;
+                    emitAt(b.indent + 4, b.step, b.stepVA); activeOrigin = saved;
+                }   // for-loop step
             }
             continue;
         }
@@ -1808,34 +3267,67 @@ DecompResult DecompileToPython(const DecompResult& c) {
         if (t.size() > 2 && t.compare(t.size() - 2, 2, " {") == 0) {   // block opener "X {"
             std::string head = t.substr(0, t.size() - 2);
             while (!head.empty() && head.back() == ' ') head.pop_back();
-            if (head == "while (1)") { emitAt(ind, "while True:" + cmt, va); stack.push_back({ ind, 1, "", 0 }); }
+            if (head == "while (1)") { emitAt(ind, "while True:" + cmt, va); stack.push_back({ ind, 1, "", 0, {} }); }
             else if (head.rfind("for (; ", 0) == 0 && head.back() == ')') {
                 std::string inner = head.substr(7, head.size() - 8);     // "COND; STEP"
                 size_t semi = inner.rfind("; ");
                 std::string cond = semi == std::string::npos ? inner : inner.substr(0, semi);
                 std::string step = semi == std::string::npos ? std::string() : inner.substr(semi + 2);
-                emitAt(ind, "while " + pyExpr(cond) + ":" + cmt, va);
-                stack.push_back({ ind, 1, step.empty() ? std::string() : pyStmt(step), va });
+                PyRangeParts range;
+                size_t close = std::string::npos;
+                size_t init = out.size();
+                while (init > 0 && trim(out[init - 1]).empty()) --init;
+                if (init > 0) --init; else init = std::string::npos;
+                std::string initVar, start;
+                const size_t renderedIndent = ind + 4 * switchDepth();
+                const bool rangeReady = !step.empty() && pyParseRangeParts(cond, step, range) &&
+                    init != std::string::npos && pyIndentOf(out[init]) == renderedIndent &&
+                    trim(out[init]) == pyCodePart(out[init]) &&
+                    pySimpleAssignment(out[init], initVar, start) && initVar == range.variable &&
+                    pyRangeSemanticsSafe(L, i, range, start, close);
+                if (rangeReady) {
+                    const std::string initText = trim(out[init]);
+                    const uint64_t initVA = init < outVA.size() ? outVA[init] : 0;
+                    const SourceOrigin initOrigin = init < outOrigins.size() ? outOrigins[init] : SourceOrigin{};
+                    out.erase(out.begin() + init);
+                    if (init < outVA.size()) outVA.erase(outVA.begin() + init);
+                    if (init < outOrigins.size()) outOrigins.erase(outOrigins.begin() + init);
+                    // range() absorbs the initializer syntactically, but its
+                    // instruction is still independently navigable in the source
+                    // map. Retain it as a mapped source-oriented comment.
+                    const SourceOrigin headerOrigin = activeOrigin;
+                    activeOrigin = initOrigin;
+                    emitAt(ind, "# init: " + initText, initVA);
+                    activeOrigin = headerOrigin;
+                    emitAt(ind, "for " + range.variable + " in " + pyRangeCall(start, range) + ":" + cmt, va);
+                    stack.push_back({ ind, 1, "", 0, {} });
+                } else {
+                    emitAt(ind, "while " + pyCondition(cond) + ":" + cmt, va);
+                    stack.push_back({ ind, 1, step.empty() ? std::string() : pyStmt(step), va, activeOrigin });
+                }
             }
             else if (head.rfind("while (", 0) == 0 && head.back() == ')') {
-                emitAt(ind, "while " + pyExpr(head.substr(7, head.size() - 8)) + ":" + cmt, va);
-                stack.push_back({ ind, 1, "", 0 });
+                emitAt(ind, "while " + pyCondition(head.substr(7, head.size() - 8)) + ":" + cmt, va);
+                stack.push_back({ ind, 1, "", 0, {} });
             }
-            else if (head == "else") { emitAt(ind, "else:" + cmt, va); stack.push_back({ ind, 0, "", 0 }); }
+            else if (head == "else") { emitAt(ind, "else:" + cmt, va); stack.push_back({ ind, 0, "", 0, {} }); }
             else if (head.rfind("if (", 0) == 0 && head.back() == ')') {
-                emitAt(ind, "if " + pyExpr(head.substr(4, head.size() - 5)) + ":" + cmt, va);
-                stack.push_back({ ind, 0, "", 0 });
+                emitAt(ind, "if " + pyCondition(head.substr(4, head.size() - 5)) + ":" + cmt, va);
+                stack.push_back({ ind, 0, "", 0, {} });
             }
             else if (head.rfind("switch (", 0) == 0 && head.back() == ')') {
                 emitAt(ind, "match " + pyExpr(head.substr(8, head.size() - 9)) + ":" + cmt, va);
-                stack.push_back({ ind, 2, "", 0 });   // push AFTER emit: the match line sits outside
+                stack.push_back({ ind, 2, "", 0, {} });   // push AFTER emit: the match line sits outside
             }
-            else { emitAt(ind, head + ":" + cmt, va); stack.push_back({ ind, 0, "", 0 }); }
+            else { emitAt(ind, head + ":" + cmt, va); stack.push_back({ ind, 0, "", 0, {} }); }
             continue;
         }
 
         if (pyIsLabel(t)) { emitAt(ind, "# " + t, va); continue; }       // goto target marker
-        if (t.rfind("case ", 0) == 0 && t.back() == ':') { emitAt(ind, t + cmt, va); continue; }
+        if (t.rfind("case ", 0) == 0 && t.back() == ':') {
+            emitAt(ind, "case " + pyExpr(t.substr(5, t.size() - 6)) + ":" + cmt, va);
+            continue;
+        }
         if (t == "default:") { emitAt(ind, "case _:" + cmt, va); continue; }
 
         if (!t.empty() && t.back() == ';') {                             // plain statement
@@ -1846,7 +3338,7 @@ DecompResult DecompileToPython(const DecompResult& c) {
                 continue;
             }
             if (decl == PyDecl::Initialized) {
-                emitAt(ind, declStatement + cmt, va);
+                emitStatementsAt(ind, declStatement, cmt, va);
                 continue;
             }
             std::string stmt = t.substr(0, t.size() - 1);
@@ -1861,13 +3353,17 @@ DecompResult DecompileToPython(const DecompResult& c) {
                     if (rest == "continue") {
                         const Blk* loop = currentLoop();
                         if (loop && !loop->step.empty()) {
-                            emitAt(ind, "if " + pyExpr(cond) + ":", va);
+                            emitAt(ind, "if " + pyCondition(cond) + ":", va);
+                            const SourceOrigin saved = activeOrigin;
+                            activeOrigin = loop->stepOrigin;
                             emitAt(ind + 4, loop->step, loop->stepVA);
+                            activeOrigin = saved;
                             emitAt(ind + 4, "continue" + cmt, va);
                             continue;
                         }
                     }
-                    emitAt(ind, "if " + pyExpr(cond) + ": " + pyStmt(rest) + cmt, va);
+                    emitAt(ind, "if " + pyCondition(cond) + ":", va);
+                    emitStatementsAt(ind + 4, pyStmt(rest), cmt, va);
                     continue;
                 }
             }
@@ -1875,23 +3371,52 @@ DecompResult DecompileToPython(const DecompResult& c) {
                 bool inSwitch = false;
                 for (auto it = stack.rbegin(); it != stack.rend(); ++it)
                     if (it->kind == 1) break; else if (it->kind == 2) { inSwitch = true; break; }
-                if (inSwitch) { if (!cmt.empty()) emitAt(ind, "pass" + cmt, va); continue; }
+                if (inSwitch) {
+                    if (!cmt.empty()) emitAt(ind, "pass" + cmt, va);
+                    else {
+                        size_t previous = out.size();
+                        while (previous > 0 && pyCodePart(out[previous - 1]).empty()) --previous;
+                        if (previous > 0) {
+                            const size_t header = previous - 1;
+                            const std::string code = pyCodePart(out[header]);
+                            if (code.rfind("case ", 0) == 0 && code.back() == ':' &&
+                                pyIndentOf(out[header]) + 4 == ind + 4 * switchDepth()) {
+                                // This empty arm exits the switch. Keep an
+                                // explicit synthetic body before label merging
+                                // can confuse it with source fallthrough.
+                                activeOrigin = {};
+                                emitAt(ind, "pass", outVA[header]);
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
             if (stmt == "continue") {
                 const Blk* loop = currentLoop();
-                if (loop && !loop->step.empty()) emitAt(ind, loop->step, loop->stepVA);
+                if (loop && !loop->step.empty()) {
+                    const SourceOrigin saved = activeOrigin;
+                    activeOrigin = loop->stepOrigin;
+                    emitAt(ind, loop->step, loop->stepVA);
+                    activeOrigin = saved;
+                }
             }
-            emitAt(ind, pyStmt(stmt) + cmt, va);
+            emitStatementsAt(ind, pyStmt(stmt), cmt, va);
             continue;
         }
 
         emitAt(ind, pyExpr(t) + cmt, va);   // anything else: best-effort expression rewrite
     }
 
-    pyFoldElif(out, outVA);
-    pyEnsureNonEmptySuites(out, outVA);
+    pyMergeEmptyCases(out, outVA, outOrigins);
+    pyFoldElif(out, outVA, outOrigins);
+    pyEnsureNonEmptySuites(out, outVA, outOrigins);
     for (const std::string& l : out) { r.text += l; r.text += '\n'; }
     r.lineVA = std::move(outVA);
+    r.lineOrigins = std::move(outOrigins);
+    r.complete = c.complete;
+    r.incompleteReason = c.incompleteReason;
+    r.diagnostics = c.diagnostics;
     return r;
 }
 

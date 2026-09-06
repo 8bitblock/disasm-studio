@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ds;
@@ -89,6 +90,8 @@ int main() {
     CHECK(bf.format() == BinFormat::MachO);
     CHECK(bf.machine() == MachineArch::X86);
     CHECK(!bf.is64Bit());
+    CHECK(!bf.bigEndian());
+    CHECK(!bf.hasEntryPoint()); // no LC_MAIN: an executable section is not a header entry
 
     // The crux of the fix: with the old offsets nsects==0 and this is empty.
     CHECK(bf.sections().size() == 1);
@@ -106,6 +109,78 @@ int main() {
     CHECK(bf.vaToOffset(0x1050, off) && off == 0x150);
     uint64_t va = 0;
     CHECK(bf.offsetToVA(0x100, va) && va == 0x1000);
+
+    // A structurally valid thin Mach-O for an unsupported CPU must not inherit
+    // x86 merely because its header is 32-bit. Normal loading safely exposes it
+    // as Raw so the analyst can choose an architecture explicitly.
+    auto unsupportedBytes = buildMacho32();
+    put32(unsupportedBytes, 4, 0x00000006u); // historical MC680x0 CPU type
+    const std::string unsupportedTmp = "macho32_unsupported_cpu.bin";
+    {
+        std::ofstream f(unsupportedTmp, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(unsupportedBytes.data()),
+                static_cast<std::streamsize>(unsupportedBytes.size()));
+    }
+    BinaryFile unsupported;
+    CHECK(!unsupported.load(unsupportedTmp));
+    CHECK(!unsupported.loaded());
+    CHECK(unsupported.format() == BinFormat::Unknown);
+    CHECK(unsupported.machine() == MachineArch::Unknown);
+    std::remove(unsupportedTmp.c_str());
+
+    // CPU_ARCH_ABI64 must agree with the thin Mach-O magic width.
+    auto contradictoryBytes = buildMacho32();
+    put32(contradictoryBytes, 4, 0x01000007u); // CPU_TYPE_X86_64 in MH_MAGIC
+    const std::string contradictoryTmp = "macho32_contradictory_cpu_width.bin";
+    {
+        std::ofstream f(contradictoryTmp, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(contradictoryBytes.data()),
+                static_cast<std::streamsize>(contradictoryBytes.size()));
+    }
+    BinaryFile contradictory;
+    CHECK(!contradictory.load(contradictoryTmp));
+    CHECK(contradictory.loadError() == BinaryLoadError::MalformedMachO);
+    CHECK(!contradictory.loaded() && contradictory.machine() == MachineArch::Unknown);
+    std::remove(contradictoryTmp.c_str());
+
+    auto expectMalformedMapping = [](std::vector<uint8_t> malformed,
+                                     const char* path) {
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(malformed.data()),
+                    static_cast<std::streamsize>(malformed.size()));
+        }
+        BinaryFile image;
+        CHECK(!image.load(path));
+        CHECK(image.loadError() == BinaryLoadError::MalformedMachO);
+        CHECK(!image.loaded());
+        std::remove(path);
+    };
+
+    // Load-command and section framing is mapping authority, not optional
+    // metadata: no valid prefix may survive any of these truncations.
+    {
+        auto malformed = buildMacho32();
+        put32(malformed, 20, 0x1000); // sizeofcmds overruns the slice
+        expectMalformedMapping(std::move(malformed), "macho32_sizeofcmds_overrun.bin");
+    }
+    {
+        auto malformed = buildMacho32();
+        put32(malformed, 16, 2); // declares a second command outside sizeofcmds
+        expectMalformedMapping(std::move(malformed), "macho32_ncmds_mismatch.bin");
+    }
+    {
+        auto malformed = buildMacho32();
+        put32(malformed, 20, 56);      // command table ends before section row
+        put32(malformed, 28 + 4, 56);  // segment cmdsize has no declared row bytes
+        expectMalformedMapping(std::move(malformed), "macho32_section_row_truncated.bin");
+    }
+    {
+        auto malformed = buildMacho32();
+        constexpr size_t sec = 28 + 56;
+        put32(malformed, sec + 40, 0x1F0); // only 16 file bytes remain for size 0x100
+        expectMalformedMapping(std::move(malformed), "macho32_section_payload_truncated.bin");
+    }
 
     std::remove(tmp.c_str());
 

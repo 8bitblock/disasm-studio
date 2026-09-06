@@ -117,6 +117,25 @@ int main() {
     CHECK(!CompileCondition("garbage").valid);
     CHECK(CompileCondition("rax == 1").valid && !CompileCondition("rax == 1").empty);
 
+    // Breakpoint commands validate both syntax and the debugger's concrete
+    // register vocabulary before they are queued. Empty remains the intentional
+    // unconditional form; malformed/unknown input must never reach the hit path.
+    {
+        std::string error = "stale";
+        CHECK(ValidateBreakpointCondition("", &error));
+        CHECK(error.empty());
+        CHECK(ValidateBreakpointCondition("rax == 1", &error));
+        CHECK(ValidateBreakpointCondition("[rsp+8] != 0", &error));
+        CHECK(ValidateBreakpointCondition("rflags != 0", &error));
+        CHECK(!ValidateBreakpointCondition("garbage", &error));
+        CHECK(!error.empty());
+        CHECK(!ValidateBreakpointCondition("rax = 1", &error));
+        CHECK(!ValidateBreakpointCondition("bogus == 1", &error));
+        CHECK(error.find("bogus") != std::string::npos);
+        CHECK(!ValidateBreakpointCondition("[unknown+8] == 0", &error));
+        CHECK(ValidateBreakpointCondition("RAX == 1", &error));
+    }
+
     // ---- 2b) Signed operators: concrete truth values. ----
     CHECK(EvalCompiled(CompileCondition("rbx s> -5"), cc, false));    // 5 > -5 signed
     CHECK(!EvalCompiled(CompileCondition("rbx > -5"), cc, true));     // unsigned: 5 not > 0xFF..FB

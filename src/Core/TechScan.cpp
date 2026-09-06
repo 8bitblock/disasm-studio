@@ -1,6 +1,8 @@
 #include "TechScan.h"
+#include "AddressSpan.h"
 #include "BinaryFile.h"
 #include "JavaScan.h"
+#include "NetworkApiCatalog.h"
 #include "RuntimeScan.h"
 #include "SigMatch.h"
 
@@ -48,9 +50,6 @@ const ApiRule kApiRules[] = {
     { "anti-debug", "Anti-debugging checks",
       { "isdebuggerpresent", "checkremotedebugger", "ntqueryinformationprocess",
         "ntsetinformationthread", "outputdebugstring", "debugactiveprocess", "ntquerysysteminformation" }, 0.66f },
-    { "network", "Network I/O",
-      { "wsastartup", "wsasocket", "socket", "connect", "send", "recv", "gethostbyname", "getaddrinfo",
-        "internetopen", "internetconnect", "httpsendrequest", "winhttpopen", "winhttpconnect", "urldownloadtofile" }, 0.62f },
     { "crypto", "Cryptographic API",
       { "cryptacquirecontext", "cryptencrypt", "cryptdecrypt", "cryptgenkey", "cryptderivekey",
         "bcryptencrypt", "bcryptdecrypt", "bcryptgeneratesymmetrickey", "cryptstringtobinary" }, 0.7f },
@@ -72,21 +71,28 @@ void mk(std::vector<uint8_t>& b, std::vector<bool>& m, std::initializer_list<int
 
 } // namespace
 
-std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
+std::vector<Capability> ScanCapabilities(
+    const BinaryFile& bin, const std::function<bool()>& cancelled) {
     std::vector<Capability> out;
     if (!bin.loaded()) return out;
+    const auto stopped = [&] { return cancelled && cancelled(); };
 
     // ---- 1) Imported-API grouping ----
     const auto& imports = bin.imports();
     for (const auto& rule : kApiRules) {
+        if (stopped()) return {};
         std::vector<std::string> hits;
         uint64_t addr = 0;
+        bool addrValid = false;
         for (const auto& im : imports) {
             std::string ln = lower(im.name);
             for (const char* k : rule.keys) {
                 if (ln.find(k) != std::string::npos) {
                     if (std::find(hits.begin(), hits.end(), im.name) == hits.end()) hits.push_back(im.name);
-                    if (!addr) addr = im.iatVA;
+                    if (!addrValid && im.addressKnown) {
+                        addr = im.iatVA;
+                        addrValid = true;
+                    }
                     break;
                 }
             }
@@ -97,10 +103,54 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
         c.category = rule.category;
         c.confidence = std::min(0.96f, rule.base + 0.07f * (float)(hits.size() - 1));
         c.address = addr;
+        c.addressValid = addrValid;
         c.detail = "Imports: ";
         for (size_t i = 0; i < hits.size() && i < 12; ++i) { if (i) c.detail += ", "; c.detail += hits[i]; }
         if (hits.size() > 12) c.detail += ", ...";
         out.push_back(std::move(c));
+    }
+
+    // Networking is classified by the shared exact DLL-aware catalog. Substring
+    // matching here used to turn USER32!SendMessageW into socket evidence merely
+    // because the name contains "send".
+    {
+        std::vector<std::string> hits;
+        NetworkStageMask stages = 0;
+        uint64_t address = 0;
+        bool addressValid = false;
+        for (const auto& import : imports) {
+            const auto match = LookupNetworkApi(import.dll, import.name);
+            if (!match) continue;
+            const std::string display = match->dll + "!" + match->canonicalName +
+                                        " (" + NetworkStageText(match->stage) + ")";
+            if (std::find(hits.begin(), hits.end(), display) == hits.end())
+                hits.push_back(display);
+            stages |= NetworkStageBit(match->stage);
+            if (!addressValid && import.addressKnown) {
+                address = import.iatVA;
+                addressValid = true;
+            }
+        }
+        if (!hits.empty()) {
+            unsigned stageCount = 0;
+            for (unsigned i = 0; i < static_cast<unsigned>(NetworkStage::Count); ++i)
+                if (stages & NetworkStageBit(static_cast<NetworkStage>(i))) ++stageCount;
+            Capability capability;
+            capability.name = "Network I/O";
+            capability.category = "network";
+            capability.confidence = std::min(0.96f,
+                0.62f + 0.07f * static_cast<float>(hits.size() - 1) +
+                0.03f * static_cast<float>(stageCount > 0 ? stageCount - 1 : 0));
+            capability.address = address;
+            capability.addressValid = addressValid;
+            capability.detail = "Exact imports: ";
+            for (size_t i = 0; i < hits.size() && i < 12; ++i) {
+                if (i) capability.detail += ", ";
+                capability.detail += hits[i];
+            }
+            if (hits.size() > 12) capability.detail += ", ...";
+            out.push_back(std::move(capability));
+        }
     }
 
     // ---- 2) Packer / protector section names ----
@@ -117,12 +167,20 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
     std::vector<std::string> packerSecs;
     std::string packerName;
     uint64_t packerAddr = 0;
+    bool packerAddrValid = false;
     for (const auto& s : bin.sections())
         for (const auto& pk : kPackers)
+            if (stopped()) return {};
+            else
             if (s.name == pk.sec) {
                 packerSecs.push_back(s.name);
                 packerName = pk.name;
-                if (!packerAddr) packerAddr = bin.imageBase() + s.virtualAddress;
+                if (!packerAddrValid) {
+                    if (CheckedAddressAdd(bin.imageBase(), s.virtualAddress,
+                                          packerAddr)) {
+                        packerAddrValid = true;
+                    }
+                }
             }
     if (!packerSecs.empty()) {
         Capability c;
@@ -130,6 +188,7 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
         c.category = "packer";
         c.confidence = 0.8f;
         c.address = packerAddr;
+        c.addressValid = packerAddrValid;
         c.detail = "Section names: ";
         for (size_t i = 0; i < packerSecs.size(); ++i) { if (i) c.detail += ", "; c.detail += packerSecs[i]; }
         c.detail += " (image may be packed/protected)";
@@ -138,8 +197,6 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
 
     // ---- 3) Distinctive byte patterns ----
     const auto& d = bin.bytes();
-    auto patVA = [&](size_t off) { uint64_t va = 0; return bin.offsetToVA(off, va) ? va : (bin.imageBase() + off); };
-
     struct Found { const char* name; const char* cat; float conf; const char* note;
                    std::vector<size_t> offs; size_t total; };
     std::vector<Found> found;
@@ -147,6 +204,7 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
     // Collect every (bounded) hit of `b`/`m`; record the capability only if >=1.
     auto scanPat = [&](const char* name, const char* cat, float conf, const char* note,
                        const std::vector<uint8_t>& b, const std::vector<bool>& m) {
+        if (stopped()) return;
         size_t total = 0;
         std::vector<size_t> offs = findAllPattern(d, b, m, total);
         if (!offs.empty()) found.push_back({ name, cat, conf, note, std::move(offs), total });
@@ -163,12 +221,19 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
     // orientation-variant (BE/LE), and extent-mapped to the referencing function. The
     // Binary Tech tab merges those results into this list (see BinaryTechTab::runTechScan).
     for (const auto& f : found) {
+        if (stopped()) return {};
         Capability c;
         c.name = f.name; c.category = f.cat; c.confidence = f.conf;
         c.hitCount = f.total;
         c.addresses.reserve(f.offs.size());
-        for (size_t off : f.offs) c.addresses.push_back(patVA(off));
+        size_t unmappedHits = 0;
+        for (size_t off : f.offs) {
+            uint64_t va = 0;
+            if (bin.offsetToVA(off, va)) c.addresses.push_back(va);
+            else ++unmappedHits;
+        }
         c.address = c.addresses.empty() ? 0 : c.addresses.front();
+        c.addressValid = !c.addresses.empty();
         c.detail = f.note;
         // Surface the occurrence count in the human-readable evidence: more hits
         // of a crypto table / syscall stub = stronger evidence (and a "+" when the
@@ -179,6 +244,10 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
                           f.total, (f.total >= kMaxPatternHits ? "+" : ""));
             c.detail += tail;
         }
+        if (unmappedHits) {
+            c.detail += " (" + std::to_string(unmappedHits) +
+                        " collected hit(s) are file-only/unmapped and are not navigable)";
+        }
         out.push_back(std::move(c));
     }
 
@@ -187,6 +256,7 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
 
     // ---- 4) Java launcher / embedded JAR (JavaScan) ----
     {
+        if (stopped()) return {};
         JavaScanResult jr = ScanJava(bin);
         if (jr.kind != JavaWrapKind::None) {
             Capability c;
@@ -194,6 +264,7 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
             c.category   = "java";
             c.confidence = jr.confidence;
             c.address    = 0;   // the appended archive is overlay data: it has no VA
+            c.addressValid = false;
             c.detail     = jr.detail;
             c.analyzer   = "JavaScan";
             out.push_back(std::move(c));
@@ -204,12 +275,14 @@ std::vector<Capability> ScanCapabilities(const BinaryFile& bin) {
         // finding (analyzer "JavaScan") is skipped: the merge above covers it.
         RuntimeScanResult rr = ScanRuntimes(bin, jr);
         for (auto& f : rr.findings) {
+            if (stopped()) return {};
             if (f.analyzer == "JavaScan") continue;
             Capability c;
             c.name       = f.title;
             c.category   = f.category;
             c.confidence = f.confidence;
             c.address    = f.address;
+            c.addressValid = f.addressValid;
             c.detail     = f.detail;
             c.analyzer   = f.analyzer;
             out.push_back(std::move(c));

@@ -116,5 +116,6 @@ public:
 // so the app still links. Tests inject their own mocks instead.
 std::unique_ptr<ISymEngine> MakeSymEngine(Arch arch);
 std::unique_ptr<ISolver>    MakeSolver();
+bool SymEngineAvailable();
 
 } // namespace ds

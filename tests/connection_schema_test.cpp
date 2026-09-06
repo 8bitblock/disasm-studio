@@ -58,6 +58,17 @@ int main() {
     msg.payloadJson = "{}";
     msg.address = "0xZZ";
     CHECK(!ValidateConnectionEnvelope(msg, &err));
+    msg.address = "0x10000000000000000";
+    CHECK(!ValidateConnectionEnvelope(msg, &err));
+    msg.address = "0xFFFFFFFFFFFFFFFF";
+    CHECK(ValidateConnectionEnvelope(msg, &err));
+
+    // Present known fields are schema-authoritative. A numeric address must not
+    // be coerced to the optional empty string and accepted as if it were absent.
+    ConnectionEnvelope malformed;
+    CHECK(!DeserializeConnectionEnvelope(
+        "{\"type\":\"event\",\"source\":\"tool\",\"address\":16,\"payload\":{}}",
+        malformed, &err));
 
     if (g_fail) { std::printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     std::printf("connection_schema_test: all checks passed\n");

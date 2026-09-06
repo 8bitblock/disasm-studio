@@ -3,6 +3,7 @@
 #include "AlgoScan.h"
 #include "AnalysisJobs.h"   // FuncResult, StrResult
 #include "BinaryFile.h"
+#include "CrackmeTriage.h"
 #include "TechScan.h"
 
 #include <algorithm>
@@ -20,6 +21,7 @@ namespace {
 
 constexpr size_t kMaxAddrsPerBehavior = 32;
 constexpr size_t kMaxHighlights       = 16;
+constexpr size_t kMaxRankedEndpoints  = 8;
 
 std::string lower(std::string s) {
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
@@ -36,19 +38,444 @@ bool hasAny(const std::string& lowHay, std::initializer_list<const char*> subs) 
     return false;
 }
 
-// Match a lower-case identifier as a token, so Win32 names such as SendMessage
-// do not accidentally satisfy the socket API token "send".
-bool hasToken(const std::string& lowHay, const char* token) {
-    const size_t n = std::char_traits<char>::length(token);
+bool hasExactNetworkApiEvidence(const std::string& text) {
     size_t at = 0;
-    while ((at = lowHay.find(token, at)) != std::string::npos) {
-        const bool left = at == 0 || !std::isalnum((unsigned char)lowHay[at - 1]);
-        const size_t end = at + n;
-        const bool right = end == lowHay.size() || !std::isalnum((unsigned char)lowHay[end]);
-        if (left && right) return true;
-        ++at;
+    while (at < text.size()) {
+        while (at < text.size() &&
+               !(std::isalnum(static_cast<unsigned char>(text[at])) || text[at] == '_'))
+            ++at;
+        const size_t begin = at;
+        while (at < text.size()) {
+            const unsigned char c = static_cast<unsigned char>(text[at]);
+            if (!(std::isalnum(c) || c == '_' || c == '.' || c == '!' || c == '@')) break;
+            ++at;
+        }
+        if (begin == at) continue;
+        const std::string token = text.substr(begin, at - begin);
+        size_t separator = token.find_last_of('!');
+        if (separator == std::string::npos) separator = token.find_last_of('.');
+        if (separator == std::string::npos || separator == 0 || separator + 1 >= token.size())
+            continue;
+        if (LookupNetworkApi(token.substr(0, separator), token.substr(separator + 1)))
+            return true;
     }
     return false;
+}
+
+const char* trailStageName(NetworkTrailStage stage) {
+    switch (stage) {
+    case NetworkTrailStage::Endpoint: return "Endpoint";
+    case NetworkTrailStage::Connect:  return "Connect";
+    case NetworkTrailStage::Request:  return "Request";
+    case NetworkTrailStage::Reply:    return "Reply";
+    case NetworkTrailStage::Decision: return "Decision";
+    case NetworkTrailStage::Count:    break;
+    }
+    return "Unknown";
+}
+
+int triageConfidenceRank(CrackmeTriageConfidence confidence) {
+    return static_cast<int>(confidence);
+}
+
+const CrackmeTrail* trailForEndpoint(const CrackmeTriageReport& report,
+                                     size_t endpointIndex) {
+    for (const CrackmeTrail& trail : report.trails)
+        if (trail.endpointIndex == endpointIndex) return &trail;
+    return nullptr;
+}
+
+bool trailHasStage(const CrackmeTriageReport& report, size_t endpointIndex,
+                   NetworkTrailStage stage) {
+    if (stage == NetworkTrailStage::Endpoint) return true;
+    if (const CrackmeTrail* trail = trailForEndpoint(report, endpointIndex)) {
+        const auto& evidence = trail->stages[static_cast<size_t>(stage)];
+        return evidence.apiCount != 0 || evidence.correlationCount != 0;
+    }
+    const NetworkStageMask low = report.endpoints[endpointIndex].stages;
+    auto hasLowStage = [low](NetworkStage value) {
+        return (low & NetworkStageBit(value)) != 0;
+    };
+    switch (stage) {
+    case NetworkTrailStage::Connect:
+        return hasLowStage(NetworkStage::Resolve) || hasLowStage(NetworkStage::Connect);
+    case NetworkTrailStage::Request:
+        return hasLowStage(NetworkStage::Request) || hasLowStage(NetworkStage::Write);
+    case NetworkTrailStage::Reply:
+        return hasLowStage(NetworkStage::Read);
+    default:
+        return false;
+    }
+}
+
+std::string trailStageList(const CrackmeTriageReport& report, size_t endpointIndex) {
+    std::string text;
+    for (size_t i = 0; i < static_cast<size_t>(NetworkTrailStage::Count); ++i) {
+        const auto stage = static_cast<NetworkTrailStage>(i);
+        if (!trailHasStage(report, endpointIndex, stage)) continue;
+        if (!text.empty()) text += " -> ";
+        text += trailStageName(stage);
+    }
+    return text;
+}
+
+size_t endpointArtifactCount(const CrackmeTriageReport& report, size_t endpointIndex) {
+    size_t count = 0;
+    for (const NetworkArtifact& artifact : report.artifacts)
+        if (artifact.endpointIndexValid && artifact.endpointIndex == endpointIndex) ++count;
+    return count;
+}
+
+std::vector<size_t> rankedEndpointIndices(const CrackmeTriageReport& report) {
+    std::vector<size_t> indices(report.endpoints.size());
+    for (size_t i = 0; i < indices.size(); ++i) indices[i] = i;
+    std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+        const CrackmeTriageEndpoint& ea = report.endpoints[a];
+        const CrackmeTriageEndpoint& eb = report.endpoints[b];
+        const int ca = triageConfidenceRank(ea.confidence);
+        const int cb = triageConfidenceRank(eb.confidence);
+        if (ca != cb) return ca > cb;
+        size_t sa = 0, sb = 0;
+        for (size_t i = 0; i < static_cast<size_t>(NetworkTrailStage::Count); ++i) {
+            const auto stage = static_cast<NetworkTrailStage>(i);
+            sa += trailHasStage(report, a, stage) ? 1u : 0u;
+            sb += trailHasStage(report, b, stage) ? 1u : 0u;
+        }
+        if (sa != sb) return sa > sb;
+        if (ea.correlationIndices.size() != eb.correlationIndices.size())
+            return ea.correlationIndices.size() > eb.correlationIndices.size();
+        const size_t aa = endpointArtifactCount(report, a);
+        const size_t ab = endpointArtifactCount(report, b);
+        return aa != ab ? aa > ab : a < b;
+    });
+    if (indices.size() > kMaxRankedEndpoints) indices.resize(kMaxRankedEndpoints);
+    return indices;
+}
+
+std::string rankedEndpointAnswer(const CrackmeTriageReport* report) {
+    if (!report || report->endpoints.empty()) return {};
+    const std::vector<size_t> ranked = rankedEndpointIndices(*report);
+    std::string answer = "Ranked static endpoint leads (not contacted): ";
+    for (size_t rank = 0; rank < ranked.size(); ++rank) {
+        const size_t index = ranked[rank];
+        const CrackmeTriageEndpoint& endpoint = report->endpoints[index];
+        if (rank) answer += " ";
+        answer += std::to_string(rank + 1) + ". " + endpoint.display + " [" +
+                  (endpoint.confidenceLabel.empty() ? "unrated" : endpoint.confidenceLabel) +
+                  "] — " + trailStageList(*report, index) + ".";
+        if (!endpoint.honestyLabel.empty()) answer += " " + endpoint.honestyLabel + ".";
+        size_t shown = 0;
+        for (const NetworkArtifact& artifact : report->artifacts) {
+            if (!artifact.endpointIndexValid || artifact.endpointIndex != index ||
+                artifact.value.empty()) continue;
+            answer += (shown++ == 0 ? " Artifacts: " : ", ") + artifact.value;
+            if (shown == 3) break;
+        }
+        if (shown) answer += ".";
+    }
+    if (!report->completeness.complete) {
+        answer += " The bounded static report is partial";
+        if (!report->completeness.reason.empty())
+            answer += ": " + report->completeness.reason;
+        answer += ".";
+    }
+    return answer;
+}
+
+std::string hex(uint64_t v);
+
+std::string networkReturnFlowAnswer(const CrackmeTriageReport* report) {
+    if (!report) return "No crackme network-return report is available.";
+    std::string answer;
+    if (!report->replyDecisionFlows.empty()) {
+        answer = "Reply-content comparison candidates (bounded static data flow; not runtime proof): ";
+        size_t replyShown = 0;
+        for (const NetworkReplyDecisionFlow& flow : report->replyDecisionFlows) {
+            if (!flow.apiIndexValid || flow.apiIndex >= report->apis.size()) continue;
+            if (replyShown++) answer += " ";
+            const CrackmeTriageApiEvidence& api = report->apis[flow.apiIndex];
+            answer += api.dll + "!" + api.canonicalName;
+            if (flow.callsiteValid) answer += " read at " + hex(flow.callsite);
+            answer += ": " + (flow.comparisonSummary.empty()
+                ? flow.comparisonInstruction : flow.comparisonSummary);
+            if (flow.comparisonAddressValid)
+                answer += " (comparison " + hex(flow.comparisonAddress) + ")";
+            if (flow.decisionAddressValid)
+                answer += "; branch " + hex(flow.decisionAddress);
+            if (flow.matchAddressValid)
+                answer += "; match path " + hex(flow.matchAddress);
+            if (flow.mismatchAddressValid)
+                answer += "; mismatch path " + hex(flow.mismatchAddress);
+            answer += ".";
+            if (replyShown == 8) break;
+        }
+        if (replyShown)
+            answer += " Match/mismatch describes comparison polarity; it is not automatically labelled accept/reject. ";
+    }
+    answer += "Documented API returns and bounded static handling (not predicted server data): ";
+    size_t shown = 0;
+    for (const NetworkReturnFlow& flow : report->returnFlows) {
+        if (!flow.apiIndexValid || flow.apiIndex >= report->apis.size()) continue;
+        const CrackmeTriageApiEvidence& api = report->apis[flow.apiIndex];
+        const auto contract = LookupNetworkApiReturnContract(api.dll, api.canonicalName);
+        if (shown++) answer += " ";
+        answer += api.dll + "!" + api.canonicalName;
+        if (flow.callsiteValid) answer += " at " + hex(flow.callsite);
+        answer += ": expected ";
+        if (contract) {
+            answer += std::string(contract->returnType) + " — " +
+                      std::string(contract->successMeaning) +
+                      "; failure is " + std::string(contract->failureMeaning);
+            if (contract->outParameterCount) {
+                answer += "; outputs ";
+                for (uint8_t i = 0; i < contract->outParameterCount; ++i) {
+                    if (i) answer += ", ";
+                    const auto& output = contract->outParameters[i];
+                    answer += "arg " + std::to_string(output.oneBasedOrdinal()) + " " +
+                              NetworkOutParameterRoleText(output.role);
+                }
+            }
+        } else answer += "contract unavailable";
+        answer += ". Static use: ";
+        if (!flow.returnValueUseKnown) {
+            answer += "not recovered inside the bounded analysis window";
+        } else {
+            answer += std::string(NetworkReturnUseKindText(flow.useKind));
+            if (!flow.useSummary.empty()) answer += " (" + flow.useSummary + ")";
+            if (flow.useAddressValid) answer += " at " + hex(flow.useAddress);
+            if (flow.decisionAddressValid)
+                answer += "; branch at " + hex(flow.decisionAddress);
+        }
+        answer += ".";
+        if (shown == 8) break;
+    }
+    if (!shown) {
+        size_t contracts = 0;
+        for (const CrackmeTriageApiEvidence& api : report->apis) {
+            const auto contract = LookupNetworkApiReturnContract(api.dll,
+                                                                  api.canonicalName);
+            if (!contract) continue;
+            if (contracts++) answer += " ";
+            answer += api.dll + "!" + api.canonicalName + ": " +
+                      std::string(contract->returnType) + " — " +
+                      std::string(contract->successMeaning) + ".";
+            if (contracts == 8) break;
+        }
+        if (!contracts)
+            answer += "no exact network API contracts were found.";
+    }
+    answer +=
+        " A read API status/byte-count check confirms only the API operation; it does not prove that reply-buffer content or a license was accepted.";
+    return answer;
+}
+
+const char* cortexAuthorizationOutcomeText(AuthorizationOutcome outcome) {
+    switch (outcome) {
+    case AuthorizationOutcome::LikelyAllow: return "Likely allow";
+    case AuthorizationOutcome::LikelyDeny: return "Likely deny";
+    default: return "Unknown";
+    }
+}
+
+const char* cortexPersistentStateKindText(PersistentStateKind kind) {
+    switch (kind) {
+    case PersistentStateKind::Registry: return "Registry";
+    case PersistentStateKind::File: return "File";
+    case PersistentStateKind::Ini: return "INI";
+    case PersistentStateKind::Credential: return "Credential Manager";
+    case PersistentStateKind::DpapiTransform: return "DPAPI transform";
+    default: return "Unknown store";
+    }
+}
+
+std::string persistentIdentitySummary(const PersistentStateIdentity& identity) {
+    if (!identity.display.empty()) return identity.display;
+    std::string result = cortexPersistentStateKindText(identity.kind);
+    if (!identity.canonicalScope.empty()) result += " " + identity.canonicalScope;
+    if (!identity.canonicalKey.empty()) result += " / " + identity.canonicalKey;
+    if (!identity.canonicalValue.empty()) result += " / " + identity.canonicalValue;
+    return result;
+}
+
+float supportingEvidenceWeight(AuthorizationOutcome outcome,
+                               const AuthorizationEvidence& evidence) {
+    float weight = 0.0f;
+    if (outcome == AuthorizationOutcome::LikelyAllow) {
+        switch (evidence.kind) {
+        case AuthorizationEvidenceKind::ApplicationContinuation: weight = 0.85f; break;
+        case AuthorizationEvidenceKind::SuccessIndicator: weight = 0.65f; break;
+        // A durable write is direction-neutral.  It may persist a grant, but
+        // just as legitimately may record a denial, revocation, or attempt
+        // counter.  Written-value provenance must establish direction before
+        // another evidence kind can describe the write as an allow effect.
+        case AuthorizationEvidenceKind::PersistentStateWrite: break;
+        default: break;
+        }
+    } else if (outcome == AuthorizationOutcome::LikelyDeny) {
+        switch (evidence.kind) {
+        case AuthorizationEvidenceKind::ProcessTermination: weight = 0.95f; break;
+        case AuthorizationEvidenceKind::EarlyFailureReturn: weight = 0.80f; break;
+        case AuthorizationEvidenceKind::FailureIndicator: weight = 0.65f; break;
+        default: break;
+        }
+    }
+    if (weight > 0.0f && evidence.strength > 0.0f)
+        weight = std::clamp(evidence.strength, 0.0f, 1.0f);
+    return weight;
+}
+
+const AuthorizationEvidence* strongestSupportingEvidence(
+    const AuthorizationPath& path) {
+    const AuthorizationEvidence* strongest = nullptr;
+    float strongestWeight = 0.0f;
+    for (const AuthorizationEvidence& evidence : path.evidence) {
+        const float weight = supportingEvidenceWeight(path.outcome, evidence);
+        if (weight > strongestWeight) {
+            strongest = &evidence;
+            strongestWeight = weight;
+        }
+    }
+    return strongest;
+}
+
+void appendAuthorizationPath(std::string& answer, const char* branch,
+                             const AuthorizationPath& path) {
+    answer += std::string(branch) + " " +
+              cortexAuthorizationOutcomeText(path.outcome);
+    if (path.entry.addressValid)
+        answer += " (candidate path entry at " + hex(path.entry.address) + ")";
+    else if (path.entry.fileOffsetValid)
+        answer += " (candidate path entry at file offset " +
+                  hex(path.entry.fileOffset) + ")";
+    else
+        answer += " (candidate path entry unresolved)";
+
+    if (path.outcome == AuthorizationOutcome::Unknown) return;
+    const AuthorizationEvidence* effect = strongestSupportingEvidence(path);
+    if (!effect) {
+        answer += "; no retained supporting downstream effect location";
+        return;
+    }
+    answer += "; strongest supporting downstream effect: ";
+    answer += AuthorizationEvidenceKindText(effect->kind);
+    if (effect->location.addressValid)
+        answer += " at " + hex(effect->location.address);
+    else if (effect->location.functionAddressValid)
+        answer += " in function " + hex(effect->location.functionAddress);
+    else if (effect->location.fileOffsetValid)
+        answer += " at file offset " + hex(effect->location.fileOffset);
+    if (!effect->text.empty()) answer += " (" + effect->text + ")";
+}
+
+std::string authorizationAnswer(const CrackmeTriageReport* report,
+                                bool rememberedOnly,
+                                bool localInputOnly = false) {
+    if (!report) return "No static authorization report is available.";
+    const AuthorizationAnalysisReport& authorization = report->authorization;
+    auto appendCompleteness = [&](std::string answer) {
+        if (authorization.completeness.complete) return answer;
+        answer += " The bounded authorization report is partial";
+        if (!authorization.completeness.reason.empty())
+            answer += ": " + authorization.completeness.reason;
+        answer += ".";
+        return answer;
+    };
+
+    size_t matchingFlows = 0;
+    for (const AuthorizationFlow& flow : authorization.flows) {
+        if (rememberedOnly && !flow.rememberedAccessLinked) continue;
+        const bool localInput = flow.localInputFlow ||
+            flow.gateSource == AuthorizationGateSource::LocalInput;
+        if (localInputOnly && !localInput) continue;
+        ++matchingFlows;
+    }
+    if (!matchingFlows) {
+        if (localInputOnly)
+            return appendCompleteness(
+                "No bounded local credential/input authorization check was recovered. Indirect input handling, custom comparators, and generated code may remain opaque.");
+        if (rememberedOnly)
+            return appendCompleteness(
+                "No exact persistent-state write -> startup read -> launch-gate chain was recovered. This does not rule out a custom, computed, or dynamically resolved store.");
+        return appendCompleteness(
+            "No bounded reply, startup-state, or local credential/input authorization check was recovered. API success alone is not treated as access being accepted.");
+    }
+
+    std::string answer = rememberedOnly
+        ? "Remembered-access chains (bounded static evidence; not runtime proof): "
+        : "Authorization outcomes (evidence-graded static analysis; not runtime proof): ";
+    size_t shown = 0;
+    for (const AuthorizationFlow& flow : authorization.flows) {
+        if (rememberedOnly && !flow.rememberedAccessLinked) continue;
+        const bool localInput = flow.localInputFlow ||
+            flow.gateSource == AuthorizationGateSource::LocalInput;
+        if (localInputOnly && !localInput) continue;
+        if (shown++) answer += " ";
+        answer += flow.id.empty() ? "authorization flow" : flow.id;
+        if (localInput) {
+            answer += " local credential/input check: input read";
+            if (flow.inputLocation.addressValid)
+                answer += " at " + hex(flow.inputLocation.address);
+            else if (flow.inputLocation.fileOffsetValid)
+                answer += " at file offset " + hex(flow.inputLocation.fileOffset);
+            else
+                answer += " location unresolved";
+            answer += "; compare";
+            if (flow.comparisonLocation.addressValid)
+                answer += " at " + hex(flow.comparisonLocation.address);
+            else if (flow.comparisonLocation.fileOffsetValid)
+                answer += " at file offset " +
+                          hex(flow.comparisonLocation.fileOffset);
+            else
+                answer += " location unresolved";
+            answer += "; decision";
+            if (flow.decisionLocation.addressValid)
+                answer += " at " + hex(flow.decisionLocation.address);
+            else if (flow.decisionLocation.fileOffsetValid)
+                answer += " at file offset " +
+                          hex(flow.decisionLocation.fileOffset);
+            else
+                answer += " location unresolved";
+            if (!flow.originExpression.empty())
+                answer += "; input expression " + flow.originExpression;
+            if (!flow.expectedValue.empty())
+                answer += "; expected value " + flow.expectedValue;
+            answer += ". Paths: ";
+        } else {
+            if (flow.decisionLocation.addressValid)
+                answer += " gate at " + hex(flow.decisionLocation.address);
+            answer += ": ";
+        }
+        appendAuthorizationPath(answer, "taken", flow.takenPath);
+        answer += "; ";
+        appendAuthorizationPath(answer, "fallthrough", flow.fallthroughPath);
+
+        size_t stateShown = 0;
+        auto appendOperation = [&](size_t index, const char* role) {
+            if (index >= authorization.stateOperations.size() || stateShown == 3) return;
+            const PersistentStateOperation& operation = authorization.stateOperations[index];
+            answer += stateShown++ == 0 ? ". State chain: " : ", ";
+            answer += std::string(role) + " " + persistentIdentitySummary(operation.identity);
+            if (operation.location.addressValid)
+                answer += " at " + hex(operation.location.address);
+        };
+        for (size_t index : flow.linkedStateWriteIndices) appendOperation(index, "write");
+        for (size_t index : flow.linkedStartupReadIndices) appendOperation(index, "startup read");
+        if (flow.rememberedAccessLinked)
+            answer += ". The exact store identity links a success-side write to a startup-reachable read";
+        if (!flow.honestyLabel.empty()) answer += ". " + flow.honestyLabel;
+        answer += ".";
+        if (shown == 8) break;
+    }
+    if (shown < matchingFlows) {
+        const size_t omitted = matchingFlows - shown;
+        answer += " Showing first " + std::to_string(shown) + " of " +
+                  std::to_string(matchingFlows) + " matching flows; " +
+                  std::to_string(omitted) +
+                  (omitted == 1 ? " flow omitted." : " flows omitted.");
+    }
+    answer = appendCompleteness(std::move(answer));
+    answer += " Likely allow/deny labels describe downstream effects; only a live Authorization Watch hit can be called observed.";
+    return answer;
 }
 
 std::string hex(uint64_t v) {
@@ -73,6 +500,7 @@ const char* archName(MachineArch m) {
         case MachineArch::X86:     return "x86";
         case MachineArch::X64:     return "x64";
         case MachineArch::ARM:     return "ARM";
+        case MachineArch::THUMB:   return "Thumb/Thumb-2";
         case MachineArch::ARM64:   return "ARM64";
         case MachineArch::MIPS:    return "MIPS";
         case MachineArch::MIPS64:  return "MIPS64";
@@ -81,6 +509,7 @@ const char* archName(MachineArch m) {
         case MachineArch::RISCV:   return "RISC-V";
         case MachineArch::RISCV64: return "RISC-V 64";
         case MachineArch::JVM:     return "JVM bytecode";
+        case MachineArch::GML:     return "GameMaker GML bytecode";
         default:                   return "unknown";
     }
 }
@@ -203,8 +632,8 @@ CortexReport BuildCortexReport(const CortexInput& in) {
         }
         return b;
     };
-    auto pushAddr = [](CortexBehavior& b, uint64_t va) {
-        if (!va || b.addresses.size() >= kMaxAddrsPerBehavior) return;
+    auto pushAddr = [](CortexBehavior& b, uint64_t va, bool valid = true) {
+        if (!valid || b.addresses.size() >= kMaxAddrsPerBehavior) return;
         if (std::find(b.addresses.begin(), b.addresses.end(), va) == b.addresses.end())
             b.addresses.push_back(va);
     };
@@ -222,8 +651,40 @@ CortexReport BuildCortexReport(const CortexInput& in) {
             addEvidence(b, c.detail);
             // Packer/java capability names carry the specific tool ("UPX packer").
             if (c.category == "packer" || c.category == "java") addSpecific(b.specifics, c.name);
-            pushAddr(b, c.address);
+            pushAddr(b, c.address, c.addressValid);
             for (uint64_t va : c.addresses) pushAddr(b, va);
+        }
+    }
+
+    // The dedicated crackme pass contributes ranked, DLL-aware endpoint evidence.
+    // It is still static evidence: surfacing it here must never imply that Cortex
+    // contacted a server or proved runtime argument flow.
+    if (in.crackmeTriage && !in.crackmeTriage->endpoints.empty()) {
+        CortexBehavior& b = bucket("network");
+        const std::vector<size_t> ranked = rankedEndpointIndices(*in.crackmeTriage);
+        for (size_t rank = 0; rank < ranked.size(); ++rank) {
+            const size_t endpointIndex = ranked[rank];
+            const CrackmeTriageEndpoint& endpoint =
+                in.crackmeTriage->endpoints[endpointIndex];
+            const float confidence = endpoint.confidence == CrackmeTriageConfidence::High
+                ? 0.85f : endpoint.confidence == CrackmeTriageConfidence::Medium ? 0.65f : 0.4f;
+            b.confidence = std::max(b.confidence, confidence);
+            addSpecific(b.specifics, endpoint.display);
+            if (rank < 3) {
+                addEvidence(b, "Static endpoint lead " + endpoint.display + " [" +
+                    (endpoint.confidenceLabel.empty() ? "unrated" : endpoint.confidenceLabel) +
+                    "]: " + trailStageList(*in.crackmeTriage, endpointIndex));
+            }
+            for (const CrackmeTriageLiteralSource& source : endpoint.sources) {
+                if (source.literalAddressValid) {
+                    pushAddr(b, source.literalAddress);
+                    break;
+                }
+                if (source.addressValid) {
+                    pushAddr(b, source.address);
+                    break;
+                }
+            }
         }
     }
 
@@ -235,8 +696,11 @@ CortexReport BuildCortexReport(const CortexInput& in) {
             b.confidence = std::max(b.confidence, confidence01(a.confidence));
             addSpecific(b.specifics, a.name);
             addEvidence(b, a.detail);
-            pushAddr(b, a.address);
-            for (const AlgoXref& x : a.referencedBy) pushAddr(b, x.refInsn ? x.refInsn : x.funcAddress);
+            pushAddr(b, a.address, a.addressValid);
+            for (const AlgoXref& x : a.referencedBy) {
+                if (x.refInsnValid) pushAddr(b, x.refInsn);
+                else pushAddr(b, x.funcAddress, x.funcAddressValid);
+            }
         }
     }
 
@@ -248,13 +712,17 @@ CortexReport BuildCortexReport(const CortexInput& in) {
         for (const ImpRule& r : kImpRules) {
             std::vector<std::string> hits;
             uint64_t addr = 0;
+            bool addrValid = false;
             for (size_t ii = 0; ii < bin->imports().size(); ++ii) {
                 const auto& im = bin->imports()[ii];
                 const std::string& ln = loweredImports[ii];
                 for (const char* k : r.keys)
                     if (ln.find(k) != std::string::npos) {
                         if (std::find(hits.begin(), hits.end(), im.name) == hits.end()) hits.push_back(im.name);
-                        if (!addr) addr = im.iatVA;
+                        if (!addrValid && im.addressKnown) {
+                            addr = im.iatVA;
+                            addrValid = true;
+                        }
                         break;
                     }
             }
@@ -262,7 +730,7 @@ CortexReport BuildCortexReport(const CortexInput& in) {
             CortexBehavior& b = bucket(r.cat);
             b.confidence = std::max(b.confidence, std::min(0.9f, r.base + 0.05f * (float)(hits.size() - 1)));
             addEvidence(b, "Imports: " + joinList(hits, 10));
-            pushAddr(b, addr);
+            pushAddr(b, addr, addrValid);
         }
     }
 
@@ -278,13 +746,13 @@ CortexReport BuildCortexReport(const CortexInput& in) {
     if (in.algorithms)
         for (const AlgoMatch& a : *in.algorithms)
             for (const AlgoXref& x : a.referencedBy)
-                if (x.funcAddress) {
+                if (x.funcAddressValid) {
                     addSpecific(algoByFunc[x.funcAddress], a.name);
                     addSpecific(algoCatsByFunc[x.funcAddress], a.category);
                 }
 
-    uint64_t entryAbs = (bin && bin->loaded() && bin->entryPoint())
-                      ? bin->imageBase() + bin->entryPoint() : 0;
+    const bool haveEntry = bin && bin->loaded() && bin->hasEntryPoint();
+    uint64_t entryAbs = haveEntry ? bin->entryPointVA() : 0;
 
     // Per-function annotation facts (from FuncAnnotate, supplied by the caller).
     std::unordered_map<uint64_t, const CortexFuncInfo*> infoByFunc;
@@ -311,7 +779,7 @@ CortexReport BuildCortexReport(const CortexInput& in) {
 
             std::string ln = lower(f.name);
             std::string lr = lower(f.reason);
-            bool isEntry = (entryAbs && f.address == entryAbs) || f.name == "start";
+            bool isEntry = (haveEntry && f.address == entryAbs) || f.name == "start";
 
             // Tags — from the name/reason, the crypto-constant xref, and annotation patterns.
             if (isEntry) addTag(fb.tags, "entry");
@@ -321,10 +789,9 @@ CortexReport BuildCortexReport(const CortexInput& in) {
                 if (ci != algoCatsByFunc.end())
                     for (const std::string& cat : ci->second) addTag(fb.tags, cat.c_str());
             }
-            if (hasAny(lr, { "socket", "wsasend", "wsarecv", "sendto", "recvfrom", "winhttp",
-                             "wininet", "internetopen", "internetconnect", "http", "curl" }) ||
-                hasToken(lr, "send") || hasToken(lr, "recv") || hasToken(lr, "connect") ||
-                hasAny(ln, { "net_", "http_", "socket", "net_send", "net_recv", "net_connect" }))
+            if (hasExactNetworkApiEvidence(f.name) || hasExactNetworkApiEvidence(f.reason) ||
+                hasAny(ln, { "net_", "network", "http_", "httpclient", "websocket",
+                             "socket", "net_send", "net_recv", "net_connect" }))
                 addTag(fb.tags, "network");
             if (hasAny(lr, { "createfile", "readfile", "writefile", "deletefile", "copyfile", "movefile" }) ||
                 hasAny(ln, { "read_file", "write_file", "open_file", "_file" })) addTag(fb.tags, "file");
@@ -418,6 +885,7 @@ CortexReport BuildCortexReport(const CortexInput& in) {
     if (bin && bin->loaded()) {
         switch (bin->format()) {
             case BinFormat::JavaClass: kindNoun = "Java class file"; break;
+            case BinFormat::GameMakerArchive: kindNoun = "GameMaker archive"; break;
             case BinFormat::Raw:       kindNoun = "raw code blob"; break;
             default:                   kindNoun = "executable"; break;
         }
@@ -482,6 +950,17 @@ CortexReport BuildCortexReport(const CortexInput& in) {
     if (isJava) {
         v += " A Java payload is present — the real logic is in the embedded bytecode; open the JAR/class to analyse it.";
     }
+    // Prefer the ranked endpoint report over whichever URL happened to appear
+    // first in the generic string scan.
+    const std::vector<size_t> rankedEndpoints = in.crackmeTriage
+        ? rankedEndpointIndices(*in.crackmeTriage) : std::vector<size_t>{};
+    if (!rankedEndpoints.empty()) {
+        const CrackmeTriageEndpoint& lead =
+            in.crackmeTriage->endpoints[rankedEndpoints.front()];
+        v += " Offline static triage ranks " + lead.display + " as the leading endpoint [" +
+             (lead.confidenceLabel.empty() ? "unrated" : lead.confidenceLabel) +
+             "]; it did not contact that endpoint.";
+    }
     // String-derived hints (URLs, paths, registry keys).
     if (in.strings) {
         std::string url, regkey;
@@ -491,7 +970,8 @@ CortexReport BuildCortexReport(const CortexInput& in) {
             if (regkey.empty() && has(ls, "hkey_")) regkey = s.text;
             if (!url.empty() && !regkey.empty()) break;
         }
-        if (!url.empty()) v += " A URL is embedded in its strings (" + url.substr(0, 80) + ").";
+        if (rankedEndpoints.empty() && !url.empty())
+            v += " A URL is embedded in its strings (" + url.substr(0, 80) + ").";
         if (!regkey.empty()) v += " It references a registry key (" + regkey.substr(0, 80) + ").";
     }
     if (in.functions && !in.functions->empty()) {
@@ -512,7 +992,7 @@ CortexReport BuildCortexReport(const CortexInput& in) {
             rep.facts.push_back("Analysis architecture: " + in.effectiveArchitecture);
         else if (bin->machine() != MachineArch::Unknown)
             rep.facts.push_back(std::string("Architecture: ") + archName(bin->machine()));
-        if (bin->entryPoint()) rep.facts.push_back("Entry point: " + hex(entryAbs));
+        if (haveEntry) rep.facts.push_back("Entry point: " + hex(entryAbs));
         rep.facts.push_back("Imports: " + std::to_string(bin->imports().size()));
         if (managed) rep.facts.push_back(".NET managed assembly");
     }
@@ -522,6 +1002,12 @@ CortexReport BuildCortexReport(const CortexInput& in) {
         rep.facts.push_back(c);
     }
     if (in.strings) rep.facts.push_back("Strings: " + std::to_string(in.strings->size()));
+    if (in.crackmeTriage) {
+        rep.facts.push_back("Static endpoint leads: " +
+                            std::to_string(in.crackmeTriage->endpoints.size()) +
+                            (in.crackmeTriage->completeness.complete ? " (complete bounded pass)"
+                                                                     : " (partial bounded pass)"));
+    }
     if (packed) rep.facts.push_back("Packed: yes" + (byCat["packer"].specifics.empty() ? std::string() :
                                      " (" + joinList(byCat["packer"].specifics, 2) + ")"));
 
@@ -623,11 +1109,45 @@ std::string AskCortex(const CortexReport& rep, const CortexInput& in, const std:
     if (hasAny(q, { "base64", "encode", "encoding" }))
         return answerCategory(rep, "encoding", "Yes — it encodes/decodes data",
                               "No Base64/encoding alphabets were detected.");
+    // Return/result questions need the typed contract + downstream-use report,
+    // not the broad endpoint summary below.
+    if (hasAny(q, { "remembered access", "remember access", "already valid",
+                    "valid user", "next launch", "subsequent launch",
+                    "persisted license", "startup state", "stored license" }))
+        return authorizationAnswer(in.crackmeTriage, true);
+    if (hasAny(q, { "local input", "local check", "password", "serial",
+                    "credential", "credential check", "expected value",
+                    "input compared", "input comparison" }))
+        return authorizationAnswer(in.crackmeTriage, false, true);
+    if (hasAny(q, { "accepted or denied", "allow or deny", "allow access",
+                    "deny access", "decline access", "accepted or declined",
+                    "access accepted", "access denied", "access declined",
+                    "response accepted", "response denied", "reply accepted",
+                    "reply denied",
+                    "authorization", "launch gate", "startup gate",
+                    "condition met", "access at launch", "launch access",
+                    "license decision", "where is it accepted",
+                    "where is it denied", "where is it declined" }))
+        return authorizationAnswer(in.crackmeTriage, false);
+    if (hasAny(q, { "server return", "server reply checked", "response checked",
+                    "reply checked", "return value", "expected return",
+                    "request fails", "request fail", "result ignored",
+                    "return ignored", "what happens with the result",
+                    "what does it return", "done with the return",
+                    "done with this return" }))
+        return networkReturnFlowAnswer(in.crackmeTriage);
     // Network.
     if (hasAny(q, { "network", "socket", "http", "internet", "connect", "url", "download",
-                    "exfil", "c2", "command and control", "server" })) {
-        std::string a = answerCategory(rep, "network", "Yes — it communicates over the network",
-                                       "No networking APIs were detected in the import table.");
+                    "exfil", "c2", "command and control", "server", "endpoint", "reply",
+                    "license", "activation", "validation" })) {
+        std::string a = rankedEndpointAnswer(in.crackmeTriage);
+        const std::string category = answerCategory(
+            rep, "network", "Static evidence indicates network communication",
+            "No exact networking APIs or static endpoint trails were detected.");
+        if (!category.empty()) {
+            if (!a.empty()) a += " ";
+            a += category;
+        }
         std::string fns = functionsWithTag(rep, "network");
         if (!fns.empty()) a += " Networking functions: " + fns + ".";
         return a;
@@ -665,8 +1185,8 @@ std::string AskCortex(const CortexReport& rep, const CortexInput& in, const std:
         for (const CortexFuncBrief& f : rep.functions)
             if (std::find(f.tags.begin(), f.tags.end(), "entry") != f.tags.end())
                 return "Entry point is " + f.name + " @ " + hex(f.address) + ". " + f.brief;
-        if (in.bin && in.bin->loaded())
-            return "Entry point is at " + hex(in.bin->imageBase() + in.bin->entryPoint()) +
+        if (in.bin && in.bin->loaded() && in.bin->hasEntryPoint())
+            return "Entry point is at " + hex(in.bin->entryPointVA()) +
                    " (no discovered function is anchored there).";
         return "No entry point is available (no binary loaded, or a raw blob).";
     }

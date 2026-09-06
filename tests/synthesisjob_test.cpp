@@ -44,6 +44,8 @@ int main() {
 
     CHECK(r.regionStart == 0x1000);
     CHECK(r.regionSize == 0x10);
+    SynthResult arm = SynthesizeJob(bin, dis, Arch::ARM64, 0x1000, 0x1010, opt);
+    CHECK(!arm.inEnvelope && arm.rejectedReason.find("x86/x64-only") != std::string::npos);
     // With the stub engine, the region is in-envelope (all nops) but symbolic execution
     // is unavailable, so we expect a clean rejection reason and zero confidence.
     std::printf("  inEnvelope=%d reason=\"%s\" conf=%.2f\n",

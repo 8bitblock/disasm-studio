@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace ds {
 
@@ -46,28 +47,171 @@ bool IsJavaClassImage(const uint8_t* data, size_t n) {
 
 static const size_t kMaxUtf8Stored = 4096;   // longer strings are truncated, not rejected
 
+// CONSTANT_Utf8 uses modified UTF-8: U+0000 is C0 80 and supplementary
+// characters are encoded as two three-byte UTF-16 surrogate units.  The model
+// always stores valid UTF-8.  Invalid bytes and lone UTF-16 surrogates become
+// U+FFFD, while JvmUtf8Status preserves exactly why the decoded text is lossy.
+// The cap affects storage only; the entire input is still validated.
+static void appendUtf8(uint32_t cp, std::string& out, bool& storing,
+                       JvmUtf8Status& status) {
+    if (!storing) return;
+    char bytes[4];
+    size_t count = 0;
+    if (cp <= 0x7F) {
+        bytes[count++] = (char)cp;
+    } else if (cp <= 0x7FF) {
+        bytes[count++] = (char)(0xC0 | (cp >> 6));
+        bytes[count++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        bytes[count++] = (char)(0xE0 | (cp >> 12));
+        bytes[count++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        bytes[count++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        bytes[count++] = (char)(0xF0 | (cp >> 18));
+        bytes[count++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        bytes[count++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        bytes[count++] = (char)(0x80 | (cp & 0x3F));
+    }
+    if (out.size() > kMaxUtf8Stored - count) {
+        status |= JvmUtf8Status::OutputTruncated;
+        storing = false;
+        return;
+    }
+    out.append(bytes, count);
+}
+
+static JvmUtf8Status decodeModifiedUtf8(const uint8_t* p, size_t n,
+                                        std::string& out) {
+    out.clear();
+    out.reserve(std::min(n, kMaxUtf8Stored));
+    bool storing = true;
+    JvmUtf8Status status = JvmUtf8Status::Valid;
+    auto replacement = [&]() { appendUtf8(0xFFFD, out, storing, status); };
+    for (size_t i = 0; i < n;) {
+        uint32_t cp = 0;
+        const uint8_t first = p[i];
+        if (first > 0 && first < 0x80) {
+            cp = first;
+            ++i;
+            appendUtf8(cp, out, storing, status);
+            continue;
+        }
+
+        if ((first & 0xE0) == 0xC0) {
+            if (n - i < 2) {
+                status |= JvmUtf8Status::TruncatedEncoding;
+                replacement();
+                break;
+            }
+            if ((p[i + 1] & 0xC0) != 0x80) {
+                status |= JvmUtf8Status::InvalidEncoding;
+                replacement();
+                ++i; // preserve the following byte for independent recovery
+                continue;
+            }
+            cp = ((uint32_t)(first & 0x1F) << 6) | (p[i + 1] & 0x3F);
+            // C0 80 is the one permitted overlong form (modified UTF-8 NUL).
+            if ((first == 0xC0 && p[i + 1] != 0x80) || first == 0xC1 ||
+                (cp != 0 && cp < 0x80)) {
+                status |= JvmUtf8Status::InvalidEncoding;
+                replacement();
+                i += 2;
+                continue;
+            }
+            i += 2;
+            appendUtf8(cp, out, storing, status);
+            continue;
+        }
+
+        if ((first & 0xF0) == 0xE0) {
+            if (n - i < 3) {
+                status |= JvmUtf8Status::TruncatedEncoding;
+                replacement();
+                break;
+            }
+            if ((p[i + 1] & 0xC0) != 0x80 || (p[i + 2] & 0xC0) != 0x80) {
+                status |= JvmUtf8Status::InvalidEncoding;
+                replacement();
+                ++i;
+                continue;
+            }
+            cp = ((uint32_t)(first & 0x0F) << 12) |
+                 ((uint32_t)(p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F);
+            if (cp < 0x800) {
+                status |= JvmUtf8Status::InvalidEncoding; // overlong form
+                replacement();
+                i += 3;
+                continue;
+            }
+            i += 3;
+
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                // Normalize a complete surrogate pair. A lone Java UTF-16
+                // surrogate has no valid UTF-8 scalar representation.
+                if (n - i >= 3 && (p[i] & 0xF0) == 0xE0 &&
+                    (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80) {
+                    const uint32_t low = ((uint32_t)(p[i] & 0x0F) << 12) |
+                                         ((uint32_t)(p[i + 1] & 0x3F) << 6) |
+                                         (p[i + 2] & 0x3F);
+                    if (low >= 0xDC00 && low <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        i += 3;
+                    }
+                }
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    status |= JvmUtf8Status::UnpairedSurrogate;
+                    replacement();
+                    continue;
+                }
+            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                status |= JvmUtf8Status::UnpairedSurrogate;
+                replacement();
+                continue;
+            }
+            appendUtf8(cp, out, storing, status);
+            continue;
+        }
+
+        // Includes raw NUL, continuation bytes, and standard UTF-8's four-byte
+        // form, none of which is legal in CONSTANT_Utf8. Consume a complete
+        // four-byte UTF-8 sequence as one invalid unit to avoid four U+FFFDs.
+        status |= JvmUtf8Status::InvalidEncoding;
+        replacement();
+        if (first >= 0xF0 && first <= 0xF4 && n - i >= 4 &&
+            (p[i + 1] & 0xC0) == 0x80 && (p[i + 2] & 0xC0) == 0x80 &&
+            (p[i + 3] & 0xC0) == 0x80)
+            i += 4;
+        else
+            ++i;
+    }
+    return status;
+}
+
 static bool parseCpEntries(Cur& c, uint16_t count, JvmClassFile& out) {
-    out.cp.assign(count ? count : 1, JvmCpEntry{});   // 1-based; [0] stays tag 0
-    for (uint16_t i = 1; i < count && !c.fail; ++i) {
+    if (count == 0) return false;
+    out.cp.assign(count, JvmCpEntry{});               // 1-based; [0] stays tag 0
+    for (size_t i = 1; i < count && !c.fail; ++i) {
         JvmCpEntry& e = out.cp[i];
         e.tag = c.u1();
         switch (e.tag) {
             case CP_Utf8: {
                 const uint16_t len = c.u2();
                 if (!c.need(len)) return false;
-                e.utf8.assign((const char*)c.p + c.off, std::min<size_t>(len, kMaxUtf8Stored));
+                e.utf8Status = decodeModifiedUtf8(c.p + c.off, len, e.utf8);
                 c.off += len;
                 break;
             }
             case CP_Integer: e.i32 = (int32_t)c.u4(); break;
             case CP_Float:   { uint32_t v = c.u4(); std::memcpy(&e.f32, &v, 4); break; }
             case CP_Long: {
+                if (i + 1 >= count) return false;        // required unusable pad slot
                 uint64_t hi = c.u4(), lo = c.u4();
                 e.i64 = (int64_t)((hi << 32) | lo);
                 ++i;                                   // Long/Double take two slots
                 break;
             }
             case CP_Double: {
+                if (i + 1 >= count) return false;        // required unusable pad slot
                 uint64_t hi = c.u4(), lo = c.u4();
                 uint64_t v = (hi << 32) | lo; std::memcpy(&e.f64, &v, 8);
                 ++i;
@@ -103,6 +247,17 @@ bool ParseConstantPoolOnly(const uint8_t* data, size_t n, uint16_t count, JvmCla
 std::string JvmClassFile::utf8At(uint16_t idx) const {
     const JvmCpEntry* e = at(idx);
     return (e && e->tag == CP_Utf8) ? e->utf8 : std::string();
+}
+
+JvmUtf8Status JvmClassFile::utf8StatusAt(uint16_t idx) const {
+    const JvmCpEntry* e = at(idx);
+    return (e && e->tag == CP_Utf8) ? e->utf8Status : JvmUtf8Status::Valid;
+}
+
+bool JvmClassFile::hasUtf8Issues() const {
+    return std::any_of(cp.begin(), cp.end(), [](const JvmCpEntry& entry) {
+        return entry.tag == CP_Utf8 && entry.utf8Status != JvmUtf8Status::Valid;
+    });
 }
 
 std::string JvmClassFile::classNameAt(uint16_t idx) const {
@@ -168,16 +323,17 @@ std::string JvmClassFile::describeCp(uint16_t idx) const {
 }
 
 const JvmMethod* JvmClassFile::methodAtOffset(uint64_t off) const {
-    // codeOffsets ascend in file order; binary-search the last start <= off.
-    auto it = std::partition_point(methods.begin(), methods.end(),
-        [off](const JvmMethod& m) { return (uint64_t)m.codeOffset <= off; });
-    while (it != methods.begin()) {
-        --it;
-        if (!it->codeLength) continue;                  // abstract/native: no body
-        if (off >= it->codeOffset && off < (uint64_t)it->codeOffset + it->codeLength)
-            return &*it;
-        break;                                          // starts ascend: earlier can't contain off
+    // Code-bearing methods ascend in file order, but abstract/native methods
+    // retain codeOffset == 0 wherever they were declared. Those zero sentinels
+    // make the full vector unsuitable for partition_point/lower_bound.
+    const JvmMethod* candidate = nullptr;
+    for (const JvmMethod& method : methods) {
+        if (!method.codeLength) continue;
+        if ((uint64_t)method.codeOffset > off) break;
+        candidate = &method;
     }
+    if (candidate && off - candidate->codeOffset < candidate->codeLength)
+        return candidate;
     return nullptr;
 }
 
@@ -198,44 +354,69 @@ static bool attrHeader(Cur& c, const JvmClassFile& cf, std::string& name, uint32
     const uint16_t nameIdx = c.u2();
     len = c.u4();
     if (c.fail || !c.need(len)) return false;
-    name = cf.utf8At(nameIdx);
+    const JvmCpEntry* nameEntry = cf.at(nameIdx);
+    if (!nameEntry || nameEntry->tag != CP_Utf8) return false;
+    name = nameEntry->utf8;
     return true;
 }
 
-static bool parseCodeAttribute(Cur& c, const JvmClassFile& cf, uint32_t attrEnd, JvmMethod& m) {
-    m.maxStack  = c.u2();
-    m.maxLocals = c.u2();
-    const uint32_t codeLen = c.u4();
-    if (c.fail || !c.need(codeLen) || codeLen == 0) return false;
-    m.codeOffset = (uint32_t)c.off;
-    m.codeLength = codeLen;
-    c.skip(codeLen);
+static bool parseCodeAttribute(Cur& c, const JvmClassFile& cf, size_t attrEnd, JvmMethod& m) {
+    if (attrEnd < c.off || attrEnd > c.n) return false;
+    Cur body{c.p, attrEnd, c.off, false};                // hard parent-attribute boundary
 
-    const uint16_t excCount = c.u2();
-    for (uint16_t i = 0; i < excCount && !c.fail; ++i) {
+    m.maxStack  = body.u2();
+    m.maxLocals = body.u2();
+    const uint32_t codeLen = body.u4();
+    if (body.fail || codeLen == 0 || codeLen >= 65536 || !body.need(codeLen) ||
+        body.off > std::numeric_limits<uint32_t>::max())
+        return false;
+    m.codeOffset = (uint32_t)body.off;
+    m.codeLength = codeLen;
+    body.skip(codeLen);
+
+    const uint16_t excCount = body.u2();
+    if (body.fail || !body.need((size_t)excCount * 8)) return false;
+    m.handlers.reserve(excCount);
+    for (uint16_t i = 0; i < excCount; ++i) {
         JvmExceptionHandler h;
-        h.startPC = c.u2(); h.endPC = c.u2(); h.handlerPC = c.u2();
-        h.catchTypeIndex = c.u2();
+        h.startPC = body.u2(); h.endPC = body.u2(); h.handlerPC = body.u2();
+        h.catchTypeIndex = body.u2();
+        if (h.startPC >= h.endPC || h.endPC > codeLen || h.handlerPC >= codeLen)
+            return false;
+        if (h.catchTypeIndex != 0) {
+            const JvmCpEntry* catchType = cf.at(h.catchTypeIndex);
+            if (!catchType || catchType->tag != CP_Class) return false;
+        }
         m.handlers.push_back(h);
     }
 
     // Nested attributes: keep LineNumberTable, skip the rest.
-    const uint16_t nAttr = c.u2();
-    for (uint16_t i = 0; i < nAttr && !c.fail && c.off < attrEnd; ++i) {
+    const uint16_t nAttr = body.u2();
+    if (body.fail) return false;
+    static constexpr size_t kMaxLineNumbers = 65536;
+    for (uint16_t i = 0; i < nAttr; ++i) {
         std::string an; uint32_t alen = 0;
-        if (!attrHeader(c, cf, an, alen)) return false;
-        const size_t payloadEnd = c.off + alen;
+        if (!attrHeader(body, cf, an, alen)) return false;
+        const size_t payloadEnd = body.off + alen;
         if (an == "LineNumberTable") {
-            const uint16_t cnt = c.u2();
-            for (uint16_t k = 0; k < cnt && !c.fail; ++k) {
-                uint16_t pc = c.u2(), ln = c.u2();
+            Cur lines{body.p, payloadEnd, body.off, false};
+            const uint16_t cnt = lines.u2();
+            if (lines.fail || !lines.need((size_t)cnt * 4) ||
+                m.lineNumbers.size() > kMaxLineNumbers - cnt)
+                return false;
+            for (uint16_t k = 0; k < cnt; ++k) {
+                uint16_t pc = lines.u2(), ln = lines.u2();
+                if (pc >= codeLen) return false;
                 m.lineNumbers.emplace_back(pc, ln);
             }
-            std::sort(m.lineNumbers.begin(), m.lineNumbers.end());
+            if (lines.fail || lines.off != payloadEnd) return false;
         }
-        c.off = payloadEnd;                             // resync regardless of parse depth
+        body.off = payloadEnd;
     }
-    return !c.fail;
+    if (body.fail || body.off != attrEnd) return false; // no spill or unclaimed tail bytes
+    std::sort(m.lineNumbers.begin(), m.lineNumbers.end());
+    c.off = attrEnd;
+    return true;
 }
 
 JvmClassFile ParseJavaClass(const uint8_t* data, size_t n) {
@@ -283,13 +464,15 @@ JvmClassFile ParseJavaClass(const uint8_t* data, size_t n) {
         m.name        = cf.utf8At(c.u2());
         m.descriptor  = cf.utf8At(c.u2());
         const uint16_t nAttr = c.u2();
+        bool sawCode = false;
         for (uint16_t k = 0; k < nAttr && !c.fail; ++k) {
             std::string an; uint32_t alen = 0;
             if (!attrHeader(c, cf, an, alen)) return bail("malformed method attribute");
             const size_t payloadEnd = c.off + alen;
             if (an == "Code") {
-                if (!parseCodeAttribute(c, cf, (uint32_t)payloadEnd, m))
+                if (sawCode || !parseCodeAttribute(c, cf, payloadEnd, m))
                     return bail("malformed Code attribute");
+                sawCode = true;
             }
             c.off = payloadEnd;
         }
@@ -297,15 +480,29 @@ JvmClassFile ParseJavaClass(const uint8_t* data, size_t n) {
     }
     if (c.fail) return bail("malformed methods");
 
-    // class attributes: keep SourceFile, skip the rest
+    // Class attributes: keep SourceFile, skip the rest. Unlike the former
+    // best-effort tail, every declared attribute must be wholly present: the
+    // class-file grammar ends here, so truncation or trailing bytes are errors.
     const uint16_t nAttr = c.u2();
+    if (c.fail) return bail("malformed class attributes");
+    bool sawSourceFile = false;
     for (uint16_t k = 0; k < nAttr && !c.fail; ++k) {
         std::string an; uint32_t alen = 0;
-        if (!attrHeader(c, cf, an, alen)) break;        // trailing junk: keep what we have
+        if (!attrHeader(c, cf, an, alen)) return bail("malformed class attribute");
         const size_t payloadEnd = c.off + alen;
-        if (an == "SourceFile") cf.sourceFile = cf.utf8At(c.u2());
+        if (an == "SourceFile") {
+            if (sawSourceFile || alen != 2) return bail("malformed SourceFile attribute");
+            const uint16_t sourceIndex = c.u2();
+            const JvmCpEntry* source = cf.at(sourceIndex);
+            if (c.fail || !source || source->tag != CP_Utf8)
+                return bail("malformed SourceFile attribute");
+            cf.sourceFile = source->utf8;
+            sawSourceFile = true;
+        }
         c.off = payloadEnd;
     }
+    if (c.fail) return bail("malformed class attributes");
+    if (c.off != n) return bail("trailing bytes after class file");
 
     cf.ok = true;
     return cf;

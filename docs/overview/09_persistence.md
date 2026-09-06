@@ -6,12 +6,15 @@ library, the recents index that backs the **Projects** tab, when state is saved
 and reloaded, and the **Export Analysis** report generator (Markdown / HTML). The
 guiding design idea is simple: a binary's content hash is the identity key, so the
 analyst's annotations follow the *bytes*, not the file path — rename a file, move
-it, copy it, and your comments, renames, bookmarks, breakpoints, patches and notes
-come right back. There is no notion of a manually-saved `.dsproj` file the user
+it, copy it, and your comments, renames, bookmarks, breakpoints, named patch sets, notes,
+and explicit listing-region choices come right back. There is no notion of a manually-saved `.dsproj` file the user
 juggles; persistence is implicit and automatic.
 
 Key files: `src/Core/Project.h`, `src/Core/Project.cpp` (state model + sidecar
-I/O + recents), `src/Core/Json.h`, `src/Core/Json.cpp` (the tiny JSON lib),
+I/O + recents), `src/Core/PatchSet.h` and `src/Core/PatchedImage.h` (bounded set
+selection, pristine reconstruction, and comparison), `src/Core/AtomicFile.{h,cpp}` (flushed atomic replacement and
+backup recovery), `src/Core/Preferences.{h,cpp}` (strict bounded `prefs.ini`
+codec/store), `src/Core/Json.h`, `src/Core/Json.cpp` (the tiny JSON lib),
 `src/Core/Report.h`, `src/Core/Report.cpp` (report formatters). Wiring lives in
 `src/App.cpp` (`AppContext::loadProjectForBinary`, `saveProject`,
 `exportAnalysisFile`), `src/Tabs/BinaryViewTab.cpp` (`loadProjectState`,
@@ -29,6 +32,9 @@ Identity / metadata:
 - `binaryPath`, `arch` (`"x86"`/`"x64"`/`"ARM"`/`"ARM64"`/…), `engine`
   (`"Zydis"`/`"Capstone"`), `name` (display name, defaults to the file name),
   `status` (defaults to `"analyzed"`), and `lastOpenedUnix` (a Unix timestamp).
+- Raw-layout identity: `rawMappingSaved`, the exact `rawImageBase`, an explicit-entry bit
+  plus `rawEntry` (so VA 0 survives), and bounded named raw landmarks with evidence. A raw
+  blob has no header from which any of these addresses can be reconstructed.
 
 Analysis annotations (the part actually worth persisting):
 - `comments` — `unordered_map<uint64_t,string>`, address → user comment.
@@ -37,16 +43,29 @@ Analysis annotations (the part actually worth persisting):
 - `breakpoints` — `vector<uint64_t>` of addresses.
 - `bpConditions` — `unordered_map<uint64_t,string>`, address → condition
   expression, kept 1:1 with `breakpoints`.
-- `patches` — `vector<PjPatch>`, each holding `{address, orig, bytes}` where
-  `orig` and `bytes` are the original and replacement byte vectors.
+- `patches` — `vector<PjPatch>`, each holding `{address, orig, bytes, patchSetId}` where
+  `orig` and `bytes` are the original and replacement byte vectors. Vector order
+  is application order and is preserved exactly because overlapping patches are later-wins.
+- `patchSets` — ordered presentation records `{id, name, enabled}`. Id zero is reserved for
+  the implicit **Ungrouped** compatibility set; named ids are stable project-local identities,
+  not vector positions, so renaming/reordering the table never retargets patch bytes.
+- `functionOverrides` — authoritative define/undefine decisions with an optional exact
+  extent, tri-state noreturn, calling convention, prototype, and ARM/Thumb mode metadata.
+- `dataOverrides` — non-overlapping, bounded analyst spans classified as code, data,
+  string, pointer table, or jump table, with an optional type spelling.
 - `lastCursor` — the last cursor VA, so reopening returns you where you were.
 - `notes` — free-form text from the Notes tab.
 - `watches` — the watch-panel expressions.
+- `listingLayoutSaved` — an explicit marker that the analyst has changed/reset the
+  listing layout. When set, `peHeaderVisible`/`peHeaderFolded` store the PE-header
+  choice and `listingSections` stores `{rva, name, visible, folded}` for each section.
+  The stable key is `(RVA, name)`, never a loader-vector position.
 
 Two helpers shape the save policy. `reset()` clears the struct to defaults
 (called when switching targets), and `hasContent()` returns true only if there is
-real analysis present (any comment, name, bookmark, breakpoint, patch, note,
-watch, or a non-zero `lastCursor`). Crucially, *metadata alone is not "content"* —
+real analysis present (any comment, name, bookmark, breakpoint, patch or patch set, note,
+watch, an analyst override, a valid cursor, an explicitly saved listing layout, or a saved raw mapping). Crucially, *metadata
+alone is not "content"* —
 a freshly-opened binary with only an auto-stamped open time is considered empty.
 This gate prevents `%APPDATA%` from filling with junk sidecars for binaries the
 user merely glanced at (see save policy below).
@@ -79,11 +98,14 @@ project key is stable across patch/revert cycles within a session.
 
 `SerializeProject` / `DeserializeProject` (split out from filesystem I/O so they
 are unit-testable with no disk) convert `ProjectState` to and from a JSON object.
-The serialized document carries `version: 1`, the metadata fields, then arrays for
-`names`, `comments`, `bookmarks`, `breakpoints`, `patches`, and `watches`. Maps
-are emitted as arrays of `{a, v}` (or `{a, label}`, etc.) **sorted by address**,
-so the on-disk output is stable and diff-friendly regardless of `unordered_map`
-iteration order.
+The serialized document carries `version: 4`, the metadata fields, an optional
+`rawMapping` object, then arrays for annotations, named patch sets, ordered patches, and analyst
+overrides. Maps are emitted as arrays of `{a, v}` (or `{a, label}`, etc.) sorted
+by address, so unordered state remains stable and diff-friendly. The patch array
+is deliberately *not* sorted: its order defines later-wins overlap precedence.
+Versions 1–3 remain readable. Their patches have no membership field and load into the
+implicit always-enabled Ungrouped set; every new save writes version 4 with an explicit
+hex-string set id on each patch.
 
 The single most important serialization decision: **every address is stored as a
 hex string, not a JSON number.** The reasons:
@@ -109,9 +131,15 @@ to drive bad behaviour:
   nibble rather than fabricating a wrong byte.
 - Patches are validated before the file-splicer is ever allowed to trust them:
   `bytes` must be non-empty, `orig` and `bytes` must be the same length, and the
-  size is capped at 1 MiB. A malformed patch entry is skipped, not applied — this
+  size is capped at 1 MiB. Named set ids/names and membership are bounded and unique;
+  original-byte overlap disagreement and conflicting enabled-set replacements are rejected.
+  A malformed version-4 patch entry or invalid set plan rejects the sidecar rather than
+  publishing a partial selection — this
   matters because saved patches are re-applied to the in-memory image on reopen
   and can be spliced into a written-out binary via **Save Binary As…**.
+- Function/data overrides have bounded counts and string sizes; ranges are checked
+  for overflow, duplicate function decisions are rejected, and data spans must not
+  overlap. An explicit validity bit represents optional extents, so VA 0 remains valid.
 
 ### The hand-rolled JSON library (`Json.*`)
 
@@ -140,23 +168,29 @@ all on top of this library.
 
 Loading (`AppContext::loadProjectForBinary` in `App.cpp`): on opening a binary it
 `reset()`s the project, computes the content hash, and calls `LoadProject(hash)`.
-If a sidecar exists it is restored. On the normal open path it also re-applies the
-*saved* arch/engine so the binary reopens exactly as last analyzed — especially
-valuable for raw blobs and mis-detected images where the header alone picks the
-wrong architecture; on the **Open as Raw…** path (`loadRawPath`) this is skipped
-because the dialog's explicit arch choice must win. It then stamps fresh metadata
-(hash, path, arch, engine, name, `lastOpenedUnix`).
+If a sidecar exists it is restored. On the normal open path, a raw candidate is first
+re-staged at the saved base with the saved explicit entry and named landmarks, then the
+saved arch/engine is applied. This prevents every VA-keyed annotation from shifting when a
+recent raw blob is reopened. Invalid/corrupt saved raw metadata is ignored safely rather
+than making the underlying file unopenable. On the interactive **Open as Raw…** path the
+dialog's explicit mapping and architecture win. The loader then stamps fresh metadata
+(hash, path, arch, engine, name, `lastOpenedUnix`). A bounded firmware rescan recreates
+the evidence report on an ordinary raw reopen but never overrides the saved mapping.
 
 The Binary View tab then mirrors `ctx.project` into its live editing state via
 `loadProjectState` (comments, names, bookmarks, breakpoints + conditions, notes,
-watches, and `lastCursor` → cursor). If a debugger is already attached, saved
-breakpoints (with conditions) are armed immediately. Saved patches are re-written
-into the in-memory image so the disassembly reflects them across sessions — and
+watches, named patch sets, and `lastCursor` → cursor). If a debugger is already attached, saved
+breakpoints (with conditions) arm only when an exact x86/x64 path/module/bitness match
+can translate their file VAs safely; otherwise they remain visible as pending. The enabled
+patch-set selection is rebuilt from verified pristine bytes and written into the in-memory
+image so the disassembly reflects that selection across sessions — and
 because the hash was cached from the pristine file, those writes don't change the
 sidecar key.
 
-Saving happens automatically at every natural boundary; the user never has to
-"save the project":
+Mutations increment a project revision and mark the global save indicator dirty.
+After a short debounce, `App` snapshots the state and runs serialization and disk
+I/O on a background task, so even a large sidecar is not written on the render
+thread. Saving also happens synchronously at every destructive boundary:
 - **Window close / Alt+F4 / Exit** — `App` calls `ctx_.saveProject()` on
   shutdown.
 - **File ▸ Close Binary** — flush, then unload and `reset()`.
@@ -164,17 +198,28 @@ Saving happens automatically at every natural boundary; the user never has to
   for the *outgoing* binary before loading the new one.
 - **Projects tab "Save project now"** button — an explicit manual flush.
 
-Each frame, `BinaryViewTab::saveProjectState` cheaply mirrors live tab state back
-into `ctx.project` so the App's flush is always current (no dirty tracking needed
-for small, user-sized state). One performance refinement: the potentially large
-`comments` and `names` maps are only deep-copied when an edit actually changed
-them (`projectDirty_`), since copying thousands of entries every frame was the real
-cost on a heavily-annotated binary.
+Binary View mirrors live editing state into `ctx.project`, and mutation sites call
+`markProjectDirty()`. The App tracks the in-flight revision separately: edits that
+arrive during a save remain dirty and schedule another commit. A failed save is
+surfaced in the status UI, retains the in-memory state, and prevents close/target
+replacement from silently discarding it.
 
 `SaveProject` itself enforces the empty-project policy: if `hasContent()` is
 false it records the open in the recents index but writes **no** sidecar (and
 leaves any pre-existing sidecar from a prior, content-bearing session untouched);
 otherwise it writes the sidecar and upserts recents.
+
+Project, recents, and preferences commits share `Core/AtomicFile` and use a
+same-directory unique temporary file written through Win32 `WriteFile`, flushed with `FlushFileBuffers`,
+closed, and atomically installed with `ReplaceFileW`/`MoveFileExW`. Replacement
+preserves a `.bak` copy of the previous good file. Loads try the primary first and
+fall back to that backup after corruption or a torn external edit; abandoned temp
+files are cleaned up. Reads reject oversized inputs before allocation: project
+sidecars are capped at 64 MiB, recents at 4 MiB, and preferences at 64 KiB.
+`Preferences` validates every known field and encoded FILE/LIVE recent query before
+accepting a primary or backup; malformed data cannot silently enable symbol-network
+access. A sidecar, recents, or preferences failure propagates into visible dirty/error
+state.
 
 ### The recents index and the Projects tab
 
@@ -196,6 +241,35 @@ double-click or right-click ▸ **Open** to reopen (which calls
 for the currently loaded binary, a live "Saved analysis" summary (counts of
 comments, renames, bookmarks, breakpoints, patches) plus the **Save project now**
 button and a reminder that it auto-saves on close/exit.
+
+### Save ASM / Save C (source export)
+
+Source export is intentionally separate from the persisted project and the analysis
+report below. **File ▸ Save ASM… / Save C…** exports either every analyzed function/
+executable range or one selected function. ASM preserves resolved names and analyst
+comments. On x86/x64, C has two contracts: `CodeExportCStyle::Readable` keeps the decompiler's
+display pseudo-C, while `CodeExportCStyle::Compilable` produces a self-contained portable
+C11 translation unit with normalized identifiers, declarations/stubs, and explicit
+fallbacks where the lightweight decompiler cannot express an operation faithfully.
+
+`Core/CodeExport` keeps generation independent of ImGui and Win32. The pure
+`GenerateCodeExport(request, decoder, out, cancel, progress)` function streams into an
+arbitrary `std::ostream`; `CodeExportService` wraps it in a dedicated one-job thread and
+opens the path chosen by `AppContext::selectCodeExportPath`. A request snapshots the
+engine/architecture, scope, function table, import/discovered/user name layers, comments,
+source name, destination, and expected image revision. The worker creates its own decoder
+through the injected factory, so a long whole-program export neither touches `ctx.disasm`
+nor occupies the load-time `AnalysisService` worker.
+
+Progress is structured (`Preparing`, `Assembly`, `Decompiling`, `Finalizing`) rather than
+a spinner-only flag: assembly reports bytes, C reports functions and the current function
+VA, and both expose bytes written. `cancel()` is non-blocking for the render thread;
+`cancelAndWaitIdle()` is the stronger lifetime barrier used before loading, closing,
+patching, or reverting the borrowed `BinaryFile`. The source files are write-out artifacts
+only; their paths/options are not stored in the project sidecar and there is no import path.
+The service writes a same-directory temporary file and commits it only after generation and
+flush succeed; an existing destination is protected by a rollback backup during replacement,
+and failure/cancellation cleans the staged artifacts without changing that destination.
 
 ### Export Analysis (Markdown / HTML report)
 
@@ -241,18 +315,18 @@ cancelled dialog produces no popup.
   decompiler's structuring limitations.
 - **Reports are export-only.** They are write-out artifacts; there is no import
   path, and they are not part of the persisted project state.
-- **Sidecars are best-effort and tolerant, not transactional.** A truncated/torn
-  write (e.g. crash mid-save) could leave a partial file; loaders fail gracefully
-  (returning the empty defaults) rather than crashing, but there is no atomic
-  rename or backup. Hand-editing a sidecar is possible but validated:
-  malformed patches/breakpoints are dropped, and out-of-range addresses parse to
-  `0`.
+- **Sidecars and recents are crash-recoverable filesystem transactions.** Each
+  commit is flushed and atomically replaced, with the prior good file retained as
+  `.bak`; load falls back to it when the primary is invalid. Hand-edited content is
+  still treated as hostile and subjected to the same schema/range validation.
 - **The empty-project policy is intentional.** Opening a binary and doing nothing
   writes no sidecar; only real annotations create one. The first content-bearing
   save is what materializes `<hash>.json`.
 - **Recents are capped at 50** and keyed by hash, so two copies of the same bytes
   collapse to one entry; conversely, an analyzed file that is later modified gets
   a *new* hash and therefore a fresh, separate project.
+- A valid saved raw mapping is part of project content and is restored before annotations;
+  versions 1–3 remain readable, while new saves use version 4. Legacy patches become Ungrouped.
 - **The JSON lib is minimal by design** — `double`-backed numbers (hence the
   hex-string address convention), no comments, no streaming; it exists solely to
   back persistence without adding a dependency.

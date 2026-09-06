@@ -14,6 +14,7 @@
 //
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -40,5 +41,13 @@ size_t FindFirstMasked(const uint8_t* data, size_t n, const SigPattern& pat, siz
 // pattern matches is reported, in ascending order. When `maxHits` > 0 the
 // search stops after collecting that many hits.
 std::vector<size_t> FindAllMasked(const uint8_t* data, size_t n, const SigPattern& pat, size_t maxHits = 0);
+
+// Apply admission before the hit limit, so file gaps or other excluded spans
+// cannot consume the visible-result budget and hide later eligible matches.
+// An empty admission callback accepts every match. Offsets remain relative to
+// this input span; accepted matches may overlap and remain in ascending order.
+std::vector<size_t> FindAllMaskedAccepted(
+    const uint8_t* data, size_t n, const SigPattern& pat, size_t maxHits,
+    const std::function<bool(size_t)>& admit);
 
 } // namespace ds

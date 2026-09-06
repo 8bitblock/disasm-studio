@@ -9,16 +9,16 @@
 //
 // How it works (the OpenJDK Windows attach path):
 //   1. Find jvm.dll in the target and confirm it's a 64-bit HotSpot/OpenJ9 VM.
-//   2. CreateRemoteThread a tiny position-independent x64 stub that, inside the
-//      target, resolves jvm.dll!JVM_EnqueueOperation (via GetModuleHandleA /
-//      GetProcAddress, whose addresses are identical across the session) and
-//      calls it with: cmd="load", arg0="jdwp", arg1="false",
+//   2. Resolve jvm.dll!JVM_EnqueueOperation from the target's mapped PE export
+//      table, then CreateRemoteThread a tiny position-independent x64 stub that
+//      calls that validated target address with: cmd="load", arg0="jdwp", arg1="false",
 //      arg2="transport=dt_socket,server=y,suspend=n,address=127.0.0.1:<port>".
 //   3. The VM's attach listener loads the JDWP agent (which starts listening on
 //      the port) and writes the completion code back over a named pipe.
 //   4. The caller then connects to 127.0.0.1:<port> with JdwpClient.
 //
-// Win32 + a live JVM, so this is review-verified, not unit-tested.
+// The live injection is Win32 integration code. Its remote-memory cleanup rule
+// is kept as a pure policy below so timeout/failure handling is unit-testable.
 //
 #include <cstdint>
 #include <string>
@@ -34,8 +34,18 @@ struct JvmInfo {
     JvmFlavor   flavor = JvmFlavor::None;
     bool        is64   = true;
     std::string vmPath;       // path of the VM module (when resolvable)
+    uint64_t    vmBase = 0;   // target-process mapping base of jvm.dll / j9vm.dll
+    uint64_t    vmSize = 0;   // target-process SizeOfImage reported by Toolhelp
     bool        hosts() const { return flavor != JvmFlavor::None; }
 };
+
+// Remote allocations are releasable only after the remote thread is proven to
+// have exited. WAIT_TIMEOUT and WAIT_FAILED both mean it may still be fetching
+// instructions or arguments from those allocations.
+enum class JvmRemoteThreadCompletion { ConfirmedExited, MayStillRun };
+constexpr bool CanReleaseJvmAttachRemoteMemory(JvmRemoteThreadCompletion state) {
+    return state == JvmRemoteThreadCompletion::ConfirmedExited;
+}
 
 struct JvmAttachResult {
     bool        ok = false;       // VM confirmed the agent loaded (completion 0 over the pipe)

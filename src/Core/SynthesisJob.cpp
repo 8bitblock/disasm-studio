@@ -17,6 +17,11 @@ SynthResult SynthesizeJob(const BinaryFile& bin, IDisassembler& dis, Arch arch,
     res.regionSize  = (hi > lo) ? (uint32_t)(hi - lo) : 0;
 
     if (hi <= lo) { res.rejectedReason = "empty region"; return res; }
+    if (!ArchIsX86_32Or64(arch)) {
+        res.rejectedReason = std::string("synthesis is x86/x64-only; unsupported architecture: ") +
+                             ArchName(arch);
+        return res;
+    }
 
     size_t avail = 0;
     const uint8_t* p = bin.ptrFromVA(lo, avail);

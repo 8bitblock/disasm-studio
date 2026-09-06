@@ -23,19 +23,35 @@
 
 namespace ds {
 
-// Per-module analysis results, mirrored from AnalysisService so switching back to an
-// already-analyzed module restores instantly instead of re-running the passes.
+struct AnalysisResult;
+
+// Result of routing one app-global module-analysis completion.  The caller uses
+// Failed to surface the structured worker error; Ignored covers stale epochs and
+// results for modules which were unloaded before publication.
+enum class ModuleAnalysisRoute : uint8_t {
+    Ignored = 0,
+    Applied,
+    Completed,
+    Failed,
+};
+
+// Per-module analysis results for the registry's captured image. A newly captured
+// static-document image is analyzed independently: this cache has neither exact
+// capture identity nor a complete decoder configuration to authorize replay.
 struct ModuleAnalysisCache {
     std::vector<FuncResult>    functions;
     std::vector<StrResult>     strings;
     std::vector<ListRowR>      listRows;
-    int                        listInsnCount = 0;
+    std::shared_ptr<const CodeDataMap> codeData;
+    uint64_t                   listingCodeBytes = 0;
+    uint64_t                   listingCodePages = 0;
     std::shared_ptr<XrefIndex> xref;
     std::string                summary;
     bool stringsTruncated = false;
     bool funcsValid = false, stringsValid = false, listingValid = false;
-    void clear() { functions.clear(); strings.clear(); listRows.clear(); listInsnCount = 0;
-                   xref.reset(); summary.clear(); stringsTruncated = false;
+    void clear() { functions.clear(); strings.clear(); listRows.clear();
+                   listingCodeBytes = listingCodePages = 0;
+                   codeData.reset(); xref.reset(); summary.clear(); stringsTruncated = false;
                    funcsValid = stringsValid = listingValid = false; }
 };
 
@@ -47,12 +63,15 @@ struct LoadedModule {
     MachineArch arch = MachineArch::Unknown;
     bool        isMain = false;       // the process's main executable
     bool        imageLoaded = false;  // bin holds this module's mapped image
-    bool        analyzing = false;    // a background job for it is in flight/queued
+    bool        analyzing = false;    // image read or background analysis is in flight/queued
+    bool        analysisComplete = false; // every requested analysis pass was adopted
+    uint64_t    analysisEpoch = 0;    // rejects results from a cancelled/base-reused job
+    std::string analysisError;        // structured worker/drop failure, empty on success
     BinaryFile  bin;                  // mapped image (empty until imageLoaded)
     ModuleAnalysisCache cache;        // analysis results (valid once analyzed)
 
-    bool analyzed() const { return cache.funcsValid || cache.stringsValid; }
-    bool contains(uint64_t va) const { return base && va >= base && va < base + size; }
+    bool analyzed() const { return analysisComplete; }
+    bool contains(uint64_t va) const { return base && va >= base && va - base < size; }
 };
 
 class ModuleRegistry {
@@ -105,6 +124,12 @@ public:
     LoadedModule* active() { return at(active_); }
     void          setActive(int i) { active_ = (i >= 0 && i < (int)mods_.size()) ? i : -1; }
     void          setActiveByBase(uint64_t base) { active_ = indexByBase(base); }
+
+    // Adopt one immutable result from the app-global module AnalysisService.
+    // Module analysis requests always include K_Xref, whose result is the final
+    // pass for this bounded cache.  Epoch + base matching makes unload/base reuse
+    // fail closed instead of writing into a replacement module.
+    ModuleAnalysisRoute applyAnalysisResult(AnalysisResult&& result);
 
 private:
     std::vector<std::unique_ptr<LoadedModule>> mods_;

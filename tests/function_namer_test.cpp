@@ -39,6 +39,9 @@ int main() {
     CHECK_EQ(ToSnakeIdentifier("VirtualAllocEx"), "virtual_alloc_ex");
     CHECK_EQ(ToSnakeIdentifier("KERNEL32.CreateFileW"), "create_file");
     CHECK_EQ(ToSnakeIdentifier("__imp_CreateFileW@16"), "create_file");
+    CHECK_EQ(ToSnakeIdentifier("__imp__CreateFileW@16"), "create_file");
+    CHECK_EQ(ToSnakeIdentifier("@CreateFileW@16"), "create_file");
+    CHECK_EQ(ToSnakeIdentifier("__imp_@CreateFileW@16"), "create_file");
     CHECK_EQ(ToSnakeIdentifier("operator new"), "operator_new");
     CHECK_EQ(ToSnakeIdentifier("123Api"), "fn_123_api");
     CHECK(ToSnakeIdentifier("#12").empty());
@@ -50,6 +53,11 @@ int main() {
       auto g = GuessFromEvidence(e); CHECK_EQ(g.name, "j_CreateFileW"); CHECK(g.guessed); }
     { FuncEvidence e; e.isThunk = true; e.thunkApi = "__imp_CreateFileW@16";
       CHECK_EQ(GuessFromEvidence(e).name, "j_CreateFileW"); }
+    for (const char* decorated : {
+             "__imp__CreateFileW@16", "@CreateFileW@16", "__imp_@CreateFileW@16" }) {
+        FuncEvidence e; e.isThunk = true; e.thunkApi = decorated;
+        CHECK_EQ(GuessFromEvidence(e).name, "j_CreateFileW");
+    }
     { FuncEvidence e; e.isThunk = true; e.thunkApi = "#12";
       CHECK(!GuessFromEvidence(e).guessed); }
     { FuncEvidence e; e.isThunk = true; e.thunkApi = "";   // jmp to a local sub -> no guess
@@ -78,6 +86,265 @@ int main() {
     CHECK_EQ(GuessFromEvidence(apis({"URLDownloadToFileW"})).name,                    "download_file");
     CHECK_EQ(GuessFromEvidence(apis({"IsDebuggerPresent"})).name,                     "check_debugger");
     CHECK_EQ(GuessFromEvidence(apis({"ExitProcess"})).name,                           "exit_process");
+
+    // Connectivity predicates earn the analyst-facing WifiCheck name only when
+    // the function immediately returns their result or branches on it. Merely
+    // mentioning a connectivity-related API is not enough.
+    {
+        FuncEvidence e = apis({"InternetGetConnectedState"}, /*instr*/3, /*calls*/1);
+        e.connectivityResultReturned = true;
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed); CHECK_EQ(g.name, "WifiCheck");
+        CHECK(g.reason.find("InternetGetConnectedState") != std::string::npos);
+        CHECK(g.reason.find("connectivity result") != std::string::npos);
+    }
+    {
+        FuncEvidence e = apis({"InternetCheckConnectionW"}, /*instr*/6, /*calls*/1);
+        e.connectivityResultChecked = true;
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed); CHECK_EQ(g.name, "WifiCheck");
+        CHECK(g.reason.find("InternetCheckConnectionW") != std::string::npos);
+        CHECK(g.reason.find("connectivity result") != std::string::npos);
+    }
+    {
+        FuncEvidence e = apis({"InternetGetConnectedState"}, /*instr*/6, /*calls*/1);
+        CHECK(GuessFromEvidence(e).name != "WifiCheck"); // result is never consumed
+    }
+    {
+        FuncEvidence e = apis(
+            {"InternetGetConnectedState", "CreateFileW", "ReadFile"},
+            /*instr*/18, /*calls*/3);
+        e.connectivityResultChecked = true;
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "read_file"); // broader file worker, not a dedicated connectivity predicate
+    }
+    for (const char* decorated : {
+             "__imp__InternetGetConnectedState@8",
+             "@InternetGetConnectedState@8",
+             "__imp_@InternetGetConnectedState@8" }) {
+        FuncEvidence e = apis({decorated}, /*instr*/4, /*calls*/1);
+        e.connectivityResultReturned = true;
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "WifiCheck");
+    }
+    {
+        FuncEvidence e = apis({"InternetGetConnectedState", "send"}, /*instr*/12, /*calls*/2);
+        e.connectivityResultChecked = true;
+        CHECK(GuessFromEvidence(e).name != "WifiCheck"); // transport work vetoes a predicate wrapper
+    }
+    {
+        FuncEvidence e = apis({"WlanQueryInterface"}, /*instr*/6, /*calls*/1);
+        e.connectivityResultChecked = true;
+        CHECK(GuessFromEvidence(e).name != "WifiCheck"); // query class is unknown
+    }
+    {
+        FuncEvidence e = apis({"MyInternetGetConnectedStateHelper"}, /*instr*/6, /*calls*/1);
+        e.connectivityResultChecked = true;
+        CHECK(GuessFromEvidence(e).name != "WifiCheck"); // API matching is exact, never substring based
+    }
+    {
+        FuncEvidence e = apis({"InternetGetConnectedState"}, /*instr*/97, /*calls*/1);
+        e.connectivityResultReturned = true;
+        CHECK(GuessFromEvidence(e).name != "WifiCheck"); // bounded wrapper policy
+    }
+    {
+        FuncEvidence e = apis({"InternetGetConnectedState"}, /*instr*/12, /*calls*/5);
+        e.connectivityResultReturned = true;
+        CHECK(GuessFromEvidence(e).name != "WifiCheck"); // too many calls for a predicate wrapper
+    }
+
+    // ---- contextual intent + operation names -----------------------------
+    // A compound analyst-facing name requires independent subject and operation
+    // evidence.  API result-use records distinguish an operation's status check
+    // from a comparator/verifier result that actually controls a decision.
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam"},
+            /*instr*/36, /*calls*/3);
+        e.strings = {"license key", "activation code"};
+        e.apiResultUses.push_back({"CryptHashData", true, false});
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "licenseHashing");
+        CHECK(!g.reason.empty());
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam", "memcmp"},
+            /*instr*/48, /*calls*/4);
+        e.strings = {"license key", "invalid license"};
+        e.apiResultUses.push_back({"CryptHashData", true, false}); // API success only
+        e.apiResultUses.push_back({"memcmp", true, false});        // decision predicate
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "licenseValidation");
+        CHECK(!g.reason.empty());
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam", "memcmp"},
+            /*instr*/42, /*calls*/4);
+        e.strings = {"license key"};
+        e.apiResultUses.push_back({"memcmp", false, true, false});
+        CHECK_EQ(GuessFromEvidence(e).name, "licenseHashing"); // raw tri-state return is not Boolean
+        e.apiResultUses.back().normalizedReturned = true;
+        CHECK_EQ(GuessFromEvidence(e).name, "licenseValidation");
+    }
+    {
+        FuncEvidence e = apis(
+            {"BCryptCreateHash", "BCryptHashData", "BCryptFinishHash"},
+            /*instr*/34, /*calls*/3);
+        e.strings = {"password hash", "enter password"};
+        e.apiResultUses.push_back({"BCryptFinishHash", true, false});
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "passwordHashing");
+    }
+    {
+        FuncEvidence e = apis(
+            {"BCryptGenRandom", "BCryptCreateHash", "BCryptHashData", "BCryptFinishHash"},
+            /*instr*/42, /*calls*/4);
+        e.strings = {"password hash"};
+        CHECK_EQ(GuessFromEvidence(e).name, "passwordHashing"); // RNG is compatible salt support
+    }
+    {
+        FuncEvidence e = apis({"CryptDecrypt"}, /*instr*/20, /*calls*/1);
+        e.strings = {"encrypted config", "settings.ini"};
+        e.apiResultUses.push_back({"CryptDecrypt", true, false});
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "configDecryption");
+    }
+    {
+        FuncEvidence e = apis(
+            {"EVP_DecryptInit_ex", "EVP_DecryptUpdate", "EVP_DecryptFinal_ex"},
+            /*instr*/30, /*calls*/3);
+        e.strings = {"encrypted config"};
+        CHECK_EQ(GuessFromEvidence(e).name, "configDecryption");
+    }
+    {
+        FuncEvidence e = apis({"RtlDecompressBuffer"}, /*instr*/22, /*calls*/1);
+        e.strings = {"compressed payload"};
+        e.apiResultUses.push_back({"RtlDecompressBuffer", true, false});
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "payloadDecompression");
+    }
+    {
+        FuncEvidence e = apis({"BCryptGenRandom"}, /*instr*/18, /*calls*/1);
+        e.strings = {"authentication token"};
+        e.apiResultUses.push_back({"BCryptGenRandom", true, false});
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "tokenGeneration");
+    }
+    {
+        FuncEvidence e = apis({"WinVerifyTrust"}, /*instr*/18, /*calls*/1);
+        e.strings = {"integrity check"};
+        e.apiResultUses.push_back({"WinVerifyTrust", true, false});
+        auto g = GuessFromEvidence(e);
+        CHECK(g.guessed);
+        CHECK_EQ(g.name, "integrityVerification");
+    }
+
+    // Compound guesses stay conservative: neither half of the evidence is
+    // sufficient by itself, matching is exact, and broad/ambiguous workers
+    // retain a generic mechanical name.
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam"},
+            /*instr*/30, /*calls*/3);
+        CHECK_EQ(GuessFromEvidence(e).name, "hash_data"); // operation, no subject
+    }
+    {
+        FuncEvidence e;
+        e.instrCount = 16;
+        e.strings = {"license key", "activation code"};
+        CHECK(!GuessFromEvidence(e).guessed); // subject, no operation
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam"},
+            /*instr*/32, /*calls*/3);
+        e.strings = {"Software License Agreement"};
+        CHECK_EQ(GuessFromEvidence(e).name, "hash_data"); // legal prose is not key material
+    }
+    {
+        FuncEvidence e = apis({"MyCryptHashDataHelper"}, /*instr*/12, /*calls*/1);
+        e.strings = {"license key"};
+        auto g = GuessFromEvidence(e);
+        CHECK(g.name != "licenseHashing"); // exact API catalog, never substring matching
+        CHECK(g.name != "licenseValidation");
+    }
+    {
+        FuncEvidence e = apis({"CryptHashData"}, /*instr*/14, /*calls*/1);
+        e.strings = {"license key"};
+        e.apiResultUses.push_back({"CryptHashData", true, false});
+        CHECK_EQ(GuessFromEvidence(e).name, "hash_data"); // incomplete hash pipeline
+    }
+    {
+        FuncEvidence e = apis({"BCryptOpenAlgorithmProvider"}, /*instr*/12, /*calls*/1);
+        e.strings = {"license key"};
+        CHECK(GuessFromEvidence(e).name != "licenseHashing"); // setup alone is not hashing
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptGetHashParam", "CryptHashData", "CryptCreateHash"},
+            /*instr*/24, /*calls*/3);
+        e.strings = {"license key"};
+        CHECK_EQ(GuessFromEvidence(e).name, "hash_data"); // phases in reverse are not a workflow
+    }
+    {
+        FuncEvidence e = apis({"EVP_DecryptInit_ex"}, /*instr*/12, /*calls*/1);
+        e.strings = {"encrypted config"};
+        CHECK(GuessFromEvidence(e).name != "configDecryption"); // initialization processes no data
+    }
+    {
+        FuncEvidence e = apis({"CryptDecrypt"}, /*instr*/12, /*calls*/1);
+        e.strings = {"settings.initial"};
+        CHECK_EQ(GuessFromEvidence(e).name, "decrypt_data"); // .ini must be a bounded extension
+    }
+    {
+        FuncEvidence e = apis({"BCryptGenRandom"}, /*instr*/12, /*calls*/1);
+        e.strings = {"password"};
+        CHECK(GuessFromEvidence(e).name != "passwordGeneration"); // RNG may only be salt
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam"},
+            /*instr*/28, /*calls*/3);
+        e.strings = {"license"};
+        CHECK_EQ(GuessFromEvidence(e).name, "hash_data"); // bare legal/product word is ambiguous
+    }
+    {
+        FuncEvidence e = apis({"memcmp"}, /*instr*/16, /*calls*/1);
+        e.strings = {"license key", "invalid license"};
+        CHECK_EQ(GuessFromEvidence(e).name, "compare_buffer"); // comparator result unchecked
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam"},
+            /*instr*/34, /*calls*/3);
+        e.strings = {"license key", "password hash"};
+        CHECK_EQ(GuessFromEvidence(e).name, "hash_data"); // conflicting subjects
+    }
+    {
+        FuncEvidence e = apis(
+            {"CryptCreateHash", "CryptHashData", "CryptGetHashParam", "send"},
+            /*instr*/60, /*calls*/4);
+        e.strings = {"license key"};
+        auto g = GuessFromEvidence(e);
+        CHECK(g.name != "licenseHashing"); // broader network worker vetoes the narrow intent
+        CHECK(g.name != "licenseValidation");
+    }
+    {
+        FuncEvidence e = apis({"WinVerifyTrust"}, /*instr*/16, /*calls*/1);
+        e.strings = {"license key"};
+        e.apiResultUses.push_back({"WinVerifyTrust", true, false});
+        CHECK(GuessFromEvidence(e).name != "licenseValidation"); // publisher trust is not licensing
+    }
 
     // "SendMessageW" must NOT be mistaken for a network send.
     CHECK(GuessFromEvidence(apis({"SendMessageW"})).name != "net_send");

@@ -1,4 +1,5 @@
 #include "RuntimeScan.h"
+#include "AddressSpan.h"
 #include "SigMatch.h"
 
 #include <algorithm>
@@ -76,7 +77,11 @@ Finding mk(std::string title, const char* category, float conf, std::string deta
     f.confidence = conf;
     f.detail     = std::move(detail);
     f.evidence   = std::move(ev);
-    for (const auto& e : f.evidence) if (e.va) { f.address = e.va; break; }
+    for (const auto& e : f.evidence) if (e.vaValid) {
+        f.address = e.va;
+        f.addressValid = true;
+        break;
+    }
     return f;
 }
 
@@ -90,7 +95,7 @@ struct Scan {
         e.what       = std::move(what);
         e.fileOffset = off;
         uint64_t va  = 0;
-        if (bin.offsetToVA(off, va)) e.va = va;
+        if (bin.offsetToVA(off, va)) { e.va = va; e.vaValid = true; }
         return e;
     }
     bool strEvidence(const char* s, std::vector<FindingEvidence>& ev) const {
@@ -105,7 +110,10 @@ struct Scan {
             if (lower(im.dll) != want) continue;
             FindingEvidence e;
             e.what = "import: " + im.dll + "!" + im.name;
-            e.va   = im.iatVA;
+            if (im.addressKnown) {
+                e.va = im.iatVA;
+                e.vaValid = true;
+            }
             ev.push_back(std::move(e));
             return true;
         }
@@ -140,14 +148,33 @@ RuntimeScanResult ScanRuntimes(const BinaryFile& bin, const JavaScanResult& java
             FindingEvidence e;
             e.what = "PE data directory [14] (CLR descriptor) at RVA " + hexs(bin.clrDirRVA())
                    + ", size " + std::to_string(bin.clrDirSize());
-            e.va = bin.imageBase() + bin.clrDirRVA();
             uint64_t off = 0;
-            if (bin.vaToOffset(e.va, off)) e.fileOffset = off;
-            ev.push_back(std::move(e));
-            std::string detail = "PE data directory [14] (CLR descriptor) present";
-            // COR20 header +8 = MetaData directory RVA -> metadata root magic "BSJB".
+            uint64_t clrVA = 0;
+            if (CheckedAddressAdd(bin.imageBase(), bin.clrDirRVA(), clrVA) &&
+                bin.vaToOffset(clrVA, off)) {
+                e.va = clrVA;
+                e.vaValid = true;
+                e.fileOffset = off;
+            }
             size_t av = 0;
-            if (const uint8_t* cor = bin.ptrFromRVA(bin.clrDirRVA(), av); cor && av >= 16) {
+            const uint8_t* cor = bin.ptrFromRVA(bin.clrDirRVA(), av);
+            uint32_t corSize = 0;
+            if (cor && av >= sizeof(corSize)) std::memcpy(&corSize, cor, sizeof(corSize));
+            const bool validCorHeader = cor && av >= 0x48 &&
+                                        bin.clrDirSize() >= 0x48 &&
+                                        corSize >= 0x48 && corSize <= av &&
+                                        corSize <= bin.clrDirSize();
+            if (!validCorHeader) {
+                e.what += "; directory is unmapped, truncated, or has an invalid COR20 cb field";
+                ev.push_back(std::move(e));
+                r.findings.push_back(mk(
+                    "Malformed CLR directory", "malformed", 0.35f,
+                    "PE data directory [14] is nonzero but does not contain a bounded valid COR20 header; .NET runtime authority was not granted",
+                    std::move(ev)));
+            } else {
+                ev.push_back(std::move(e));
+                std::string detail = "PE data directory [14] contains a bounded COR20 header";
+                // COR20 header +8 = MetaData directory RVA -> metadata root magic "BSJB".
                 uint32_t metaRVA = 0;
                 std::memcpy(&metaRVA, cor + 8, 4);
                 size_t ma = 0;
@@ -155,21 +182,30 @@ RuntimeScanResult ScanRuntimes(const BinaryFile& bin, const JavaScanResult& java
                 if (meta && ma >= 4 && std::memcmp(meta, "BSJB", 4) == 0) {
                     FindingEvidence m;
                     m.what = "CLR metadata root magic \"BSJB\" at RVA " + hexs(metaRVA);
-                    m.va   = bin.imageBase() + metaRVA;
                     uint64_t mo = 0;
-                    if (bin.vaToOffset(m.va, mo)) m.fileOffset = mo;
+                    uint64_t metaVA = 0;
+                    if (CheckedAddressAdd(bin.imageBase(), metaRVA, metaVA) &&
+                        bin.vaToOffset(metaVA, mo)) {
+                        m.va = metaVA;
+                        m.vaValid = true;
+                        m.fileOffset = mo;
+                    }
                     ev.push_back(std::move(m));
                     detail += " + BSJB metadata root";
                 }
+                r.findings.push_back(mk(".NET / CLR runtime", "runtime", 0.97f,
+                                        std::move(detail), std::move(ev)));
             }
-            r.findings.push_back(mk(".NET / CLR runtime", "runtime", 0.97f, std::move(detail), std::move(ev)));
         } else {
             bool corMain = false;
             for (const auto& im : bin.imports()) {
                 if (lower(im.dll) == "mscoree.dll" && (im.name == "_CorExeMain" || im.name == "_CorDllMain")) {
                     FindingEvidence e;
                     e.what = "import: " + im.dll + "!" + im.name;
-                    e.va   = im.iatVA;
+                    if (im.addressKnown) {
+                        e.va = im.iatVA;
+                        e.vaValid = true;
+                    }
                     ev.push_back(std::move(e));
                     corMain = true;
                     break;
@@ -255,7 +291,10 @@ RuntimeScanResult ScanRuntimes(const BinaryFile& bin, const JavaScanResult& java
             if (dl.rfind("python3", 0) == 0 || dl.rfind("python2", 0) == 0) {
                 FindingEvidence e;
                 e.what = "import: " + im.dll + "!" + im.name;
-                e.va   = im.iatVA;
+                if (im.addressKnown) {
+                    e.va = im.iatVA;
+                    e.vaValid = true;
+                }
                 pyDllEv.push_back(std::move(e));
                 pyDll = true;
                 break;
@@ -380,8 +419,12 @@ RuntimeScanResult ScanRuntimes(const BinaryFile& bin, const JavaScanResult& java
                           s.name.c_str(), (unsigned long long)s.rawOffset,
                           (unsigned long long)s.rawSize, bits);
             e.what       = w;
-            e.va         = bin.imageBase() + s.virtualAddress;
             e.fileOffset = s.rawOffset;
+            uint64_t sectionVA = 0;
+            if (bin.offsetToVA(s.rawOffset, sectionVA)) {
+                e.va = sectionVA;
+                e.vaValid = true;
+            }
             char d[160];
             std::snprintf(d, sizeof(d), "entropy %.2f bits/byte (heuristic; compressed resources also look like this)", bits);
             r.findings.push_back(mk("High-entropy section " + s.name, "packed", 0.5f, d, { std::move(e) }));

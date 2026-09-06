@@ -18,6 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -43,6 +44,11 @@ struct StubDisasm : IDisassembler {
     std::vector<Instruction> disassemble(const uint8_t*, size_t, uint64_t, size_t) override { return {}; }
 };
 
+struct FailedDisasm final : StubDisasm {
+    bool ready() const override { return false; }
+    std::string_view errorMessage() const override { return "configured decoder unavailable"; }
+};
+
 int main() {
     const uint64_t imgBase = 0x140000000ull;
     // Fake debuggee image: nops, an ASCII string at +0x10, a 0xE8 "call" at +0x40.
@@ -65,7 +71,10 @@ int main() {
         return k;
     };
 
-    LiveScanService svc([](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+    DecoderConfig observedConfig;
+    LiveScanService svc([&](const DecoderConfig& config) -> std::unique_ptr<IDisassembler> {
+        observedConfig = config;
+        if (config.features.armV8) return std::make_unique<FailedDisasm>();
         return std::make_unique<StubDisasm>();
     });
 
@@ -123,6 +132,32 @@ int main() {
         for (uint64_t a : got.hits) if (a == imgBase + 0x40) hit = true;
         CHECK(hit, "live xref found the call referencing the target at +0x40");
         CHECK(got.target == kCallTarget, "xref result echoes the target");
+        CHECK(got.complete && got.error.empty(), "successful xref is explicitly complete");
+    }
+
+    // Full decoder configuration reaches the private worker decoder, and a
+    // decoder initialization failure is a result rather than an empty success.
+    {
+        std::vector<LiveRange> ranges = { { imgBase, mem.size() } };
+        DecoderConfig config;
+        config.engine = Engine::Capstone;
+        config.arch = Arch::PPC64;
+        config.byteOrder = ByteOrder::Big;
+        config.features.riscvCompressed = false;
+        uint64_t tok = svc.requestXref(ranges, kCallTarget, config, reader, svc.epoch());
+        LiveScanResult got;
+        CHECK(collect(3000, tok, got), "configured xref job produced a result");
+        CHECK(observedConfig == config, "live xref preserved byte order and feature bits");
+        CHECK(got.complete && got.error.empty(), "configured decoder completed normally");
+
+        config.features.armV8 = true; // fixture's explicit failure switch
+        tok = svc.requestXref(ranges, kCallTarget, config, reader, svc.epoch());
+        got = LiveScanResult{};
+        CHECK(collect(3000, tok, got), "failed-decoder xref published a result");
+        CHECK(!got.complete && !got.error.empty() && got.hits.empty(),
+              "failed decoder is not reported as an empty successful xref");
+        CHECK(got.error.find("configured decoder unavailable") != std::string::npos,
+              "failed decoder reason is preserved");
     }
 
     // ---- ReadImage ----
@@ -133,6 +168,26 @@ int main() {
         CHECK(got.image.size() == 0x80, "read-image returned the requested span");
         CHECK(got.moduleBase == imgBase, "read-image echoes the module base");
         CHECK(!got.image.empty() && got.image[0x10] == (uint8_t)'H', "read-image bytes match the source");
+    }
+
+    // An exception from a target-memory reader is reported as a failed job and
+    // does not escape the worker thread or poison the pool.
+    {
+        MemReader throwingReader = [](uint64_t, void*, size_t) -> size_t {
+            throw std::runtime_error("fixture read failure");
+        };
+        uint64_t tok = svc.requestReadImage(imgBase, 0x20, imgBase,
+                                            throwingReader, svc.epoch());
+        LiveScanResult got;
+        CHECK(collect(3000, tok, got), "throwing reader produced a failure result");
+        CHECK(!got.complete && got.error.find("fixture read failure") != std::string::npos,
+              "worker exception text is preserved");
+
+        tok = svc.requestReadImage(imgBase, 0x20, imgBase, reader, svc.epoch());
+        got = LiveScanResult{};
+        CHECK(collect(3000, tok, got), "pool accepted a job after worker exception");
+        CHECK(got.complete && got.image.size() == 0x20,
+              "post-exception worker result completed normally");
     }
 
     // ---- Epoch gating: a bumped epoch means no result is accepted as current ----
@@ -154,6 +209,14 @@ int main() {
         svc.requestStrings(ranges, reader, svc.epoch());
         svc.cancelAndWaitIdle();
         CHECK(!svc.busy(), "not busy after cancelAndWaitIdle");
+    }
+
+    // The historical two-argument factory remains source compatible.
+    {
+        LiveScanService legacy([](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<StubDisasm>();
+        });
+        legacy.cancelAndWaitIdle();
     }
 
     if (g_fail == 0) std::printf("livescan_service_test: all checks passed\n");

@@ -9,7 +9,7 @@
 // Build & run (Windows, from project root, in a VS dev shell):
 //   cl /std:c++20 /EHsc /I src tests\techscan_multi_test.cpp ^
 //       src\Core\TechScan.cpp src\Core\JavaScan.cpp src\Core\RuntimeScan.cpp src\Core\Inflate.cpp ^
-//       src\Core\SigMatch.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp
+//       src\Core\NetworkApiCatalog.cpp src\Core\SigMatch.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp
 //   .\techscan_multi_test.exe
 //
 #include "Core/TechScan.h"
@@ -49,8 +49,100 @@ static bool loadBlob(BinaryFile& bf, const std::vector<uint8_t>& bytes, uint64_t
     return ok;
 }
 
+struct ImportFixtureGroup {
+    std::string dll;
+    std::vector<std::string> names;
+};
+
+// Minimal PE32 with one .rdata section containing a bounded ordinary import
+// directory. This exercises TechScan through BinaryFile's real parser rather
+// than reaching around it with a test-only import seam.
+static std::vector<uint8_t> importFixturePe(
+    const std::vector<ImportFixtureGroup>& groups) {
+    constexpr size_t kRaw = 0x200;
+    constexpr uint32_t kRva = 0x1000;
+    std::vector<uint8_t> b(0xA00, 0);
+    auto put16 = [&](size_t off, uint16_t value) {
+        std::memcpy(b.data() + off, &value, sizeof(value));
+    };
+    auto put32 = [&](size_t off, uint32_t value) {
+        std::memcpy(b.data() + off, &value, sizeof(value));
+    };
+    auto asRva = [&](size_t off) { return kRva + static_cast<uint32_t>(off - kRaw); };
+    auto align = [](size_t value, size_t amount) {
+        return (value + amount - 1) & ~(amount - 1);
+    };
+
+    b[0] = 'M'; b[1] = 'Z'; put32(0x3C, 0x80); put32(0x80, 0x00004550);
+    const size_t coff = 0x84;
+    put16(coff + 0, 0x014C); put16(coff + 2, 1);
+    put16(coff + 16, 0xE0); put16(coff + 18, 0x0102);
+    const size_t opt = coff + 20;
+    put16(opt + 0, 0x10B); put32(opt + 16, 0x1000); put32(opt + 28, 0x400000);
+    put32(opt + 32, 0x1000); put32(opt + 36, 0x200); put32(opt + 56, 0x2000);
+    put32(opt + 60, 0x200); put32(opt + 92, 16);
+    put32(opt + 96 + 8, kRva);
+    put32(opt + 96 + 12, static_cast<uint32_t>((groups.size() + 1) * 20));
+    const size_t sec = opt + 0xE0;
+    std::memcpy(b.data() + sec, ".rdata\0\0", 8);
+    put32(sec + 8, 0x800); put32(sec + 12, kRva);
+    put32(sec + 16, 0x800); put32(sec + 20, static_cast<uint32_t>(kRaw));
+    put32(sec + 36, 0x40000040u);
+
+    size_t cursor = align(kRaw + (groups.size() + 1) * 20, 16);
+    for (size_t groupIndex = 0; groupIndex < groups.size(); ++groupIndex) {
+        const ImportFixtureGroup& group = groups[groupIndex];
+        const size_t oft = cursor;
+        cursor += (group.names.size() + 1) * sizeof(uint32_t);
+        const size_t iat = cursor;
+        cursor += (group.names.size() + 1) * sizeof(uint32_t);
+        const size_t dll = cursor;
+        std::memcpy(b.data() + cursor, group.dll.c_str(), group.dll.size() + 1);
+        cursor = align(cursor + group.dll.size() + 1, 2);
+
+        for (size_t nameIndex = 0; nameIndex < group.names.size(); ++nameIndex) {
+            const size_t hintName = cursor;
+            put16(hintName, 0);
+            std::memcpy(b.data() + hintName + 2, group.names[nameIndex].c_str(),
+                        group.names[nameIndex].size() + 1);
+            cursor = align(hintName + 2 + group.names[nameIndex].size() + 1, 2);
+            put32(oft + nameIndex * 4, asRva(hintName));
+            put32(iat + nameIndex * 4, asRva(hintName));
+        }
+
+        const size_t descriptor = kRaw + groupIndex * 20;
+        put32(descriptor + 0, asRva(oft));
+        put32(descriptor + 12, asRva(dll));
+        put32(descriptor + 16, asRva(iat));
+    }
+    CHECK(cursor <= b.size());
+    return b;
+}
+
+static bool loadPe(BinaryFile& binary, const std::vector<uint8_t>& bytes,
+                   const char* path) {
+    { std::ofstream file(path, std::ios::binary);
+      file.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size())); }
+    const bool loaded = binary.load(path);
+    std::remove(path);
+    return loaded;
+}
+
 int main() {
     const uint64_t base = 0x400000;
+
+    // A real match at VA zero must remain navigable; zero is not a
+    // missing-address sentinel.
+    {
+        std::vector<uint8_t> blob(kStub, kStub + sizeof(kStub));
+        BinaryFile bf;
+        CHECK(loadBlob(bf, blob, 0));
+        const std::vector<Capability> caps = ScanCapabilities(bf);
+        const Capability* st = find(caps, kStubName);
+        CHECK(st != nullptr);
+        if (st) CHECK(st->addressValid && st->address == 0);
+    }
 
     // ---- Several scattered copies of the stub -> all collected -------------------
     {
@@ -69,6 +161,7 @@ int main() {
         if (st) {
             CHECK(st->hitCount == 3);
             CHECK(st->addresses.size() == 3);
+            CHECK(st->addressValid);
             CHECK(!st->addresses.empty() && st->address == st->addresses.front());
             for (size_t i = 0; i < offs.size() && i < st->addresses.size(); ++i)
                 CHECK(st->addresses[i] == base + offs[i]);
@@ -123,6 +216,47 @@ int main() {
         CHECK(find(caps, kStubName) == nullptr);
         // ...and no fabricated "java" capability on a clean blob either.
         for (const auto& c : caps) CHECK(c.category != "java");
+    }
+
+    // ---- Exact DLL-aware network imports: UI names must not become sockets -------
+    {
+        BinaryFile bf;
+        const auto pe = importFixturePe({
+            { "USER32.dll", { "SendMessageW" } },
+            { "KERNEL32.dll", { "ConnectNamedPipeW" } },
+        });
+        CHECK(loadPe(bf, pe, "techscan_non_network_imports.exe"));
+        const auto caps = ScanCapabilities(bf);
+        size_t networkCount = 0;
+        for (const Capability& capability : caps)
+            if (capability.category == "network") ++networkCount;
+        CHECK(networkCount == 0);
+    }
+
+    // ---- One real WinHTTP trail folds into one staged network capability --------
+    {
+        BinaryFile bf;
+        const auto pe = importFixturePe({
+            { "WINHTTP.dll", { "WinHttpConnect", "WinHttpSendRequest",
+                                "WinHttpReceiveResponse" } },
+        });
+        CHECK(loadPe(bf, pe, "techscan_winhttp_imports.exe"));
+        const auto caps = ScanCapabilities(bf);
+        const Capability* network = nullptr;
+        size_t networkCount = 0;
+        for (const Capability& capability : caps) {
+            if (capability.category != "network") continue;
+            network = &capability;
+            ++networkCount;
+        }
+        CHECK(networkCount == 1);
+        CHECK(network != nullptr);
+        if (network) {
+            CHECK(network->detail.find("WinHttpConnect") != std::string::npos);
+            CHECK(network->detail.find("WinHttpSendRequest") != std::string::npos);
+            CHECK(network->detail.find("WinHttpReceiveResponse") != std::string::npos);
+            CHECK(network->addressValid);
+        }
     }
 
     // ---- Java launcher: PE with an appended JAR -> a "java" capability -----------

@@ -80,7 +80,7 @@ PlaceResult PlacePatch(const PlaceInput& in) {
     // Pick the destination: a caller-allocated region wins; else the first fitting cave.
     uint64_t caveVA = 0;
     bool haveCave = false;
-    if (in.allocVA != 0) {
+    if (in.allocVAValid) {
         caveVA = in.allocVA;
         haveCave = true;
     } else {
@@ -136,6 +136,7 @@ PlaceResult PlacePatch(const PlaceInput& in) {
 
     res.status = PlaceStatus::Detour;
     res.caveVA = caveVA;
+    res.caveVAValid = true;
     return res;
 }
 

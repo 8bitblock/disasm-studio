@@ -4,72 +4,197 @@
 #include "Fonts.h"
 #include "Icons.h"
 #include "Theme.h"
+#include "Widgets.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 
 namespace ds::ui {
 
-void CommandPalette::open(std::vector<PaletteItem> actions, std::vector<PaletteSymbol> symbols) {
+namespace {
+
+const char* categoryName(InvestigationCategory category) {
+    switch (category) {
+    case InvestigationCategory::Address:       return "address";
+    case InvestigationCategory::Function:      return "function";
+    case InvestigationCategory::StringLiteral: return "string";
+    case InvestigationCategory::Import:        return "import";
+    case InvestigationCategory::Comment:       return "comment";
+    case InvestigationCategory::Resource:      return "resource";
+    case InvestigationCategory::ByteResult:    return "bytes";
+    case InvestigationCategory::Xref:          return "xref";
+    case InvestigationCategory::LiveModule:    return "module";
+    case InvestigationCategory::NetworkTrail:  return "network trail";
+    case InvestigationCategory::Authorization: return "authorization";
+    case InvestigationCategory::RecentQuery:   return "recent";
+    }
+    return "result";
+}
+
+const char* identityName(InvestigationIdentity identity) {
+    return identity == InvestigationIdentity::Live ? "LIVE" : "FILE";
+}
+
+std::string replayRecentQuery(std::string query, InvestigationIdentity identity) {
+    // A bare numeric expression defaults to FILE. Preserve the history row's
+    // recorded LIVE identity when replaying it; explicit live:/file:/va: text is
+    // already unambiguous and ordinary text queries remain unchanged.
+    const InvestigationParsedAddress parsed = ParseInvestigationAddress(query);
+    std::string_view spelling(query);
+    while (!spelling.empty() && std::isspace(static_cast<unsigned char>(spelling.front())))
+        spelling.remove_prefix(1);
+    auto startsInsensitive = [&](std::string_view prefix) {
+        if (spelling.size() < prefix.size()) return false;
+        for (size_t i = 0; i < prefix.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(spelling[i])) !=
+                std::tolower(static_cast<unsigned char>(prefix[i]))) return false;
+        }
+        return true;
+    };
+    const bool explicitlyScoped = startsInsensitive("file:") ||
+                                  startsInsensitive("va:") ||
+                                  startsInsensitive("live:");
+    if (identity == InvestigationIdentity::Live &&
+        parsed.status == InvestigationAddressParseStatus::Valid &&
+        parsed.identity != InvestigationIdentity::Live && !explicitlyScoped)
+        query.insert(0, "live:");
+    return query;
+}
+
+} // namespace
+
+void CommandPalette::open(std::vector<PaletteItem> actions,
+                          InvestigationService* investigation,
+                          uint64_t generation,
+                          std::vector<InvestigationRecentQuery> recentQueries,
+                          DebugTargetIdentity liveTarget,
+                          RememberQuery rememberQuery) {
     actions_ = std::move(actions);
-    symbols_ = std::move(symbols);
+    recentQueries_ = std::move(recentQueries);
+    if (recentQueries_.size() > 32) recentQueries_.resize(32);
+    investigation_ = investigation;
+    investigationGeneration_ = generation;
+    liveTarget_ = liveTarget;
+    rememberQuery_ = std::move(rememberQuery);
+    searchRequestId_ = seenSearchRequestId_ = 0;
+    searchPublication_.reset();
     actionLower_.clear();
     actionLower_.reserve(actions_.size());
     for (const auto& a : actions_) {
         std::string l = a.label;
+        if (!a.searchAliases.empty()) {
+            l.push_back(' ');
+            l += a.searchAliases;
+        }
         for (char& c : l) c = (char)std::tolower((unsigned char)c);
         actionLower_.push_back(std::move(l));
     }
     query_[0]  = 0;
     lastQuery_ = "\x01";   // force a rebuild on the first frame
     sel_       = 0;
+    selMoved_  = true;
     open_      = true;
     focusNext_ = true;
 }
 
-void CommandPalette::close() {
-    open_ = false;
-    actions_.clear(); actionLower_.clear(); symbols_.clear(); results_.clear();
+void CommandPalette::updateInvestigationSession(InvestigationService* investigation,
+                                                uint64_t generation,
+                                                DebugTargetIdentity liveTarget) {
+    if (investigation_ == investigation && investigationGeneration_ == generation &&
+        liveTarget_.pid == liveTarget.pid &&
+        liveTarget_.sessionGeneration == liveTarget.sessionGeneration)
+        return;
+    investigation_ = investigation;
+    investigationGeneration_ = generation;
+    liveTarget_ = liveTarget;
+    searchRequestId_ = seenSearchRequestId_ = 0;
+    searchPublication_.reset();
+    if (open_ && query_[0]) submitInvestigationSearch();
+    if (open_) rebuildResults();
 }
 
-// Query -> scored result list. Empty query lists the actions in their given
-// order (a menu); symbols only join in once the user types something.
+void CommandPalette::close() {
+    open_ = false;
+    actions_.clear();
+    actionLower_.clear();
+    recentQueries_.clear();
+    results_.clear();
+    searchPublication_.reset();
+    searchRequestId_ = seenSearchRequestId_ = 0;
+    investigation_ = nullptr;
+    investigationGeneration_ = 0;
+    liveTarget_ = {};
+    rememberQuery_ = {};
+}
+
+void CommandPalette::submitInvestigationSearch() {
+    searchPublication_.reset();
+    seenSearchRequestId_ = 0;
+    searchRequestId_ = 0;
+    if (!investigation_ || !investigationGeneration_ || !query_[0]) return;
+    InvestigationSearchOptions options;
+    options.maxResults = 64;
+    searchRequestId_ = investigation_->requestSearch(
+        investigationGeneration_, std::string(query_), options);
+}
+
+void CommandPalette::pollInvestigationSearch() {
+    if (!investigation_ || !searchRequestId_) return;
+    auto publication = investigation_->latestSearch();
+    if (!publication || publication->generation != investigationGeneration_ ||
+        publication->requestId != searchRequestId_ ||
+        publication->requestId == seenSearchRequestId_)
+        return;
+    if (publication->query != query_) return;
+    searchPublication_ = std::move(publication);
+    seenSearchRequestId_ = searchPublication_->requestId;
+    rebuildResults();
+}
+
+// Query -> a small merged result list. Only the command list is fuzzy-matched
+// here; investigation traversal and ranking have already happened on the worker.
 void CommandPalette::rebuildResults() {
     results_.clear();
     std::string q = query_;
     for (char& c : q) c = (char)std::tolower((unsigned char)c);
 
-    // A bare hex value (optional 0x) becomes a "go to address" entry on top.
-    {
-        std::string h = q;
-        if (h.rfind("0x", 0) == 0) h = h.substr(2);
-        bool hex = !h.empty() && h.size() <= 16;
-        for (char c : h) if (!std::isxdigit((unsigned char)c)) { hex = false; break; }
-        if (hex) {
-            unsigned long long va = 0;
-            std::sscanf(h.c_str(), "%llx", &va);
-            results_.push_back({ 1 << 20, 2, 0, (uint64_t)va, false });
-        }
-    }
-
+    constexpr size_t kMaxShown = 50;
     if (q.empty()) {
-        for (int i = 0; i < (int)actions_.size(); ++i) results_.push_back({ 0, 0, i, 0, false });
+        // Keep a bounded slice of history at the top of the zero-query view.
+        // Commands remain fuzzy-searchable, while recent investigations no
+        // longer disappear behind a long command list and the result cap.
+        constexpr size_t kRecentPreview = 8;
+        const size_t recentCount = std::min(recentQueries_.size(), kRecentPreview);
+        for (size_t i = 0; i < recentCount; ++i)
+            results_.push_back({ 1, 2, static_cast<int>(i) });
+        for (int i = 0; i < (int)actions_.size(); ++i)
+            results_.push_back({ 0, 0, i });
     } else {
-        for (int i = 0; i < (int)actions_.size(); ++i) {
-            int s = FuzzyScore(q.c_str(), actionLower_[i].c_str());
-            if (s >= 0) results_.push_back({ s + 4, 0, i, 0, false }); // small action bias over symbols
+        const InvestigationParsedAddress parsed = ParseInvestigationAddress(q);
+        const bool malformedAddress =
+            parsed.status == InvestigationAddressParseStatus::Malformed ||
+            parsed.status == InvestigationAddressParseStatus::Overflow;
+        // A recognized-but-invalid address must stay an error. Do not let local
+        // action fuzzy matching reinterpret e.g. "live:" as an unrelated command.
+        if (!malformedAddress) {
+            for (int i = 0; i < (int)actions_.size(); ++i) {
+                int s = FuzzyScore(q.c_str(), actionLower_[i].c_str());
+                if (s >= 0) results_.push_back({ 8000 + std::min(s, 1500), 0, i });
+            }
         }
-        for (int i = 0; i < (int)symbols_.size(); ++i) {
-            int s = FuzzyScore(q.c_str(), symbols_[i].lower.c_str());
-            if (s >= 0) results_.push_back({ s, 1, i, symbols_[i].addr, symbols_[i].live });
+        if (searchPublication_ && searchPublication_->query == query_ &&
+            searchPublication_->result.complete) {
+            const auto& hits = searchPublication_->result.results;
+            for (int i = 0; i < (int)hits.size(); ++i)
+                results_.push_back({ static_cast<int>(hits[(size_t)i].score), 1, i });
         }
         std::stable_sort(results_.begin(), results_.end(),
                          [](const Result& a, const Result& b) { return a.score > b.score; });
     }
-    const size_t kMaxShown = 50;
     if (results_.size() > kMaxShown) results_.resize(kMaxShown);
     if (sel_ >= (int)results_.size()) sel_ = results_.empty() ? 0 : (int)results_.size() - 1;
     if (sel_ < 0) sel_ = 0;
@@ -79,11 +204,64 @@ void CommandPalette::render(AppContext& ctx) {
     if (!open_) return;
     const float s = theme::UiScale();
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float w = 560.0f * s;
+    const ImGuiStyle& style = ImGui::GetStyle();
+
+    // A full-viewport input surface sits above the workbench and below the
+    // palette. Besides providing the dim treatment, it owns outside clicks so
+    // dismissing the palette can never trigger a debugger control underneath.
+    ImGui::SetNextWindowViewport(vp->ID);
+    ImGui::SetNextWindowPos(vp->Pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(vp->Size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+                          ImGui::GetStyleColorVec4(ImGuiCol_ModalWindowDimBg));
+    const ImGuiWindowFlags blockerFlags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoFocusOnAppearing;
+    bool dismissFromOutside = false;
+    if (ImGui::Begin("##cmdpalette_blocker", nullptr, blockerFlags)) {
+        ImGui::SetCursorScreenPos(vp->Pos);
+        dismissFromOutside = ImGui::InvisibleButton(
+            "##cmdpalette_dismiss", vp->Size,
+            ImGuiButtonFlags_MouseButtonLeft |
+            ImGuiButtonFlags_MouseButtonRight |
+            ImGuiButtonFlags_MouseButtonMiddle);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    if (dismissFromOutside) {
+        close();
+        return;
+    }
+
+    // Preserve the desktop proportions when space permits, but clamp both axes
+    // to the work area so small windows and high-DPI displays retain the query,
+    // results, and keyboard-help footer.
+    const float marginX = std::min(16.0f * s, vp->WorkSize.x * 0.04f);
+    const float marginY = std::min(18.0f * s, vp->WorkSize.y * 0.04f);
+    const float maxW = std::max(1.0f, vp->WorkSize.x - marginX * 2.0f);
+    const float maxH = std::max(1.0f, vp->WorkSize.y - marginY * 2.0f);
+    const float w = std::min(560.0f * s, maxW);
+    const float desiredH = 340.0f * s + ImGui::GetFrameHeight() +
+                           ImGui::GetTextLineHeightWithSpacing() +
+                           style.WindowPadding.y * 2.0f +
+                           style.ItemSpacing.y * 2.0f;
+    const float h = std::min(desiredH, maxH);
+    const float minY = vp->WorkPos.y + marginY;
+    const float maxY = vp->WorkPos.y + vp->WorkSize.y - marginY - h;
+    const float preferredY = vp->WorkPos.y + vp->WorkSize.y * 0.16f;
+    const float paletteY = std::max(minY, std::min(preferredY, maxY));
+
+    ImGui::SetNextWindowViewport(vp->ID);
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
-                                   vp->WorkPos.y + vp->WorkSize.y * 0.16f),
+                                   paletteY),
                             ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-    ImGui::SetNextWindowSize(ImVec2(w, 0));
+    ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                              ImGuiWindowFlags_NoCollapse;
@@ -99,10 +277,27 @@ void CommandPalette::render(AppContext& ctx) {
     // Query box, focused on open.
     if (focusNext_) { ImGui::SetKeyboardFocusHere(); focusNext_ = false; }
     ImGui::SetNextItemWidth(-FLT_MIN);
-    bool enter = ImGui::InputTextWithHint("##palq", "Type a command, symbol, or 0x address...",
+    bool enter = ImGui::InputTextWithHint("##palq",
+                                          "Search commands, addresses, functions, strings, imports, xrefs...",
                                           query_, sizeof(query_),
                                           ImGuiInputTextFlags_EnterReturnsTrue);
-    if (lastQuery_ != query_) { lastQuery_ = query_; rebuildResults(); }
+    if (lastQuery_ != query_) {
+        lastQuery_ = query_;
+        sel_ = 0;
+        selMoved_ = true;
+        submitInvestigationSearch();
+        rebuildResults();
+    }
+    pollInvestigationSearch();
+    const bool awaitingSearchPublication = searchRequestId_ != 0 &&
+                                            seenSearchRequestId_ != searchRequestId_;
+    if (awaitingSearchPublication) ctx.wantContinuousRedraw = true;
+    if (investigation_) {
+        const InvestigationServicePending pending = investigation_->pending();
+        if (pending.generation == investigationGeneration_ &&
+            (pending.buildQueued || pending.searchQueued || pending.building || pending.searching))
+            ctx.wantContinuousRedraw = true;
+    }
 
     // Keyboard: arrows move the selection (single-line InputText ignores them).
     if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && sel_ + 1 < (int)results_.size()) { ++sel_; selMoved_ = true; }
@@ -113,72 +308,230 @@ void CommandPalette::render(AppContext& ctx) {
         runIdx = sel_;
 
     // Result list.
-    const float listH = 340.0f * s;
+    const float footerH = ImGui::GetTextLineHeightWithSpacing();
+    const float listH = std::max(
+        1.0f, std::min(340.0f * s,
+                       ImGui::GetContentRegionAvail().y - footerH -
+                       style.ItemSpacing.y));
     ImGui::BeginChild("##palresults", ImVec2(0, listH), ImGuiChildFlags_None);
     const ImVec4 acc = theme::col::accent();
-    for (int i = 0; i < (int)results_.size(); ++i) {
-        const Result& r = results_[i];
-        char label[320];
-        const char* icon = nullptr;
-        const char* detail = nullptr;
-        char detailBuf[48];
-        if (r.kind == 2) {
-            std::snprintf(label, sizeof(label), "Go to address 0x%llX", (unsigned long long)r.va);
-            icon = DS_ICON_CODE; detail = "address";
-        } else if (r.kind == 1) {
-            const PaletteSymbol& sym = symbols_[(size_t)r.idx];
-            std::snprintf(label, sizeof(label), "%s", sym.name.c_str());
-            std::snprintf(detailBuf, sizeof(detailBuf), "0x%llX", (unsigned long long)sym.addr);
-            icon = DS_ICON_CODE; detail = detailBuf;
-        } else {
-            const PaletteItem& a = actions_[(size_t)r.idx];
-            std::snprintf(label, sizeof(label), "%s", a.label.c_str());
-            icon = a.icon; detail = a.detail.empty() ? nullptr : a.detail.c_str();
-        }
+    const ImGuiTableFlags resultTableFlags =
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings |
+        ImGuiTableFlags_PadOuterX;
+    if (ImGui::BeginTable("##palette_rows", 2, resultTableFlags)) {
+        ImGui::TableSetupColumn("Result", ImGuiTableColumnFlags_WidthStretch,
+                                0.70f);
+        ImGui::TableSetupColumn("Context", ImGuiTableColumnFlags_WidthStretch,
+                                0.30f);
+        for (int i = 0; i < (int)results_.size(); ++i) {
+            const Result& r = results_[i];
+            char label[320];
+            const char* icon = nullptr;
+            const char* detail = nullptr;
+            char detailBuf[192];
+            const InvestigationResult* investigationResult = nullptr;
+            if (r.kind == 2) {
+                const InvestigationRecentQuery& recent = recentQueries_[(size_t)r.idx];
+                std::snprintf(label, sizeof(label), "%s", recent.query.c_str());
+                std::snprintf(detailBuf, sizeof(detailBuf), "%s recent query",
+                              identityName(recent.identity));
+                icon = DS_ICON_CODE; detail = detailBuf;
+            } else if (r.kind == 1 && searchPublication_ &&
+                       r.idx >= 0 && (size_t)r.idx < searchPublication_->result.results.size()) {
+                investigationResult = &searchPublication_->result.results[(size_t)r.idx];
+                std::snprintf(label, sizeof(label), "%s", investigationResult->label.c_str());
+                if (investigationResult->location.valid) {
+                    std::snprintf(detailBuf, sizeof(detailBuf), "%s 0x%llX  %s",
+                                  identityName(investigationResult->location.identity),
+                                  (unsigned long long)investigationResult->location.value,
+                                  categoryName(investigationResult->category));
+                } else if (investigationResult->fileOffsetValid) {
+                    std::snprintf(detailBuf, sizeof(detailBuf), "FILE+0x%llX  %s",
+                                  (unsigned long long)investigationResult->fileOffset,
+                                  categoryName(investigationResult->category));
+                } else {
+                    std::snprintf(detailBuf, sizeof(detailBuf), "%s",
+                                  categoryName(investigationResult->category));
+                }
+                icon = DS_ICON_CODE; detail = detailBuf;
+            } else {
+                const PaletteItem& a = actions_[(size_t)r.idx];
+                std::snprintf(label, sizeof(label), "%s", a.label.c_str());
+                icon = a.icon; detail = a.detail.empty() ? nullptr : a.detail.c_str();
+            }
 
-        ImGui::PushID(i);
-        if (i == sel_) ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(acc.x, acc.y, acc.z, 0.30f));
-        char row[352];
-        if (IconsLoaded() && icon) std::snprintf(row, sizeof(row), "%s  %s", icon, label);
-        else                       std::snprintf(row, sizeof(row), "%s", label);
-        if (ImGui::Selectable(row, i == sel_)) runIdx = i;
-        if (i == sel_) {
-            ImGui::PopStyleColor();
-            if (selMoved_) { ImGui::SetScrollHereY(0.5f); selMoved_ = false; }
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            if (i == sel_)
+                ImGui::PushStyleColor(ImGuiCol_Header,
+                                      ImVec4(acc.x, acc.y, acc.z, 0.30f));
+            char row[352];
+            if (IconsLoaded() && icon) std::snprintf(row, sizeof(row), "%s  %s", icon, label);
+            else                       std::snprintf(row, sizeof(row), "%s", label);
+            if (ImGui::Selectable(row, i == sel_,
+                                  ImGuiSelectableFlags_SpanAllColumns))
+                runIdx = i;
+            bool rowHovered = ImGui::IsItemHovered();
+            if (i == sel_) {
+                ImGui::PopStyleColor();
+                if (selMoved_) { ImGui::SetScrollHereY(0.5f); selMoved_ = false; }
+            }
+
+            ImGui::TableSetColumnIndex(1);
+            if (detail) {
+                const float detailW = ImGui::CalcTextSize(detail).x;
+                const float detailAvail = ImGui::GetContentRegionAvail().x;
+                if (detailW < detailAvail)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + detailAvail - detailW);
+                ImGui::TextDisabled("%s", detail);
+                rowHovered = rowHovered || ImGui::IsItemHovered();
+            }
+            if (investigationResult && rowHovered &&
+                (!investigationResult->detail.empty() ||
+                 !investigationResult->evidence.empty())) {
+                ImGui::BeginTooltip();
+                if (!investigationResult->detail.empty())
+                    ImGui::TextWrapped("%s", investigationResult->detail.c_str());
+                if (!investigationResult->evidence.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("%s", investigationResult->evidence.c_str());
+                }
+                ImGui::EndTooltip();
+            }
+            ImGui::PopID();
         }
-        if (detail) {
-            float dw = ImGui::CalcTextSize(detail).x;
-            ImGui::SameLine(ImGui::GetWindowWidth() - dw - 16.0f * s);   // right-aligned hint
-            ImGui::TextDisabled("%s", detail);
-        }
-        ImGui::PopID();
+        ImGui::EndTable();
     }
-    if (results_.empty()) ImGui::TextDisabled("No matches.");
+    if (results_.empty()) {
+        bool waiting = awaitingSearchPublication;
+        if (investigation_ && query_[0]) {
+            const auto pending = investigation_->pending();
+            waiting = waiting ||
+                      (pending.generation == investigationGeneration_ &&
+                       (pending.buildQueued || pending.searchQueued ||
+                        pending.building || pending.searching));
+        }
+        if (waiting) ImGui::TextDisabled("Indexing / searching...");
+        else if (searchPublication_ && !searchPublication_->result.error.empty())
+            ImGui::TextColored(theme::col::bad(), "%s", searchPublication_->result.error.c_str());
+        else ImGui::TextDisabled(query_[0] ? "No matches." : "No commands or recent queries.");
+    }
     ImGui::EndChild();
-    ImGui::TextDisabled("Enter run   Up/Down select   Esc close");
+    ImGui::TextDisabled("Enter open   Up/Down select   Esc close");
+    if (investigation_ && ImGui::IsItemHovered()) {
+        const InvestigationServiceStats stats = investigation_->stats();
+        ImGui::SetTooltip("Search requests combined: %llu\nSearch requests dropped: %llu",
+                          (unsigned long long)stats.coalesced,
+                          (unsigned long long)stats.dropped);
+    }
 
-    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
     ImGui::PopStyleVar(2);
 
     // Execute AFTER End() - an action may open dialogs / mutate app state.
     // Capture the callable BEFORE close() (which clears actions_).
     if (runIdx >= 0 && runIdx < (int)results_.size()) {
-        Result r = results_[(size_t)runIdx];
+        const Result r = results_[(size_t)runIdx];
         std::function<void()> action;
         if (r.kind == 0) action = actions_[(size_t)r.idx].run;
-        close();
-        if (r.kind != 0) {
-            if (r.live) ctx.gotoAddressLive(r.va);
-            else        ctx.gotoAddress(r.va);
+        if (r.kind == 2) {
+            const InvestigationRecentQuery& item = recentQueries_[(size_t)r.idx];
+            const std::string recent = replayRecentQuery(item.query, item.identity);
+            std::snprintf(query_, sizeof(query_), "%s", recent.c_str());
+            lastQuery_ = query_;
+            sel_ = 0;
+            selMoved_ = true;
+            focusNext_ = true;
+            submitInvestigationSearch();
+            rebuildResults();
+            return;
         }
-        else if (action) action();
+        if (r.kind == 1 && searchPublication_ && r.idx >= 0 &&
+            (size_t)r.idx < searchPublication_->result.results.size()) {
+            const InvestigationResult hit = searchPublication_->result.results[(size_t)r.idx];
+            if (hit.category == InvestigationCategory::RecentQuery) {
+                const std::string recent = replayRecentQuery(hit.label,
+                                                             hit.location.identity);
+                std::snprintf(query_, sizeof(query_), "%s", recent.c_str());
+                lastQuery_ = query_;
+                sel_ = 0;
+                selMoved_ = true;
+                focusNext_ = true;
+                submitInvestigationSearch();
+                rebuildResults();
+                return;
+            }
+            if (hit.category == InvestigationCategory::NetworkTrail) {
+                const std::string executedQuery = query_;
+                const InvestigationIdentity identity = hit.location.identity;
+                RememberQuery remember = rememberQuery_;
+                close();
+                if (remember) remember(executedQuery, identity);
+                if (hit.location.valid) {
+                    // Keep the Triage workspace visible while honoring the
+                    // mapped literal/callsite selected from the typed result.
+                    ctx.gotoAddress(hit.location.value);
+                    ctx.openCrackmeTriage(TriageWorkspaceView::NetworkTrail);
+                } else if (hit.fileOffsetValid) {
+                    ctx.openCrackmeTriageAtFileOffset(hit.fileOffset);
+                } else {
+                    ctx.openCrackmeTriage(TriageWorkspaceView::NetworkTrail);
+                }
+                return;
+            }
+            if (hit.category == InvestigationCategory::Authorization) {
+                const std::string executedQuery = query_;
+                const InvestigationIdentity identity = hit.location.identity;
+                RememberQuery remember = rememberQuery_;
+                close();
+                if (remember) remember(executedQuery, identity);
+                if (hit.location.valid) {
+                    ctx.gotoAddress(hit.location.value);
+                    ctx.openCrackmeAuthorization(hit.focusId);
+                } else if (hit.fileOffsetValid) {
+                    ctx.openCrackmeAuthorizationAtFileOffset(
+                        hit.fileOffset, hit.focusId);
+                } else {
+                    ctx.openCrackmeAuthorization(hit.focusId);
+                }
+                return;
+            }
+            if (!hit.location.valid) {
+                ui::Toast(ui::ToastKind::Info,
+                          "This result has no validated address to open.");
+                return;
+            }
+            const std::string executedQuery = query_;
+            const InvestigationIdentity identity = hit.location.identity;
+            const uint64_t address = hit.location.value;
+            // close() retires the palette session. Capture the exact owner with
+            // the selected address before closing so LIVE handoffs survive it.
+            const DebugTargetIdentity target = liveTarget_;
+            RememberQuery remember = rememberQuery_;
+            close();
+            if (remember) remember(executedQuery, identity);
+            if (identity == InvestigationIdentity::Live) {
+                const DbgSnapshot* snapshot = ctx.frameDebugSnapshot;
+                if (!snapshot || !snapshot->attached() ||
+                    !DebugTargetIdentityMatches(
+                        { snapshot->pid, snapshot->sessionGeneration }, target)) {
+                    ui::Toast(ui::ToastKind::Warn,
+                              "This live result belongs to an earlier debugger session.");
+                    return;
+                }
+                ctx.gotoAddressLive(address, target);
+            } else {
+                ctx.gotoAddress(address);
+            }
+            return;
+        }
+        close();
+        if (action) action();
         return;
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) close();
-    else if (!focused && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-                          ImGui::IsMouseClicked(ImGuiMouseButton_Right))) close();   // click-away
 }
 
 } // namespace ds::ui
