@@ -15,6 +15,9 @@
 // updates *leftW by the mouse delta — clamped so neither side shrinks below its min.
 //
 #include "imgui.h"
+#include "Theme.h"
+#include <algorithm>
+#include <cmath>
 
 namespace ds::ui {
 
@@ -26,9 +29,17 @@ inline void VSplitter(const char* id, float* leftW, float minLeft, float minRigh
     const float total      = *leftW + rightAvail;
     const float h          = ImGui::GetContentRegionAvail().y;
     ImGui::InvisibleButton(id, ImVec2(thickness, h > 1.0f ? h : 1.0f));
-    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (hovered || active)
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-    if (ImGui::IsItemActive())
+    const ImVec2 lo = ImGui::GetItemRectMin(), hiPoint = ImGui::GetItemRectMax();
+    const float centerX = std::floor((lo.x + hiPoint.x) * 0.5f);
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(centerX, lo.y), ImVec2(centerX, hiPoint.y),
+        ImGui::GetColorU32(active ? theme::col::accent()
+            : hovered ? theme::col::muted() : theme::col::lineSoft()),
+        std::max(1.0f, std::round(theme::UiScale())));
+    if (active)
         *leftW += ImGui::GetIO().MouseDelta.x;
     const float hi = total - minRight - thickness;
     if (*leftW > hi)      *leftW = hi;

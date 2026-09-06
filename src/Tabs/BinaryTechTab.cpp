@@ -193,7 +193,10 @@ void BinaryTechTab::render(AppContext& ctx) {
         scanned_ = false;
     }
 
-    // No binary: a hero card with the open action instead of a disabled form.
+    ImGui::TextUnformatted("Binary Tech");
+    ui::SameLineIfFits(270.0f * theme::UiScale());
+    ImGui::TextDisabled("Capabilities and supporting evidence");
+
     if (!ctx.staticBinary().loaded()) {
         if (ui::EmptyState(DS_ICON_SHIELD, "No binary loaded",
                            "Open a binary to detect capabilities from imports, section names, and byte patterns.",
@@ -275,13 +278,21 @@ void BinaryTechTab::render(AppContext& ctx) {
     // the evidence/disassembly preview receives the rest of the viewport.
     const float scale = theme::UiScale();
     if (listWidth_ <= 0.0f) listWidth_ = 340.0f * scale;
-    const float workspaceWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const ImVec2 workspaceSize = ImGui::GetContentRegionAvail();
+    const float workspaceWidth = std::max(1.0f, workspaceSize.x);
+    const bool stacked = workspaceWidth < 660.0f * scale;
     const float maxListWidth = std::max(1.0f, workspaceWidth -
         std::min(320.0f * scale, workspaceWidth * 0.5f) - 5.0f * scale);
     listWidth_ = std::clamp(listWidth_, std::min({230.0f * scale, workspaceWidth * 0.4f, maxListWidth}),
                            maxListWidth);
-    ImGui::BeginChild("caplist", ImVec2(listWidth_, 0), ImGuiChildFlags_Borders);
-    if (ImGui::BeginTable("caps", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+    const float listHeight = stacked
+        ? std::max(1.0f, std::min(240.0f * scale, workspaceSize.y * 0.42f)) : 0.0f;
+    ImGui::BeginChild("caplist", ImVec2(stacked ? 0.0f : listWidth_, listHeight), ImGuiChildFlags_Borders);
+    ImGui::TextUnformatted("Findings");
+    ui::SameLineIfFits(130.0f * scale);
+    ImGui::TextDisabled("%zu of %zu", visible.size(), caps_.size());
+    if (ImGui::BeginTable("caps", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                   ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Capability");
         ImGui::TableSetupColumn("Cat", ImGuiTableColumnFlags_WidthFixed, 84 * scale);
         ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 46 * scale);
@@ -311,19 +322,21 @@ void BinaryTechTab::render(AppContext& ctx) {
     }
     ImGui::EndChild();
 
-    ui::VSplitter("##tech_split", &listWidth_, std::min(230.0f * scale, workspaceWidth * 0.4f),
-                  std::min(320.0f * scale, workspaceWidth * 0.5f), 5.0f * scale);
+    if (!stacked)
+        ui::VSplitter("##tech_split", &listWidth_, std::min(230.0f * scale, workspaceWidth * 0.4f),
+                      std::min(320.0f * scale, workspaceWidth * 0.5f), 5.0f * scale);
     ImGui::BeginChild("capdetail", ImVec2(0, 0), ImGuiChildFlags_Borders);
     if (selected_ >= 0 && selected_ < (int)caps_.size()) {
         auto& c = caps_[selected_];
-        ImGui::TextColored(theme::col::accent(), "%s", c.name.c_str());
+        ImGui::PushTextWrapPos();
+        ImGui::TextUnformatted(c.name.c_str());
+        ImGui::PopTextWrapPos();
+        ui::KeyValueRow("Category", "%s", c.category.c_str());
+        ui::KeyValueRow("Confidence", "%.0f%%", c.confidence * 100.0f);
         if (c.addressValid)
-            ImGui::TextDisabled("Category: %s   Confidence: %.0f%%   Address: 0x%llX",
-                                c.category.c_str(), c.confidence * 100.0f,
-                                (unsigned long long)c.address);
+            ui::KeyValueRow("Address", "0x%llX", (unsigned long long)c.address);
         else
-            ImGui::TextDisabled("Category: %s   Confidence: %.0f%%   Address: unavailable",
-                                c.category.c_str(), c.confidence * 100.0f);
+            ui::KeyValueRow("Address", "%s", "unavailable");
         if (c.addressValid) {
             if (ImGui::SmallButton("View in disassembly")) ctx.gotoAddress(c.address);
         }
@@ -334,7 +347,7 @@ void BinaryTechTab::render(AppContext& ctx) {
         }
         if (!c.analyzer.empty())
             ImGui::TextColored(theme::col::muted(), "Source: %s", c.analyzer.c_str());
-        ImGui::Separator();
+        ImGui::SeparatorText("Evidence");
         ImGui::TextWrapped("%s", c.detail.c_str());
         ImGui::Separator();
 

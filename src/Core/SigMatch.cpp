@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
 namespace ds {
 
@@ -51,6 +52,39 @@ size_t FindFirstMasked(const uint8_t* data, size_t n, const SigPattern& pat, siz
     const size_t m = pat.bytes.size();
     if (m == 0 || n < m) return SIZE_MAX;
     if (from > n - m) return SIZE_MAX;
+
+    // Runtime/Java discovery asks for many short, exact signatures over the
+    // complete image. The C runtime's vectorized byte search avoids a scalar
+    // BMH table-dependent step for every few input bytes. Keep candidates fully
+    // inside the requested span, and verify the complete signature before a hit.
+    // Dense first-byte candidates can favor BMH; switch back after a bounded
+    // run of false candidates rather than repeatedly calling memchr per byte.
+    if (m <= 32) {
+        bool exact = true;
+        for (size_t j = 0; j < m; ++j) exact &= pat.mask[j];
+        if (exact) {
+            const uint8_t* cursor = data + from;
+            const uint8_t* const end = data + (n - m + 1);
+            const uint8_t* batchStart = cursor;
+            size_t candidates = 0;
+            while (cursor < end) {
+                const uint8_t* candidate = static_cast<const uint8_t*>(
+                    std::memchr(cursor, pat.bytes[0], static_cast<size_t>(end - cursor)));
+                if (!candidate) return SIZE_MAX;
+                if (candidate[m - 1] == pat.bytes[m - 1] &&
+                    std::memcmp(candidate, pat.bytes.data(), m) == 0)
+                    return static_cast<size_t>(candidate - data);
+                cursor = candidate + 1;
+                if (++candidates == 32) {
+                    if (static_cast<size_t>(cursor - batchStart) <= 512) break;
+                    batchStart = cursor;
+                    candidates = 0;
+                }
+            }
+            if (cursor >= end) return SIZE_MAX;
+            from = static_cast<size_t>(cursor - data);
+        }
+    }
 
     // Anchor on the last concrete (non-wildcard) byte. Wildcards at the tail are
     // skipped so the BMH skip table keys off real data; the anchor is the index

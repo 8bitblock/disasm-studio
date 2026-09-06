@@ -15,10 +15,13 @@
 #include "Tabs/BinaryViewTab.h"
 #undef private
 #include "Ui/Widgets.h"
+#include "Ui/Fonts.h"
 #include "Core/GameMakerArchive.h"
+#include "Core/ApiInfo.h"
 #include "gamemaker_fixture.h"
 #include <windows.h>
 #include <cstdio>
+#include <cmath>
 
 using namespace ds;
 static int failures = 0;
@@ -471,6 +474,374 @@ static void checkListingColumns(const std::string& path) {
     theme::SetUiScale(1.0f);
 }
 
+static bool sameRgb(ImU32 a, ImU32 b) {
+    return (a & IM_COL32(255, 255, 255, 0)) == (b & IM_COL32(255, 255, 255, 0));
+}
+
+static void checkListingVisualSignals(const std::string& path) {
+    Fixture f(path);
+    const uint64_t first = kTarget;
+    std::vector<Instruction> rows;
+    for (size_t i = 0; i < 10; ++i) {
+        Instruction in;
+        in.address = first + i * 2;
+        in.length = 2; in.bytes = "FF C0";
+        in.mnemonic = "inc"; in.operands = "eax";
+        rows.push_back(std::move(in));
+    }
+    rows[1].mnemonic = "jne"; rows[1].operands = "0x1400C";
+    rows[1].isBranch = true; rows[1].branchTarget = rows[2].address;
+    rows[1].comment = "decoder branch annotation retained";
+    rows[6].mnemonic = "lea"; rows[6].operands = "rax, [0x1000]";
+    rows[7].mnemonic = "call"; rows[7].operands = "[0x2000]";
+    rows[7].isCall = rows[7].isBranch = true;
+    rows[8].comment = "constant-pool annotation retained";
+    const char string[] = "String evidence retained";
+    CHECK(f.ctx.writeStaticImage(0x1000, reinterpret_cast<const uint8_t*>(string), sizeof(string)) == sizeof(string));
+    f.tab->importMap_[0x2000] = "KERNEL32.ReadFile";
+    f.tab->comments_[rows[5].address] = "User comment retained";
+    BinaryViewTab::Func function{};
+    function.address = first; function.size = 64; function.name = "visual_fixture";
+    f.tab->functions_ = {function}; f.tab->funcIndexDirty_ = true;
+    BinaryViewTab::AnnEntry annotation;
+    annotation.fn = first;
+    annotation.inlineText[rows[9].address] = "Cached analysis note retained";
+    annotation.inlineTip[rows[9].address] = "fixture evidence; confidence high";
+    f.tab->annLru_.push_back(std::move(annotation));
+    f.tab->annSig_ = f.tab->listingSig(f.ctx);
+    f.tab->showNames_ = false;
+    f.tab->showStringComments_ = f.tab->showFnNotes_ = f.tab->showHints_ = true;
+    f.tab->setStaticCursor(rows[1].address);
+    f.tab->breakpoints_.insert(rows[0].address);
+    f.tab->traceInstructionHitsFile_[rows[3].address] = 1;
+    DbgSnapshot paused;
+    paused.state = DbgState::Paused; paused.regs.rip = rows[0].address;
+    paused.lastEvent = "Breakpoint hit";
+
+    const auto priorTheme = theme::CurrentTheme();
+    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+        for (float scale : {1.0f, 1.5f, 2.0f}) {
+            theme::SetUiScale(scale); theme::ApplyTheme(palette);
+            std::string text;
+            frame([&] {
+                f.tab->frameSnap_ = &paused;
+                f.tab->frameStaticRip_ = paused.regs.rip;
+                f.tab->frameStaticRipValid_ = true;
+                f.tab->hlJumpVA_ = rows[2].address; f.tab->hlJumpValid_ = true;
+                f.tab->navFlashVA_ = rows[4].address; f.tab->navFlashValid_ = true;
+                f.tab->navFlashT0_ = ImGui::GetTime();
+                f.tab->asmFlow_.clear(); f.tab->rowGlow_.clear();
+                f.tab->asmGotLaneX_ = f.tab->asmGotAddrX_ = false;
+                const ImVec2 origin = ImGui::GetCursorScreenPos();
+                const ImVec2 available = ImGui::GetContentRegionAvail();
+                ImDrawList* listingDrawList = nullptr;
+                ImGui::LogToBuffer();
+                if (ImGui::BeginTable("Visual signal rows", 6,
+                        ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoSavedSettings)) {
+                    const char* names[] = {"", "", "Address", "Bytes", "Instruction", "Comment"};
+                    const float widths[] = {18, 40, 115, 80, 240, 1100};
+                    for (int i = 0; i < 6; ++i)
+                        ImGui::TableSetupColumn(names[i], ImGuiTableColumnFlags_WidthFixed, widths[i] * scale);
+                    ImGui::TableHeadersRow();
+                    std::string nextHover;
+                    for (const auto& in : rows)
+                        f.tab->renderAsmRow(f.ctx, in, paused, {}, nextHover, false, true);
+                    listingDrawList = ImGui::GetWindowDrawList();
+                    ImGui::EndTable();
+                }
+                text = ImGui::GetCurrentContext()->LogBuffer.c_str();
+                ImGui::LogFinish();
+                CHECK(f.tab->asmFlow_.size() == rows.size());
+                CHECK(f.tab->rowGlow_.size() == 5);
+                if (f.tab->rowGlow_.size() != 5) return;
+                const auto glows = f.tab->rowGlow_;
+                CHECK(sameRgb(glows[0].colorPacked, ImGui::GetColorU32(theme::col::good())));
+                CHECK(sameRgb(glows[1].colorPacked, ImGui::GetColorU32(theme::col::accent())));
+                CHECK(sameRgb(glows[2].colorPacked, ImGui::GetColorU32(theme::col::jump())));
+                CHECK(sameRgb(glows[3].colorPacked, ImGui::GetColorU32(theme::col::good())));
+                CHECK(glows[0].intensity > glows[3].intensity);
+                CHECK(glows[4].intensity >= 1.0f);
+                CHECK(!sameRgb(glows[4].colorPacked, glows[1].colorPacked));
+                for (size_t i = 0; i < glows.size(); ++i) {
+                    CHECK(std::abs(glows[i].y - f.tab->asmFlow_[i].y) < 0.01f);
+                    CHECK(glows[i].h > 0.0f && glows[i].intensity > 0.0f);
+                }
+                ImDrawList* foreground = ImGui::GetForegroundDrawList();
+                const int foregroundBefore = foreground->VtxBuffer.Size;
+                CHECK(listingDrawList != nullptr);
+                if (!listingDrawList) return;
+                const int beforeGlow = listingDrawList->VtxBuffer.Size;
+                f.tab->drawRowGlows(origin.x, origin.y, origin.x + available.x, origin.y + available.y,
+                                   listingDrawList);
+                CHECK(f.tab->rowGlow_.empty());
+                CHECK(listingDrawList->VtxBuffer.Size > beforeGlow);
+                // Inspect actual post-table draw vertices, not only the queued
+                // records: every signal must reach the row-wide glow painter.
+                for (const auto& glow : glows) {
+                    bool painted = false;
+                    for (int i = beforeGlow; i < listingDrawList->VtxBuffer.Size; ++i) {
+                        const auto& vertex = listingDrawList->VtxBuffer[i];
+                        if (sameRgb(vertex.col, glow.colorPacked) &&
+                            (vertex.col & IM_COL32(0, 0, 0, 255)) &&
+                            std::abs(vertex.pos.y - glow.y) <= glow.h * 0.5f + 1.0f &&
+                            vertex.pos.x < f.tab->asmAddrX_) painted = true;
+                    }
+                    CHECK(painted);
+                }
+                const int beforeArrow = listingDrawList->VtxBuffer.Size;
+                f.tab->drawAsmArrows(origin.x, origin.y, origin.x + available.x, origin.y + available.y,
+                                    listingDrawList);
+                CHECK(listingDrawList->VtxBuffer.Size > beforeArrow);
+                CHECK(f.tab->asmFlow_[1].branch && f.tab->asmFlow_[1].target == rows[2].address);
+                for (int i = beforeArrow; i < listingDrawList->VtxBuffer.Size; ++i) {
+                    const auto& vertex = listingDrawList->VtxBuffer[i];
+                    CHECK(vertex.pos.x >= f.tab->asmLaneX_ - 2.0f * scale);
+                    CHECK(vertex.pos.x < f.tab->asmAddrX_);
+                }
+                // These signals remain part of the listing's window order;
+                // they must never paint through menus or the command palette.
+                CHECK(foreground->VtxBuffer.Size == foregroundBefore);
+                // Arrival flashes expire through the production time check.
+                f.tab->navFlashT0_ = ImGui::GetTime() - 1.2;
+                CHECK(f.tab->navFlashAt(rows[4].address) == 0.0f);
+                CHECK(!f.tab->navFlashValid_);
+            }, "Visual signal integration", ImVec2(3000, 1000));
+            for (const char* expected : {"User comment retained", "String evidence retained",
+                    "KERNEL32.ReadFile", "constant-pool annotation retained",
+                    "decoder branch annotation retained", "Cached analysis note retained"})
+                CHECK(text.find(expected) != std::string::npos);
+            CHECK(text.find(ApiPurpose("KERNEL32.ReadFile")) != std::string::npos);
+            CHECK(text.find("jumps if zero flag is clear; otherwise falls through") != std::string::npos);
+            CHECK(text.find('*') != std::string::npos); // breakpoint marker was rendered
+
+            // Exercise the actual LIVE row renderer from a retained display
+            // cache. There is no attached process; identity-checked reads return
+            // empty and the existing matching cache supplies all rendered rows.
+            f.tab->liveInsns_.assign(rows.begin(), rows.begin() + 5);
+            f.tab->liveIdxOf_.clear(); f.tab->liveFuncSet_.clear();
+            for (size_t i = 0; i < f.tab->liveInsns_.size(); ++i)
+                f.tab->liveIdxOf_[f.tab->liveInsns_[i].address] = static_cast<int>(i);
+            f.tab->liveBrowseValid_ = false;
+            f.tab->liveCacheStart_ = first;
+            f.tab->liveCacheSig_ = first ^ (paused.regs.rip * 0x9E3779B97F4A7C15ull) ^
+                (static_cast<uint64_t>(f.tab->liveGen_) << 1) ^
+                (f.tab->functionsGen_ * 0xD6E8FEB86659FD93ull) ^
+                (static_cast<uint64_t>(f.tab->symPid_) << 33) ^
+                (static_cast<uint64_t>(f.ctx.staticEngine()) << 56);
+            paused.breakpoints = {{first, {}, 1, 1}};
+            f.tab->lastScrolledRip_ = first; f.tab->lastScrolledRipValid_ = true;
+            f.tab->showRegHints_ = false;
+            f.tab->setLiveCursor(rows[1].address);
+            int withoutTrace = 0, withTrace = 0;
+            for (bool traced : {false, true}) {
+                f.tab->traceInstructionHitsLive_.clear();
+                if (traced) f.tab->traceInstructionHitsLive_[rows[3].address] = 1;
+                frame([&] {
+                    f.tab->frameSnap_ = &paused;
+                    f.tab->navFlashVA_ = rows[4].address; f.tab->navFlashValid_ = true;
+                    f.tab->navFlashT0_ = ImGui::GetTime();
+                    const ImGuiID liveTableId = ImGui::GetCurrentWindow()->GetID("live_asm");
+                    const int foregroundBefore = ImGui::GetForegroundDrawList()->VtxBuffer.Size;
+                    ImGui::LogToBuffer();
+                    f.tab->renderLiveListing(f.ctx, paused, first);
+                    const std::string liveText = ImGui::GetCurrentContext()->LogBuffer.c_str();
+                    ImGui::LogFinish();
+                    CHECK(liveText.find("decoder branch annotation retained") != std::string::npos);
+                    CHECK(liveText.find('*') != std::string::npos);
+                    CHECK(liveText.find("Could not read process memory") == std::string::npos);
+                    CHECK(f.tab->rowGlow_.empty()); // the actual LIVE post-table pass consumed them
+                    const ImGuiTable* liveTable = ImGui::TableFindByID(liveTableId);
+                    CHECK(liveTable && liveTable->InnerWindow && liveTable->InnerWindow != liveTable->OuterWindow);
+                    if (!liveTable || !liveTable->InnerWindow) return;
+                    const ImDrawList* listingDrawList = liveTable->InnerWindow->DrawList;
+                    for (const auto color : {theme::col::good(), theme::col::accent(), theme::col::jump()}) {
+                        bool painted = false;
+                        for (const auto& vertex : listingDrawList->VtxBuffer)
+                            if (sameRgb(vertex.col, ImGui::GetColorU32(color))) painted = true;
+                        CHECK(painted);
+                    }
+                    CHECK(ImGui::GetForegroundDrawList()->VtxBuffer.Size == foregroundBefore);
+                    (traced ? withTrace : withoutTrace) = listingDrawList->VtxBuffer.Size;
+                }, "Live visual signal integration", ImVec2(3000, 1000));
+            }
+            CHECK(withTrace > withoutTrace); // coverage adds real rendered glow geometry
+            f.tab->setStaticCursor(rows[1].address);
+        }
+    }
+    f.tab->frameSnap_ = &f.detached;
+    theme::SetUiScale(1.0f); theme::ApplyTheme(priorTheme);
+}
+
+// Exercise the real shell through its public entry point. Window inspection is
+// confined to ImGui's own rendered layout; App gets no private fixture access.
+static void workbenchFrame(App& app, ImVec2 size) {
+    ImGui::GetIO().DisplaySize = size;
+    ImGui::NewFrame();
+    app.render();
+    ImGui::Render();
+}
+
+static ImGuiWindow* activeWorkbenchContent() {
+    ImGuiWindow* main = ImGui::FindWindowByName("##main");
+    if (!main) return nullptr;
+    ImGuiWindow* content = nullptr;
+    for (ImGuiWindow* child : main->DC.ChildWindows) {
+        if (child->LastFrameActive != ImGui::GetFrameCount() ||
+            !std::strstr(child->Name, "##tabcontent")) continue;
+        CHECK(content == nullptr);
+        content = child;
+    }
+    return content;
+}
+
+static void checkWorkbenchDestination(const char* name) {
+    ImGuiWindow* main = ImGui::FindWindowByName("##main");
+    ImGuiWindow* content = activeWorkbenchContent();
+    CHECK(main && content);
+    if (!main || !content) return;
+    // The ID identifies the tab's retained content owner, including destinations
+    // whose empty-state text is intentionally similar.
+    const ImGuiID owner = ImHashStr(name, 0, main->ID);
+    const ImGuiID expected = ImHashStr("##tabcontent", 0, owner);
+    CHECK(content->ChildId == expected);
+}
+
+static void workbenchChord(App& app, ImVec2 size, ImGuiKey key) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddKeyEvent(ImGuiMod_Ctrl, true);
+    io.AddKeyEvent(key, true);
+    workbenchFrame(app, size);
+    io.AddKeyEvent(key, false);
+    io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    workbenchFrame(app, size);
+    workbenchFrame(app, size);
+}
+
+static void checkWorkbenchBounds(ImVec2 size) {
+    const char* bands[] = {"##MainMenuBar", "##document-strip", "##tabstrip",
+                          "##debugbar", "##main", "##status"};
+    float previousBottom = 0.0f;
+    for (const char* name : bands) {
+        ImGuiWindow* window = ImGui::FindWindowByName(name);
+        CHECK(window && window->LastFrameActive == ImGui::GetFrameCount());
+        if (!window) continue;
+        CHECK(window->Size.x > 0.0f && window->Size.y > 0.0f);
+        CHECK(window->Pos.x >= -1.0f && window->Pos.y >= previousBottom - 1.0f);
+        CHECK(window->Pos.x + window->Size.x <= size.x + 1.0f);
+        if (window->Pos.y + window->Size.y > size.y + 1.0f)
+            std::printf("[diag] shell %s y=%.1f h=%.1f viewport=%.1f min=%.1f\n",
+                name, window->Pos.y, window->Size.y, size.y, ImGui::GetStyle().WindowMinSize.y);
+        CHECK(window->Pos.y + window->Size.y <= size.y + 1.0f);
+        previousBottom = window->Pos.y + window->Size.y;
+    }
+    CHECK(std::abs(previousBottom - size.y) <= 1.0f);
+}
+
+static void checkWorkbenchShell() {
+    ImGui::ClosePopupsOverWindow(nullptr, false);
+    ImGui::ClearActiveID();
+    ImGui::GetIO().ClearInputKeys();
+    ImGui::GetIO().ClearInputMouse();
+    const auto priorTheme = theme::CurrentTheme();
+    App app;
+    const char* destinations[] = {"Projects", "Communications", "Sig Scanner", "Binary View",
+                                 "Memory Tools", "Binary Diff", "Binary Tech", "Cortex", "Prism"};
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        // Include the actual UI/mono atlas sizes, rather than only scaling the
+        // empty spacing around an unchanged test font.
+        ui::LoadFonts(scale);
+        unsigned char* pixels = nullptr; int atlasWidth = 0, atlasHeight = 0;
+        ImGui::GetIO().Fonts->GetTexDataAsRGBA32(&pixels, &atlasWidth, &atlasHeight);
+        CHECK(pixels && atlasWidth > 0 && atlasHeight > 0);
+        theme::SetUiScale(scale);
+        for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+            theme::ApplyTheme(palette);
+            for (ImVec2 size : {ImVec2(820, 560), ImVec2(1600, 960)}) {
+                std::printf("[ui] workbench %s %.1fx %.0fx%.0f\n",
+                            theme::ThemeName(palette), scale, size.x, size.y);
+                for (int i = 0; i < 3; ++i) workbenchFrame(app, size);
+                for (int tab = 0; tab < 9; ++tab) {
+                    workbenchChord(app, size, static_cast<ImGuiKey>(ImGuiKey_1 + tab));
+                    checkWorkbenchDestination(destinations[tab]);
+                    checkWorkbenchBounds(size);
+                }
+
+                // The palette must remain usable when its preferred size is
+                // larger than the available window, including at 200% DPI.
+                workbenchChord(app, size, ImGuiKey_K);
+                ImGuiWindow* paletteWindow = ImGui::FindWindowByName("##cmdpalette");
+                CHECK(paletteWindow && paletteWindow->LastFrameActive == ImGui::GetFrameCount());
+                if (!paletteWindow) continue;
+                CHECK(paletteWindow->Pos.x >= 0.0f && paletteWindow->Pos.y >= 0.0f);
+                CHECK(paletteWindow->Pos.x + paletteWindow->Size.x <= size.x + 1.0f);
+                CHECK(paletteWindow->Pos.y + paletteWindow->Size.y <= size.y + 1.0f);
+                CHECK(paletteWindow->ScrollMax.x <= 0.5f && paletteWindow->ScrollMax.y <= 0.5f);
+                CHECK(ImGui::GetActiveID() == paletteWindow->GetID("##palq"));
+                ImGuiWindow* blocker = ImGui::FindWindowByName("##cmdpalette_blocker");
+                CHECK(blocker && blocker->LastFrameActive == ImGui::GetFrameCount());
+                if (blocker) {
+                    const int blockerOrder = ImGui::FindWindowDisplayIndex(blocker);
+                    CHECK(ImGui::FindWindowDisplayIndex(paletteWindow) > blockerOrder);
+                    for (const char* name : {"##MainMenuBar", "##document-strip", "##tabstrip",
+                                             "##debugbar", "##main", "##status"}) {
+                        ImGuiWindow* underlying = ImGui::FindWindowByName(name);
+                        CHECK(underlying && ImGui::FindWindowDisplayIndex(underlying) < blockerOrder);
+                    }
+                }
+                ImGuiWindow* results = nullptr;
+                for (ImGuiWindow* child : paletteWindow->DC.ChildWindows)
+                    if (child->LastFrameActive == ImGui::GetFrameCount() &&
+                        std::strstr(child->Name, "##palresults")) results = child;
+                CHECK(results != nullptr);
+                if (results) {
+                    CHECK(results->Size.y > 0.0f && results->ScrollMax.x <= 0.5f);
+                    CHECK(results->Pos.y > paletteWindow->Pos.y);
+                    CHECK(results->Pos.y + results->Size.y + ImGui::GetTextLineHeight() <=
+                          paletteWindow->Pos.y + paletteWindow->Size.y);
+                }
+                // While typing in the palette, the underlying workspace must
+                // ignore the same shortcut which normally selects Projects.
+                workbenchChord(app, size, ImGuiKey_1);
+                checkWorkbenchDestination("Prism");
+
+                ImGuiWindow* strip = ImGui::FindWindowByName("##tabstrip");
+                CHECK(strip != nullptr);
+                if (!strip) continue;
+                // The left edge of the Projects cell is outside the centered
+                // palette. Clicking it first dismisses; the identical click
+                // after dismissal must activate Projects, proving that the
+                // first click was consumed rather than reaching an inert area.
+                const ImVec2 projectsPoint(strip->Pos.x + 10.0f * scale,
+                                            strip->Pos.y + strip->Size.y * 0.5f);
+                CHECK(!paletteWindow->Rect().Contains(projectsPoint));
+                ImGuiIO& io = ImGui::GetIO();
+                io.AddMousePosEvent(projectsPoint.x, projectsPoint.y);
+                workbenchFrame(app, size);
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+                workbenchFrame(app, size);
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+                workbenchFrame(app, size);
+                workbenchFrame(app, size);
+                CHECK(paletteWindow->LastFrameActive != ImGui::GetFrameCount());
+                checkWorkbenchDestination("Prism");
+                // Retire a failed overlay through its real shortcut so one
+                // dismissal regression does not invalidate later scenarios.
+                if (paletteWindow->LastFrameActive == ImGui::GetFrameCount())
+                    workbenchChord(app, size, ImGuiKey_K);
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+                workbenchFrame(app, size);
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+                workbenchFrame(app, size);
+                workbenchFrame(app, size);
+                checkWorkbenchDestination("Projects");
+                CHECK(!app.wantsExit());
+                io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            }
+        }
+    }
+    theme::SetUiScale(1.0f); theme::ApplyTheme(priorTheme);
+}
+
 int main() {
     char temporary[MAX_PATH]{};
     if (!GetEnvironmentVariableA("DS_STATIC_LISTING_TEST_ROOT", temporary, MAX_PATH)) return 2;
@@ -512,7 +883,9 @@ int main() {
         checkEffectivePatchPreview(path, true);
         checkLivePatchMappingAndSkippedOutcome(path);
         checkListingColumns(path);
+        checkListingVisualSignals(path);
         checkGameMakerActions(temporary);
+        checkWorkbenchShell();
     } catch (const std::exception& error) { std::printf("EXCEPTION: %s\n", error.what()); ++failures; }
     ImGui::DestroyContext();
     std::printf("static_listing_actions_test: %s (%d failure(s))\n", failures ? "FAILED" : "passed", failures);

@@ -30,14 +30,14 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
     }
 
     const float scale = theme::UiScale();
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 7 * scale));
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8 * scale, 7 * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 5 * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8 * scale, 4 * scale));
     ImGui::PushTextWrapPos(0.0f);
     const std::string& path = binary.path();
     const size_t slash = path.find_last_of("/\\");
     const char* name = slash == std::string::npos ? path.c_str() : path.c_str() + slash + 1;
-    ImGui::TextColored(theme::col::accent(), "%s", name);
-    ImGui::TextWrapped("Understand this image, choose a starting point, then follow its references into code.");
+    ImGui::TextUnformatted(name);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path.c_str());
     ImGui::TextDisabled("%s | %s | %s | %zu bytes", binary.formatName(),
                         ArchName(ctx.staticArch()),
                         binary.isMappedImage() ? "Memory snapshot" : "File image",
@@ -57,9 +57,7 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
     };
     auto wrapButton = [&](const char* label) {
         const float width = ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2;
-        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
-        if (ImGui::GetItemRectMax().x + width + ImGui::GetStyle().ItemSpacing.x <= right)
-            ImGui::SameLine();
+        ui::SameLineIfFits(width);
     };
     if (ImGui::Button("Browse functions")) sideAction(1);
     wrapButton("Find strings");
@@ -105,13 +103,13 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
                 navigateTo(lead.va);
             }
             if (lead.code && canDecompile) {
-                ImGui::SameLine();
+                wrapButton("Pseudocode");
                 if (ImGui::SmallButton("Pseudocode")) {
                     mainView_ = 1;
                     navigateTo(lead.va);
                 }
             }
-            ImGui::SameLine();
+            wrapButton("References");
             if (ImGui::SmallButton("References")) startXrefSearch(ctx, lead.va, false);
             ImGui::PopID();
         }
@@ -126,7 +124,7 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
     if (ImGui::CollapsingHeader("Analysis coverage", ImGuiTreeNodeFlags_DefaultOpen)) {
         const bool busy = ctx.staticAnalysis().bulkPending() || functionsDirty_;
         if (busy) {
-            ImGui::TextColored(theme::col::accent(), "Analysis is running; available results can be explored now.");
+            ImGui::TextDisabled("Analysis is running. Available results are ready to explore.");
         }
         const char* unavailable = busy ? "Result not available yet" : "Not available - use Analyze";
         if (ImGui::BeginTable("overview_coverage", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {

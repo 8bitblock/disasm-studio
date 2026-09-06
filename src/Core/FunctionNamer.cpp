@@ -1173,7 +1173,13 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     };
 
     // ---- Pass 1: detect thunks so calls *to* a thunk resolve to its API. ----
-    struct ThunkInfo { bool isThunk = false; bool targetValid = false; std::string api; uint64_t target = 0; };
+    struct ThunkInfo {
+        bool isThunk = false;
+        bool targetValid = false;
+        bool resolved = false;
+        std::string api;
+        uint64_t target = 0;
+    };
     std::unordered_map<uint64_t, ThunkInfo> thunks;
     std::vector<std::vector<Instruction>> bodies(funcs.size());
     for (size_t i = 0; i < funcs.size(); ++i) {
@@ -1194,20 +1200,26 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         if (t.isThunk) thunks[funcs[i].address] = t;
     }
 
-    // Follow chains such as jmp sub_X -> jmp [IAT].  The previous one-level pass
-    // left the outer thunk anonymous even though its final import was known.
-    for (size_t pass = 0; pass < thunks.size(); ++pass) {
-        bool changed = false;
-        for (auto& [address, t] : thunks) {
-            (void)address;
-            if (!t.api.empty() || !t.targetValid) continue;
-            auto next = thunks.find(t.target);
-            if (next != thunks.end() && !next->second.api.empty()) {
-                t.api = next->second.api;
-                changed = true;
-            }
+    // Follow each one-successor chain once, memoizing both resolved imports and
+    // dead ends. Repeated whole-map propagation was quadratic for long chains.
+    // Marking before descent also terminates cycles, which retain an unknown
+    // API. This iterative walk keeps hostile chains off the call stack.
+    std::vector<ThunkInfo*> chain;
+    for (auto& [address, root] : thunks) {
+        (void)address;
+        if (root.resolved) continue;
+        chain.clear();
+        ThunkInfo* current = &root;
+        while (current && !current->resolved) {
+            current->resolved = true;
+            chain.push_back(current);
+            if (!current->api.empty()) break;
+            const auto next = current->targetValid ? thunks.find(current->target) : thunks.end();
+            current = next == thunks.end() ? nullptr : &next->second;
         }
-        if (!changed) break;
+        if (current && !current->api.empty()) {
+            for (ThunkInfo* member : chain) member->api = current->api;
+        }
     }
 
     // ---- Pass 2: full evidence + synthesis. ----
@@ -1398,13 +1410,21 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         }
     }
 
+    // Assigned names only accumulate from here. A suffix already occupied for
+    // one case-insensitive base can never become available later, so remember
+    // where its search stopped instead of restarting at _1 for every function.
+    std::unordered_map<std::string, size_t> nextSuffix;
     for (size_t i = 0; i < funcs.size(); ++i) {
         GuessedName& g = synthesized[i];
         if (!g.guessed) continue;
         std::string base = g.name, cand = base;
-        for (int k = 1; used.count(nameKey(cand)); ++k) {
-            char suf[16]; std::snprintf(suf, sizeof(suf), "_%d", k);
-            cand = base + suf;
+        const std::string baseKey = nameKey(base);
+        if (used.count(baseKey)) {
+            size_t& suffix = nextSuffix[baseKey];
+            if (!suffix) suffix = 1;
+            do {
+                cand = base + "_" + std::to_string(suffix++);
+            } while (used.count(nameKey(cand)));
         }
         ++used[nameKey(cand)];
         if (cand != base)

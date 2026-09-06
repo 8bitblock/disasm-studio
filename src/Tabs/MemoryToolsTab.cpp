@@ -631,7 +631,10 @@ void MemoryToolsTab::refreshProcessList() {
 void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target) {
     const float scale = theme::UiScale();
     ImGui::BeginChild("##memory_target_bar", ImVec2(0, 0),
-                      ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+                      ImGuiChildFlags_AutoResizeY);
+    ImGui::TextUnformatted("Memory Tools");
+    ui::SameLineIfFits(240.0f * scale);
+    ImGui::TextDisabled("Value scans, memory and address records");
     if (target.valid()) {
         ui::StatePill(target.source == TargetSource::Debugger ? "DEBUGGER" : "PASSIVE",
                       target.source == TargetSource::Debugger
@@ -639,14 +642,14 @@ void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target)
         ui::SameLineIfFits(145.0f * scale);
         if (ImGui::Button("Open Process...")) processPickerOpen_ = true;
         if (target.source == TargetSource::Passive) {
-            ImGui::SameLine();
+            ui::SameLineIfFits(60.0f * scale);
             if (ImGui::Button("Close")) {
                 passive_.close();
                 passiveModules_.clear();
                 targetSource_ = TargetSource::None;
             }
         } else {
-            ImGui::SameLine();
+            ui::SameLineIfFits(140.0f * scale);
             if (ImGui::Button("Communications")) ctx.requestedTab = "Communications";
         }
         ImGui::TextWrapped("%s  |  PID %u  |  %s  |  %s",
@@ -654,7 +657,7 @@ void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target)
                            target.canWrite ? "read/write" : "read-only");
     } else {
         ImGui::TextDisabled("No live-memory target");
-        ImGui::SameLine();
+        ui::SameLineIfFits(150.0f * scale);
         if (ui::AccentButton("Open Process...", theme::col::accent(),
                              "Open a non-invasive query/read/write handle; this does not attach a debugger.",
                              true))
@@ -663,7 +666,7 @@ void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target)
             ? *ctx.frameDebugSnapshot : ctx.debug.snapshot();
         if ((debug.state == DbgState::Running || debug.state == DbgState::Paused) &&
             debug.pid && debug.sessionGeneration) {
-            ImGui::SameLine();
+            ui::SameLineIfFits(160.0f * scale);
             if (ImGui::SmallButton("Use debugger target"))
                 targetSource_ = TargetSource::Debugger;
         }
@@ -674,6 +677,7 @@ void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target)
         ImGui::PopTextWrapPos();
     }
     ImGui::EndChild();
+    ImGui::Separator();
 }
 
 void MemoryToolsTab::renderProcessPicker(AppContext& ctx) {
@@ -1212,7 +1216,7 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
         }
     }
 
-    if (ImGui::CollapsingHeader("Scan scope", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Scan scope")) {
         ImGui::BeginDisabled(running || firstScanDone_);
         ImGui::Checkbox("Private", &scanPrivate_); ui::SameLineIfFits(75.0f * scale);
         ImGui::Checkbox("Image", &scanImage_); ui::SameLineIfFits(95.0f * scale);
@@ -2513,19 +2517,19 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
     const float scale = theme::UiScale();
     pumpFreezeCompletion();
     ImGui::TextUnformatted("Address table");
-    ImGui::SameLine();
+    ui::SameLineIfFits(65.0f * scale);
     if (ImGui::SmallButton("Save...")) {
         if (saveTableDialog(target)) ui::Toast(ui::ToastKind::Success, targetStatus_);
         else if (!targetStatus_.empty()) ui::Toast(ui::ToastKind::Error, targetStatus_);
     }
-    ImGui::SameLine();
+    ui::SameLineIfFits(65.0f * scale);
     if (ImGui::SmallButton("Load...")) {
         if (loadTableDialog()) ui::Toast(ui::ToastKind::Success, targetStatus_);
         else if (!targetStatus_.empty()) ui::Toast(ui::ToastKind::Error, targetStatus_);
     }
-    ui::SameLineIfFits(180.0f * scale);
+    ui::SameLineIfFits(220.0f * scale);
     int interval = static_cast<int>(freezeIntervalMs_);
-    ImGui::SetNextItemWidth(80.0f * theme::UiScale());
+    ImGui::SetNextItemWidth(120.0f * scale);
     if (ImGui::InputInt("Freeze ms", &interval, 25, 100))
         freezeIntervalMs_ = static_cast<uint32_t>((std::clamp)(interval, 25, 5000));
     ui::SameLineIfFits(245.0f * scale);
@@ -2547,6 +2551,7 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
     }
     ImGui::EndDisabled();
     ImGui::TextDisabled("%zu records; loaded records never auto-enable", table_.size());
+    ImGui::Separator();
     if (table_.empty()) {
         ImGui::TextWrapped("Add an address above, add a scan result or viewer selection, or load a saved memory table.");
         return;
@@ -2865,7 +2870,9 @@ void MemoryToolsTab::render(AppContext& ctx) {
             "Open Process..."))
             processPickerOpen_ = true;
         ImGui::SeparatorText("Offline address table");
+        ImGui::PushTextWrapPos();
         ImGui::TextDisabled("Load, inspect, and edit records now. Enabling, resolving, applying, and freezing require a live target.");
+        ImGui::PopTextWrapPos();
         ImGui::BeginChild("##memory_table_no_target", ImVec2(0, 0),
                           ImGuiChildFlags_Borders);
         renderAddressTable(ctx, target);
@@ -2887,25 +2894,52 @@ void MemoryToolsTab::render(AppContext& ctx) {
 
     const float scale = theme::UiScale();
     const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float contentHeight = (std::max)(1.0f, available.y - 6.0f * scale -
+                                          ImGui::GetStyle().ItemSpacing.y * 2.0f);
+    const float minUpper = (std::min)(220.0f * scale, contentHeight * 0.55f);
+    const float maxUpper = (std::max)(minUpper, contentHeight -
+        (std::min)(150.0f * scale, contentHeight * 0.4f));
     if (upperHeight_ <= 0.0f) upperHeight_ = available.y * 0.62f;
-    upperHeight_ = (std::clamp)(upperHeight_, 220.0f * scale,
-                                (std::max)(220.0f * scale, available.y - 150.0f * scale));
+    upperHeight_ = (std::clamp)(upperHeight_, minUpper, maxUpper);
     if (ImGui::BeginChild("##memory_upper", ImVec2(0, upperHeight_), false)) {
         const float upperWidth = ImGui::GetContentRegionAvail().x;
-        if (scannerWidth_ <= 0.0f) scannerWidth_ = upperWidth * 0.37f;
-        scannerWidth_ = (std::clamp)(scannerWidth_, 300.0f * scale,
-                                     (std::max)(300.0f * scale,
-                                                upperWidth - 360.0f * scale));
-        ImGui::BeginChild("##memory_scanner", ImVec2(scannerWidth_, 0),
-                          ImGuiChildFlags_Borders);
-        renderScanner(ctx, target);
-        ImGui::EndChild();
-        ui::VSplitter("##memory_split", &scannerWidth_, 300.0f * scale,
-                      360.0f * scale, 6.0f * scale);
-        ImGui::BeginChild("##memory_inspector", ImVec2(0, 0),
-                          ImGuiChildFlags_Borders);
-        renderInspector(ctx, target);
-        ImGui::EndChild();
+        const bool compact = upperWidth < 720.0f * scale;
+        if (compact != compactUpperLayout_ && inspectorSelectRequest_ < 0)
+            inspectorSelectRequest_ = inspectorTab_;
+        compactUpperLayout_ = compact;
+        if (compact) {
+            // Give each tool readable columns at narrow widths; the address
+            // table and its live controls retain their own pane below.
+            if (inspectorSelectRequest_ >= 0) compactUpperView_ = 1;
+            static const char* upperViews[] = { "Value scanner", "Memory inspector" };
+            compactUpperView_ = ui::TabStrip("##memory_compact_views", upperViews, 2,
+                                             compactUpperView_);
+            if (compactUpperView_ != 0 && scanRunning_.load(std::memory_order_acquire)) {
+                if (ImGui::SmallButton("Cancel value scan##compact")) cancelScan();
+            }
+            if (compactUpperView_ == 0 && pointerRunning_.load(std::memory_order_acquire)) {
+                if (ImGui::SmallButton("Cancel pointer scan##compact"))
+                    cancelPointerScan();
+            }
+            ImGui::BeginChild("##memory_compact_tool", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            if (compactUpperView_ == 0) renderScanner(ctx, target);
+            else renderInspector(ctx, target);
+            ImGui::EndChild();
+        } else {
+            if (scannerWidth_ <= 0.0f) scannerWidth_ = upperWidth * 0.37f;
+            scannerWidth_ = (std::clamp)(scannerWidth_, 300.0f * scale,
+                                         upperWidth - 360.0f * scale - 6.0f * scale);
+            ImGui::BeginChild("##memory_scanner", ImVec2(scannerWidth_, 0),
+                              ImGuiChildFlags_Borders);
+            renderScanner(ctx, target);
+            ImGui::EndChild();
+            ui::VSplitter("##memory_split", &scannerWidth_, 300.0f * scale,
+                          360.0f * scale, 6.0f * scale);
+            ImGui::BeginChild("##memory_inspector", ImVec2(0, 0),
+                              ImGuiChildFlags_Borders);
+            renderInspector(ctx, target);
+            ImGui::EndChild();
+        }
     }
     ImGui::EndChild();
 
@@ -2914,9 +2948,7 @@ void MemoryToolsTab::render(AppContext& ctx) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
     if (ImGui::IsItemActive()) {
         upperHeight_ += ImGui::GetIO().MouseDelta.y;
-        upperHeight_ = (std::clamp)(upperHeight_, 220.0f * scale,
-                                    (std::max)(220.0f * scale,
-                                               available.y - 150.0f * scale));
+        upperHeight_ = (std::clamp)(upperHeight_, minUpper, maxUpper);
     }
     ImGui::BeginChild("##memory_table", ImVec2(0, 0), ImGuiChildFlags_Borders);
     renderAddressTable(ctx, target);

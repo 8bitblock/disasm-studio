@@ -877,7 +877,10 @@ void SigScannerTab::render(AppContext& ctx) {
             scan(ctx);   // populate Results (the default sub-tab) right away
         }
     }
-    // Nothing to scan against at all: a hero card instead of a dead form.
+    ImGui::TextUnformatted("Signature Scanner");
+    ui::SameLineIfFits(300.0f * theme::UiScale());
+    ImGui::TextDisabled("Byte patterns, match health and functions");
+
     if (!ctx.staticBinary().loaded() && !snap.attached()) {
         if (ui::EmptyState(DS_ICON_SEARCH, "Nothing to scan",
                            "Open a binary to scan for byte patterns, or attach a process for live scans.",
@@ -917,7 +920,7 @@ void SigScannerTab::render(AppContext& ctx) {
                                                         : "Open a binary to scan file bytes.");
     ImGui::SetNextItemWidth(std::min(190.0f * s, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint("##signame", "signature name", sigName_, sizeof(sigName_));
-    ImGui::SameLine();
+    ui::SameLineIfFits(105.0f * s);
     SigPattern savePattern;
     const bool validPattern = !patternClipped_ && parsePattern(patternInput_, savePattern);
     ImGui::BeginDisabled(workerPending_ || !validPattern);
@@ -940,9 +943,9 @@ void SigScannerTab::render(AppContext& ctx) {
         ui::Toast(ui::ToastKind::Success, "Signature added to Sig Health for this session.");
     }
     ImGui::EndDisabled();
-    ui::SameLineIfFits(140.0f * s);
-    ImGui::ProgressBar(progress_, ImVec2(140.0f * s, 0));
     if (workerPending_) {
+        ui::SameLineIfFits(140.0f * s);
+        ImGui::ProgressBar(progress_, ImVec2(140.0f * s, 0));
         ui::SameLineIfFits(80.0f * s);
         if (ImGui::SmallButton("Cancel##sigworker")) cancelWorker();
     }
@@ -967,19 +970,21 @@ void SigScannerTab::render(AppContext& ctx) {
         const int selectSub = std::exchange(requestedSub_, -1);
         if (ImGui::BeginTabItem("Results", nullptr, selectSub == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
             ImGui::Text("%d match(es)", (int)results_.size());
-            ImGui::SameLine();
+            ui::SameLineIfFits(180.0f * s);
             ImGui::TextDisabled(resultsLive_ ? "(live process memory)" : "(file on disk)");
             if (truncated_) {
-                ImGui::SameLine();
+                ui::SameLineIfFits(280.0f * s);
                 ImGui::TextColored(theme::col::warn(), "(capped at %d \xE2\x80\x94 refine the pattern)",
                                    (int)results_.size());
             }
             if (ImGui::BeginTable("res", 3,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                    ImGuiTableFlags_Resizable,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
-                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 160);
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 160.0f * s);
                 ImGui::TableSetupColumn("Signature");
                 ImGui::TableSetupColumn("Module");
+                ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 ImGuiListClipper clip;   // up to 4096 rows -> only build widgets for the visible ones
                 clip.Begin((int)results_.size());
@@ -1008,7 +1013,7 @@ void SigScannerTab::render(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Current Scan", nullptr, selectSub == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
-            ImGui::Text("Pattern: %s", patternInput_);
+            ImGui::TextWrapped("Pattern: %s", patternInput_);
             if (live_) ImGui::Text("Live process: %lu", static_cast<unsigned long>(snap.pid));
             else ImGui::Text("Bytes loaded: %zu", ctx.staticBinary().bytes().size());
             ImGui::ProgressBar(progress_, ImVec2(-1, 0));
@@ -1030,17 +1035,21 @@ void SigScannerTab::render(AppContext& ctx) {
             ImGui::BeginDisabled(!ctx.staticBinary().loaded() || workerPending_);
             if (ImGui::Button("Recompute health")) refreshHealth(ctx);
             ImGui::EndDisabled();
-            ImGui::SameLine();
+            ui::SameLineIfFits(300.0f * s);
             ImGui::TextDisabled(ctx.staticBinary().loaded() ? "FILE match counts: none / unique / multiple"
                                                      : "Load a binary to score signatures.");
+            ImGui::PushTextWrapPos();
             ImGui::TextDisabled("Session signatures: select to edit, double-click to scan in the selected FILE / Live mode.");
+            ImGui::PopTextWrapPos();
             if (ImGui::BeginTable("health", 4,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                    ImGuiTableFlags_Resizable,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
-                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 140);
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 140.0f * s);
                 ImGui::TableSetupColumn("Pattern");
-                ImGui::TableSetupColumn("Matches", ImGuiTableColumnFlags_WidthFixed, 70);
-                ImGui::TableSetupColumn("Health", ImGuiTableColumnFlags_WidthFixed, 90);
+                ImGui::TableSetupColumn("Matches", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
+                ImGui::TableSetupColumn("Health", ImGuiTableColumnFlags_WidthFixed, 90.0f * s);
+                ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 ImGuiListClipper clip;
                 clip.Begin(static_cast<int>(sigs_.size()));
@@ -1081,19 +1090,23 @@ void SigScannerTab::render(AppContext& ctx) {
                 analyzeFunctions(ctx);
             }
             ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(200);
+            ui::SameLineIfFits(200.0f * s);
+            ImGui::SetNextItemWidth(std::min(200.0f * s, ImGui::GetContentRegionAvail().x));
             ImGui::InputTextWithHint("##fnfilter", "filter name...", fnFilter_, sizeof(fnFilter_));
-            ImGui::SameLine();
+            ui::SameLineIfFits(330.0f * s);
+            ImGui::PushTextWrapPos();
             if (!analyzeSummary_.empty()) ImGui::TextDisabled("%s", analyzeSummary_.c_str());
             else ImGui::TextDisabled("Recursive-descent + prologue + export sweep.");
+            ImGui::PopTextWrapPos();
 
             if (ImGui::BeginTable("fns", 3,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+                    ImGuiTableFlags_Resizable,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
-                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 160);
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 160.0f * s);
                 ImGui::TableSetupColumn("Name");
-                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 70);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
+                ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 // Pre-filter into a dense index list so a uniform-height clipper can
                 // skip the off-screen rows (this list can hold thousands of entries).

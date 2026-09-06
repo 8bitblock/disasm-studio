@@ -125,6 +125,12 @@ public:
     void clear();
     AnalysisCacheStats stats() const;
 
+    // Check immutable capacity before allocating a potentially large snapshot.
+    // Current occupancy does not matter: put() evicts old entries as needed.
+    bool canStore(size_t approximateBytes) const noexcept {
+        return maxEntries_ && maxBytes_ && approximateBytes <= maxBytes_;
+    }
+
 private:
     template <typename T>
     static const void* typeToken() {

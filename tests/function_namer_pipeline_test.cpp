@@ -10,6 +10,7 @@
 #include "Core/FunctionNamer.h"
 #include "Disasm/IDisassembler.h"
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -89,7 +90,80 @@ static Instruction ret(uint64_t va) {
     return in;
 }
 
-int main() {
+// Large batches exercise allocation after reserved-name holes and long thunk
+// chains without depending on a particular unordered-map traversal order. The
+// optional benchmark reports wall time; correctness never uses timing limits.
+static void checkLargeNamingBatches(size_t count, bool reportTime) {
+    const uint64_t base = 0x200000, iat = base + count + 16;
+    const std::string path = "ds_function_namer_scale_tmp.bin";
+    {
+        std::ofstream f(path, std::ios::binary);
+        const std::vector<char> bytes(count + 32, 0);
+        f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    BinaryFile bin;
+    CHECK(bin.loadRaw(path, base));
+    ScriptDisasm dis;
+    std::vector<NamerInput> funcs;
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t address = base + i;
+        char name[40];
+        std::snprintf(name, sizeof(name), "sub_%llX", static_cast<unsigned long long>(address));
+        funcs.push_back({address, 1, false, name});
+        dis.bodies[address] = {ret(address)};
+    }
+    funcs.push_back({base + count, 1, true, "NULLSUB"});
+    funcs.push_back({base + count + 1, 1, true, "NullSub_2"});
+    funcs.push_back({base + count + 2, 1, true, "nullsub_4"});
+    FunctionNamer namer;
+    auto begin = std::chrono::steady_clock::now();
+    auto results = namer.name(bin, dis, funcs, 0, false, false, {}, {});
+    const double repeatedMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+    size_t suffix = 1;
+    for (size_t i = 0; i < count; ++i) {
+        while (suffix == 2 || suffix == 4) ++suffix;
+        const std::string expected = "nullsub_" + std::to_string(suffix++);
+        CHECK(results[i].guessed);
+        CHECK_EQ(results[i].name, expected);
+        CHECK_EQ(results[i].reason, "empty stub (returns immediately); name \"nullsub\" already existed, shown as \"" + expected + "\"");
+    }
+    CHECK(namer.guessedCount() == static_cast<int>(count));
+    for (size_t i = count; i < funcs.size(); ++i) {
+        CHECK(!results[i].guessed);
+        CHECK_EQ(results[i].name, funcs[i].name);
+    }
+
+    // Named thunks still donate API evidence to the first anonymous thunk.
+    // Giving the rest authoritative names isolates chain-resolution cost from
+    // duplicate guessed-name allocation and protects those names at the same time.
+    funcs.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t address = base + i;
+        dis.bodies[address] = {i + 1 < count ? jumpTo(address, address + 1) : jumpMem(address, iat)};
+        if (i) { funcs[i].isExport = true; funcs[i].name = "export_" + std::to_string(i); }
+    }
+    const auto importName = [iat](uint64_t address) -> std::string {
+        return address == iat ? "KERNEL32.CreateFileW" : "";
+    };
+    begin = std::chrono::steady_clock::now();
+    results = namer.name(bin, dis, funcs, 0, false, false, importName, {});
+    const double chainMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+    CHECK_EQ(results.front().name, "j_CreateFileW");
+    CHECK_EQ(results.front().reason, "tail-jumps to CreateFileW");
+    CHECK(namer.guessedCount() == 1);
+    for (size_t i = 1; i < count; ++i) {
+        CHECK(!results[i].guessed);
+        CHECK_EQ(results[i].name, funcs[i].name);
+    }
+    if (reportTime)
+        std::printf("function_namer benchmark: %zu functions, duplicate names %.3f ms, thunk chain %.3f ms\n",
+                    count, repeatedMs, chainMs);
+    std::remove(path.c_str());
+}
+
+int main(int argc, char** argv) {
     const uint64_t base = 0x100000;
     const uint64_t iatCreate = base + 0xE00;
     const uint64_t iatOrdinal = base + 0xE10;
@@ -213,6 +287,32 @@ int main() {
         FunctionNamer n;
         auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
         CHECK(r[0].guessed); CHECK_EQ(r[0].name, "OpenConfig");
+    }
+
+    // Cycles, self-loops, and chains ending outside the known functions cannot
+    // inherit an unrelated resolved import.
+    {
+        const uint64_t a = base + 0x900, b = base + 0x910, lead = base + 0x920;
+        const uint64_t self = base + 0x930, unknown = base + 0x940, good = base + 0x950;
+        dis.bodies[a] = {jumpTo(a, b)};
+        dis.bodies[b] = {jumpTo(b, a)};
+        dis.bodies[lead] = {jumpTo(lead, a)};
+        dis.bodies[self] = {jumpTo(self, self)};
+        dis.bodies[unknown] = {jumpTo(unknown, base + 0xDDD)};
+        dis.bodies[good] = {jumpMem(good, iatCreate)};
+        std::vector<NamerInput> f;
+        for (uint64_t address : {a, b, lead, self, unknown, good}) {
+            char name[40];
+            std::snprintf(name, sizeof(name), "sub_%llX", static_cast<unsigned long long>(address));
+            f.push_back({address, 1, false, name});
+        }
+        FunctionNamer n;
+        const auto r = n.name(bin, dis, f, 0, importNameFor, stringRefFor);
+        for (size_t i = 0; i + 1 < r.size(); ++i) {
+            CHECK(!r[i].guessed);
+            CHECK_EQ(r[i].name, f[i].name);
+        }
+        CHECK_EQ(r.back().name, "j_CreateFileW");
     }
 
     // A thin wrapper that returns the predicate's BOOL directly also qualifies.
@@ -509,6 +609,9 @@ int main() {
         CHECK_EQ(r[2].name, "ret_zero");
         CHECK_EQ(r[4].name, "nullsub");
     }
+
+    const bool benchmark = argc > 1 && std::string(argv[1]) == "--benchmark";
+    checkLargeNamingBatches(benchmark ? 16384 : 1024, benchmark);
 
     std::remove(path.c_str());
     if (!g_fail) std::printf("function_namer_pipeline_test: ALL PASS\n");

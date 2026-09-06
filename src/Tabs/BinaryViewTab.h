@@ -37,6 +37,8 @@
 #include <utility>
 #include <vector>
 
+struct ImDrawList;
+
 namespace ds {
 
 // Binary View: the central workspace. Three synchronized views (assembly,
@@ -146,7 +148,8 @@ private:
     void liveSelectionMenu(AppContext& ctx, const struct DbgSnapshot& snap); // batch actions over selVAs_ (live listing)
     void emitInstrCopyMenu(const Instruction& in);                          // shared Copy bytes/C-array/instruction (static + live menus)
     void stepAsmCursor(AppContext& ctx, int delta);                         // exact on-demand page stepping
-    void drawAsmArrows(float x0, float y0, float x1, float y1);            // branch arrows in the static flow gutter (table body rect)
+    void drawAsmArrows(float x0, float y0, float x1, float y1,
+                       ImDrawList* listingDrawList = nullptr); // branch arrows in the scrolling table's drawlist
     void revertPatchAt(AppContext& ctx, uint64_t va,
                        size_t exactIndex = (std::numeric_limits<size_t>::max)()); // restore one recorded patch
     bool transitionPatchSetState(AppContext& ctx,
@@ -578,7 +581,8 @@ private:
     // plus a decaying white-hot navigation-arrival flash on top.
     struct RowGlow { float y; float h; unsigned int colorPacked; float intensity; };
     std::vector<RowGlow> rowGlow_;
-    void  drawRowGlows(float x0, float y0, float x1, float y1);   // paint + clear rowGlow_
+    void  drawRowGlows(float x0, float y0, float x1, float y1,
+                       ImDrawList* listingDrawList = nullptr); // paint + clear rowGlow_
     void  pushRowGlow(float yCenter, bool rowAtRip, bool rowSel, bool rowJump,
                       bool rowTraced, float flash);
     float navFlashAt(uint64_t addr);   // 1..0 decaying flash if addr was just navigated to

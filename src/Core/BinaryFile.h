@@ -171,6 +171,12 @@ public:
     // invalid input leaves the prior metadata unchanged.
     bool setRawEntryPointVA(uint64_t va);
     bool setAnalysisLandmarks(std::vector<AnalysisLandmark> landmarks);
+    // Replace a disk-backed Raw image's complete mapping without rereading or
+    // copying its bytes. Entry/landmarks are absolute addresses in the new
+    // mapping. Validation is atomic; success preserves the pristine hash/path
+    // and advances imageRevision so existing analysis cannot reuse old VAs.
+    bool remapRaw(uint64_t base, uint64_t entryVA, bool entryExplicit,
+                  std::vector<AnalysisLandmark> landmarks);
     const std::vector<AnalysisLandmark>& analysisLandmarks() const { return analysisLandmarks_; }
 
     // Stable 64-bit content hash (FNV-1a) used as the persistence sidecar key.

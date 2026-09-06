@@ -275,6 +275,34 @@ static bool codeContains(const std::vector<Claim>& code, uint64_t address) {
     return claimContains(code, address);
 }
 
+// Padding scans only move forward through a sorted, disjoint union of stronger
+// claims. Keep one cursor per scan instead of binary-searching that same union
+// for every executable byte. Returning the covered extent also lets the outer
+// scan skip a whole code/string/table span without examining its bytes.
+class CoveredClaimCursor {
+public:
+    CoveredClaimCursor(const std::vector<Claim>& claims, uint64_t start) : claims_(claims) {
+        const auto it = std::upper_bound(claims.begin(), claims.end(), start,
+            [](uint64_t value, const Claim& claim) { return value < claim.address; });
+        next_ = static_cast<size_t>(it - claims.begin());
+        if (next_) --next_;
+    }
+
+    uint64_t coveredBytesAt(uint64_t address) {
+        while (next_ < claims_.size() && claims_[next_].address <= address) {
+            const Claim& claim = claims_[next_];
+            if (spanContains(claim.address, claim.size, address))
+                return claim.size - (address - claim.address);
+            ++next_;
+        }
+        return 0;
+    }
+
+private:
+    const std::vector<Claim>& claims_;
+    size_t next_ = 0;
+};
+
 static void addStats(CodeDataStats& stats, const CodeDataSpan& span) {
     switch (span.kind) {
         case CodeDataKind::Code:         stats.codeBytes += span.size; break;
@@ -782,20 +810,28 @@ CodeDataMap ClassifyCodeData(const BinaryFile& bin, IDisassembler& dis,
         size_t available = 0;
         const uint8_t* p = bin.ptrFromVA(range.address, available);
         const size_t n = static_cast<size_t>(std::min<uint64_t>(available, range.size));
+        CoveredClaimCursor coverage(prePadding, range.address);
         std::vector<uint8_t> fixedNop;
         if (arch == Arch::ARM64) fixedNop = {0x1F, 0x20, 0x03, 0xD5};
         else if (arch == Arch::ARM) fixedNop = {0x00, 0xF0, 0x20, 0xE3};
         else if (arch == Arch::THUMB) fixedNop = {0x00, 0xBF};
         if (!fixedNop.empty()) {
             for (size_t i = 0; i + fixedNop.size() <= n;) {
-                if (claimContains(prePadding, range.address + i) ||
-                    std::memcmp(p + i, fixedNop.data(), fixedNop.size()) != 0) {
+                if (const uint64_t covered = coverage.coveredBytesAt(range.address + i)) {
+                    const size_t skip = static_cast<size_t>(std::min<uint64_t>(covered, n - i));
+                    i += skip;
+                    // Retain the original scan's ISA stride even when a string
+                    // or literal claim ends between instruction-aligned bytes.
+                    i += std::min(n - i, (fixedNop.size() - skip % fixedNop.size()) % fixedNop.size());
+                    continue;
+                }
+                if (std::memcmp(p + i, fixedNop.data(), fixedNop.size()) != 0) {
                     i += std::max<size_t>(1, fixedNop.size());
                     continue;
                 }
                 size_t end = i;
                 while (end + fixedNop.size() <= n &&
-                       !claimContains(prePadding, range.address + end) &&
+                       !coverage.coveredBytesAt(range.address + end) &&
                        std::memcmp(p + end, fixedNop.data(), fixedNop.size()) == 0)
                     end += fixedNop.size();
                 addClaim(claims, range.address + i, end - i, CodeDataKind::Padding, 1,
@@ -805,10 +841,13 @@ CodeDataMap ClassifyCodeData(const BinaryFile& bin, IDisassembler& dis,
             }
         } else if (ArchIsX86(arch)) {
             for (size_t i = 0; i < n;) {
-                if (claimContains(prePadding, range.address + i) ||
-                    (p[i] != 0x0F && p[i] != 0x66)) { ++i; continue; }
+                if (const uint64_t covered = coverage.coveredBytesAt(range.address + i)) {
+                    i += static_cast<size_t>(std::min<uint64_t>(covered, n - i));
+                    continue;
+                }
+                if (p[i] != 0x0F && p[i] != 0x66) { ++i; continue; }
                 size_t end = i;
-                while (end < n && !claimContains(prePadding, range.address + end) &&
+                while (end < n && !coverage.coveredBytesAt(range.address + end) &&
                        (p[end] == 0x0F || p[end] == 0x66 || p[end] == 0x90)) {
                     Instruction nop;
                     if (!validInstructionAt(bin, dis, ranges, range.address + end, &nop) ||
@@ -827,16 +866,20 @@ CodeDataMap ClassifyCodeData(const BinaryFile& bin, IDisassembler& dis,
         size_t available = 0;
         const uint8_t* p = bin.ptrFromVA(range.address, available);
         const size_t n = static_cast<size_t>(std::min<uint64_t>(available, range.size));
+        CoveredClaimCursor coverage(prePadding, range.address);
         for (size_t i = 0; i < n;) {
             const uint64_t address = range.address + i;
-            if (claimContains(prePadding, address)) { ++i; continue; }
+            if (const uint64_t covered = coverage.coveredBytesAt(address)) {
+                i += static_cast<size_t>(std::min<uint64_t>(covered, n - i));
+                continue;
+            }
             const uint8_t value = p[i];
             const bool candidate = value == 0x00 ||
                 (ArchIsX86(arch) && (value == 0x90 || value == 0xCC));
             if (!candidate) { ++i; continue; }
             size_t end = i + 1;
             while (end < n && p[end] == value &&
-                   !claimContains(prePadding, range.address + end)) ++end;
+                   !coverage.coveredBytesAt(range.address + end)) ++end;
             const size_t minimum = value == 0 ? 8 : 4;
             if (end - i >= minimum)
                 addClaim(claims, address, end - i, CodeDataKind::Padding, 1,

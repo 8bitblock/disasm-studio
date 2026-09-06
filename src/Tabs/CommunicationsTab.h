@@ -88,6 +88,7 @@ private:
     // the fixed nine-section shell and avoids spending permanent top-level
     // navigation on a second communications surface.
     int                      workspaceView_ = 0; // 0 native, 1 network, 2 Java/JDWP, 3 GameMaker
+    float                    processPaneWidth_ = 0.0f;
     std::string              gmlStatus_;
     ConnectionsTab           systemConnections_;
 

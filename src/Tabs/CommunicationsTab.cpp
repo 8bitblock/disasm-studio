@@ -10,6 +10,7 @@
 #include "../Ui/Icons.h"
 #include "../Ui/Theme.h"
 #include "../Ui/Widgets.h"
+#include "../Ui/Splitter.h"
 #include "imgui.h"
 #include <algorithm>
 #include <cctype>
@@ -735,11 +736,11 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         ImGui::SeparatorText("Or connect to a listening JDWP agent");
         ImGui::SetNextItemWidth(150.0f * scale);
         ImGui::InputTextWithHint("##jdwphost", "host", jdwpHost_, sizeof(jdwpHost_));
-        ImGui::SameLine();
+        ui::SameLineIfFits(135.0f * scale);
         ImGui::SetNextItemWidth(90.0f * scale);
         ImGui::InputInt("Port##jdwpport", &jdwpPort_, 0, 0);
         jdwpPort_ = jdwpPort_ < 1 ? 1 : jdwpPort_ > 65535 ? 65535 : jdwpPort_;
-        ImGui::SameLine();
+        ui::SameLineIfFits(90.0f * scale);
         if (ImGui::Button("Connect##jdwp")) {
             std::string err;
             if (ctx.jdwp.attach(jdwpHost_, (uint16_t)jdwpPort_, err)) {
@@ -762,12 +763,12 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     const bool suspended = snap.state == JdwpState::Suspended;
     if (suspended) {
         if (ImGui::Button("Resume##jdwp")) ctx.jdwp.resumeAll();
-        ImGui::SameLine();
+        ui::SameLineIfFits(100.0f * scale);
         ImGui::BeginDisabled(!snap.stopThread || !snap.stopLoc.classID);
         if (ImGui::Button("Step Into##jdwp")) ctx.jdwp.stepInto();
-        ImGui::SameLine();
+        ui::SameLineIfFits(105.0f * scale);
         if (ImGui::Button("Step Over##jdwp")) ctx.jdwp.stepOver();
-        ImGui::SameLine();
+        ui::SameLineIfFits(100.0f * scale);
         if (ImGui::Button("Step Out##jdwp")) ctx.jdwp.stepOut();
         ImGui::EndDisabled();
     } else {
@@ -805,8 +806,12 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     }
 
     // ---- three-column console -------------------------------------------------
+    ImGui::SetNextWindowContentSize(ImVec2(
+        (std::max)(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().WindowPadding.x * 2.0f,
+                    940.0f * scale), 0.0f));
     ImGui::BeginChild("jdwp_body", ImVec2(0, (std::max)(380.0f * scale,
-        ImGui::GetContentRegionAvail().y)), ImGuiChildFlags_Borders);
+        ImGui::GetContentRegionAvail().y)), ImGuiChildFlags_Borders,
+        ImGuiWindowFlags_HorizontalScrollbar);
     const float colW = ImGui::GetContentRegionAvail().x;
 
     // -- column 1: threads / breakpoints / session log --
@@ -1005,13 +1010,14 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
 }
 
 void CommunicationsTab::renderGameMaker(AppContext& ctx) {
+    const float scale = theme::UiScale();
     const auto archive=ctx.staticBinary().gameMakerArchive();
     const auto session=ctx.debug.gameMakerSnapshot();
     const auto fallback=ctx.frameDebugSnapshot?DbgSnapshot{}:ctx.debug.snapshot();
     const auto& native=ctx.frameDebugSnapshot?*ctx.frameDebugSnapshot:fallback;
     const bool matching=native.attached() && DebugTargetIdentityMatches(session.target,{native.pid,native.sessionGeneration});
     const bool paused=matching && native.state==DbgState::Paused && session.state==GameMakerSessionState::Paused && session.stop && session.stop->identity.tid==native.activeTid;
-    ImGui::TextColored(theme::col::accent(),"GameMaker / GML instruction debugger");
+    ImGui::TextUnformatted("GameMaker / GML instruction debugger");
     ImGui::TextWrapped("Open the game's data.win as a document, attach its running process in Processes & Attach, then start GML debugging here.");
     ImGui::Text("Native target: %s",native.attached()?std::to_string(native.pid).c_str():"not attached");
     if(archive)ImGui::Text("Archive: %s (%zu code entries)",archive->gameName.c_str(),archive->code.size());
@@ -1023,7 +1029,7 @@ void CommunicationsTab::renderGameMaker(AppContext& ctx) {
         gmlStatus_.clear();
         if(ctx.debug.connectGameMaker(archive,ctx.staticBinary().path(),ctx.staticBinary().contentHash(),ctx.staticProject().gmlBreakpoints,gmlStatus_))ctx.gmlExecutionMode=true;
     }
-    ImGui::EndDisabled();ImGui::SameLine();
+    ImGui::EndDisabled();ui::SameLineIfFits(170.0f * scale);
     ImGui::BeginDisabled(session.state==GameMakerSessionState::Disconnected || session.state==GameMakerSessionState::Inert);
     if(ImGui::Button("Stop GML debugging"))ctx.debug.disconnectGameMaker();
     ImGui::EndDisabled();
@@ -1047,12 +1053,13 @@ void CommunicationsTab::renderGameMaker(AppContext& ctx) {
     if(!session.error.empty())ImGui::TextColored(theme::col::warn(),"%s",session.error.c_str());
     if(!gmlStatus_.empty())ImGui::TextColored(theme::col::warn(),"%s",gmlStatus_.c_str());
     auto command=[&](GmlControlCommand c){gmlStatus_.clear();ctx.debug.gameMakerCommand(c,paused?session.stop->identity:GmlPauseIdentity{},gmlStatus_);};
+    ImGui::SeparatorText("Execution");
     ImGui::BeginDisabled(!matching || !session.ready() || (!paused && native.state!=DbgState::Running));
     if(ImGui::Button(paused?"Continue GML":"Pause GML"))command(paused?GmlControlCommand::Continue:GmlControlCommand::Pause);
-    ImGui::EndDisabled();ImGui::SameLine();
+    ImGui::EndDisabled();ui::SameLineIfFits(125.0f * scale);
     ImGui::BeginDisabled(!paused);
-    if(ImGui::Button("Step Into GML"))command(GmlControlCommand::StepInto);ImGui::SameLine();
-    if(ImGui::Button("Step Over GML"))command(GmlControlCommand::StepOver);ImGui::SameLine();
+    if(ImGui::Button("Step Into GML"))command(GmlControlCommand::StepInto);ui::SameLineIfFits(130.0f * scale);
+    if(ImGui::Button("Step Over GML"))command(GmlControlCommand::StepOver);ui::SameLineIfFits(125.0f * scale);
     if(ImGui::Button("Step Out GML"))command(GmlControlCommand::StepOut);
     ImGui::EndDisabled();
     if(native.state==DbgState::Paused && matching && !paused)ImGui::TextDisabled("This is a native pause. GML frame and numeric-edit authority are unavailable.");
@@ -1071,6 +1078,9 @@ void CommunicationsTab::renderGameMaker(AppContext& ctx) {
 
 void CommunicationsTab::render(AppContext& ctx) {
     const float scale = theme::UiScale();
+    ImGui::TextUnformatted("Communications");
+    ui::SameLineIfFits(330.0f * scale);
+    ImGui::TextDisabled("Processes, connections and runtime debugging");
     static const char* views[] = {
         "Processes & Attach", "Network Monitor", "Java / JDWP", "GameMaker / GML"
     };
@@ -1109,17 +1119,23 @@ void CommunicationsTab::render(AppContext& ctx) {
         renderJdwp(ctx);
         ImGui::EndChild();
     } else {
-        ImVec2 avail = ImGui::GetContentRegionAvail();
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
         const float divider = 5.0f * scale;
-        float processW = (std::max)(280.0f * scale, avail.x * 0.43f);
-        if (processW > avail.x - 300.0f * scale)
-            processW = (std::max)(180.0f * scale, avail.x * 0.50f);
+        const bool stacked = avail.x < 800.0f * scale;
+        if (processPaneWidth_ <= 0.0f) processPaneWidth_ = avail.x * 0.46f;
+        if (!stacked)
+            processPaneWidth_ = std::clamp(processPaneWidth_, 380.0f * scale,
+                                            avail.x - 340.0f * scale - divider);
+        const float processHeight = stacked
+            ? (std::max)(1.0f, (std::min)(280.0f * scale, avail.y * 0.46f)) : 0.0f;
 
-        ImGui::BeginChild("c_proc", ImVec2(processW, 0),
+        ImGui::BeginChild("c_proc", ImVec2(stacked ? 0.0f : processPaneWidth_, processHeight),
                           ImGuiChildFlags_Borders);
         renderProcesses(ctx);
         ImGui::EndChild();
-        ImGui::SameLine(0.0f, divider);
+        if (!stacked)
+            ui::VSplitter("##communications_split", &processPaneWidth_,
+                          380.0f * scale, 340.0f * scale, divider);
         ImGui::BeginChild("c_right", ImVec2(0, 0),
                           ImGuiChildFlags_Borders);
         if (ImGui::BeginTabBar("##process_details")) {

@@ -3,6 +3,7 @@
 #include "../Core/FunctionNamer.h"
 #include "../Core/CFG.h"
 #include "../Core/Cond.h"
+#include "../Core/BranchComment.h"
 #include "../Core/CodeByteSignatureBuilder.h"
 #include "../Core/Decompiler.h"
 #include "../Core/Demangle.h"
@@ -57,6 +58,13 @@ namespace ds {
 // Stable table IDs retain user widths/visibility in the existing ImGui settings.
 // Navigation and execution gutters cannot be hidden; analyst text columns can.
 static bool beginDisassemblyTable(const char* id) {
+    ImVec4 rule = theme::col::lineSoft();
+    rule.w *= 0.45f;
+    ImVec4 stripe = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    stripe.w = 0.025f;
+    ImGui::PushStyleColor(ImGuiCol_TableBorderLight, rule);
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, stripe);
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, theme::col::panelHeader());
     // ImGui inherits NoSavedSettings from the fixed shell's root window. Allow
     // this table to load/save its settings without persisting window geometry.
     ImGuiWindow* root = ImGui::GetCurrentWindow()->RootWindow;
@@ -64,10 +72,21 @@ static bool beginDisassemblyTable(const char* id) {
     root->Flags &= ~ImGuiWindowFlags_NoSavedSettings;
     const bool visible = ImGui::BeginTable(id, 6,
         ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH |
+        ImGuiTableFlags_BordersInnerV |
         ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable);
     root->Flags = rootFlags;
+    if (!visible) ImGui::PopStyleColor(3);
     return visible;
+}
+
+static ImDrawList* endDisassemblyTable() {
+    // A scrolling table owns a child drawlist. Append decorations after its
+    // channels merge, retaining the child's normal window ordering below menus,
+    // tooltips, and the command palette instead of using viewport foreground.
+    ImDrawList* listingDrawList = ImGui::GetWindowDrawList();
+    ImGui::EndTable();
+    ImGui::PopStyleColor(3);
+    return listingDrawList;
 }
 
 static void setupDisassemblyColumns() {
@@ -996,7 +1015,11 @@ static std::string resolveString(const uint8_t* buf, size_t n) {
 // A concise plain-language / C-ish gloss of what one instruction does, shown
 // inline in the listing (same place as string comments). Returns "" when the
 // mnemonic is self-explanatory or unmodelled (so the line stays uncluttered).
-static std::string instrGloss(const Instruction& in) {
+static std::string instrGloss(const Instruction& in, Arch arch) {
+    // JVM's cached stack-aware branch explanation is emitted separately.
+    if (arch != Arch::JVM) {
+        if (std::string branch = StaticBranchComment(in, arch); !branch.empty()) return branch;
+    }
     const std::string& m = in.mnemonic;
     std::string a, b;
     bool two = split2(in.operands, a, b);
@@ -1025,18 +1048,6 @@ static std::string instrGloss(const Instruction& in) {
     if (m == "pop")  return cOperand(in.operands) + " = pop()";
     if (m == "ret" || m == "retn" || m == "retf") return "return";
     if (m == "leave") return "tear down stack frame";
-    struct JC { const char* mn; const char* desc; };
-    static const JC jcs[] = {
-        {"je","if =="},{"jz","if zero"},{"jne","if !="},{"jnz","if not zero"},
-        {"jg","if > (signed)"},{"jnle","if > (signed)"},{"jge","if >= (signed)"},{"jnl","if >= (signed)"},
-        {"jl","if < (signed)"},{"jnge","if < (signed)"},{"jle","if <= (signed)"},{"jng","if <= (signed)"},
-        {"ja","if > (unsigned)"},{"jnbe","if > (unsigned)"},{"jae","if >= (unsigned)"},{"jnb","if >= (unsigned)"},
-        {"jb","if < (unsigned)"},{"jnae","if < (unsigned)"},{"jbe","if <= (unsigned)"},{"jna","if <= (unsigned)"},
-        {"js","if negative"},{"jns","if not negative"},{"jo","if overflow"},{"jno","if no overflow"},
-        {"jc","if carry"},{"jnc","if no carry"},{"jp","if parity"},{"jnp","if no parity"},
-        {"jcxz","if cx == 0"},{"jecxz","if ecx == 0"},{"jrcxz","if rcx == 0"},{"loop","decrement rcx, loop while != 0"},
-    };
-    for (const auto& j : jcs) if (m == j.mn) return std::string(j.desc) + " -> jump";
     if (m.rfind("rep", 0) == 0 || m == "movs" || m == "movsb" || m == "movsd" || m == "movsq" ||
         m == "stos" || m == "stosb" || m == "stosd" || m == "lods" || m == "scas" || m == "cmps")
         return "string/block operation";
@@ -1270,11 +1281,22 @@ void BinaryViewTab::renderWelcome(AppContext& ctx) {
     ImGui::EndChild();
 }
 
+// Fit toolbar controls using their actual font and theme metrics. The next-line
+// cursor is already in place when a control does not fit, so no control needs to
+// disappear or overflow a narrow pane to keep the workbench usable.
+static void nextToolbarItem(const char* label, bool checkbox = false) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float width = ImGui::CalcTextSize(label, nullptr, true).x +
+        (checkbox ? ImGui::GetFrameHeight() + style.ItemInnerSpacing.x : style.FramePadding.x * 2.0f);
+    ui::SameLineIfFits(width);
+}
+
 // Assembly view dispatcher: a full-program listing (default) or a window around
 // the cursor. The full listing is the "see the entire app as asm" mode.
 void BinaryViewTab::renderAssembly(AppContext& ctx) {
     if (!ctx.staticBinary().loaded() || !ctx.staticDisassembler()) {
-        ImGui::TextDisabled("Load a binary to disassemble (File > Open Binary).");
+        ui::EmptyState(DS_ICON_CODE, "Open a binary to explore its code",
+            "Use File > Open Binary or Ctrl+O. Assembly, Hex and the available analysis views share the same target.");
         return;
     }
     // Launch-and-debug the loaded binary straight from the static view (breaks at
@@ -1284,9 +1306,7 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
         const bool canDebugDll = ctx.binaryDllDebuggable();
         const bool canRun = canLaunch || canDebugDll;
         ImGui::BeginDisabled(!canRun);
-        ImGui::PushStyleColor(ImGuiCol_Button, theme::col::good());
-        bool run = ImGui::SmallButton("> Run");
-        ImGui::PopStyleColor();
+        bool run = ui::AccentButton("> Run", ui::Dim(theme::col::good(), 0.28f), nullptr, true);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip(canDebugDll
@@ -1308,15 +1328,19 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
                 else runErr_ = "Launch failed: " + err;
             }
         }
-        if (!runErr_.empty()) { ImGui::SameLine(); ImGui::TextColored(theme::col::bad(), "%s", runErr_.c_str()); }
-        ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+        if (!runErr_.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::col::bad());
+            ImGui::TextWrapped("%s", runErr_.c_str());
+            ImGui::PopStyleColor();
+        }
+        nextToolbarItem("Full program", true);
     }
     if (ImGui::Checkbox("Full program", &asmFullProgram_)) {
         asmWindowBrowseValid_ = false;
         asmWindowPanScrollValid_ = false;
         asmWindowScrollSampleValid_ = false;
     }
-    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    nextToolbarItem("Rebuild listing");
     if (ImGui::SmallButton("Rebuild listing")) {
         ++listingLayoutRevision_;
         if (!listingLayoutRevision_) ++listingLayoutRevision_;
@@ -1339,31 +1363,32 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
         else                       annotationsFor(ctx, cursorVA_, true);
     }
 
-    ImGui::SameLine();
-    const double mappedMiB = (double)listingCodeBytes_ / (1024.0 * 1024.0);
-    ImGui::TextDisabled("%.1f MiB code, %llu lazy page(s), %d function(s)", mappedMiB,
-                        (unsigned long long)listingCodePages_, (int)functions_.size());
-    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    nextToolbarItem("Explain", true);
     ImGui::Checkbox("Explain", &showHints_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Inline plain-language note of what each instruction does");
-    ImGui::SameLine();
+    nextToolbarItem("Notes", true);
     ImGui::Checkbox("Notes", &showFnNotes_);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Inline per-function analysis notes (calling convention, branch meaning,\n"
                           "loops, call args, suspicious patterns). Heuristic - hover a note for its\n"
                           "evidence and confidence; the Annotations tab shows the full report.");
-    ImGui::SameLine();
-    ImGui::Checkbox("Str", &showStringComments_);
+    nextToolbarItem("Strings", true);
+    ImGui::Checkbox("Strings###Str", &showStringComments_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Inline string / imported-API comments");
-    ImGui::SameLine();
+    nextToolbarItem("Arrows", true);
     ImGui::Checkbox("Arrows", &showJumpArrows_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Branch arrows in the flow gutter");
-    ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
+    nextToolbarItem("Prev");
     if (ImGui::SmallButton("Prev")) stepAsmCursor(ctx, -1);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous instruction (K)");
-    ImGui::SameLine();
+    nextToolbarItem("Next");
     if (ImGui::SmallButton("Next")) stepAsmCursor(ctx, 1);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next instruction (J)");
+    const double mappedMiB = (double)listingCodeBytes_ / (1024.0 * 1024.0);
+    ImGui::TextDisabled("%.1f MiB code  |  %d functions", mappedMiB, (int)functions_.size());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%llu lazy pages; only visible or requested instructions are decoded.",
+                          (unsigned long long)listingCodePages_);
     ImGui::Separator();
 
     if (ctx.staticArch() == Arch::ARM || ctx.staticArch() == Arch::THUMB) {
@@ -8729,14 +8754,14 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
             } else {
                 size_t av = 0; const uint8_t* pp = ctx.staticBinary().ptrFromVA(ref, av);
                 if (pp) { std::string s = resolveString(pp, std::min(av, (size_t)80));
-                          if (!s.empty()) { appendComment(); ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), "; \"%.50s\"", s.c_str()); dataComment = true; } }
+                          if (!s.empty()) { appendComment(); ImGui::TextColored(theme::col::warn(), "; \"%.50s\"", s.c_str()); dataComment = true; } }
             }
         }
     }
     // Decoder-supplied annotation (JVM: resolved constant-pool refs, string
     // literals, switch case targets). Same visual channel as string comments.
     if (!in.comment.empty()) {
-        appendComment(); ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), "; %s", in.comment.c_str());
+        appendComment(); ImGui::TextColored(theme::col::warn(), "; %s", in.comment.c_str());
         dataComment = true;
     }
     // Per-function analysis note (FuncAnnotate): branch meaning, call args,
@@ -8744,25 +8769,33 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
     // function is built eagerly in renderAssembly). These are heuristic guesses:
     // the hover tooltip shows each note's kind, confidence, and evidence.
     bool annShown = false;
+    bool branchExplained = false;
     if (showFnNotes_) {
         if (const AnnEntry* ae = annotationsFor(ctx, in.address, false)) {
             auto nit = ae->inlineText.find(in.address);
             if (nit != ae->inlineText.end()) {
                 appendComment();
-                ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.82f, 1.0f), "; %s", nit->second.c_str());
+                ImGui::TextColored(theme::col::branch(), "; %s", nit->second.c_str());
                 if (ImGui::IsItemHovered()) {
                     auto tit = ae->inlineTip.find(in.address);
                     if (tit != ae->inlineTip.end()) ImGui::SetTooltip("%s", tit->second.c_str());
                 }
                 annShown = true;
+                branchExplained = nit->second.find("jumps") != std::string::npos &&
+                    nit->second.find("falls through") != std::string::npos;
             }
         }
     }
-    // Inline "what it does" gloss, unless a string/API comment or an analysis
-    // note already explains the line.
-    if (showHints_ && !dataComment && !annShown) {
-        std::string g = instrGloss(in);
-        if (!g.empty()) { appendComment(); ImGui::TextColored(ImVec4(0.52f, 0.58f, 0.68f, 1.0f), "; %s", g.c_str()); }
+    // Branch outcomes stay visible alongside strings and decoder annotations.
+    // A detailed branch note already supplies both paths, so avoid repeating it.
+    const bool branchHint = in.isBranch && !in.isCall && !in.isRet && ctx.staticArch() != Arch::JVM;
+    if (showHints_ && (branchHint ? !branchExplained : (!dataComment && !annShown))) {
+        std::string g = instrGloss(in, ctx.staticArch());
+        if (!g.empty()) {
+            appendComment();
+            ImGui::TextColored(theme::col::muted(), "; %s", g.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g.c_str());
+        }
     }
     // JVM bytecode: plain-language stack effect / branch meaning (JvmAnnotate).
     // The CP-resolved comment already occupies the dataComment channel, so this
@@ -8773,19 +8806,19 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
             if (bit != je->inlineBranch.end()) {
                 appendComment(); ImGui::TextColored(theme::col::branch(), "; %s", bit->second.c_str());
             } else if (auto eit = je->inlineEffect.find(in.address); eit != je->inlineEffect.end()) {
-                appendComment(); ImGui::TextColored(ImVec4(0.55f, 0.78f, 0.82f, 1.0f), "; %s", eit->second.c_str());
+                appendComment(); ImGui::TextColored(theme::col::branch(), "; %s", eit->second.c_str());
             }
         }
     }
     if (auto cit = comments_.find(in.address); cit != comments_.end() && !cit->second.empty()) {
-        appendComment(); ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.55f, 1.0f), "; %s", cit->second.c_str());
+        appendComment(); ImGui::TextColored(theme::col::good(), "; %s", cit->second.c_str());
     }
     {   // anti-analysis / timing / privileged instruction flag
         const std::string& m = in.mnemonic;
         bool susp = m == "rdtsc" || m == "rdtscp" || m == "cpuid" || m == "sysenter" ||
                     m == "sidt"  || m == "sgdt"   || m == "sldt"  || m == "smsw" || m == "in" || m == "out";
         if (!susp && m == "int" && in.operands.find("2d") != std::string::npos) susp = true; // int 0x2d
-        if (susp) { appendComment(); ImGui::TextColored(ImVec4(0.95f, 0.5f, 0.4f, 1.0f), "; anti-analysis?"); }
+        if (susp) { appendComment(); ImGui::TextColored(theme::col::warn(), "; anti-analysis?"); }
     }
     ImGui::PopID();
 }
@@ -8803,8 +8836,7 @@ static void panelPopToggle(bool* poppedOut, const char* id) {
     ImGui::PopID();
 }
 
-// Inline analysis-progress widget (phase label + bar [+ Cancel]) shared by the Binary
-// View hot spots. Mirrors the status-bar version in App::renderStatusBar.
+// Quiet state for pending views; detailed jobs live in the status bar.
 static bool drawAnalysisProgress(AppContext& ctx, bool withCancel) {
     ProgressSnapshot pr = ctx.staticAnalysis().progress();
     char lbl[64];
@@ -8820,22 +8852,34 @@ static bool drawAnalysisProgress(AppContext& ctx, bool withCancel) {
                        : "Analyzing";
         std::snprintf(lbl, sizeof(lbl), "%s", ph);
     }
-    ImGui::TextColored(theme::col::accent(), "%s", lbl);
-    ImGui::SameLine();
-    float frac = (pr.modulesTotal > 0) ? (float)pr.modulesDone / (float)pr.modulesTotal
-               : (pr.total > 0 ? (float)pr.current / (float)pr.total : -1.0f);
-    float w = 160.0f * theme::UiScale();
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::accent());
-    if (frac >= 0.0f) ImGui::ProgressBar(frac, ImVec2(w, 0.0f));
-    else { float t = (float)ImGui::GetTime(); ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), ""); }
-    ImGui::PopStyleColor();
+    ImGui::TextColored(theme::col::muted(), "%s...", lbl);
+    if (ImGui::IsItemHovered()) {
+        if (pr.modulesTotal)
+            ImGui::SetTooltip("%u of %u modules", pr.modulesDone, pr.modulesTotal);
+        else if (pr.total)
+            ImGui::SetTooltip("%llu of %llu", (unsigned long long)pr.current,
+                              (unsigned long long)pr.total);
+        else ImGui::SetTooltip("Working; progress total is not available yet.");
+    }
     bool cancelled = false;
     if (withCancel) {
         ImGui::SameLine();
-        if (ImGui::SmallButton("Cancel")) {
+        ImGui::PushID(&ctx.staticAnalysis());
+        const float size = ImGui::GetTextLineHeight();
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        if (ImGui::InvisibleButton("##analysis_stop", ImVec2(size, size))) {
             ctx.staticAnalysis().cancelPending();
             cancelled = true;
         }
+        const bool hovered = ImGui::IsItemHovered();
+        const float inset = size * 0.3f;
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImVec2(at.x + inset, at.y + inset),
+            ImVec2(at.x + size - inset, at.y + size - inset),
+            ImGui::GetColorU32(hovered ? theme::col::bad() : theme::col::muted()),
+            theme::UiScale());
+        if (hovered) ImGui::SetTooltip("Stop analysis");
+        ImGui::PopID();
     }
     return cancelled;
 }
@@ -8871,6 +8915,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
     std::vector<size_t> deferredCodePages;
     ImVec2 tableMin = ImGui::GetCursorScreenPos();
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
+    ImDrawList* listingDrawList = nullptr;
 
     // Branch target of the instruction under the cursor: one bounded on-demand
     // decode, independent of whether its page currently resides in the LRU.
@@ -9124,7 +9169,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
         }
         clipper.End();
         hoverToken_ = nextHoverTok;
-        ImGui::EndTable();
+        listingDrawList = endDisassemblyTable();
     }
     ui::PopMono();
     if (!deferredCodePages.empty()) {
@@ -9142,8 +9187,8 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
         listingAnchorVA_ = listingViewportAnchorVA_;
         listingAnchorPending_ = true;
     }
-    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
-    if (showJumpArrows_) drawAsmArrows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
+    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y, listingDrawList);
+    if (showJumpArrows_) drawAsmArrows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y, listingDrawList);
 }
 
 void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
@@ -9250,6 +9295,7 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
     asmFlow_.clear(); rowGlow_.clear(); asmGotLaneX_ = asmGotAddrX_ = false;
     ImVec2 tableMin = ImGui::GetCursorScreenPos();
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
+    ImDrawList* listingDrawList = nullptr;
 
     // Jump-target highlight: the branch target of the cursor's instruction.
     hlJumpVA_ = 0; hlJumpValid_ = false;
@@ -9357,11 +9403,11 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
             asmWindowScrollSampleValid_ = true;
         }
         hoverToken_ = nextHoverTok;
-        ImGui::EndTable();
+        listingDrawList = endDisassemblyTable();
     }
     ui::PopMono();
-    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
-    if (showJumpArrows_) drawAsmArrows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
+    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y, listingDrawList);
+    if (showJumpArrows_) drawAsmArrows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y, listingDrawList);
 }
 
 // Branch arrows for the static listings, painted in the flow gutter over the
@@ -9370,7 +9416,54 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
 // scrolled off-screen gets a short up/down stub). clipX0/clipX1 bound the gutter
 // horizontally; the vertical clip is derived from the visible rows so arrows
 // never paint over the frozen column header.
-void BinaryViewTab::drawAsmArrows(float x0, float y0, float x1, float y1) {
+struct ListingArrow { float y0, y1; bool toWin, up; ImU32 col; };
+
+static ImU32 listingArrowColor(bool active, bool backward) {
+    ImVec4 color = active ? theme::col::good()
+                         : (backward ? theme::col::warn() : theme::col::accent());
+    color.w = active ? 0.95f : 0.68f;
+    return ImGui::GetColorU32(color);
+}
+
+static void paintListingArrows(std::vector<ListingArrow>& arrows, float laneX, float addrX,
+                               ImVec2 clipMin, ImVec2 clipMax, ImDrawList* listingDrawList) {
+    const float scale = theme::UiScale();
+    const float laneBase = laneX + 3.0f * scale;
+    const float xTip = addrX - 4.0f * scale;
+    if (xTip <= laneBase + 6.0f * scale) return;
+    clipMin.x = std::max(clipMin.x, laneX - 2.0f * scale);
+    clipMax.x = std::min(clipMax.x, addrX - scale);
+    ImDrawList* dl = listingDrawList ? listingDrawList : ImGui::GetWindowDrawList();
+    dl->PushClipRect(clipMin, clipMax, true);
+    std::sort(arrows.begin(), arrows.end(), [](const ListingArrow& a, const ListingArrow& b) {
+        return std::min(a.y0, a.y1) < std::min(b.y0, b.y1);
+    });
+    std::vector<float> laneBot;
+    for (const ListingArrow& a : arrows) {
+        const float top = std::min(a.y0, a.y1), bot = std::max(a.y0, a.y1);
+        size_t lane = 0;
+        while (lane < laneBot.size() && laneBot[lane] >= top - 2.0f * scale) ++lane;
+        if (lane == laneBot.size()) laneBot.push_back(bot);
+        else laneBot[lane] = bot;
+        const float xb = std::min(laneBase + (float)std::min(lane, size_t(7)) * 4.0f * scale,
+                                  xTip - 6.0f * scale);
+        const float stroke = 1.25f * scale;
+        dl->AddLine(ImVec2(xTip, a.y0), ImVec2(xb, a.y0), a.col, stroke);
+        dl->AddLine(ImVec2(xb, a.y0), ImVec2(xb, a.y1), a.col, stroke);
+        if (a.toWin) {
+            dl->AddLine(ImVec2(xb, a.y1), ImVec2(xTip, a.y1), a.col, stroke);
+            dl->AddTriangleFilled(ImVec2(xTip - 4.0f * scale, a.y1 - 3.0f * scale),
+                ImVec2(xTip - 4.0f * scale, a.y1 + 3.0f * scale), ImVec2(xTip, a.y1), a.col);
+        } else {
+            const float tail = a.y1 + (a.up ? 5.0f : -5.0f) * scale;
+            dl->AddTriangleFilled(ImVec2(xb - 3.0f * scale, tail),
+                ImVec2(xb + 3.0f * scale, tail), ImVec2(xb, a.y1), a.col);
+        }
+    }
+    dl->PopClipRect();
+}
+
+void BinaryViewTab::drawAsmArrows(float x0, float y0, float x1, float y1, ImDrawList* listingDrawList) {
     if (asmFlow_.empty() || !asmGotLaneX_ || !asmGotAddrX_) return;
 
     float firstY = 1e30f, lastY = -1e30f;
@@ -9381,48 +9474,21 @@ void BinaryViewTab::drawAsmArrows(float x0, float y0, float x1, float y1) {
     // Clip to the table's BODY rect (below the frozen header), not to firstY/lastY:
     // the clipper can force-render an off-screen navigation target, which would
     // otherwise blow the vertical bounds out for one frame.
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    dl->PushClipRect(ImVec2(x0, y0 + ImGui::GetFrameHeight()), ImVec2(x1, y1), true);
-    const float laneBase = asmLaneX_ + 3.0f;
-    const float xTip     = asmAddrX_ - 4.0f;
-
-    struct Arr { float y0, y1; bool toWin, up; ImU32 col; };
-    std::vector<Arr> arrs;
+    std::vector<ListingArrow> arrs;
     arrs.reserve(asmFlow_.size());
     for (const auto& r : asmFlow_) {
         if (!r.branch) continue;
         bool active = cursorValid_ && ((r.addr == cursorVA_) || (r.target == cursorVA_));
-        ImU32 col = active              ? IM_COL32(120, 220, 120, 235)
-                  : (r.target < r.addr) ? IM_COL32(220, 170,  90, 210)    // backward
-                                        : IM_COL32(110, 170, 230, 210);   // forward
-        Arr a; a.col = col; a.y0 = r.y;
+        ListingArrow a;
+        a.col = listingArrowColor(active, r.target < r.addr);
+        a.y0 = r.y;
         auto it = yOf.find(r.target);
         if (it != yOf.end()) { a.toWin = true; a.up = false; a.y1 = it->second; }
-        else { a.toWin = false; a.up = r.target < r.addr; a.y1 = a.up ? firstY - 8.0f : lastY + 8.0f; }
+        else { a.toWin = false; a.up = r.target < r.addr; a.y1 = a.up ? firstY - 8.0f * theme::UiScale() : lastY + 8.0f * theme::UiScale(); }
         arrs.push_back(a);
     }
-    std::sort(arrs.begin(), arrs.end(),
-              [](const Arr& a, const Arr& b) { return std::min(a.y0, a.y1) < std::min(b.y0, b.y1); });
-    std::vector<float> laneBot;
-    for (const Arr& a : arrs) {
-        float top = std::min(a.y0, a.y1), bot = std::max(a.y0, a.y1);
-        int lane = -1;
-        for (int L = 0; L < (int)laneBot.size(); ++L) if (laneBot[L] < top - 2.0f) { lane = L; break; }
-        if (lane < 0) { lane = (int)laneBot.size(); laneBot.push_back(bot); }
-        else laneBot[lane] = bot;
-        float xb = laneBase + (lane > 7 ? 7 : lane) * 4.0f;   // gutter is 36px: 3px base + up to 7 lanes * 4px
-        dl->AddLine(ImVec2(xTip, a.y0), ImVec2(xb, a.y0), a.col, 1.6f);
-        dl->AddLine(ImVec2(xb, a.y0), ImVec2(xb, a.y1), a.col, 1.6f);
-        if (a.toWin) {
-            dl->AddLine(ImVec2(xb, a.y1), ImVec2(xTip, a.y1), a.col, 1.6f);
-            dl->AddTriangleFilled(ImVec2(xTip - 5, a.y1 - 4), ImVec2(xTip - 5, a.y1 + 4), ImVec2(xTip + 1, a.y1), a.col);
-        } else if (a.up) {
-            dl->AddTriangleFilled(ImVec2(xb - 4, a.y1 + 6), ImVec2(xb + 4, a.y1 + 6), ImVec2(xb, a.y1), a.col);
-        } else {
-            dl->AddTriangleFilled(ImVec2(xb - 4, a.y1 - 6), ImVec2(xb + 4, a.y1 - 6), ImVec2(xb, a.y1), a.col);
-        }
-    }
-    dl->PopClipRect();
+    paintListingArrows(arrs, asmLaneX_, asmAddrX_,
+        ImVec2(x0, y0 + ImGui::GetFrameHeight()), ImVec2(x1, y1), listingDrawList);
 }
 
 // 1..0 decaying navigation-arrival flash for `addr` (0 when none / expired).
@@ -9459,13 +9525,13 @@ void BinaryViewTab::pushRowGlow(float yCenter, bool rowAtRip, bool rowSel, bool 
                          ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 1.0f)), inten });
 }
 
-// Paint (then clear) the collected row glows over the table body. Same
-// foreground-drawlist + clip-rect approach as the arrows (the rows live inside
-// the table's scrolling child, so a window-drawlist rect would render behind
-// it); called after EndTable, BEFORE drawAsmArrows so arrows stay on top.
-void BinaryViewTab::drawRowGlows(float x0, float y0, float x1, float y1) {
+// Paint (then clear) the collected glows after EndTable merges its channels.
+// Append to that scrolling child's drawlist: signals cover the listing rows,
+// remain below overlay windows, and retain the same table-body clipping.
+// drawAsmArrows follows this pass so arrows stay on top of the glows.
+void BinaryViewTab::drawRowGlows(float x0, float y0, float x1, float y1, ImDrawList* listingDrawList) {
     if (rowGlow_.empty()) return;
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImDrawList* dl = listingDrawList ? listingDrawList : ImGui::GetWindowDrawList();
     dl->PushClipRect(ImVec2(x0, y0 + ImGui::GetFrameHeight()), ImVec2(x1, y1), true);
     for (const RowGlow& g : rowGlow_)
         drawGlowRect(dl, x0 + 1.0f, x1 - 1.0f, g.y - g.h * 0.5f, g.y + g.h * 0.5f,
@@ -12319,7 +12385,10 @@ void BinaryViewTab::renderHoverTokens(const char* s, unsigned int col, const std
 void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     const DbgSnapshot& snap = *frameSnap_;
     if (!snap.attached()) {
-        ImGui::TextDisabled("Attach a process in the Communications tab to view live assembly.");
+        if (ui::EmptyState(DS_ICON_CODE, "No live process",
+                "Attach or launch a process in Communications to inspect live instructions and registers.",
+                "Open Communications"))
+            ctx.requestedTab = "Communications";
         return;
     }
     if (snap.state == DbgState::Terminated) {
@@ -12339,59 +12408,50 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     // (register-delta tracking for value highlighting now lives in render() so it stays
     //  current regardless of which view/tab is active when the user steps.)
 
-    // Small colored toolbar button: hover tint + optional tooltip + disabled state.
+    // Session actions share the workbench palette and retain their enable gates.
     auto cbtn = [](const char* label, ImVec4 base, bool enabled, const char* tip) -> bool {
         if (!enabled) ImGui::BeginDisabled();
-        ImVec4 hov(base.x * 1.3f, base.y * 1.3f, base.z * 1.3f, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button, base);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hov);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, base);
-        bool r = ImGui::SmallButton(label);
-        ImGui::PopStyleColor(3);
+        const bool r = ui::AccentButton(label, base, tip, true);
         if (!enabled) ImGui::EndDisabled();
-        if (tip && tip[0] && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", tip);
         return r;
     };
-    const ImVec4 cGreen(0.18f, 0.42f, 0.24f, 1.0f);
-    const ImVec4 cBlue (0.18f, 0.30f, 0.48f, 1.0f);
+    const ImVec4 cGreen = ui::Dim(theme::col::good(), 0.28f);
+    const ImVec4 cBlue = theme::col::panelHeader();
 
     // ---- Header row 1: live state pill + execution controls ----
     ImVec4 stcol = running ? theme::col::good() : paused ? theme::col::warn() : theme::col::muted();
     const char* sttext = running ? "RUNNING" : paused ? "PAUSED" : "ATTACHED";
-    {
-        ImVec2 dp = ImGui::GetCursorScreenPos();
-        float  lh = ImGui::GetTextLineHeight();
-        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(dp.x + 5.0f, dp.y + lh * 0.5f),
-                                                    5.0f, ImGui::GetColorU32(stcol));
-        ImGui::Dummy(ImVec2(14.0f, lh));
-    }
-    ImGui::SameLine(); ImGui::TextColored(stcol, "%s", sttext);
-    ImGui::SameLine(); ImGui::TextDisabled("PID %u  TID %u", snap.pid, snap.tid);
-    ImGui::SameLine(); ImGui::TextDisabled("|");
-    ImGui::SameLine();
+    ImGui::TextColored(stcol, "%s", sttext);
+    char processLabel[64];
+    std::snprintf(processLabel, sizeof(processLabel), "PID %u  TID %u", snap.pid, snap.tid);
+    nextToolbarItem(processLabel);
+    ImGui::TextDisabled("%s", processLabel);
+    nextToolbarItem(running ? "Pause" : "Continue");
     if (cbtn(running ? "Pause" : "Continue", running ? cBlue : cGreen, true,
              running ? "Break into the process (F5)" : "Resume execution (F5)")) {
         if (running) ctx.debug.pauseForSession(frameTarget);
         else ctx.debug.continueForSession(frameTarget);
     }
-    ImGui::SameLine(); if (cbtn("Into", cBlue, paused, "Step Into (F11)"))
+    nextToolbarItem("Step into");
+    if (cbtn("Step into###Into", cBlue, paused, "Step Into (F11)"))
         ctx.debug.stepIntoForSession(frameTarget);
-    ImGui::SameLine(); if (cbtn("Over", cBlue, paused, "Step Over (F10)"))
+    nextToolbarItem("Step over");
+    if (cbtn("Step over###Over", cBlue, paused, "Step Over (F10)"))
         ctx.debug.stepOverForSession(frameTarget);
-    ImGui::SameLine(); if (cbtn("Out",  cBlue, paused, "Step Out (Shift+F11)"))
+    nextToolbarItem("Step out");
+    if (cbtn("Step out###Out", cBlue, paused, "Step Out (Shift+F11)"))
         ctx.debug.stepOutForSession(frameTarget);
 
     // ---- Header row 2: navigation + search + view mode + display toggles ----
     bool canBack = canNavigateBack();
     bool canFwd  = canNavigateForward();
     if (cbtn("<", cBlue, canBack, "Back")) navBack();
-    ImGui::SameLine();
+    nextToolbarItem(">");
     if (cbtn(">", cBlue, canFwd, "Forward")) navForward();
-    ImGui::SameLine();
+    nextToolbarItem("Follow RIP", true);
     if (ImGui::Checkbox("Follow RIP", &followLiveRip_) && followLiveRip_)
         liveBrowseValid_ = false;
-    ImGui::SameLine();
+    nextToolbarItem("Sync");
     ImGui::BeginDisabled(rip == 0);
     if (ImGui::SmallButton("Sync")) {
         followLiveRip_ = true; setLiveCursor(rip);
@@ -12400,8 +12460,8 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Jump to and follow RIP");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(140);
+    ui::SameLineIfFits(160.0f * theme::UiScale());
+    ImGui::SetNextItemWidth(std::min(160.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x));
     const bool liveGotoHit = ImGui::InputTextWithHint("##livegoto", "LIVE address", gotoBuf_, sizeof(gotoBuf_),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
     if (ImGui::IsItemEdited()) { pendingGoto_ = {}; gotoStatus_.clear(); }
@@ -12417,18 +12477,16 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
             else resolveGotoAddress(ctx, parsed.value, true, false);
         } else submitGoto(ctx, gotoBuf_, false);
     }
-    ImGui::SameLine(); ImGui::TextDisabled("|");
-    ImGui::SameLine(); if (cbtn("Search", cBlue, true, "Search live memory (Ctrl+F)")) openFindPopup_ = true;
-    ImGui::SameLine(); ImGui::TextDisabled("|");
-    ImGui::SameLine(); ImGui::RadioButton("Disasm", &liveMode_, 0);
-    ImGui::SameLine(); ImGui::RadioButton("Pseudo", &liveMode_, 1);
-    ImGui::SameLine(); ImGui::TextDisabled("|");
-    ImGui::SameLine(); ImGui::Checkbox("Regs",   &showRegBox_);
-    ImGui::SameLine(); ImGui::Checkbox("Arrows", &showJumpArrows_);
-    ImGui::SameLine(); ImGui::Checkbox("Hints",  &showRegHints_);
-    ImGui::SameLine(); ImGui::Checkbox("Str",    &showStringComments_);
-    ImGui::SameLine(); ImGui::Checkbox("Names",  &showNames_);
-    if (running) { ImGui::SameLine(); ImGui::TextDisabled("(last captured)"); }
+    nextToolbarItem("Search");
+    if (cbtn("Search", cBlue, true, "Search live memory (Ctrl+F)")) openFindPopup_ = true;
+    ImGui::RadioButton("Assembly###Disasm", &liveMode_, 0);
+    nextToolbarItem("Pseudocode", true); ImGui::RadioButton("Pseudocode###Pseudo", &liveMode_, 1);
+    nextToolbarItem("Registers", true); ImGui::Checkbox("Registers###Regs", &showRegBox_);
+    nextToolbarItem("Arrows", true); ImGui::Checkbox("Arrows", &showJumpArrows_);
+    nextToolbarItem("Hints", true); ImGui::Checkbox("Hints", &showRegHints_);
+    nextToolbarItem("Strings", true); ImGui::Checkbox("Strings###Str", &showStringComments_);
+    nextToolbarItem("Names", true); ImGui::Checkbox("Names", &showNames_);
+    if (running) { nextToolbarItem("Last captured values"); ImGui::TextDisabled("Last captured values"); }
     if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F))
         openFindPopup_ = true;
 
@@ -12602,6 +12660,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
     ui::PushMono();
     ImVec2 tableMin   = ImGui::GetCursorScreenPos();
     ImVec2 tableAvail = ImGui::GetContentRegionAvail();
+    ImDrawList* listingDrawList = nullptr;
     if (beginDisassemblyTable("live_asm")) {
         setupDisassemblyColumns();
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -12849,9 +12908,9 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
             if (rowAtRip && snap.state == DbgState::Paused && in.isBranch && !in.isCall && !in.isRet) {
                 int t = evalCondBranch(in.mnemonic, snap.regs.rflags, snap.regs, snap.is32);
                 if (t == 1) {
-                    appendLiveComment(); ImGui::TextColored(theme::col::good(), "-> will jump");
+                    appendLiveComment(); ImGui::TextColored(theme::col::good(), "; jumps (current flags)");
                 } else if (t == 0) {
-                    appendLiveComment(); ImGui::TextColored(theme::col::muted(), "-> falls through");
+                    appendLiveComment(); ImGui::TextColored(theme::col::muted(), "; falls through (current flags)");
                 }
             }
             // x64dbg-style inline string/data comment for a referenced address.
@@ -12889,14 +12948,14 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
                     }
                     if (!it->second.empty()) {
                         appendLiveComment();
-                        ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), "%s", it->second.c_str());
+                        ImGui::TextColored(theme::col::warn(), "%s", it->second.c_str());
                     }
                 }
             }
             // Decoder-supplied annotation (same channel as the static listing).
             if (!in.comment.empty()) {
                 appendLiveComment();
-                ImGui::TextColored(ImVec4(0.80f, 0.72f, 0.45f, 1.0f), "; %s", in.comment.c_str());
+                ImGui::TextColored(theme::col::warn(), "; %s", in.comment.c_str());
             }
             // User comment (persisted in the project), mirroring the static listing
             // so annotations carry over between the static and live views. Keyed by
@@ -12906,7 +12965,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
                 if (auto cit = comments_.find(commentFileVA);
                     cit != comments_.end() && !cit->second.empty()) {
                     appendLiveComment();
-                    ImGui::TextColored(ImVec4(0.55f, 0.80f, 0.55f, 1.0f),
+                    ImGui::TextColored(theme::col::good(),
                                        "; %s", cit->second.c_str());
                 }
             }
@@ -12958,12 +13017,12 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
             liveWindowScrollSampleValid_ = true;
         }
         hoverToken_ = nextHoverTok;   // remember for next frame's highlight
-        ImGui::EndTable();
+        listingDrawList = endDisassemblyTable();
     }
     ui::PopMono();
 
     // Row glows (RIP / cursor / jump-target / nav flash) — under the arrows.
-    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y);
+    drawRowGlows(tableMin.x, tableMin.y, tableMin.x + tableAvail.x, tableMin.y + tableAvail.y, listingDrawList);
 
     // ---- Branch arrows in the flow gutter (drawn over the listing) ----
     if (showJumpArrows_ && gotLaneX && gotAddrX) {
@@ -12974,54 +13033,25 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
         float firstY = clipMax.y, lastY = clipMin.y;
         for (float y : rowY) if (y >= 0) { firstY = std::min(firstY, y); lastY = std::max(lastY, y); }
 
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        dl->PushClipRect(clipMin, clipMax, true);
-        const float laneBase = laneX0 + 3.0f;
-        const float xTip     = addrX - 4.0f;
-
-        struct Arr { float y0, y1; bool toWin, up; ImU32 col; };
-        std::vector<Arr> arrs;
+        std::vector<ListingArrow> arrs;
         arrs.reserve(insns.size());
         for (int i = 0; i < (int)insns.size(); ++i) {
             const auto& in = insns[i];
             if (!in.isBranch || in.isCall || !HasBranchTarget(in) || rowY[i] < 0) continue;
             auto it = idxOf.find(in.branchTarget);
             bool active = (in.address == rip) || (it != idxOf.end() && insns[it->second].address == rip);
-            ImU32 col = active                         ? IM_COL32(120, 220, 120, 235)
-                      : (in.branchTarget < in.address) ? IM_COL32(220, 170,  90, 210)   // backward
-                                                       : IM_COL32(110, 170, 230, 210);  // forward
-            Arr a; a.col = col; a.y0 = rowY[i];
+            ListingArrow a;
+            a.col = listingArrowColor(active, in.branchTarget < in.address);
+            a.y0 = rowY[i];
             if (it != idxOf.end() && rowY[it->second] >= 0) {
                 a.toWin = true; a.up = false; a.y1 = rowY[it->second];
             } else {
                 a.toWin = false; a.up = in.branchTarget < start;
-                a.y1 = a.up ? firstY - 8.0f : lastY + 8.0f;
+                a.y1 = a.up ? firstY - 8.0f * theme::UiScale() : lastY + 8.0f * theme::UiScale();
             }
             arrs.push_back(a);
         }
-        std::sort(arrs.begin(), arrs.end(),
-                  [](const Arr& a, const Arr& b) { return std::min(a.y0, a.y1) < std::min(b.y0, b.y1); });
-        std::vector<float> laneBot;
-        for (const Arr& a : arrs) {
-            float top = std::min(a.y0, a.y1), bot = std::max(a.y0, a.y1);
-            int lane = -1;
-            for (int L = 0; L < (int)laneBot.size(); ++L) if (laneBot[L] < top - 2.0f) { lane = L; break; }
-            if (lane < 0) { lane = (int)laneBot.size(); laneBot.push_back(bot); }
-            else laneBot[lane] = bot;
-            float xb = laneBase + (lane > 7 ? 7 : lane) * 4.0f;   // gutter is 36px: 3px base + up to 7 lanes * 4px
-            dl->AddLine(ImVec2(xTip, a.y0), ImVec2(xb, a.y0), a.col, 1.6f);
-            dl->AddLine(ImVec2(xb, a.y0), ImVec2(xb, a.y1), a.col, 1.6f);
-            if (a.toWin) {
-                dl->AddLine(ImVec2(xb, a.y1), ImVec2(xTip, a.y1), a.col, 1.6f);
-                dl->AddTriangleFilled(ImVec2(xTip - 5, a.y1 - 4), ImVec2(xTip - 5, a.y1 + 4),
-                                      ImVec2(xTip + 1, a.y1), a.col);
-            } else if (a.up) {
-                dl->AddTriangleFilled(ImVec2(xb - 4, a.y1 + 6), ImVec2(xb + 4, a.y1 + 6), ImVec2(xb, a.y1), a.col);
-            } else {
-                dl->AddTriangleFilled(ImVec2(xb - 4, a.y1 - 6), ImVec2(xb + 4, a.y1 - 6), ImVec2(xb, a.y1), a.col);
-            }
-        }
-        dl->PopClipRect();
+        paintListingArrows(arrs, laneX0, addrX, clipMin, clipMax, listingDrawList);
     }
 
     // Follow jumps from the keyboard: Enter follows the selected instruction's
@@ -17127,7 +17157,7 @@ void BinaryViewTab::renderDecompiler(AppContext& ctx) {
 
     // ----- RIGHT pane: compact synced disassembly for the SAME function -----
     // A self-contained listing (decoded fresh over the function range) — NOT the big
-    // glow/arrow listing, so the foreground-draw-list patterns there are untouched.
+    // glow/arrow listing, so its post-table decoration passes are independent.
     ImGui::BeginChild("##decright", ImVec2(0, 0), ImGuiChildFlags_Borders);
     {
         uint64_t lo = decompVA_;
@@ -17301,10 +17331,13 @@ void BinaryViewTab::hexCommitByte(AppContext& ctx, uint64_t off, uint8_t value) 
 }
 
 void BinaryViewTab::renderHex(AppContext& ctx) {
-    if (!ctx.staticBinary().loaded()) { ImGui::TextDisabled("No binary loaded."); return; }
+    if (!ctx.staticBinary().loaded()) {
+        ui::EmptyState(DS_ICON_CODE, "No binary open", "Open a binary to browse and edit its file bytes.");
+        return;
+    }
     const std::vector<uint8_t>& bytes = ctx.staticBinary().bytes();
     const uint64_t total = bytes.size();
-    if (!total) { ImGui::TextDisabled("Empty image."); return; }
+    if (!total) { ui::EmptyState(DS_ICON_CODE, "Empty image", "This image has no file bytes to display."); return; }
     if (hexCursorOff_ >= total) hexCursorOff_ = total - 1;
     if (navigation_ && navigation_->current().valid &&
         navigation_->current().addressSpace == DocumentAddressSpace::FileOffset &&
@@ -17317,10 +17350,12 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
         bool mapped = ctx.staticBinary().offsetToVA(hexCursorOff_, cva);
         if (mapped) ImGui::Text("VA 0x%llX", (unsigned long long)cva);
         else        ImGui::TextDisabled("no VA (unmapped file bytes: header/padding)");
-        ImGui::SameLine();
-        ImGui::TextDisabled("| file offset 0x%llX", (unsigned long long)hexCursorOff_);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(120.0f * theme::UiScale());
+        char offsetLabel[64];
+        std::snprintf(offsetLabel, sizeof(offsetLabel), "File offset 0x%llX", (unsigned long long)hexCursorOff_);
+        nextToolbarItem(offsetLabel);
+        ImGui::TextDisabled("%s", offsetLabel);
+        ui::SameLineIfFits(160.0f * theme::UiScale());
+        ImGui::SetNextItemWidth(std::min(160.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x));
         if (ImGui::InputTextWithHint("##hexoff", "goto offset", hexGotoOff_, sizeof(hexGotoOff_),
                                      ImGuiInputTextFlags_EnterReturnsTrue)) {
             const auto parsed = ParseInvestigationAddress(hexGotoOff_);
@@ -17334,7 +17369,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
             }
         }
         const bool haveSel = hexSelA_ != ~0ull && hexSelB_ != ~0ull;
-        ImGui::SameLine();
+        nextToolbarItem("Copy");
         ImGui::BeginDisabled(!haveSel);
         if (ImGui::SmallButton("Copy") && haveSel) {
             uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::min<uint64_t>(std::max(hexSelA_, hexSelB_), total - 1);
@@ -17346,12 +17381,13 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
         }
         ImGui::EndDisabled();
         if (haveSel) {
-            ImGui::SameLine();
             uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::max(hexSelA_, hexSelB_);
-            ImGui::TextDisabled("(%llu byte(s) selected)", (unsigned long long)(hi - lo + 1));
+            char selectionLabel[64];
+            std::snprintf(selectionLabel, sizeof(selectionLabel), "%llu byte(s) selected", (unsigned long long)(hi - lo + 1));
+            nextToolbarItem(selectionLabel);
+            ImGui::TextDisabled("%s", selectionLabel);
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("| type hex digits to edit; Tab = hex/ascii; click+drag to select");
+        ImGui::TextDisabled("Type hex digits to edit  /  Tab switches hex and ASCII  /  Drag to select");
     }
 
     // ---- rebuild the patched-span index when the patch set changes ----------
@@ -17395,7 +17431,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
     const int   totalRows = (int)((total + 15) / 16);
 
     // NoNav: arrows/Tab drive the hex cursor below, not ImGui widget navigation.
-    ImGui::BeginChild("hex", ImVec2(0, 0), ImGuiChildFlags_Borders,
+    ImGui::BeginChild("hex", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_HorizontalScrollbar);
     const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
 
@@ -18320,7 +18356,7 @@ void BinaryViewTab::runByteSearch(AppContext& ctx) {
 }
 
 void BinaryViewTab::renderSidePanel(AppContext& ctx) {
-    // Dedicated right inspector. Its primary navigator tabs lead; secondary binary
+    // Dedicated left navigator. Its primary navigator tabs lead; secondary binary
     // metadata/search tools remain available in the same rail without occupying
     // permanent space above the lists.
     const ImGuiStyle& sideStyle = ImGui::GetStyle();
@@ -18343,71 +18379,8 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
     char bookmarksTabLabel[64];
     std::snprintf(bookmarksTabLabel, sizeof(bookmarksTabLabel),
                   "Bookmarks (%zu)###side_bookmarks", bookmarks_.size());
-    if (ImGui::BeginTabBar(sideBarId, ImGuiTabBarFlags_FittingPolicyScroll)) {
-        if (sidePrimary && ImGui::BeginTabItem(bookmarksTabLabel, nullptr,
-                overviewSideRequest_ == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
-            if (overviewSideRequest_ == 3) overviewSideRequest_ = 0;
-            // Bookmarks persist as FILE VAs. Refuse a live address unless this
-            // exact session proves that it belongs to the active static image.
-            uint64_t bookmarkHereVA = cursorVA_;
-            const bool bookmarkAddressExact = !cursorLive_ ||
-                exactLiveToStaticVA(ctx, cursorVA_, bookmarkHereVA);
-            const bool bookmarkHereExact = bookmarkAddressExact &&
-                (cursorLive_ || !asmFullProgram_ ||
-                 listingInstructionBoundaryExact(cursorVA_));
-            ImGui::BeginDisabled(!ctx.staticBinary().loaded() || !cursorValid_ || !bookmarkHereExact);
-            if (ImGui::SmallButton("+ here"))
-                bookmarks_.push_back({ bookmarkHereVA, "bookmark" });
-            ImGui::EndDisabled();
-            if (!bookmarkHereExact && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                if (!bookmarkAddressExact)
-                    ImGui::SetTooltip("A persistent bookmark requires an exact mapping to the active static image.");
-                else
-                    ImGui::SetTooltip("A provisional listing row cannot be persisted as an instruction bookmark.");
-            }
-            ImGui::SameLine(); ImGui::TextDisabled("(persists with the project)");
-            int removeAt = -1;
-            if (!bookmarks_.empty() && ImGui::BeginTable(
-                    "bookmark_inspector", 2,
-                    ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                    ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH)) {
-                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
-                                        142.0f * sideScale);
-                ImGui::TableSetupColumn("Label");
-                ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableHeadersRow();
-                for (int i = 0; i < (int)bookmarks_.size(); ++i) {
-                    auto& b = bookmarks_[i];
-                    ImGui::PushID(i);
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0);
-                    char address[32];
-                    std::snprintf(address, sizeof(address), "0x%llX",
-                                  (unsigned long long)b.address);
-                    if (ImGui::Selectable(address, false,
-                                          ImGuiSelectableFlags_SpanAllColumns))
-                        gotoStatic(ctx, b.address);
-                    if (ImGui::BeginPopupContextItem("bmctx")) {
-                        if (ImGui::MenuItem("Go to")) gotoStatic(ctx, b.address);
-                        ImGui::SetNextItemWidth(180);
-                        char nameTmp[64];
-                        std::snprintf(nameTmp, sizeof(nameTmp), "%s", b.label.c_str());
-                        if (ImGui::InputText("label", nameTmp, sizeof(nameTmp),
-                                             ImGuiInputTextFlags_EnterReturnsTrue))
-                            b.label = nameTmp;
-                        if (ImGui::MenuItem("Remove")) removeAt = i;
-                        ImGui::EndPopup();
-                    }
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::TextUnformatted(b.label.c_str());
-                    ImGui::PopID();
-                }
-                ImGui::EndTable();
-            }
-            if (removeAt >= 0) bookmarks_.erase(bookmarks_.begin() + removeAt);
-            if (bookmarks_.empty()) ImGui::TextDisabled("No bookmarks.");
-            ImGui::EndTabItem();
-        }
+    if (ImGui::BeginTabBar(sideBarId, ImGuiTabBarFlags_FittingPolicyScroll |
+                                      ImGuiTabBarFlags_TabListPopupButton)) {
         const ImGuiTabItemFlags functionTabFlags =
             sidePrimary && (overviewSideRequest_ == 1 ||
                             (!sideTabsInitialized_ && !overviewSideRequest_))
@@ -18461,10 +18434,11 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                 }
                 if (ImGui::BeginTable("function_inspector", 3,
                         ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH)) {
+                        ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable)) {
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch |
+                                                   ImGuiTableColumnFlags_NoHide);
                     ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
-                                            142.0f * sideScale);
-                    ImGui::TableSetupColumn("Name");
+                                            ImGui::CalcTextSize("0x000000000000").x + 8.0f * sideScale);
                     ImGui::TableSetupColumn("##origin", ImGuiTableColumnFlags_WidthFixed,
                                             24.0f * sideScale);
                     ImGui::TableSetupScrollFreeze(0, 1);
@@ -18476,15 +18450,28 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                             const Func& f = functions_[fnVisible_[row]];
                             std::string dn = annName(ctx, f.address);
                             const std::string& nm = dn.empty() ? f.name : dn;
+                            const bool guessShown = f.guessed && dn.empty();
                             ImGui::PushID(fnVisible_[row]);
                             ImGui::TableNextRow();
                             ImGui::TableSetColumnIndex(0);
                             char address[32];
                             std::snprintf(address, sizeof(address), "0x%llX",
                                           (unsigned long long)f.address);
-                            if (ImGui::Selectable(address, false,
+                            const ImVec2 namePos = ImGui::GetCursorScreenPos();
+                            if (ImGui::Selectable("##fnrow", cursorValid_ && cursorVA_ == f.address,
                                                   ImGuiSelectableFlags_SpanAllColumns))
                                 gotoStatic(ctx, f.address);
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::BeginTooltip();
+                                ImGui::TextUnformatted(nm.c_str());
+                                ImGui::TextDisabled("%s", address);
+                                if (guessShown) {
+                                    auto rit = guessReason_.find(f.address);
+                                    ImGui::TextColored(theme::col::warn(), "Guessed name: %s",
+                                        rit != guessReason_.end() ? rit->second.c_str() : "heuristic");
+                                }
+                                ImGui::EndTooltip();
+                            }
                             if (ImGui::BeginPopupContextItem("fnctx")) {
                                 if (ImGui::MenuItem("Go to")) gotoStatic(ctx, f.address);
                                 if (ImGui::MenuItem("Rename...")) {
@@ -18504,17 +18491,14 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
                                 ImGui::EndDisabled();
                                 ImGui::EndPopup();
                             }
-                            ImGui::TableSetColumnIndex(1);
-                            const bool guessShown = f.guessed && dn.empty();
-                            if (guessShown)
-                                ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
+                            // Render literal symbol text separately: a name can contain
+                            // ImGui's ## marker and must still remain visible in full.
+                            ImGui::SetCursorScreenPos(namePos);
+                            if (guessShown) ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
                             ImGui::TextUnformatted(nm.c_str());
                             if (guessShown) ImGui::PopStyleColor();
-                            if (guessShown && ImGui::IsItemHovered()) {
-                                auto rit = guessReason_.find(f.address);
-                                ImGui::SetTooltip("guessed name - %s",
-                                    rit != guessReason_.end() ? rit->second.c_str() : "heuristic");
-                            }
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::TextDisabled("%s", address);
                             ImGui::TableSetColumnIndex(2);
                             const bool userNamed = !dn.empty();
                             const bool knownSymbol = !guessShown && !userNamed &&
@@ -18764,6 +18748,72 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
+        if (sidePrimary && ImGui::BeginTabItem(bookmarksTabLabel, nullptr,
+                overviewSideRequest_ == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+            if (overviewSideRequest_ == 3) overviewSideRequest_ = 0;
+            // Bookmarks persist as FILE VAs. Refuse a live address unless this
+            // exact session proves that it belongs to the active static image.
+            uint64_t bookmarkHereVA = cursorVA_;
+            const bool bookmarkAddressExact = !cursorLive_ ||
+                exactLiveToStaticVA(ctx, cursorVA_, bookmarkHereVA);
+            const bool bookmarkHereExact = bookmarkAddressExact &&
+                (cursorLive_ || !asmFullProgram_ ||
+                 listingInstructionBoundaryExact(cursorVA_));
+            ImGui::BeginDisabled(!ctx.staticBinary().loaded() || !cursorValid_ || !bookmarkHereExact);
+            if (ImGui::SmallButton("+ here"))
+                bookmarks_.push_back({ bookmarkHereVA, "bookmark" });
+            ImGui::EndDisabled();
+            if (!bookmarkHereExact && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (!bookmarkAddressExact)
+                    ImGui::SetTooltip("A persistent bookmark requires an exact mapping to the active static image.");
+                else
+                    ImGui::SetTooltip("A provisional listing row cannot be persisted as an instruction bookmark.");
+            }
+            ImGui::SameLine(); ImGui::TextDisabled("(persists with the project)");
+            int removeAt = -1;
+            if (!bookmarks_.empty() && ImGui::BeginTable(
+                    "bookmark_inspector", 2,
+                    ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                    ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH)) {
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
+                                        142.0f * sideScale);
+                ImGui::TableSetupColumn("Label");
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < (int)bookmarks_.size(); ++i) {
+                    auto& b = bookmarks_[i];
+                    ImGui::PushID(i);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    char address[32];
+                    std::snprintf(address, sizeof(address), "0x%llX",
+                                  (unsigned long long)b.address);
+                    if (ImGui::Selectable(address, false,
+                                          ImGuiSelectableFlags_SpanAllColumns))
+                        gotoStatic(ctx, b.address);
+                    if (ImGui::BeginPopupContextItem("bmctx")) {
+                        if (ImGui::MenuItem("Go to")) gotoStatic(ctx, b.address);
+                        ImGui::SetNextItemWidth(180);
+                        char nameTmp[64];
+                        std::snprintf(nameTmp, sizeof(nameTmp), "%s", b.label.c_str());
+                        if (ImGui::InputText("label", nameTmp, sizeof(nameTmp),
+                                             ImGuiInputTextFlags_EnterReturnsTrue))
+                            b.label = nameTmp;
+                        if (ImGui::MenuItem("Remove")) removeAt = i;
+                        ImGui::EndPopup();
+                    }
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(b.label.c_str());
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            if (removeAt >= 0) bookmarks_.erase(bookmarks_.begin() + removeAt);
+            if (bookmarks_.empty())
+                ui::EmptyState(DS_ICON_BOOKMARKS, "No bookmarks yet",
+                    "Choose an instruction and use + here to keep a place in this investigation.");
+            ImGui::EndTabItem();
+        }
         if (!sidePrimary && ImGui::BeginTabItem("Search")) {
             ImGui::SetNextItemWidth(-58.0f * sideScale);
             ImGui::InputTextWithHint("##bsearch", "DE AD ?? EF",
@@ -18779,7 +18829,8 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
             if (byteSearchLive_ && !frameSnap_->attached())
                 ImGui::TextDisabled("Attach to a process to search its memory.");
             if (searchHits_.empty()) {
-                ImGui::TextDisabled("Byte-pattern results appear here.");
+                ui::EmptyState(DS_ICON_SEARCH, "Search byte patterns",
+                    "Enter bytes such as DE AD ?? EF. Matches stay linked to their FILE or LIVE target.");
             } else if (ImGui::BeginTable("byte_search_hits", 1,
                        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                        ImGuiTableFlags_BordersInnerH)) {
@@ -18817,10 +18868,8 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
         }
 
         const char* sideModeToggle = sidePrimary
-            ? (ui::IconsLoaded() ? DS_ICON_NAV " More###side_mode_toggle"
-                                 : "More###side_mode_toggle")
-            : (ui::IconsLoaded() ? DS_ICON_BACK " Back###side_mode_toggle"
-                                 : "Back###side_mode_toggle");
+            ? "Metadata###side_mode_toggle"
+            : "Navigate###side_mode_toggle";
         if (ImGui::TabItemButton(sideModeToggle,
                                  ImGuiTabItemFlags_Trailing |
                                  ImGuiTabItemFlags_NoTooltip)) {
@@ -18828,8 +18877,8 @@ void BinaryViewTab::renderSidePanel(AppContext& ctx) {
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(sidePrimary
-                ? "More inspector tools: byte search, sections, and exports"
-                : "Back to Bookmarks, Functions, and Strings");
+                ? "Byte search, sections, exports and symbols"
+                : "Functions, strings and bookmarks");
         ImGui::EndTabBar();
         if (sidePrimary) sideTabsInitialized_ = true;
     }
@@ -20840,7 +20889,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
     lowerWindow->WorkRect.Max.x = std::max(lowerHeaderOrigin.x + 1.0f,
                                            lowerWorkMaxX - lowerToggleSize);
     const bool lowerBarOpen = ImGui::BeginTabBar(
-        lowerBarId, ImGuiTabBarFlags_FittingPolicyScroll);
+        lowerBarId, ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_TabListPopupButton);
     lowerWindow->WorkRect.Max.x = lowerWorkMaxX;
     if (lowerBarOpen) {
         if (!headerOnly) {
@@ -22140,10 +22189,8 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
             }
         }
         const char* lowerModeToggle = lowerPrimary
-            ? (ui::IconsLoaded() ? DS_ICON_NAV " More tools###lower_mode_toggle"
-                                 : "More tools...###lower_mode_toggle")
-            : (ui::IconsLoaded() ? DS_ICON_BACK " Core tools###lower_mode_toggle"
-                                 : "< Core tools###lower_mode_toggle");
+            ? "Analysis tools###lower_mode_toggle"
+            : "Debug & data###lower_mode_toggle";
         if (ImGui::TabItemButton(lowerModeToggle,
                                  ImGuiTabItemFlags_Trailing |
                                  ImGuiTabItemFlags_NoTooltip))
@@ -22187,7 +22234,7 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
                       ImVec2(togglePos.x + toggleSize,
                              togglePos.y + toggleSize),
                       ImGui::GetColorU32(hovered ? theme::col::accent()
-                                                : theme::col::line()));
+                                                : theme::col::lineSoft()));
         const char* glyph = lowerDockCollapsed_
             ? (ui::IconsLoaded() ? DS_ICON_UP : "^")
             : (ui::IconsLoaded() ? DS_ICON_DOWN : "v");
@@ -23159,16 +23206,16 @@ void BinaryViewTab::render(AppContext& ctx) {
     if (!ctx.staticBinary().loaded() && mainView_ != 4)
         mainView_ = 4;
 
-    // Compact IDE command band: navigation, address/symbol lookup, and analysis
-    // progress remain one crisp row immediately above the workspace hierarchy.
+    // Navigation and lookup lead the workspace. Controls wrap as a group at
+    // narrow widths; the auto-sized band never clips analysis or lookup actions.
     {
         const float k = theme::UiScale();
         const bool icons = ui::IconsLoaded();
-        const float bandH = ImGui::GetFrameHeight() + 6.0f * k;
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f * k, 3.0f * k));
-        ImGui::BeginChild("##binary_command_band", ImVec2(0, bandH),
-                          ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+        ImGui::BeginChild("##binary_command_band", ImVec2(0, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
+                          ImGuiWindowFlags_NoScrollbar);
         ImGui::PopStyleVar(2);
         bool canBack = canNavigateBack();
         bool canFwd  = canNavigateForward();
@@ -23181,8 +23228,10 @@ void BinaryViewTab::render(AppContext& ctx) {
         if (ImGui::Button(icons ? DS_ICON_FORWARD "###navfwd" : ">###navfwd")) navForward();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Forward (Alt+Right / mouse forward)");
-        ImGui::SameLine(0, 6.0f * k);
-        ImGui::SetNextItemWidth(190.0f * k);
+        const float addressWidth = std::clamp(ImGui::GetWindowWidth() * 0.30f,
+                                               180.0f * k, 420.0f * k);
+        ui::SameLineIfFits(addressWidth);
+        ImGui::SetNextItemWidth(std::min(addressWidth, ImGui::GetContentRegionAvail().x));
         ui::PushMono();
         bool gotoHit = ImGui::InputTextWithHint("##goto", "FILE:/LIVE: address or name", gotoBuf_, sizeof(gotoBuf_),
                                                 ImGuiInputTextFlags_EnterReturnsTrue);
@@ -23192,23 +23241,23 @@ void BinaryViewTab::render(AppContext& ctx) {
         if (gotoHit) submitGoto(ctx, gotoBuf_, false);
         if (!pendingGoto_.popup) pollPendingGoto(ctx);
         if (!gotoStatus_.empty()) {
-            ImGui::SameLine(0, 4.0f * k);
+            nextToolbarItem(pendingGoto_.active ? "Looking up..." : "Goto failed");
             ImGui::TextColored(pendingGoto_.active ? theme::col::muted() : theme::col::warn(),
                                "%s", pendingGoto_.active ? "Looking up..." : "Goto failed");
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", gotoStatus_.c_str());
         }
-        ImGui::SameLine(0, 6.0f * k);
-        if (ui::ToolbarIconButton(DS_ICON_CODE, "Goto sym", "Fuzzy symbol picker (Ctrl+G)"))
+        nextToolbarItem("Go to symbol", true);
+        if (ui::ToolbarIconButton(DS_ICON_CODE, "Go to symbol", "Fuzzy symbol picker (Ctrl+G)"))
             openGotoPopup_ = true;
-        ImGui::SameLine(0, 4.0f * k);
+        nextToolbarItem("Find text", true);
         if (ui::ToolbarIconButton(DS_ICON_SEARCH, "Find text", "Search the disassembly text (Ctrl+Shift+F)"))
             openTextPopup_ = true;
         if (ctx.staticAnalysis().bulkPending()) {
-            ImGui::SameLine(0, 12.0f * k);
+            ui::SameLineIfFits(300.0f * k);
             if (drawAnalysisProgress(ctx, true) && decompOwnershipPending_)
                 retireUnavailableDecompOwnership();
         } else if (patchRefreshWaiting && functionsDirty_) {
-            ImGui::SameLine(0, 12.0f * k);
+            ui::SameLineIfFits(ImGui::CalcTextSize("Patch applied - coalescing analysis...").x);
             ImGui::TextDisabled("Patch applied - coalescing analysis...");
         }
         ImGui::EndChild();
@@ -23297,10 +23346,9 @@ void BinaryViewTab::render(AppContext& ctx) {
         ImGui::Separator();
     }
 
-    // IDE workbench hierarchy from the v2 reference: a contiguous view rail over one
-    // flex analysis viewport, a dedicated right inspector, and a full-width tool
-    // drawer. Borders are square and adjacent; splitters are crisp separator bands,
-    // not card gaps. No ImGui docking state is involved.
+    // Project navigator on the left, representation workbench in the center,
+    // and a full-width tool area below. Retain each child ID and splitter value
+    // while changing the composition, so navigation and panel state survive.
     const float kS  = theme::UiScale();
 
     // Retained splitter positions are physical ImGui pixels. Apply the startup DPI
@@ -23353,7 +23401,7 @@ void BinaryViewTab::render(AppContext& ctx) {
     float bodyH = bodyAvailH - visibleDockH - splitH;
     if (bodyH < 120.0f * kS) bodyH = 120.0f * kS;   // keep the body usable
 
-    // ===== Upper workbench: ACTIVE VIEWPORT | RIGHT INSPECTOR =====
+    // ===== Upper workbench: NAVIGATOR | ACTIVE VIEWPORT =====
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::BeginChild("##binbody", ImVec2(0, bodyH), ImGuiChildFlags_None);
     {
@@ -23361,16 +23409,14 @@ void BinaryViewTab::render(AppContext& ctx) {
         const float rowW = ImGui::GetContentRegionAvail().x;
         const float dividerW = 5.0f * kS;
         if (!inspectorUserSized_ || inspectorW_ <= 0.0f) {
-            // Match the concept's code-first 72/28 composition at ordinary window
-            // sizes and keep that ratio responsive until the user explicitly drags
-            // the splitter. Cap it so ultrawide monitors still donate their extra
-            // room to the disassembly listing.
-            inspectorW_ = std::clamp(rowW * 0.26f,
-                                     320.0f * kS, 560.0f * kS);
+            // A compact project navigator leaves the instruction and comment
+            // columns room to breathe; explicit splitter drags remain retained.
+            inspectorW_ = std::clamp(rowW * 0.23f,
+                                     260.0f * kS, 380.0f * kS);
         }
         const float maxInspector = std::max(180.0f * kS,
                                              rowW - 420.0f * kS - dividerW);
-        const float minInspector = std::min(260.0f * kS, maxInspector);
+        const float minInspector = std::min(220.0f * kS, maxInspector);
         inspectorW_ = std::clamp(inspectorW_, minInspector, maxInspector);
         const float viewportW = std::max(1.0f, rowW - inspectorW_ - dividerW);
 
@@ -23381,10 +23427,35 @@ void BinaryViewTab::render(AppContext& ctx) {
             selView_ = mainView_;
         }
 
+        // Keep the historical child ID: saved table state belongs to the same
+        // navigator even though its visual position is now on the left.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(6.0f * kS, 4.0f * kS));
+        ImGui::BeginChild("##right_inspector", ImVec2(inspectorW_, rowH), ImGuiChildFlags_None);
+        ImGui::PopStyleVar();
+        renderSidePanel(ctx);
+        ImGui::EndChild();
+
+        ImGui::SameLine(0.0f, 0.0f);
+        const ImVec2 splitPos = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##inspector_split", ImVec2(dividerW, rowH));
+        const bool splitHot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (splitHot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive() && ImGui::GetIO().MouseDelta.x != 0.0f) {
+            inspectorW_ += ImGui::GetIO().MouseDelta.x;
+            inspectorUserSized_ = true;
+        }
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(splitPos.x + dividerW * 0.5f, splitPos.y),
+            ImVec2(splitPos.x + dividerW * 0.5f, splitPos.y + rowH),
+            ImGui::GetColorU32(splitHot ? theme::col::accent() : theme::col::lineSoft()),
+            1.0f * kS);
+        ImGui::SameLine(0.0f, 0.0f);
+
         // -- One active viewport: every primary analysis mode shares this rail. --
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::BeginChild("##analysis_viewport", ImVec2(viewportW, rowH),
-                          ImGuiChildFlags_Borders);
+                          ImGuiChildFlags_None);
         ImGui::PopStyleVar();
         {
             static const char* kCodeViews[] = {
@@ -23488,30 +23559,6 @@ void BinaryViewTab::render(AppContext& ctx) {
         }
         ImGui::EndChild();
 
-        // Narrow draggable separator; the line remains visible when idle.
-        ImGui::SameLine(0.0f, 0.0f);
-        const ImVec2 splitPos = ImGui::GetCursorScreenPos();
-        ImGui::InvisibleButton("##inspector_split", ImVec2(dividerW, rowH));
-        const bool splitHot = ImGui::IsItemHovered() || ImGui::IsItemActive();
-        if (splitHot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        if (ImGui::IsItemActive() && ImGui::GetIO().MouseDelta.x != 0.0f) {
-            inspectorW_ -= ImGui::GetIO().MouseDelta.x;
-            inspectorUserSized_ = true;
-        }
-        ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(splitPos.x + dividerW * 0.5f, splitPos.y),
-            ImVec2(splitPos.x + dividerW * 0.5f, splitPos.y + rowH),
-            ImGui::GetColorU32(splitHot ? theme::col::accent() : theme::col::line()),
-            1.0f * kS);
-        ImGui::SameLine(0.0f, 0.0f);
-
-        // -- Dedicated navigator/metadata inspector. --
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(4.0f * kS, 3.0f * kS));
-        ImGui::BeginChild("##right_inspector", ImVec2(0, rowH), ImGuiChildFlags_Borders);
-        ImGui::PopStyleVar();
-        renderSidePanel(ctx);
-        ImGui::EndChild();
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();
@@ -23540,7 +23587,7 @@ void BinaryViewTab::render(AppContext& ctx) {
         ? ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
         : ImGuiWindowFlags_None;
     ImGui::BeginChild("##bottom_tool_drawer", ImVec2(0, 0),
-                      ImGuiChildFlags_Borders, drawerFlags);
+                      ImGuiChildFlags_None, drawerFlags);
     ImGui::PopStyleVar(2);
     renderLowerTabs(ctx, drawerCollapsedForLayout);
     ImGui::EndChild();

@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,53 @@ int main() {
     CHECK(target == 0, "direct target resolution does not use zero as a sentinel");
 
     std::remove(path.c_str());
+    const uint8_t* originalBytes = zeroMapped.bytes().data();
+    const std::string originalPath = zeroMapped.path();
+    const uint64_t originalHash = zeroMapped.contentHash();
+    const uint64_t originalRevision = zeroMapped.imageRevision();
+    CHECK(zeroMapped.remapRaw(0xFFFF0000ull, 0xFFFFFFF0ull, true,
+          {{0xFFFFFFF0ull, "reset", "saved root"},
+           {0xFFFF0010ull, "start", "saved root"},
+           {0xFFFFFFF0ull, "reset", "duplicate"}}),
+          "restore a complete Raw mapping after the source file is removed");
+    CHECK(zeroMapped.bytes().data() == originalBytes &&
+          zeroMapped.contentHash() == originalHash && zeroMapped.path() == originalPath,
+          "remap retains the original byte allocation, pristine identity, and durable path");
+    CHECK(zeroMapped.imageRevision() > originalRevision &&
+          zeroMapped.entryPointVA() == 0xFFFFFFF0ull && zeroMapped.rawEntryExplicit(),
+          "remap advances the analysis revision and restores the explicit entry");
+    CHECK(zeroMapped.analysisLandmarks().size() == 2 &&
+          zeroMapped.analysisLandmarks()[0].address == 0xFFFF0010ull,
+          "remap normalizes and deduplicates the saved roots");
+    uint64_t offset = 0;
+    CHECK(zeroMapped.vaToOffset(0xFFFFFFF0ull, offset) && offset == 0xFFF0ull &&
+          zeroMapped.offsetToVA(offset, target) && target == 0xFFFFFFF0ull,
+          "the restored mapping retains exact VA/file-offset round trips");
+    const uint64_t mappedRevision = zeroMapped.imageRevision();
+    CHECK(!zeroMapped.remapRaw(std::numeric_limits<uint64_t>::max(), 0, false, {}),
+          "remap rejects an overflowing byte extent");
+    CHECK(!zeroMapped.remapRaw(0, bytes.size(), true, {}),
+          "remap rejects a one-past-end entry");
+    CHECK(!zeroMapped.remapRaw(0, 0, true, {{bytes.size(), "outside", ""}}),
+          "remap rejects unmapped roots");
+    CHECK(!zeroMapped.remapRaw(0, 0, true, {{0, "", ""}}),
+          "remap rejects unnamed roots");
+    CHECK(zeroMapped.imageRevision() == mappedRevision &&
+          zeroMapped.imageBase() == 0xFFFF0000ull &&
+          zeroMapped.entryPointVA() == 0xFFFFFFF0ull &&
+          zeroMapped.analysisLandmarks().size() == 2,
+          "invalid remaps preserve the entire previously accepted mapping");
+    CHECK(zeroMapped.remapRaw(0, 0, true, {{0, "zero", ""}}) &&
+          zeroMapped.hasEntryPoint() && zeroMapped.entryPointVA() == 0,
+          "remap preserves an authoritative entry and root at VA zero");
+    CHECK(zeroMapped.remapRaw(0x1000, 0, false, {}) &&
+          !zeroMapped.hasEntryPoint() && !zeroMapped.rawEntryExplicit() &&
+          zeroMapped.analysisLandmarks().empty(),
+          "remap can explicitly clear the previous entry and root set");
+    BinaryFile liveRaw;
+    CHECK(liveRaw.loadFromMemory(bytes, 0, "live raw") &&
+          !liveRaw.remapRaw(0x1000, 0x1000, true, {}),
+          "remap never changes a live capture's address identity");
     if (g_fail) {
         std::printf("binaryfile_real_mode_test: %d failure(s)\n", g_fail);
         return 1;

@@ -2515,8 +2515,9 @@ void AnalysisService::runJob(const BulkJob& job) {
     auto cacheRemember = [&](const AnalysisCacheKey& key,
                              const AnalysisResult& result) noexcept {
         try {
-            cache_.put<AnalysisResult>(key, snapshotForCache(result),
-                                       EstimateAnalysisResultBytes(result));
+            const size_t bytes = EstimateAnalysisResultBytes(result);
+            if (cache_.canStore(bytes))
+                cache_.put<AnalysisResult>(key, snapshotForCache(result), bytes);
         } catch (...) {
             // Never convert a successful analysis pass into a worker failure just
             // because the bounded opportunistic cache could not retain it.
@@ -2539,7 +2540,7 @@ void AnalysisService::runJob(const BulkJob& job) {
                                                kDefaultStringScanCap);
         AnalysisResult cached;
         if (cacheLookup(key, cached) && cached.stringsValid) {
-            strings = cached.strings;
+            strings = publish ? cached.strings : std::move(cached.strings);
             stringsTruncatedState = cached.stringsTruncated;
             haveStrings = true;
             if (publish && !superseded()) emit(std::move(cached));
@@ -2571,14 +2572,21 @@ void AnalysisService::runJob(const BulkJob& job) {
         if (haveFunctionAnalysis || superseded()) return;
         haveFunctionAnalysis = true;
         setPhase(AnalysisPhase::Functions, 0, job.modBase);
-        if (!haveStrings) ensureStrings(false);
         const AnalysisCacheKey key = cacheKey(AnalysisCachePass::Functions);
         AnalysisResult cached;
         if (cacheLookup(key, cached) && cached.funcsValid) {
-            funcs = cached.functions;
+            funcs = publish ? cached.functions : std::move(cached.functions);
             codeData = cached.codeData;
             if (publish) emit(std::move(cached));
+            // Combined function/listing requests historically include scanned
+            // strings even without K_Strings. Preserve that layout on a hit.
+            if ((job.kinds & K_Listing) && !haveStrings)
+                ensureStrings(false);
         } else {
+            // A cached Functions result already includes classification/naming.
+            // Fetch strings only when those passes actually need recomputation.
+            if (!haveStrings) ensureStrings(false);
+            if (superseded()) return;
             AnalyzeOut a = AnalyzeFunctionsNamed(*job.bin, *dis, strings, job.guess, job.decoder,
                                                  superseded,
                                                  analystFunctionSeeds(*job.bin,
@@ -2587,7 +2595,7 @@ void AnalysisService::runJob(const BulkJob& job) {
             if (!superseded()) {
                 if (job.analysisOverrides)
                     applyFunctionOverrides(*job.bin, *job.analysisOverrides, a.functions);
-                funcs = a.functions;
+                funcs = std::move(a.functions);
                 if (a.codeDataValid)
                     codeData = std::make_shared<CodeDataMap>(std::move(a.codeData));
                 if (job.analysisOverrides)
@@ -2779,13 +2787,21 @@ void AnalysisService::runJob(const BulkJob& job) {
         }
     }
 
+    // These immutable inputs are shared by both downstream cache keys. In
+    // particular, sorting and hashing every xref target twice wastes load time.
+    uint64_t downstreamFunctionsDigest = 0, downstreamXrefDigest = 0;
+    if ((job.kinds & (K_Intent | K_CrackmeTriage)) && !superseded()) {
+        downstreamFunctionsDigest = functionInputsDigest(funcs);
+        downstreamXrefDigest = xrefInputsDigest(xrefIdx.get());
+    }
+
     // Algorithm/crypto recognition (AlgoScan). Runs LAST so it can reuse this job's
     // function list (K_Funcs) and xref index (K_Xref) for extent mapping; either being
     // absent only drops the "referenced by" links, not the matches themselves.
     if ((job.kinds & K_Intent) && !superseded()) {
         PassDigest inputs;
-        inputs.u64(functionInputsDigest(funcs));
-        inputs.u64(xrefInputsDigest(xrefIdx.get()));
+        inputs.u64(downstreamFunctionsDigest);
+        inputs.u64(downstreamXrefDigest);
         const AnalysisCacheKey key = cacheKey(AnalysisCachePass::Intent,
                                                inputs.finish());
         AnalysisResult cached;
@@ -2810,8 +2826,8 @@ void AnalysisService::runJob(const BulkJob& job) {
                      job.bin->bytes().size(), (std::numeric_limits<uint32_t>::max)())),
                  job.modBase);
         PassDigest inputs;
-        inputs.u64(functionInputsDigest(funcs));
-        inputs.u64(xrefInputsDigest(xrefIdx.get()));
+        inputs.u64(downstreamFunctionsDigest);
+        inputs.u64(downstreamXrefDigest);
         inputs.u64(static_cast<uint64_t>(callEdges.size()));
         for (const CallEdgeR& edge : callEdges) {
             inputs.u64(edge.from);

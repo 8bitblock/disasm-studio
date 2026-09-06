@@ -3,6 +3,7 @@
 // Java bytecode annotation engine. See JvmAnnotate.h for the contract.
 //
 #include "JvmAnnotate.h"
+#include "BranchComment.h"
 
 #include <algorithm>
 #include <cctype>
@@ -229,9 +230,12 @@ JvmStackEffect JvmInstrStackEffect(const JvmClassFile& cf, const Instruction& in
 
 std::string JvmBranchMeaning(const Instruction& in) {
     const std::string& m = in.mnemonic;
-    char tgt[24];
-    std::snprintf(tgt, sizeof(tgt), "0x%llX", (unsigned long long)in.branchTarget);
-    auto to = [&](const char* cond) { return std::string("branches to ") + tgt + " if " + cond; };
+    uint64_t target = 0;
+    const bool targetValid = TryGetDirectTarget(in, target);
+    char tgt[24] = {};
+    if (targetValid)
+        std::snprintf(tgt, sizeof(tgt), "0x%llX", (unsigned long long)target);
+    auto to = [&](const char* cond) { return ConditionalBranchComment(cond, tgt); };
     if (m == "ifeq") return to("the top int is zero");
     if (m == "ifne") return to("the top int is non-zero");
     if (m == "iflt") return to("the top int < 0");
@@ -248,7 +252,8 @@ std::string JvmBranchMeaning(const Instruction& in) {
     if (m == "if_acmpne") return to("the two references differ");
     if (m == "ifnull") return to("the reference is null");
     if (m == "ifnonnull") return to("the reference is non-null");
-    if (m == "goto" || m == "goto_w") return std::string("always jumps to ") + tgt;
+    if (m == "goto" || m == "goto_w")
+        return targetValid ? std::string("jumps to ") + tgt : "jumps to the branch target";
     if (m == "tableswitch" || m == "lookupswitch") return "jumps to the case matching the popped index (else default)";
     return std::string();
 }

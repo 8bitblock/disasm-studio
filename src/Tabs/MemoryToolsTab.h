@@ -285,7 +285,7 @@ private:
 
     // Inspector state.
     int inspectorTab_ = 0;
-    int inspectorSelectRequest_ = 0;
+    int inspectorSelectRequest_ = -1;
     char viewAddress_[32] = "0";
     uint64_t viewBase_ = 0;
     bool viewBaseValid_ = false;
@@ -339,6 +339,8 @@ private:
 
     float scannerWidth_ = 0.0f;
     float upperHeight_ = 0.0f;
+    int compactUpperView_ = 0;
+    bool compactUpperLayout_ = false;
 };
 
 } // namespace ds

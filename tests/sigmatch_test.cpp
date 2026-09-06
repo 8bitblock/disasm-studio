@@ -13,6 +13,7 @@
 #include "Core/SigMatch.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -162,6 +163,39 @@ int main() {
     }
 
     // ---- Random fuzz: many buffers x many masked patterns ------------------
+    // Dense candidates force the exact-search fast path back to BMH. Retain
+    // first-hit/from semantics through the transition, including an overlapping
+    // pattern ending at the last byte and both sides of the short-pattern cap.
+    for (size_t m : {size_t{2}, size_t{16}, size_t{32}, size_t{33}}) {
+        std::vector<uint8_t> buf(768, 'a');
+        std::vector<uint8_t> needle(m, 'a');
+        needle.back() = 'b';
+        const SigPattern p = mk(needle, std::string(m, 'x'));
+        crossCheck("dense-absent", buf, p);
+        buf.back() = 'b';
+        crossCheck("dense-final-hit", buf, p);
+        buf[32 + m - 1] = 'b';
+        crossCheck("dense-transition-hit", buf, p);
+    }
+
+    // Exercise all-exact signatures with the full byte alphabet, unaligned
+    // matches, lengths at the optimization boundary, and valid from offsets.
+    {
+        std::mt19937 rng(0xB17E5u);
+        for (size_t trial = 0; trial < 240; ++trial) {
+            const size_t n = 64 + rng() % 400;
+            const size_t m = 1 + rng() % 40;
+            std::vector<uint8_t> buf(n), needle(m);
+            for (auto& byte : buf) byte = static_cast<uint8_t>(rng());
+            for (auto& byte : needle) byte = static_cast<uint8_t>(rng());
+            if (trial % 3 != 0) {
+                const size_t at = trial % 3 == 1 ? n - m : rng() % (n - m + 1);
+                std::copy(needle.begin(), needle.end(), buf.begin() + at);
+            }
+            crossCheck("exact-fuzz", buf, mk(needle, std::string(m, 'x')));
+        }
+    }
+
     {
         std::mt19937 rng(0xC0FFEE);
         // Small alphabet so matches actually occur with reasonable frequency.

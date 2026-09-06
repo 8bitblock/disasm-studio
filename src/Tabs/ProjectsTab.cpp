@@ -94,10 +94,14 @@ void ProjectsTab::render(AppContext& ctx) {
         }
     };
 
+    const float scale = theme::UiScale();
+    ImGui::TextUnformatted("Projects");
+    ui::SameLineIfFits(190.0f * scale);
+    ImGui::TextDisabled("%zu recent targets", recents_.size());
     if (ui::ToolbarIconButton(DS_ICON_FOLDER, "Open Binary...", "Pick a binary to analyze (Ctrl+O)")) {
         if (ctx.openBinaryDialog()) ctx.requestedTab = "Binary View";
     }
-    ImGui::SameLine();
+    ui::SameLineIfFits(100.0f * scale);
     if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh", "Re-read the recent projects index")) {
         refresh();
         if (!selectedHashValid_ && binaryLoaded && recentIndexForHash(recents_, activeHash) >= 0) {
@@ -105,7 +109,7 @@ void ProjectsTab::render(AppContext& ctx) {
             selectedHashValid_ = true;
         }
     }
-    ImGui::SameLine();
+    ui::SameLineIfFits(40.0f * scale);
     const char* toolbarHelp = "Recent analysis projects auto-save as JSON sidecars. "
                               "Use File > Open as Raw... for shellcode/firmware.";
     const char* compactHelp = ui::IconsLoaded() ? DS_ICON_INFO : "Info";
@@ -128,7 +132,6 @@ void ProjectsTab::render(AppContext& ctx) {
 
     // Resizable master/detail workbench. The old fixed 420 px card wasted space
     // on small windows and could not take advantage of larger displays.
-    const float scale = theme::UiScale();
     if (listWidth_ <= 0.0f) listWidth_ = 360.0f * scale;
     const ImVec2 panelSpace = ImGui::GetContentRegionAvail();
     const bool stacked = panelSpace.x < 620.0f * scale;
@@ -140,6 +143,7 @@ void ProjectsTab::render(AppContext& ctx) {
         : 0.0f;
     ImGui::BeginChild("proj_list", ImVec2(stacked ? 0.0f : listWidth_, listHeight),
                       ImGuiChildFlags_Borders);
+    ImGui::TextUnformatted("Recent targets");
     ImGui::SetNextItemWidth(-1.0f);
     ui::SearchBox("##project_filter", "Search recent projects...", filter_, sizeof(filter_));
     std::vector<int> visibleRecents;
@@ -150,7 +154,7 @@ void ProjectsTab::render(AppContext& ctx) {
     ImGui::TextDisabled("Showing %zu of %zu", visibleRecents.size(), recents_.size());
     ImGui::Separator();
     if (recents_.empty()) {
-        // First run / cleared index: a hero card instead of an empty table.
+        // Keep the open action beside its empty-state explanation.
         if (ui::EmptyState(DS_ICON_FOLDER, "No recent projects",
                            "Open a binary to start an analysis project - it saves automatically.",
                            "Open Binary...")) {
@@ -160,7 +164,8 @@ void ProjectsTab::render(AppContext& ctx) {
         ui::EmptyState(DS_ICON_SEARCH, "No matching projects",
                        "Try a different name, path, architecture, or status.");
     } else if (ImGui::BeginTable("projects", 3,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY)) {
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("Arch",   ImGuiTableColumnFlags_WidthFixed, 50.0f * scale);
         ImGui::TableSetupColumn("Opened", ImGuiTableColumnFlags_WidthFixed, 120.0f * scale);
@@ -215,7 +220,7 @@ void ProjectsTab::render(AppContext& ctx) {
                       300.0f * scale, 5.0f * scale);
     ImGui::BeginChild("proj_detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
 
-    ImGui::SeparatorText("Selected");
+    ImGui::SeparatorText("Project details");
     const int selectedIndex = selectedHashValid_ ? recentIndexForHash(recents_, selectedHash_) : -1;
     if (selectedIndex >= 0) {
         const auto& r = recents_[selectedIndex];
@@ -237,7 +242,7 @@ void ProjectsTab::render(AppContext& ctx) {
         ImGui::TextDisabled("Select a project (double-click to open).");
     }
 
-    ImGui::SeparatorText("Loaded Binary");
+    ImGui::SeparatorText("Active binary and saved analysis");
     if (ctx.staticBinary().loaded()) {
         ui::KeyValueRow("Path", "%s", ctx.staticBinary().path().c_str());
         ui::ItemTooltip(ctx.staticBinary().path().c_str(), false);

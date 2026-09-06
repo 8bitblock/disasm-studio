@@ -6,6 +6,7 @@
 #include "Theme.h"
 #include "Widgets.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -224,6 +225,11 @@ void CommandPalette::render(AppContext& ctx) {
         ImGuiWindowFlags_NoFocusOnAppearing;
     bool dismissFromOutside = false;
     if (ImGui::Begin("##cmdpalette_blocker", nullptr, blockerFlags)) {
+        // This surface must own mouse input above every workbench window, not
+        // merely be submitted after them. Native menu bars and newly focused
+        // panes can change display order independently of render order. Restore
+        // the overlay pair explicitly without stealing the query's key focus.
+        ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
         ImGui::SetCursorScreenPos(vp->Pos);
         dismissFromOutside = ImGui::InvisibleButton(
             "##cmdpalette_dismiss", vp->Size,
@@ -246,9 +252,9 @@ void CommandPalette::render(AppContext& ctx) {
     const float marginY = std::min(18.0f * s, vp->WorkSize.y * 0.04f);
     const float maxW = std::max(1.0f, vp->WorkSize.x - marginX * 2.0f);
     const float maxH = std::max(1.0f, vp->WorkSize.y - marginY * 2.0f);
-    const float w = std::min(560.0f * s, maxW);
-    const float desiredH = 340.0f * s + ImGui::GetFrameHeight() +
-                           ImGui::GetTextLineHeightWithSpacing() +
+    const float w = std::min(740.0f * s, maxW);
+    const float desiredH = 390.0f * s + ImGui::GetFrameHeight() +
+                           ImGui::GetTextLineHeightWithSpacing() * 2.0f +
                            style.WindowPadding.y * 2.0f +
                            style.ItemSpacing.y * 2.0f;
     const float h = std::min(desiredH, maxH);
@@ -265,7 +271,7 @@ void CommandPalette::render(AppContext& ctx) {
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                              ImGuiWindowFlags_NoCollapse;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f * s);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     if (focusNext_) ImGui::SetNextWindowFocus();   // raise over the main window on open
     if (!ImGui::Begin("##cmdpalette", nullptr, flags)) {
@@ -273,8 +279,14 @@ void CommandPalette::render(AppContext& ctx) {
         ImGui::PopStyleVar(2);
         return;
     }
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
 
-    // Query box, focused on open.
+    ImGui::TextUnformatted("Go to anything");
+    SameLineIfFits(ImGui::CalcTextSize("Commands and FILE / LIVE evidence").x);
+    ImGui::TextDisabled("Commands and FILE / LIVE evidence");
+
+    // Query box, focused on open. The worker and selection identities are
+    // unchanged; the extra room is for result context and long symbol names.
     if (focusNext_) { ImGui::SetKeyboardFocusHere(); focusNext_ = false; }
     ImGui::SetNextItemWidth(-FLT_MIN);
     bool enter = ImGui::InputTextWithHint("##palq",
@@ -310,7 +322,7 @@ void CommandPalette::render(AppContext& ctx) {
     // Result list.
     const float footerH = ImGui::GetTextLineHeightWithSpacing();
     const float listH = std::max(
-        1.0f, std::min(340.0f * s,
+        1.0f, std::min(390.0f * s,
                        ImGui::GetContentRegionAvail().y - footerH -
                        style.ItemSpacing.y));
     ImGui::BeginChild("##palresults", ImVec2(0, listH), ImGuiChildFlags_None);
@@ -318,11 +330,9 @@ void CommandPalette::render(AppContext& ctx) {
     const ImGuiTableFlags resultTableFlags =
         ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings |
         ImGuiTableFlags_PadOuterX;
-    if (ImGui::BeginTable("##palette_rows", 2, resultTableFlags)) {
+    if (ImGui::BeginTable("##palette_rows", 1, resultTableFlags)) {
         ImGui::TableSetupColumn("Result", ImGuiTableColumnFlags_WidthStretch,
-                                0.70f);
-        ImGui::TableSetupColumn("Context", ImGuiTableColumnFlags_WidthStretch,
-                                0.30f);
+                                1.0f);
         for (int i = 0; i < (int)results_.size(); ++i) {
             const Result& r = results_[i];
             char label[320];
@@ -361,16 +371,19 @@ void CommandPalette::render(AppContext& ctx) {
             }
 
             ImGui::PushID(i);
-            ImGui::TableNextRow();
+            const float rowHeight = ImGui::GetTextLineHeight() * 2.0f + 8.0f * s;
+            ImGui::TableNextRow(ImGuiTableRowFlags_None, rowHeight);
             ImGui::TableSetColumnIndex(0);
+            const ImVec2 rowAt = ImGui::GetCursorScreenPos();
             if (i == sel_)
                 ImGui::PushStyleColor(ImGuiCol_Header,
-                                      ImVec4(acc.x, acc.y, acc.z, 0.30f));
+                                      ImVec4(acc.x, acc.y, acc.z, 0.17f));
             char row[352];
             if (IconsLoaded() && icon) std::snprintf(row, sizeof(row), "%s  %s", icon, label);
             else                       std::snprintf(row, sizeof(row), "%s", label);
             if (ImGui::Selectable(row, i == sel_,
-                                  ImGuiSelectableFlags_SpanAllColumns))
+                                  ImGuiSelectableFlags_SpanAllColumns,
+                                  ImVec2(0, rowHeight - ImGui::GetStyle().CellPadding.y * 2.0f)))
                 runIdx = i;
             bool rowHovered = ImGui::IsItemHovered();
             if (i == sel_) {
@@ -378,25 +391,24 @@ void CommandPalette::render(AppContext& ctx) {
                 if (selMoved_) { ImGui::SetScrollHereY(0.5f); selMoved_ = false; }
             }
 
-            ImGui::TableSetColumnIndex(1);
             if (detail) {
-                const float detailW = ImGui::CalcTextSize(detail).x;
-                const float detailAvail = ImGui::GetContentRegionAvail().x;
-                if (detailW < detailAvail)
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + detailAvail - detailW);
+                ImGui::SetCursorScreenPos(ImVec2(rowAt.x,
+                    rowAt.y + ImGui::GetTextLineHeight() + 3.0f * s));
                 ImGui::TextDisabled("%s", detail);
                 rowHovered = rowHovered || ImGui::IsItemHovered();
             }
-            if (investigationResult && rowHovered &&
-                (!investigationResult->detail.empty() ||
-                 !investigationResult->evidence.empty())) {
+            if (rowHovered) {
                 ImGui::BeginTooltip();
-                if (!investigationResult->detail.empty())
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 42.0f);
+                ImGui::TextWrapped("%s", label);
+                if (detail) ImGui::TextDisabled("%s", detail);
+                if (investigationResult && !investigationResult->detail.empty())
                     ImGui::TextWrapped("%s", investigationResult->detail.c_str());
-                if (!investigationResult->evidence.empty()) {
+                if (investigationResult && !investigationResult->evidence.empty()) {
                     ImGui::Separator();
-                    ImGui::TextDisabled("%s", investigationResult->evidence.c_str());
+                    ImGui::TextWrapped("%s", investigationResult->evidence.c_str());
                 }
+                ImGui::PopTextWrapPos();
                 ImGui::EndTooltip();
             }
             ImGui::PopID();

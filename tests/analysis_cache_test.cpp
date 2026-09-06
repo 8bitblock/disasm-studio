@@ -87,6 +87,10 @@ int main() {
           "decoder byte order participates in the cache identity");
 
     AnalysisCache cache(/*maxEntries=*/2, /*maxBytes=*/1024);
+    CHECK(cache.canStore(0) && cache.canStore(1024) && !cache.canStore(1025),
+          "snapshot admission accepts capacity boundary and rejects oversized copies");
+    CHECK(!AnalysisCache(0, 1024).canStore(1) && !AnalysisCache(2, 0).canStore(0),
+          "disabled caches reject snapshots before allocation");
     cache.put<int>(zydis, std::make_shared<const int>(11), sizeof(int));
     CHECK(cache.find<int>(zydis) && *cache.find<int>(zydis) == 11,
           "cache returns a typed immutable payload");
@@ -113,6 +117,7 @@ int main() {
           "bounded cache reports entry and eviction counters");
     CHECK(stats.hits > 0 && stats.misses > 0 && stats.inserts == 3,
           "cache reports deterministic hit/miss/insert counters");
+    CHECK(cache.canStore(1024), "snapshot admission allows eviction from a full cache");
 
     if (!failures) std::printf("analysis_cache_test: all checks passed\n");
     return failures ? 1 : 0;

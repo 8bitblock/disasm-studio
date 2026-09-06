@@ -1205,6 +1205,10 @@ void CortexTab::ask(AppContext& ctx, const std::string& q) {
 }
 
 void CortexTab::render(AppContext& ctx) {
+    const float scale = theme::UiScale();
+    ImGui::TextUnformatted("Cortex");
+    ui::SameLineIfFits(260.0f * scale);
+    ImGui::TextDisabled("Static findings and questions");
     const DocumentResultIdentity currentIdentity = currentCortexIdentity(ctx);
     if (observedIdentity_ != currentIdentity) {
         // Cortex is an app-wide tab today, so explicitly retire every cached
@@ -1253,7 +1257,7 @@ void CortexTab::render(AppContext& ctx) {
         busy = async_->staging || async_->running.load(std::memory_order_acquire);
     }
     if (analyzed_) {
-        ImGui::SameLine();
+        ui::SameLineIfFits(100.0f * scale);
         if (ui::ToolbarIconButton(DS_ICON_SAVE, "Export", "Save this Cortex report as Markdown / HTML")) {
             std::string md = RenderCortexMarkdown(rep_);
             std::string html = RenderCortexHtml(rep_);
@@ -1264,7 +1268,7 @@ void CortexTab::render(AppContext& ctx) {
                 ui::Toast(ui::ToastKind::Warn, msg);
         }
     }
-    ImGui::SameLine();
+    ui::SameLineIfFits(240.0f * scale);
     if (busy) {
         const auto phase = static_cast<AsyncState::Phase>(
             async_->phase.load(std::memory_order_acquire));
@@ -1331,13 +1335,15 @@ void CortexTab::render(AppContext& ctx) {
     if (!rep_.facts.empty()) {
         std::string facts;
         for (size_t i = 0; i < rep_.facts.size(); ++i) { if (i) facts += "    ·    "; facts += rep_.facts[i]; }
+        ImGui::PushTextWrapPos();
         ImGui::TextColored(theme::col::muted(), "%s", facts.c_str());
+        ImGui::PopTextWrapPos();
     }
     ImGui::Separator();
 
     // ---- Retained IDE panes: behaviours | functions, over Ask Cortex ----
-    const float scale = theme::UiScale();
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    avail.y = std::max(280.0f * scale, avail.y);
     const ImVec2 layoutStart = ImGui::GetCursorPos();
     const float split = 6.0f * scale;
     const float contentH = std::max(1.0f, avail.y - split);
@@ -1359,11 +1365,13 @@ void CortexTab::render(AppContext& ctx) {
 
     ImGui::SetCursorPos(layoutStart);
     ImGui::BeginChild("cx_beh", ImVec2(behaviorW, upperH), ImGuiChildFlags_None);
-    ImGui::TextColored(theme::col::muted(), "BEHAVIOURS");
-    if (ImGui::BeginTable("cx_behtbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+    ImGui::SeparatorText("Behaviours");
+    if (ImGui::BeginTable("cx_behtbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                        ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Behaviour");
         ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 40.0f * scale);
         ImGui::TableSetupColumn("Evidence");
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         for (int i = 0; i < (int)rep_.behaviors.size(); ++i) {
             const CortexBehavior& b = rep_.behaviors[i];
@@ -1399,10 +1407,12 @@ void CortexTab::render(AppContext& ctx) {
                          std::max(minColumnRatio, 1.0f - minColumnRatio));
     ImGui::SetCursorPos(ImVec2(layoutStart.x + behaviorW + split, layoutStart.y));
     ImGui::BeginChild("cx_hi", ImVec2(contentW - behaviorW, upperH), ImGuiChildFlags_None);
-    ImGui::TextColored(theme::col::muted(), "NOTABLE FUNCTIONS");
-    if (ImGui::BeginTable("cx_hitbl", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+    ImGui::SeparatorText("Notable functions");
+    if (ImGui::BeginTable("cx_hitbl", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                       ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthFixed, 150.0f * scale);
         ImGui::TableSetupColumn("What it looks like");
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         for (const CortexFuncBrief& f : rep_.highlights) {
             ImGui::TableNextRow();
@@ -1429,7 +1439,7 @@ void CortexTab::render(AppContext& ctx) {
     // ---- Ask Cortex: flat lower pane with a two-row compact composer ----
     ImGui::SetCursorPos(ImVec2(layoutStart.x, layoutStart.y + upperH + split));
     ImGui::BeginChild("cx_chat", ImVec2(avail.x, chatH), ImGuiChildFlags_None);
-    ImGui::TextColored(theme::col::muted(), "ASK CORTEX");
+    ImGui::SeparatorText("Ask Cortex");
 
     const float composerH = ImGui::GetFrameHeightWithSpacing() * 2.0f;
     ImGui::BeginChild("cx_chatlog", ImVec2(0, -composerH), ImGuiChildFlags_None);

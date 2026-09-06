@@ -13,6 +13,7 @@
 #include "Core/CFG.h"
 #include "Core/FuncAnnotate.h"
 #include "Core/ApiInfo.h"
+#include "Core/BranchComment.h"
 #include "Disasm/IDisassembler.h"
 
 #include <cstdint>
@@ -140,6 +141,47 @@ static const DirectCallFormalBindingObservation* findFormalBinding(
 }
 
 int main() {
+    // Static branch comments describe alternatives, never a live outcome.
+    {
+        Instruction branch = mk(0x1000, 2, "jne", "0x1010", true, false, 0x1010);
+        CHECK(StaticBranchComment(branch, Arch::X64) ==
+              "jumps if zero flag is clear; otherwise falls through");
+        branch.mnemonic = "JNZ";
+        CHECK(StaticBranchComment(branch, Arch::X86) ==
+              "jumps if zero flag is clear; otherwise falls through");
+        branch.mnemonic = "jcxz";
+        CHECK(StaticBranchComment(branch, Arch::X86_16) ==
+              "jumps if CX is zero; otherwise falls through");
+        branch.mnemonic = "loop";
+        CHECK(StaticBranchComment(branch, Arch::X86).find("rcx") == std::string::npos);
+        CHECK(has(StaticBranchComment(branch, Arch::X86), "decremented loop counter"));
+        branch.mnemonic = "jmp";
+        branch.branchTarget = 0;
+        branch.branchTargetValid = true;
+        CHECK(StaticBranchComment(branch, Arch::X64) == "jumps to 0x0");
+        branch.branchTargetValid = false;
+        CHECK(StaticBranchComment(branch, Arch::X64) == "jumps to the branch target");
+        branch.flow.kind = FlowKind::DirectCall;
+        CHECK(StaticBranchComment(branch, Arch::X64).empty());
+        branch.flow.kind = FlowKind::Return;
+        CHECK(StaticBranchComment(branch, Arch::X64).empty());
+        branch.flow.kind = FlowKind::Switch;
+        CHECK(StaticBranchComment(branch, Arch::X64).empty());
+        branch.flow.kind = FlowKind::ConditionalBranch;
+        branch.mnemonic = "bne";
+        branch.flow.delaySlots = 1;
+        const std::string mips = StaticBranchComment(branch, Arch::MIPS);
+        CHECK(has(mips, "jumps if its condition is true; otherwise falls through"));
+        CHECK(has(mips, "delay-slot rules apply"));
+        CHECK(mips.find("flag") == std::string::npos);
+        branch.flow.kind = FlowKind::UnconditionalBranch;
+        branch.flow.directTarget = 0x2468;
+        branch.flow.directTargetValid = true;
+        branch.flow.delaySlots = 0;
+        CHECK(StaticBranchComment(branch, Arch::ARM64) == "jumps to 0x2468");
+        CHECK(ConditionalBranchComment("value is zero", "0x0") ==
+              "jumps to 0x0 if value is zero; otherwise falls through");
+    }
     // 1) Prologue / frame pointer / frame size + epilogue, and the honesty contract
     //    (every note has evidence and an in-range confidence).
     {
@@ -208,6 +250,7 @@ int main() {
             CHECK(has(n->text, "jumps to 0x100A"));
             CHECK(has(n->text, "eax < 0x10"));
             CHECK(has(n->text, "signed"));
+            CHECK(has(n->text, "otherwise falls through"));
             CHECK(has(n->evidence, "cmp eax, 0x10"));
         }
     }
@@ -246,6 +289,7 @@ int main() {
             CHECK(has(br->text, "strcmp"));
             CHECK(has(br->text, "non-zero"));
             CHECK(has(br->text, "differ"));
+            CHECK(has(br->text, "otherwise falls through"));
         }
         // Function-level pattern: performs string comparison.
         const FnNote* p = findNote(a, NoteKind::Pattern, "comparison");
@@ -443,7 +487,7 @@ int main() {
         CHECK(has(a.summary, "loop"));
     }
 
-    // 7) Loop condition phrased as "continues while" when the latch is conditional.
+    // 7) Loop latch describes both destinations while retaining its condition.
     //    do { --rax } while (rax != 0)
     {
         FuncAnnotations a = annotate({
@@ -452,7 +496,8 @@ int main() {
             mk(0x1007, 2, "jne", "0x1000", true, false, 0x1000),
             mk(0x1009, 1, "ret", "", true, true),
         });
-        const FnNote* n = findNote(a, NoteKind::Loop, "continues while");
+        const FnNote* n = findNote(a, NoteKind::Loop, "jumps to");
+        if (n) CHECK(has(n->text, "otherwise falls through"));
         CHECK(n != nullptr);
         if (n) CHECK(has(n->text, "rax != 0"));
     }

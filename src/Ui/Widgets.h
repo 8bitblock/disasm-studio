@@ -16,7 +16,8 @@ namespace ds::ui {
 // (dimmed so the automatic hover/active tints have headroom to read).
 ImVec4 Dim(const ImVec4& c, float f);
 
-// Colored button: base color + auto hover/active tints + optional tooltip.
+// Restrained colored action: base color mixed with the active panel palette,
+// distinct hover/active tints, readable text, and an optional tooltip.
 // `small` renders an ImGui::SmallButton (toolbar-height) instead.
 bool AccentButton(const char* label, const ImVec4& base, const char* tip = nullptr, bool small = false);
 
@@ -38,30 +39,28 @@ void SameLineIfFits(float nextWidth);
 // why an action is unavailable.
 void ItemTooltip(const char* text, bool allowWhenDisabled = true);
 
-// Small rounded pill: tinted fill + outline + colored text.
+// Small rectangular status tag: subtle tinted fill + colored text.
 void Badge(const char* text, const ImVec4& color);
 
-// ---- Wireframe chrome kit --------------------------------------------------
-// The bordered-panel / icon-toolbar vocabulary from the design wireframes
-// (disassembler-wireframes.html). Everything routes through theme::col::* so
-// all palettes (incl. Light/Paper) stay correct.
+// ---- Workbench chrome ------------------------------------------------------
+// Contiguous panes, compact controls and subdued dividers. All colors route
+// through theme::col::* so every palette (including Light/Paper) stays correct.
 
-// Square bordered icon button (wf-tbtn): 30x30 (scaled), 1px line border,
-// panel-header fill. `hot` tints border/fill with the accent (the "primary
-// action" look). Falls back to `fallback` text when the icon font is missing.
+// Compact square icon button, at least 28x28 (scaled). `hot` gives the action
+// a subtle accent border/fill. Falls back to `fallback` text without an icon font.
 // The ImGui ID comes from `id` only, so icon/fallback swaps keep state.
 bool ToolButton(const char* id, const char* icon, const char* fallback,
                 const char* tip = nullptr, bool hot = false, bool enabled = true);
 
-// Thin vertical divider between toolbar groups (wf-tdiv).
+// Thin vertical divider between toolbar groups.
 void ToolbarDivider();
 
-// Bordered rounded mono chip (wf-arch / wf-state). Returns true when clicked.
+// Compact mono control with a subtle border. Returns true when clicked.
 // `valueCol` colors the text (nullptr = normal text color).
 bool Pill(const char* id, const char* text, const ImVec4* valueCol = nullptr,
           const char* tip = nullptr);
 
-// State pill: bordered chip with a bold colored state word + optional muted
+// State label: compact field with a colored state word + optional muted
 // mono detail ("PAUSED  pid 4312  rip 7FF6..."), right of the state word.
 void StatePill(const char* state, const ImVec4& stateCol, const char* detail = nullptr);
 
@@ -72,13 +71,13 @@ void StatePill(const char* state, const ImVec4& stateCol, const char* detail = n
 int TabStrip(const char* id, const char* const* labels, int count, int active,
              const bool* enabled = nullptr);
 
-// Thin vertical divider for the status bar segments (wf-sb-div).
+// Thin vertical divider for the status bar segments.
 void StatusDivider();
 
 // "Key   value" row with a fixed-width muted key column (printf-style value).
 void KeyValueRow(const char* key, const char* fmt, ...);
 
-// Compact flat onboarding panel for empty views: glyph, title, muted subtitle,
+// Compact unboxed guidance for empty views: small glyph, title, muted subtitle,
 // and optional primary action. Returns true when the action is clicked.
 bool EmptyState(const char* icon, const char* title, const char* subtitle,
                 const char* primaryButtonLabel = nullptr);

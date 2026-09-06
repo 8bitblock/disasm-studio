@@ -141,22 +141,30 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
     const float scale = theme::UiScale();
     ImGui::TextColored(theme::col::accent(), "%s", archive->gameName.empty()
         ? "GameMaker archive" : archive->gameName.c_str());
-    ImGui::SameLine();
     ImGui::TextDisabled("%zu code records | %zu variables | bytecode %u",
         archive->code.size(), archive->variables.size(), archive->bytecodeVersion);
     if (!archive->bytecodeSupported)
         ImGui::TextColored(theme::col::warn(), "This archive's bytecode is unsupported.");
     ImGui::TextDisabled("Saved GML targets use archive and code identities; FILE offsets are not process addresses.");
     if(ImGui::SmallButton("GameMaker connection")){ctx.requestedGameMakerConnection=true;ctx.requestedTab="Communications";}
-    ImGui::SameLine();ImGui::TextDisabled("%s",session.archiveHash==ctx.staticBinary().contentHash()?session.status.c_str():"No matching live connection");
-    if(paused){ImGui::SameLine();ImGui::TextColored(theme::col::good(),"GML pause #%llu",static_cast<unsigned long long>(stop->identity.stopSequence));}
+    const char* connectionStatus = session.archiveHash == ctx.staticBinary().contentHash()
+        ? session.status.c_str() : "No matching live connection";
+    ui::SameLineIfFits(ImGui::CalcTextSize(connectionStatus).x);
+    ImGui::TextDisabled("%s", connectionStatus);
+    if (paused) {
+        char pauseStatus[64];
+        std::snprintf(pauseStatus, sizeof(pauseStatus), "GML pause #%llu",
+                      static_cast<unsigned long long>(stop->identity.stopSequence));
+        ui::SameLineIfFits(ImGui::CalcTextSize(pauseStatus).x);
+        ImGui::TextColored(theme::col::good(), "%s", pauseStatus);
+    }
     if(!session.lastEdit.empty())ImGui::TextWrapped("%s",session.lastEdit.c_str());
 
-    ImGui::SetNextItemWidth(155 * scale);
+    ImGui::SetNextItemWidth(std::min(180 * scale, ImGui::GetContentRegionAvail().x));
     ImGui::Combo("##gml_kind", &gmlBrowseKind_, "Scripts / code\0Variables\0Objects / events\0Breakpoints\0Watches\0Live frames\0Live variables\0Live instances\0");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(260 * scale);
-    ImGui::InputTextWithHint("##gml_filter", "Filter names", gmlFilter_, sizeof(gmlFilter_));
+    ui::SameLineIfFits(220 * scale);
+    ui::SearchBox("##gml_filter", "Filter names", gmlFilter_, sizeof(gmlFilter_),
+                  std::min(300 * scale, ImGui::GetContentRegionAvail().x));
 
     const std::string filter = foldName(gmlFilter_);
     if (gmlArchiveView_ != archive || gmlFilterApplied_ != filter || gmlBrowseKindApplied_ != gmlBrowseKind_) {
@@ -177,7 +185,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
     }
 
     const auto tableFlags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV;
+        ImGuiTableFlags_Resizable;
     if (gmlBrowseKind_ <= 2 && ImGui::BeginTable("gml_archive", 4, tableFlags, ImVec2(0, 0))) {
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 76 * scale);
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);

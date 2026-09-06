@@ -8,6 +8,7 @@
 #include "FuncAnnotate.h"
 #include "ApiDatabase.h"
 #include "ApiInfo.h"
+#include "BranchComment.h"
 #include "NetworkApiCatalog.h"
 #include "ValidationApiCatalog.h"
 #include "InstructionReference.h"   // instrDataRef / instrImmRef: pure operand parses
@@ -1744,34 +1745,39 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
                         }
                     }
                     std::string txt;
+                    uint64_t branchTarget = 0;
+                    const bool targetValid = TryGetDirectTarget(in, branchTarget);
+                    const std::string targetText = targetValid ? vaHex(branchTarget) : std::string();
                     if (!calleeNm.empty() && nameLooksLikeCompare(calleeNm)) {
                         bool jumpOnNonZero = !std::strcmp(op, "!=");
                         bool jumpOnZero    = !std::strcmp(op, "==");
                         if (jumpOnNonZero)
-                            txt = "jumps to " + vaHex(in.branchTarget) + " if " + calleeNm +
-                                  " result is non-zero (strings/memory differ)";
+                            txt = ConditionalBranchComment(calleeNm +
+                                  " result is non-zero (strings/memory differ)", targetText);
                         else if (jumpOnZero)
-                            txt = "jumps to " + vaHex(in.branchTarget) + " if " + calleeNm +
-                                  " result is zero (contents equal)";
+                            txt = ConditionalBranchComment(calleeNm +
+                                  " result is zero (contents equal)", targetText);
                         if (!txt.empty()) ev += "; " + calleeNm + " returns 0 on equality";
                     }
                     if (txt.empty()) {
-                        txt = "jumps to " + vaHex(in.branchTarget) + " if " + cond;
+                        txt = ConditionalBranchComment(cond, targetText);
                         if (!calleeNm.empty()) {
                             txt += " — return value of " + calleeNm + " controls this branch";
                             ev += "; value comes from " + calleeNm;
                         }
                     }
                     if (loopTermVAs.count(in.address)) {
-                        txt = "loop: continues while " + cond +
-                              (in.branchTarget <= in.address ? "" : " (exit branch)");
+                        txt = "loop: " + txt;
                         note(in.address, NoteKind::Loop, txt, ev + "; backward branch closes a loop", 0.7f);
                     } else {
                         note(in.address, NoteKind::Branch, txt, ev, 0.75f);
                     }
                 } else if (loopTermVAs.count(in.address)) {
+                    uint64_t branchTarget = 0;
+                    const bool targetValid = TryGetDirectTarget(in, branchTarget);
                     note(in.address, NoteKind::Loop,
-                         "loop back edge to " + vaHex(in.branchTarget),
+                         "loop: " + ConditionalBranchComment("its condition is true",
+                             targetValid ? vaHex(branchTarget) : std::string()),
                          "backward conditional branch (flag source not identified)", 0.6f);
                 }
             }

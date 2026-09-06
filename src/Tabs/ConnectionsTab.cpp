@@ -604,8 +604,10 @@ void ConnectionsTab::render(AppContext& ctx) {
         return;
     }
 
-    ImGui::TextColored(theme::col::accent(), "Network activity \xE2\x80\x94 live connections + history");
-    ImGui::TextWrapped("Track process endpoints and traffic history. Open Server Watch for debugger-observed API calls and payloads.");
+    ImGui::TextUnformatted("Connection history");
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+    ImGui::TextWrapped("Live process endpoints and traffic history. Server Watch shows debugger-observed API calls and payloads.");
+    ImGui::PopStyleColor();
 
     // The unavailable legacy API schema is still inspectable, but it no longer
     // occupies the prime viewport above the live monitor on every visit.
@@ -644,6 +646,7 @@ void ConnectionsTab::render(AppContext& ctx) {
         ctx.wantContinuousRedraw = true;
         ImGui::TextDisabled("Refreshing network tables\xE2\x80\xA6");
     }
+    ImGui::PushTextWrapPos();
     if (!pollError_.empty())
         ImGui::TextColored(theme::col::bad(), "%s", pollError_.c_str());
     if (!pollWarning_.empty())
@@ -652,6 +655,7 @@ void ConnectionsTab::render(AppContext& ctx) {
     if (estatsTried_ && !estatsWorked_)
         ImGui::TextColored(theme::col::muted(),
             "Byte/rate columns need TCP ESTATS \xE2\x80\x94 run the disassembler as Administrator to populate them.");
+    ImGui::PopTextWrapPos();
 
     std::string needle = filter_;
     for (char& c : needle) c = (char)std::tolower((unsigned char)c);
@@ -678,6 +682,7 @@ void ConnectionsTab::render(AppContext& ctx) {
     });
 
     int activeCount = 0; for (const auto& r : log_) if (r.active) ++activeCount;
+    ImGui::Separator();
     ImGui::TextDisabled("%d shown / %zu tracked \xC2\xB7 %d active", (int)view.size(), log_.size(), activeCount);
 
     if (view.empty()) {
@@ -691,8 +696,9 @@ void ConnectionsTab::render(AppContext& ctx) {
     const float tableH = ImGui::GetContentRegionAvail().y;
     if (ImGui::BeginTable("conn_tbl", 9,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable, ImVec2(0, tableH))) {
-        ImGui::TableSetupScrollFreeze(0, 1);
+            ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, tableH),
+            (std::max)(ImGui::GetContentRegionAvail().x, 1100.0f * scale))) {
+        ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthFixed, 160.0f * scale);
         ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
         ImGui::TableSetupColumn("Local", ImGuiTableColumnFlags_WidthFixed, 175.0f * scale);
@@ -1024,11 +1030,13 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
         observationNextRefresh_ = now + (on ? 0.20 : 1.0);
     }
 
-    ImGui::TextColored(theme::col::accent(), "Guided server watch");
-    ImGui::SameLine();
+    ImGui::TextUnformatted("Server Watch");
+    ui::SameLineIfFits(370.0f * scale);
     ImGui::TextDisabled("resolve -> connect -> request -> response / payload");
+    ImGui::PushTextWrapPos();
     ImGui::TextColored(theme::col::warn(),
         "Live observation runs only against an attached process. Use it only on targets you are authorized to execute and inspect.");
+    ImGui::PopTextWrapPos();
 
     const bool canStart = debugLive &&
         (!observationRequiresMatchingTarget_ || matchingTarget);
@@ -1040,7 +1048,7 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
         observationNextRefresh_ = 0.0;
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
+    ui::SameLineIfFits(145.0f * scale);
     if (ImGui::SmallButton("Clear observation")) {
         ctx.debug.clearNetworkObservation();
         observation_ = {};
@@ -1048,16 +1056,18 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
         observationNextRefresh_ = 0.0;
     }
     if (!debugLive) {
-        ImGui::SameLine();
+        ImGui::PushTextWrapPos();
         ImGui::TextDisabled(observationRequiresMatchingTarget_
             ? "Launch or attach the matching target first."
             : "Attach or launch a native process first.");
+        ImGui::PopTextWrapPos();
     } else if (observationRequiresMatchingTarget_ && !matchingTarget) {
-        ImGui::SameLine();
+        ImGui::PushTextWrapPos();
         ImGui::TextColored(theme::col::warn(),
             expectedImageActive
                 ? "The attached process does not contain the matching target."
                 : "The triaged document changed; reopen Live Observation from that target.");
+        ImGui::PopTextWrapPos();
         if (ImGui::SmallButton("Watch attached process instead")) {
             // Explicitly leave the crackme-scoped handoff and return to the
             // ordinary Communications behavior for an arbitrary attached PID.
@@ -1071,7 +1081,8 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
 
     const NetworkProbeCoverage& coverage = observation_.coverage;
     if (coverage.requested || on) {
-        ImGui::SameLine();
+        ImGui::SeparatorText("Observation coverage");
+        ImGui::PushTextWrapPos();
         const ImVec4 stateColor = coverage.active ? theme::col::good() : theme::col::warn();
         ImGui::TextColored(stateColor, "%u/%u probes armed%s",
                            coverage.probesArmed, coverage.probesAvailable,
@@ -1108,8 +1119,10 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
                 ImGui::BulletText("%s", limitation.c_str());
             ImGui::TreePop();
         }
+        ImGui::PopTextWrapPos();
     }
 
+    ImGui::SeparatorText("Observed calls");
     ImGui::SetNextItemWidth(260.0f * scale);
     ui::SearchBox("##observationfilter", "filter host / endpoint / API...",
                   observationFilter_, sizeof(observationFilter_), -1.0f);
@@ -1137,14 +1150,14 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
         if (eventNeedle.empty() || hay.find(eventNeedle) != std::string::npos)
             eventView.push_back(i);
     }
-    ImGui::SameLine();
     ImGui::TextDisabled("%d shown / %zu events", (int)eventView.size(), observation_.events.size());
 
     if (ImGui::BeginTable("server_watch_events", 6,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
-            ImVec2(0, 230.0f * scale))) {
-        ImGui::TableSetupScrollFreeze(0, 1);
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+            ImVec2(0, 230.0f * scale),
+            (std::max)(ImGui::GetContentRegionAvail().x, 960.0f * scale))) {
+        ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthFixed, 78.0f * scale);
         ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, 155.0f * scale);
         ImGui::TableSetupColumn("Server / request");

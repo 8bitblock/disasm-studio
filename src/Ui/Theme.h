@@ -12,7 +12,7 @@ namespace ds::theme {
 
 // Built-in palettes. Keep `Count` last so the menu can iterate the set.
 enum class ThemeId {
-    Midnight,       // deep blue dark
+    Midnight,       // neutral graphite dark, blue accent
     Slate,          // neutral gray dark, teal accent
     Light,          // bright/paper light theme
     Monokai,        // warm dark, green/pink
@@ -20,7 +20,7 @@ enum class ThemeId {
     Dracula,        // purple/pink dark
     Nord,           // cold blue-gray
     Matrix,         // black + phosphor green
-    Paper,          // warm paper + ink, amber accent (the wireframe look)
+    Paper,          // warm paper + ink, amber accent
     Count
 };
 
@@ -64,11 +64,11 @@ namespace col {
     ImVec4 menubar();    // menu-bar / status-bar background (palette, not hardcoded)
     ImVec4 windowBg();   // primary window background (e.g. the D3D clear color)
 
-    // Wireframe panel-chrome tokens (used by the ui:: panel/toolbar widgets so
-    // the bordered-panel look stays on-palette in every theme).
+    // Shared workbench surfaces and dividers. Semantic highlights above remain
+    // independent of this deliberately subdued surrounding chrome.
     ImVec4 panel();        // panel body background (child bg)
-    ImVec4 panelHeader();  // panel tab-strip / toolbar-chip background
-    ImVec4 line();         // strong panel/widget border ("ink" line)
+    ImVec4 panelHeader();  // panel tab-strip / toolbar background
+    ImVec4 line();         // primary pane/widget divider
     ImVec4 lineSoft();     // soft inner divider line
 }
 

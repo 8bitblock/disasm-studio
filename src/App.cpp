@@ -52,6 +52,23 @@
 
 namespace ds {
 
+// Keep full dialogs usable on small displays and at high DPI. The window's
+// normal scroll path retains every field when its preferred size cannot fit.
+static void prepareWorkbenchDialog(float width, float height,
+                                   ImGuiCond condition = ImGuiCond_Appearing) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float scale = theme::UiScale();
+    const ImVec2 available(std::max(1.0f, viewport->WorkSize.x - 24.0f * scale),
+                           std::max(1.0f, viewport->WorkSize.y - 24.0f * scale));
+    const ImVec2 minimum(std::min(320.0f * scale, available.x),
+                         std::min(160.0f * scale, available.y));
+    ImGui::SetNextWindowSizeConstraints(minimum, available);
+    ImGui::SetNextWindowPos(viewport->GetWorkCenter(), ImGuiCond_Appearing,
+                           ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(width * scale, available.x),
+        height > 0.0f ? std::min(height * scale, available.y) : 0.0f), condition);
+}
+
 static bool liveDocumentSessionState(const DbgSnapshot& snapshot) {
     return snapshot.state == DbgState::Running ||
            snapshot.state == DbgState::Paused;
@@ -1235,9 +1252,7 @@ void App::renderSymbolSettingsPopup() {
     }
     if (!symbolSettingsOpen_) return;
 
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(650.0f * theme::UiScale(), 0), ImGuiCond_Appearing);
+    prepareWorkbenchDialog(650.0f, 0.0f);
     if (!ImGui::BeginPopupModal("Symbol Settings", nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize)) {
         symbolSettingsOpen_ = false;
@@ -1251,16 +1266,20 @@ void App::renderSymbolSettingsPopup() {
         ImGui::TextColored(theme::col::warn(),
                            "The worker may contact the configured server and write downloaded PDBs to the cache.");
 
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("Cache directory", "absolute local cache path",
+    ImGui::TextUnformatted("Cache directory");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("###Cache directory", "absolute local cache path",
                              symbolCacheDraft_, sizeof(symbolCacheDraft_));
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("Symbol server", "https://... or a trusted symbol store",
+    ImGui::TextUnformatted("Symbol server");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("###Symbol server", "https://... or a trusted symbol store",
                              symbolServerDraft_, sizeof(symbolServerDraft_));
     ImGui::Checkbox("Source lines", &symbolSourceDraft_);
-    ImGui::SameLine();
+    ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                       ImGui::CalcTextSize("PDB prototypes/types").x);
     ImGui::Checkbox("PDB prototypes/types", &symbolTypesDraft_);
-    ImGui::SameLine();
+    ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                       ImGui::CalcTextSize("Parameters/locals").x);
     ImGui::Checkbox("Parameters/locals", &symbolLocalsDraft_);
 
     if (!symbolSettingsError_.empty())
@@ -1699,12 +1718,11 @@ AppContext::BinaryLoadCandidate AppContext::buildBinaryLoadCandidate(
                 for (const PjRawLandmark& landmark : saved.rawLandmarks)
                     selection.landmarks.push_back(
                         {landmark.address, landmark.name, landmark.evidence});
-                BinaryFile remapped;
-                valid = remapped.loadRaw(path, saved.rawImageBase, loadOptions) &&
-                        (!saved.rawEntryExplicit || remapped.setRawEntryPointVA(saved.rawEntry)) &&
-                        remapped.setAnalysisLandmarks(selection.landmarks);
+                // Restore metadata over the bytes already read and hashed. A
+                // second load both wastes I/O and can observe a different file.
+                valid = candidate.remapRaw(saved.rawImageBase, saved.rawEntry,
+                                            saved.rawEntryExplicit, selection.landmarks);
                 if (valid) {
-                    candidate = std::move(remapped);
                     restoredRawSelection = std::move(selection);
                 }
             }
@@ -1748,6 +1766,14 @@ AppContext::BinaryLoadCandidate AppContext::buildBinaryLoadCandidate(
         return result;
     }
 
+    // Prime the pristine identity on this worker; project staging and saves
+    // must not perform the first whole-file hash on the render thread.
+    (void)candidate.contentHash();
+    if (cancellationRequested()) {
+        result.cancelled = true;
+        result.error = "Binary load cancelled.";
+        return result;
+    }
     result.browseArchive = metadata.runtime.isStandaloneArchive &&
                            !metadata.java.entries.empty();
     result.image = std::move(candidate);
@@ -1797,6 +1823,7 @@ AppContext::BinaryLoadCandidate AppContext::buildRawLoadCandidate(
     DocumentRuntimeMetadata metadata;
     metadata.runtime = ScanRuntimes(image, metadata.java);
     metadata.firmware = std::move(selection.firmware);
+    if (!cancellationRequested()) (void)image.contentHash();
     if (cancellationRequested()) {
         result.cancelled = true;
         result.error = "Raw binary load cancelled.";
@@ -2578,9 +2605,7 @@ void App::extractArchiveEntryToFile(const JavaZipEntry& e) {
 void App::renderArchiveBrowser() {
     if (archiveBrowser_.open) { ImGui::OpenPopup("Archive Entries"); archiveBrowser_.open = false; }
     const float s = theme::UiScale();
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(700.0f * s, 440.0f * s), ImGuiCond_Appearing);
+    prepareWorkbenchDialog(700.0f, 440.0f);
     if (!ImGui::BeginPopupModal("Archive Entries", nullptr, 0)) return;
 
     ImGui::TextDisabled("%s \xE2\x80\x94 %zu entr%s", archiveBrowser_.sourceName.c_str(),
@@ -2960,7 +2985,7 @@ void App::applyPendingDocumentCommand() {
 void App::renderMenuBar() {
     const float k = theme::UiScale();
     titleDragRegionValid_ = false;
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * k, 8.0f * k));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * k, 6.0f * k));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * k, 4.0f * k));
     if (ImGui::BeginMainMenuBar()) {
         // The reference treats the menu as app chrome: brand and menus share one
@@ -3207,6 +3232,46 @@ void App::renderMenuBar() {
         const float captionH = (std::max)(1.0f, menuSize.y - 1.0f);
         const bool maximized = mainHwnd && ::IsZoomed(mainHwnd);
 
+        // The same asynchronous Ctrl+K investigation is reachable from every
+        // workspace. Keep this input target outside the native drag region.
+        float dragEnd = captionStart - 4.0f * k;
+        const float searchWidth = (std::min)(280.0f * k,
+            captionStart - menusEndX - 52.0f * k);
+        if (searchWidth >= 160.0f * k) {
+            const ImVec2 searchAt(captionStart - searchWidth - 12.0f * k,
+                                  menuPos.y + 3.0f * k);
+            const ImVec2 searchSize(searchWidth, captionH - 6.0f * k);
+            ImGui::SetCursorScreenPos(searchAt);
+            const bool otherPopup = ImGui::IsPopupOpen(nullptr,
+                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+            ImGui::BeginDisabled(otherPopup);
+            const bool searchClicked = ImGui::InvisibleButton("##global_search", searchSize);
+            const bool searchHovered = ImGui::IsItemHovered();
+            const bool searchFocused = ImGui::IsItemFocused();
+            dl->AddRectFilled(searchAt,
+                ImVec2(searchAt.x + searchSize.x, searchAt.y + searchSize.y),
+                ImGui::GetColorU32(theme::col::panel()), 4.0f * k);
+            dl->AddRect(searchAt,
+                ImVec2(searchAt.x + searchSize.x, searchAt.y + searchSize.y),
+                ImGui::GetColorU32(searchHovered || searchFocused
+                    ? theme::col::accent() : theme::col::lineSoft()), 4.0f * k);
+            const char* searchLabel = searchWidth >= 230.0f * k
+                ? "Search anything" : "Search";
+            const float textY = searchAt.y + (searchSize.y - ImGui::GetTextLineHeight()) * 0.5f;
+            dl->AddText(ImVec2(searchAt.x + 10.0f * k, textY),
+                ImGui::GetColorU32(theme::col::muted()), searchLabel);
+            const float keyWidth = ImGui::CalcTextSize("Ctrl+K").x;
+            dl->AddText(ImVec2(searchAt.x + searchSize.x - keyWidth - 10.0f * k, textY),
+                ImGui::GetColorU32(theme::col::muted()), "Ctrl+K");
+            ui::ItemTooltip("Search commands, addresses, functions, strings, imports, references, and recent investigations.");
+            ImGui::EndDisabled();
+            if (searchClicked && ctx_.frameDebugSnapshot) {
+                if (palette_.isOpen()) palette_.close();
+                else openCommandPalette(*ctx_.frameDebugSnapshot);
+            }
+            dragEnd = searchAt.x - 8.0f * k;
+        }
+
         enum class CaptionGlyph { Minimize, Maximize, Close };
         auto captionButton = [&](const char* id, float x, CaptionGlyph glyph,
                                  const char* tip) {
@@ -3269,7 +3334,7 @@ void App::renderMenuBar() {
 
             titleDragMinX_ = menusEndX + 8.0f * k;
             titleDragMinY_ = menuPos.y;
-            titleDragMaxX_ = captionStart - 4.0f * k;
+            titleDragMaxX_ = dragEnd;
             titleDragMaxY_ = menuPos.y + captionH;
             titleDragRegionValid_ = titleDragMaxX_ > titleDragMinX_;
         }
@@ -3387,8 +3452,7 @@ void App::renderStaticUnpackPopup() {
         ImGui::OpenPopup("Static Packed-PE Recovery");
     }
 
-    ImGui::SetNextWindowSize(ImVec2(860.0f * theme::UiScale(), 730.0f * theme::UiScale()),
-                             ImGuiCond_FirstUseEver);
+    prepareWorkbenchDialog(860.0f, 730.0f, ImGuiCond_FirstUseEver);
     if (!ImGui::BeginPopupModal("Static Packed-PE Recovery", nullptr,
                                 ImGuiWindowFlags_NoSavedSettings)) return;
     if (staticUnpackPopup_.closeAfterDocumentLoad) {
@@ -3604,8 +3668,7 @@ void App::renderAntiDebugPopup() {
         antiDebugError_.clear();
         ImGui::OpenPopup("Hide Debugger / Anti-Anti-Debug");
     }
-    ImGui::SetNextWindowSize(ImVec2(760.0f * theme::UiScale(), 660.0f * theme::UiScale()),
-                             ImGuiCond_FirstUseEver);
+    prepareWorkbenchDialog(760.0f, 660.0f, ImGuiCond_FirstUseEver);
     if (!ImGui::BeginPopupModal("Hide Debugger / Anti-Anti-Debug", nullptr,
                                 ImGuiWindowFlags_NoSavedSettings)) return;
 
@@ -3861,8 +3924,7 @@ void App::renderPassiveDumpPopup() {
         ImGui::OpenPopup("Passive Process Dump");
     }
 
-    ImGui::SetNextWindowSize(ImVec2(820.0f * theme::UiScale(), 720.0f * theme::UiScale()),
-                             ImGuiCond_FirstUseEver);
+    prepareWorkbenchDialog(820.0f, 720.0f, ImGuiCond_FirstUseEver);
     if (!ImGui::BeginPopupModal("Passive Process Dump", nullptr,
                                 ImGuiWindowFlags_NoSavedSettings)) return;
     if (passiveDumpPopup_.closeAfterDocumentLoad) {
@@ -4160,22 +4222,22 @@ void App::renderPassiveDumpPopup() {
 // while the document and workbench strips use local, denser tab metrics.
 static float DocumentStripHeight() {
     const float k = theme::UiScale();
-    const float h = 38.0f * k;
+    const float h = 36.0f * k;
     const float m = ImGui::GetFrameHeight() + 10.0f * k;
     return h > m ? h : m;
 }
 
 static float ToolbarHeight() {
     const float k = theme::UiScale();
-    const float h = 46.0f * k;
-    const float m = ImGui::GetFrameHeight() + 16.0f * k;
-    return h > m ? h : m;
+    const float row = (std::max)(30.0f * k, ImGui::GetFrameHeight());
+    return ImGui::GetMainViewport()->WorkSize.x < 920.0f * k
+        ? row * 2.0f + 18.0f * k : row + 14.0f * k;
 }
 
 // One flat label row, roughly one third shorter than the former two-line cards.
 static float TabStripHeight() {
     const float k = theme::UiScale();
-    const float h = 36.0f * k;
+    const float h = 34.0f * k;
     const float m = ImGui::GetFrameHeight() + 8.0f * k;
     return h > m ? h : m;
 }
@@ -4184,7 +4246,7 @@ static float StatusStripHeight() {
     const float k = theme::UiScale();
     const float h = 30.0f * k;
     const float m = ImGui::GetFrameHeight() + 4.0f * k;
-    return h > m ? h : m;
+    return std::max({h, m, ImGui::GetStyle().WindowMinSize.y});
 }
 
 void App::renderDocumentStrip() {
@@ -4209,6 +4271,7 @@ void App::renderDocumentStrip() {
         // The strip's own context menu must remain interactive on subsequent
         // frames. Other editors still keep ownership of the active document.
         bool documentMenuOpen = false;
+        documentMenuOpen |= ImGui::IsPopupOpen("##all_documents");
         for (const auto& document : documents) {
             ImGui::PushID((int)document.id.value);
             documentMenuOpen |= ImGui::IsPopupOpen("##document_context");
@@ -4224,7 +4287,7 @@ void App::renderDocumentStrip() {
         const float sidePad = 8.0f * k;
         const float topPad = 4.0f * k;
         const float tabH = stripH - topPad;
-        const float addW = 42.0f * k;
+        const float addW = 80.0f * k;
         const float usableW = (std::max)(1.0f,
             vp->WorkSize.x - sidePad * 2.0f - addW);
 
@@ -4257,7 +4320,10 @@ void App::renderDocumentStrip() {
             float tabW = naturalWidths[i] * fit;
             if (fit < 1.0f && i + 1 == documents.size())
                 tabW = win.x + sidePad + usableW - x;
-            tabW = (std::max)(72.0f * k, tabW);
+            // All eight documents remain reachable even in a narrow HiDPI
+            // window. Full names and close actions also live in the list menu.
+            tabW = (std::max)(1.0f, tabW);
+            const bool compactDocument = tabW < 96.0f * k;
             const ImVec2 a(x, win.y + topPad);
             const ImVec2 b(x + tabW, win.y + stripH);
 
@@ -4294,21 +4360,24 @@ void App::renderDocumentStrip() {
                 body.y = body.y * (1.0f - amount) + accent.y * amount;
                 body.z = body.z * (1.0f - amount) + accent.z * amount;
             }
-            dl->AddRectFilled(a, b, ImGui::GetColorU32(body));
-            dl->AddRect(a, b, ImGui::GetColorU32(
-                (document.active || focused) ? accent : theme::col::lineSoft()),
-                0.0f, 0, focused ? 2.0f : 1.0f);
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(body), 4.0f * k,
+                              ImDrawFlags_RoundCornersTop);
+            if (focused)
+                dl->AddRect(a, b, ImGui::GetColorU32(accent), 4.0f * k, 0, k);
+            else if (!document.active)
+                dl->AddLine(ImVec2(b.x, a.y + 8.0f * k), ImVec2(b.x, b.y - 8.0f * k),
+                            ImGui::GetColorU32(theme::col::lineSoft()));
             if (document.active)
                 dl->AddRectFilled(a, ImVec2(b.x, a.y + 2.0f * k),
                                   ImGui::GetColorU32(accent));
 
-            const float iconW = ui::IconsLoaded() ? 18.0f * k : 0.0f;
-            const float closeW = 20.0f * k;
+            const float iconW = ui::IconsLoaded() && !compactDocument ? 18.0f * k : 0.0f;
+            const float closeW = compactDocument ? 0.0f : 20.0f * k;
             const float dirtyW = document.dirty ? 10.0f * k : 0.0f;
             const float textLeft = a.x + 11.0f * k + iconW;
             const float textRight = b.x - 8.0f * k - closeW - dirtyW;
             const float textAvail = (std::max)(1.0f, textRight - textLeft);
-            if (ui::IconsLoaded()) {
+            if (ui::IconsLoaded() && !compactDocument) {
                 const char* glyph = document.mapped ? DS_ICON_NETWORK : DS_ICON_CODE;
                 const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
                 dl->AddText(ImVec2(a.x + 10.0f * k,
@@ -4316,11 +4385,14 @@ void App::renderDocumentStrip() {
                     ImGui::GetColorU32(document.active ? accent : theme::col::muted()),
                     glyph);
             }
-            std::string shown = visible;
+            std::string shown = compactDocument ? std::to_string(i + 1) : visible;
             while (shown.size() > 1 &&
-                   ImGui::CalcTextSize((shown + "...").c_str()).x > textAvail)
-                shown.pop_back();
-            if (shown != visible) shown += "...";
+                   ImGui::CalcTextSize((shown + "...").c_str()).x > textAvail) {
+                size_t last = shown.size() - 1;
+                while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
+                shown.resize(last);
+            }
+            if (!compactDocument && shown != visible) shown += "...";
             const ImVec2 textSize = ImGui::CalcTextSize(shown.c_str());
             dl->AddText(ImVec2(textLeft, a.y + (tabH - textSize.y) * 0.5f),
                         ImGui::GetColorU32(document.active
@@ -4336,8 +4408,8 @@ void App::renderDocumentStrip() {
             const bool pointerOverDocument = ImGui::IsWindowHovered(
                 ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                 ImGui::IsMouseHoveringRect(a, b);
-            const bool showClose = document.active || hovered || focused ||
-                                   pointerOverDocument;
+            const bool showClose = !compactDocument && (document.active || hovered || focused ||
+                                   pointerOverDocument);
             bool closeHovered = false;
             if (showClose) {
                 ImGui::SetCursorScreenPos(closePos);
@@ -4358,8 +4430,8 @@ void App::renderDocumentStrip() {
                 if (closeClicked) close = document.id;
             }
             if (document.dirty) {
-                const float dirtyX = showClose ? closePos.x - 4.0f * k
-                                               : closePos.x + closeSize * 0.5f;
+                const float dirtyX = compactDocument ? b.x - 8.0f * k
+                    : showClose ? closePos.x - 4.0f * k : closePos.x + closeSize * 0.5f;
                 dl->AddCircleFilled(ImVec2(dirtyX, a.y + tabH * 0.5f),
                                     2.5f * k, ImGui::GetColorU32(theme::col::warn()));
             }
@@ -4379,7 +4451,8 @@ void App::renderDocumentStrip() {
             x += tabW;
         }
 
-        const ImVec2 addA(x + 5.0f * k, win.y + topPad);
+        const ImVec2 addA((std::min)(x + 5.0f * k,
+            win.x + vp->WorkSize.x - 78.0f * k), win.y + topPad);
         const ImVec2 addB(addA.x + 34.0f * k, win.y + stripH);
         ImGui::SetCursorScreenPos(addA);
         const bool addClicked = ImGui::InvisibleButton(
@@ -4390,9 +4463,8 @@ void App::renderDocumentStrip() {
         ImVec4 addBody = (addHovered || addFocused || addHeld)
             ? theme::col::panel() : theme::col::menubar();
         dl->AddRectFilled(addA, addB, ImGui::GetColorU32(addBody));
-        dl->AddRect(addA, addB, ImGui::GetColorU32(
-            addFocused ? accent : theme::col::lineSoft()), 0.0f, 0,
-            addFocused ? 2.0f : 1.0f);
+        if (addFocused)
+            dl->AddRect(addA, addB, ImGui::GetColorU32(accent), 4.0f * k, 0, k);
         const char* plus = ui::IconsLoaded() ? DS_ICON_ADD : "+";
         const ImVec2 plusSize = ImGui::CalcTextSize(plus);
         dl->AddText(ImVec2(addA.x + (addB.x - addA.x - plusSize.x) * 0.5f,
@@ -4406,6 +4478,45 @@ void App::renderDocumentStrip() {
                           "Open another binary (up to %u documents)",
                           (unsigned)DocumentManager::kMaxDocuments);
             ui::ItemTooltip(tip, false);
+        }
+        ImGui::SetCursorScreenPos(ImVec2(win.x + vp->WorkSize.x - 36.0f * k,
+                                        win.y + topPad));
+        if (ImGui::InvisibleButton("##document_list", ImVec2(28.0f * k, tabH)))
+            ImGui::OpenPopup("##all_documents");
+        const bool listHovered = ImGui::IsItemHovered();
+        const ImVec2 listAt = ImGui::GetItemRectMin();
+        const float listCx = listAt.x + 14.0f * k, listCy = listAt.y + tabH * 0.5f;
+        const ImU32 listInk = ImGui::GetColorU32(listHovered ? accent : theme::col::muted());
+        dl->AddLine(ImVec2(listCx - 4.0f * k, listCy - 2.0f * k),
+                    ImVec2(listCx, listCy + 2.0f * k), listInk, k);
+        dl->AddLine(ImVec2(listCx, listCy + 2.0f * k),
+                    ImVec2(listCx + 4.0f * k, listCy - 2.0f * k), listInk, k);
+        ui::ItemTooltip("Open documents: switch, close, or copy a path. Ctrl+Tab cycles documents.");
+        if (ImGui::BeginPopup("##all_documents")) {
+            ImGui::TextDisabled("Open documents (%zu / %u)", documents.size(),
+                                (unsigned)DocumentManager::kMaxDocuments);
+            ImGui::Separator();
+            for (size_t i = 0; i < documents.size(); ++i) {
+                const auto& document = documents[i];
+                ImGui::PushID((int)document.id.value);
+                const std::string name = std::to_string(i + 1) + "  " +
+                    (document.mapped ? "[LIVE] " : "") +
+                    (document.title.empty() ? "Untitled" : document.title);
+                if (ImGui::MenuItem(name.c_str(), nullptr, document.active)) activate = document.id;
+                if (ImGui::BeginPopupContextItem("##document_list_context")) {
+                    if (!document.path.empty() && ImGui::MenuItem("Copy full path"))
+                        ImGui::SetClipboardText(document.path.c_str());
+                    if (ImGui::MenuItem("Close document")) close = document.id;
+                    ImGui::EndPopup();
+                }
+                if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+                    close = document.id;
+                ImGui::PopID();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Close active document", "Ctrl+W"))
+                for (const auto& document : documents) if (document.active) close = document.id;
+            ImGui::EndPopup();
         }
         ImGui::EndDisabled();
 
@@ -4429,22 +4540,26 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
     const float docH = DocumentStripHeight();
     const float barH = ToolbarHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y + docH));
+    const float toolbarY = vp->WorkPos.y + docH + TabStripHeight();
+    const bool twoRows = vp->WorkSize.x < 920.0f * k;
+    const float rowH = (std::max)(30.0f * k, ImGui::GetFrameHeight());
+    const float toolbarPaddingY = (barH - (twoRows ? rowH * 2.0f + 4.0f * k : rowH)) * 0.5f;
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, toolbarY));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, barH));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(8.0f * k, (barH - 30.0f * k) * 0.5f));
+                        ImVec2(8.0f * k, toolbarPaddingY));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panel());
     if (ImGui::Begin("##debugbar", nullptr, flags)) {
         // Bottom border line (wireframe panel chrome).
         ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(vp->WorkPos.x, vp->WorkPos.y + docH + barH - 1.0f),
+            ImVec2(vp->WorkPos.x, toolbarY + barH - 1.0f),
             ImVec2(vp->WorkPos.x + vp->WorkSize.x,
-                   vp->WorkPos.y + docH + barH - 1.0f),
-            ImGui::GetColorU32(theme::col::line()));
+                   toolbarY + barH - 1.0f),
+            ImGui::GetColorU32(theme::col::lineSoft()));
 
         Debugger& d = ctx_.debug;
         const bool attached = s.attached();
@@ -4483,13 +4598,14 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             }
         }
         const bool loaded   = ctx_.staticBinary().loaded();
-        const float commandH = 30.0f * k;
+        const float commandH = rowH;
         const bool compactCommands = vp->WorkSize.x < 1120.0f * k;
+        const bool tinyCommands = vp->WorkSize.x < 760.0f * k;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         auto commandWidth = [&](const char* icon, const char* fallback,
                                 const char* label, bool keepLabel) {
             const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
-            const bool showLabel = keepLabel || !compactCommands;
+            const bool showLabel = (keepLabel && !tinyCommands) || !compactCommands;
             const float glyphW = (glyph && glyph[0])
                 ? ImGui::CalcTextSize(glyph).x : 0.0f;
             const float labelW = showLabel ? ImGui::CalcTextSize(label).x : 0.0f;
@@ -4502,7 +4618,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                                  const char* tip, bool hot, bool enabled,
                                  bool keepLabel = false) {
             const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
-            const bool showLabel = keepLabel || !compactCommands;
+            const bool showLabel = (keepLabel && !tinyCommands) || !compactCommands;
             const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
             const ImVec2 labelSize = showLabel
                 ? ImGui::CalcTextSize(label) : ImVec2(0, 0);
@@ -4522,7 +4638,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 fill.w = hot ? (held ? 0.30f : 0.18f)
                              : held ? 0.20f : focused ? 0.14f : 0.10f;
                 dl->AddRectFilled(p, ImVec2(p.x + width, p.y + commandH),
-                                  ImGui::GetColorU32(fill));
+                                  ImGui::GetColorU32(fill), 4.0f * k);
             }
             if (focused)
                 dl->AddRect(ImVec2(p.x + 1.0f * k, p.y + 1.0f * k),
@@ -4549,7 +4665,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             dl->AddLine(ImVec2(p.x, p.y + 3.0f * k),
                         ImVec2(p.x, p.y + commandH - 3.0f * k),
-                        ImGui::GetColorU32(theme::col::line()), 1.0f * k);
+                        ImGui::GetColorU32(theme::col::lineSoft()), 1.0f * k);
             ImGui::Dummy(ImVec2(1.0f * k, commandH));
         };
         auto nextGroup = [&] {
@@ -4559,7 +4675,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         };
         auto nextCommand = [&] { ImGui::SameLine(0.0f, 3.0f * k); };
 
-        ImGui::SetNextItemWidth(98.0f * k);
+        ImGui::SetNextItemWidth((tinyCommands ? 76.0f : 98.0f) * k);
         int executionMode = ctx_.gmlExecutionMode ? 1 : 0;
         if (ImGui::Combo("##execution_mode", &executionMode, "Native\0GML\0"))
             ctx_.gmlExecutionMode = executionMode == 1;
@@ -4635,7 +4751,9 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             ctx_.requestedTab = "Binary View";
         }
 
-        nextGroup();
+        if (twoRows)
+            ImGui::SetCursorPos(ImVec2(8.0f * k, toolbarPaddingY + rowH + 4.0f * k));
+        else nextGroup();
         bool mirrorValid = false;
         bool mirrorLive = false;
         uint64_t mirrorAddress = 0;
@@ -4674,12 +4792,12 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 ? mirrorTarget : DebugTargetIdentity{};
         }
 
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * k);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                             ImVec2(10.0f * k, 6.0f * k));
         ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::col::panelHeader());
-        ImGui::PushStyleColor(ImGuiCol_Border, theme::col::line());
+        ImGui::PushStyleColor(ImGuiCol_Border, theme::col::lineSoft());
         float trailingReserve = 0.0f;
         if (attached) {
             trailingReserve = 12.0f * k + commandWidth(
@@ -4852,11 +4970,10 @@ void App::resolveWorkbenchNavigation() {
 void App::renderTabCardStrip(const DbgSnapshot& dbg) {
     const float k = theme::UiScale();
     const float docH    = DocumentStripHeight();
-    const float barH    = ToolbarHeight();
     const float stripH  = TabStripHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x,
-                                   vp->WorkPos.y + docH + barH));
+                                   vp->WorkPos.y + docH));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, stripH));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -4868,10 +4985,10 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
     if (ImGui::Begin("##tabstrip", nullptr, flags)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 win = ImGui::GetWindowPos();
-        // One shared baseline keeps this a tab row rather than a row of cards.
+        // Workspaces precede their tools; one shared baseline keeps navigation calm.
         dl->AddLine(ImVec2(win.x, win.y + stripH - 1.0f),
                     ImVec2(win.x + vp->WorkSize.x, win.y + stripH - 1.0f),
-                    ImGui::GetColorU32(theme::col::line()));
+                    ImGui::GetColorU32(theme::col::lineSoft()));
 
         // Binary View's tooltip carries the loaded basename; live tabs expose
         // their current state there as well.
@@ -4902,7 +5019,7 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
 
         const ImVec4 acc = theme::col::accent();
         const float sidePad = 8.0f * k;
-        const float hpad = 14.0f * k;
+        const float hpad = 12.0f * k;
         const float cardTop = win.y + 1.0f * k;
         const float cardH = (std::max)(1.0f, stripH - 2.0f * k);
         const float usableW = (std::max)(1.0f, vp->WorkSize.x - sidePad * 2.0f);
@@ -4970,23 +5087,22 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             const bool focused = ImGui::IsItemFocused();
             const bool held = ImGui::IsItemActive();
 
-            // Flat cells share edges. Active/hovered states brighten the fill;
-            // the active section gets the mockup's crisp cyan overline.
+            // A quiet active surface and underline distinguish workspaces from
+            // open-document tabs without surrounding every label in a box.
             ImVec4 bodyCol = active ? theme::col::panel() : theme::col::panelHeader();
             if (active) {
-                bodyCol.x = bodyCol.x * 0.86f + acc.x * 0.14f;
-                bodyCol.y = bodyCol.y * 0.86f + acc.y * 0.14f;
-                bodyCol.z = bodyCol.z * 0.86f + acc.z * 0.14f;
+                bodyCol.x = bodyCol.x * 0.94f + acc.x * 0.06f;
+                bodyCol.y = bodyCol.y * 0.94f + acc.y * 0.06f;
+                bodyCol.z = bodyCol.z * 0.94f + acc.z * 0.06f;
             } else if (hovered || focused || held) {
                 bodyCol.x = bodyCol.x * 0.92f + acc.x * 0.08f;
                 bodyCol.y = bodyCol.y * 0.92f + acc.y * 0.08f;
                 bodyCol.z = bodyCol.z * 0.92f + acc.z * 0.08f;
             }
             dl->AddRectFilled(a, b, ImGui::GetColorU32(bodyCol));
-            dl->AddLine(ImVec2(b.x, a.y), ImVec2(b.x, b.y),
-                        ImGui::GetColorU32(theme::col::lineSoft()));
             if (active)
-                dl->AddRectFilled(a, ImVec2(b.x, a.y + 2.0f * k),
+                dl->AddRectFilled(ImVec2(a.x + 8.0f * k, b.y - 2.0f * k),
+                                  ImVec2(b.x - 8.0f * k, b.y),
                                   ImGui::GetColorU32(acc));
             if (focused)
                 dl->AddRect(ImVec2(a.x + 2.0f * k, a.y + 3.0f * k),
@@ -5116,10 +5232,122 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                     (std::max)(1.0f, theme::UiScale()));
 
         ImGui::AlignTextToFramePadding();
-        // Stable left-to-right summary from the reference: architecture, format,
-        // execution state, then document. Activity is appended only when present.
+        // Stable left-to-right summary: architecture, format, execution state,
+        // then document. Background activity has its own quiet right-edge slot.
         ui::PushMono();
         const float lh = ImGui::GetTextLineHeight();
+        const float scale = theme::UiScale();
+        const ProgressSnapshot analysisHealth = ctx_.staticAnalysis().progress();
+        const ProgressSnapshot moduleHealth = ctx_.moduleAnalysisProgress();
+        const bool opening = ctx_.binaryLoadPending();
+        const bool analyzing = ctx_.staticAnalysis().bulkPending();
+        const bool moduleAnalysis = ctx_.moduleAnalysisPending();
+        const size_t modulesInFlight = moduleAnalysis ? ctx_.moduleAnalysesInFlight() : 0;
+        const bool liveScanning = ctx_.livescan.busy();
+        const LiveProgress liveProgress = liveScanning ? ctx_.livescan.progress() : LiveProgress{};
+        const uint32_t liveDone = liveScanning ? ctx_.livescan.batchDone() : 0;
+        const uint32_t liveTotal = liveScanning ? ctx_.livescan.batchTotal() : 0;
+        const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
+        const size_t plantedDone = tr ? tr->armedSites + tr->hitSites + tr->skippedSites + tr->retiredSites : 0;
+        const bool planting = tr && tr->active && tr->plannedSites > plantedDone;
+        const bool exporting = ctx_.staticCodeExport().pending();
+        const CodeExportProgress exportProgress = exporting ? ctx_.staticCodeExport().progress() : CodeExportProgress{};
+        const bool analysisIssues = analysisHealth.jobsFailed || analysisHealth.resultsDropped ||
+                                    moduleHealth.jobsFailed || moduleHealth.resultsDropped;
+        const bool saveFailure = prefsSaveFailed_ ||
+            ctx_.projectSaveState == AppContext::ProjectSaveState::Failed;
+        const bool statusIssues = analysisIssues || saveFailure || !ctx_.projectSaveWarning.empty();
+
+        // One small activity label owns the right edge. All services keep their
+        // separate cancellation routes in its details popup, including when the
+        // left summary has to clip on a narrow window. No work runs in this UI.
+        enum class StatusActivity { Open, Static, Modules, Live, Trace, Export };
+        struct Activity {
+            StatusActivity kind;
+            const char* label;
+            uint64_t current;
+            uint64_t total;
+        };
+        Activity activities[6]{};
+        size_t activityCount = 0;
+        auto phaseLabel = [](AnalysisPhase phase) {
+            switch (phase) {
+                case AnalysisPhase::Strings: return "Scanning strings";
+                case AnalysisPhase::Functions: return "Finding functions";
+                case AnalysisPhase::Listing: return "Building listing";
+                case AnalysisPhase::ListingPrefix: return "Code boundaries";
+                case AnalysisPhase::Xref: return "Building xrefs";
+                case AnalysisPhase::CrackmeTriage: return "Network trail";
+                default: return "Analyzing";
+            }
+        };
+        if (opening) activities[activityCount++] = {StatusActivity::Open, "Opening binary", 0, 0};
+        if (analyzing) activities[activityCount++] = {
+            StatusActivity::Static, phaseLabel(analysisHealth.phase),
+            analysisHealth.modulesTotal ? analysisHealth.modulesDone : analysisHealth.current,
+            analysisHealth.modulesTotal ? analysisHealth.modulesTotal : analysisHealth.total};
+        if (moduleAnalysis) activities[activityCount++] = {
+            StatusActivity::Modules, "Analyzing live modules", moduleHealth.current, moduleHealth.total};
+        if (liveScanning) activities[activityCount++] = {
+            StatusActivity::Live, liveTotal ? "Reading modules"
+                : liveProgress.kind == LiveKind::Strings ? "Process strings"
+                : liveProgress.kind == LiveKind::Xref ? "Searching references" : "Reading module",
+            liveTotal ? liveDone : liveProgress.current, liveTotal ? liveTotal : liveProgress.total};
+        if (ctx_.traceSeedPlanning || planting) activities[activityCount++] = {
+            StatusActivity::Trace, ctx_.traceSeedPlanning ? "Finding trace blocks" : "Planting trace sites",
+            ctx_.traceSeedPlanning ? ctx_.traceSeedCurrent : plantedDone,
+            ctx_.traceSeedPlanning ? ctx_.traceSeedTotal : tr->plannedSites};
+        if (exporting) activities[activityCount++] = {
+            StatusActivity::Export, CodeExportPhaseName(exportProgress.phase), exportProgress.current, exportProgress.total};
+        auto stopLabel = [](StatusActivity kind) {
+            switch (kind) {
+                case StatusActivity::Open: return "Stop opening binary";
+                case StatusActivity::Static: return "Stop static analysis";
+                case StatusActivity::Modules: return "Stop live-module analysis";
+                case StatusActivity::Live: return "Stop live-memory scan";
+                case StatusActivity::Trace: return "Stop trace preparation";
+                case StatusActivity::Export: return "Stop source export";
+            }
+            return "Stop";
+        };
+        auto stopActivity = [&](StatusActivity kind) {
+            switch (kind) {
+                case StatusActivity::Open: ctx_.cancelBinaryLoad(); break;
+                case StatusActivity::Static: ctx_.staticAnalysis().cancelPending(); break;
+                case StatusActivity::Modules: ctx_.cancelModuleAnalysisPending(); break;
+                case StatusActivity::Live: ctx_.livescan.cancelPending(); break;
+                case StatusActivity::Export: ctx_.staticCodeExport().cancel(); break;
+                case StatusActivity::Trace:
+                    ctx_.requestedTraceCancel = true;
+                    ctx_.requestedTraceCancelTarget = ctx_.frameDebugSnapshot
+                        ? DebugTargetIdentity{ctx_.frameDebugSnapshot->pid,
+                                              ctx_.frameDebugSnapshot->sessionGeneration}
+                        : DebugTargetIdentity{};
+                    break;
+            }
+        };
+        char activityText[128]{};
+        if (activityCount > 1)
+            std::snprintf(activityText, sizeof(activityText), "%s +%zu", activities[0].label, activityCount - 1);
+        else if (activityCount)
+            std::snprintf(activityText, sizeof(activityText), "%s", activities[0].label);
+        else if (analysisIssues)
+            std::snprintf(activityText, sizeof(activityText), "Analysis issues");
+        else if (saveFailure)
+            std::snprintf(activityText, sizeof(activityText), "Save failed");
+        else if (statusIssues)
+            std::snprintf(activityText, sizeof(activityText), "Status warning");
+        const float activityHeight = ImGui::GetFrameHeight();
+        const float stopWidth = activityCount ? activityHeight : 0.0f;
+        const float statusRight = statusPos.x + ImGui::GetWindowSize().x - 12.0f * scale;
+        const float maxActivityWidth = (std::max)(activityHeight,
+            (std::min)(280.0f * scale, ImGui::GetWindowSize().x * 0.45f));
+        const float labelWidth = (std::max)(activityHeight,
+            (std::min)(ImGui::CalcTextSize(activityText).x + 24.0f * scale,
+                       maxActivityWidth - stopWidth));
+        const float activityLeft = statusRight - labelWidth - stopWidth;
+        const float summaryRight = (std::max)(statusPos.x, activityLeft - 12.0f * scale);
+        ImGui::PushClipRect(statusPos, ImVec2(summaryRight, statusPos.y + statusH), true);
         auto statusDot = [&] {
             ImGui::SameLine(0.0f, 9.0f * theme::UiScale());
             const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -5223,197 +5451,11 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                 ImGui::SetTooltip("%s", prefsSaveError_.c_str());
         }
 
-        if (ctx_.binaryLoadPending()) {
-            statusDot();
-            ImGui::TextColored(theme::col::accent(), "Opening binary...");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel##binary-load"))
-                ctx_.cancelBinaryLoad();
-        }
-
-        // Background analysis progress (worker pool): phase label + bar + cancel. The
-        // module counters drive the bar during an "analyze all modules" batch; otherwise
-        // the per-pass byte/instruction count does, falling back to an indeterminate bar.
-        if (ctx_.staticAnalysis().bulkPending()) {
-            ProgressSnapshot pr = ctx_.staticAnalysis().progress();
-            char lbl[64];
-            if (pr.modulesTotal > 0)
-                std::snprintf(lbl, sizeof(lbl), "Modules %u/%u", pr.modulesDone, pr.modulesTotal);
-            else {
-                const char* ph = pr.phase == AnalysisPhase::Strings   ? "Scanning strings"
-                               : pr.phase == AnalysisPhase::Functions ? "Discovering functions"
-                               : pr.phase == AnalysisPhase::Listing   ? "Building listing"
-                               : pr.phase == AnalysisPhase::ListingPrefix ? "Resolving code boundaries"
-                               : pr.phase == AnalysisPhase::Xref      ? "Building xrefs"
-                               : pr.phase == AnalysisPhase::CrackmeTriage ? "Correlating network trail"
-                               : "Analyzing";
-                std::snprintf(lbl, sizeof(lbl), "%s", ph);
-            }
-            statusDot();
-            ImGui::TextColored(theme::col::accent(), "%s", lbl);
-            ImGui::SameLine();
-            float frac = (pr.modulesTotal > 0) ? (float)pr.modulesDone / (float)pr.modulesTotal
-                       : (pr.total > 0 ? (float)pr.current / (float)pr.total : -1.0f);
-            float w = 150.0f * theme::UiScale();
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::accent());
-            if (frac >= 0.0f) {
-                ImGui::ProgressBar(frac, ImVec2(w, 0.0f));
-            } else {
-                // Indeterminate (no known total, e.g. function discovery): sliding fill.
-                float t = (float)ImGui::GetTime();
-                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), "");
-            }
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel")) ctx_.staticAnalysis().cancelPending();
-        }
-
-        const ProgressSnapshot analysisHealth = ctx_.staticAnalysis().progress();
-        if (analysisHealth.jobsFailed || analysisHealth.resultsDropped) {
-            statusDot();
-            ImGui::TextColored(analysisHealth.jobsFailed ? theme::col::bad() : theme::col::warn(),
-                               "Analysis: %llu failed, %llu dropped",
-                               (unsigned long long)analysisHealth.jobsFailed,
-                               (unsigned long long)analysisHealth.resultsDropped);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%llu pending request(s) coalesced. Dropped results mean the bounded UI result queue filled.",
-                                  (unsigned long long)analysisHealth.requestsCoalesced);
-        }
-
-        // Registry-module analysis has independent ownership from the active
-        // static document. Keep its progress and cancellation visible even after
-        // switching documents or leaving Binary View.
-        if (ctx_.moduleAnalysisPending()) {
-            const ProgressSnapshot progress = ctx_.moduleAnalysisProgress();
-            const size_t modulesInFlight = ctx_.moduleAnalysesInFlight();
-            statusDot();
-            ImGui::TextColored(theme::col::accent(), "Analyzing %zu live module%s",
-                               modulesInFlight, modulesInFlight == 1 ? "" : "s");
-            ImGui::SameLine();
-            const float fraction = progress.total > 0
-                                 ? (float)progress.current / (float)progress.total
-                                 : -1.0f;
-            const float width = 150.0f * theme::UiScale();
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::accent());
-            if (fraction >= 0.0f)
-                ImGui::ProgressBar(fraction, ImVec2(width, 0.0f));
-            else {
-                const float t = (float)ImGui::GetTime();
-                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(width, 0.0f), "");
-            }
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel##module-analysis"))
-                ctx_.cancelModuleAnalysisPending();
-        }
-
-        const ProgressSnapshot moduleHealth = ctx_.moduleAnalysisProgress();
-        if (moduleHealth.jobsFailed || moduleHealth.resultsDropped) {
-            statusDot();
-            ImGui::TextColored(moduleHealth.jobsFailed ? theme::col::bad() : theme::col::warn(),
-                               "Modules: %llu failed, %llu dropped",
-                               (unsigned long long)moduleHealth.jobsFailed,
-                               (unsigned long long)moduleHealth.resultsDropped);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%llu module request(s) coalesced. Incomplete modules remain retryable.",
-                                  (unsigned long long)moduleHealth.requestsCoalesced);
-        }
-
-        // Live-memory scan progress (process string scan / xref sweep / "analyze all
-        // modules" image reads, on the LiveScanService pool). Green to distinguish it
-        // from the static-analysis bar above.
-        if (ctx_.livescan.busy()) {
-            LiveProgress lp = ctx_.livescan.progress();
-            uint32_t bd = ctx_.livescan.batchDone(), bt = ctx_.livescan.batchTotal();
-            char lbl[64];
-            if (bt > 0) std::snprintf(lbl, sizeof(lbl), "Reading modules %u/%u", bd, bt);
-            else        std::snprintf(lbl, sizeof(lbl), "%s",
-                            lp.kind == LiveKind::Strings ? "Scanning process strings"
-                          : lp.kind == LiveKind::Xref    ? "Searching references"
-                          : "Reading module image");
-            statusDot();
-            ImGui::TextColored(theme::col::good(), "%s", lbl);
-            ImGui::SameLine();
-            float frac = (bt > 0) ? (float)bd / (float)bt
-                       : (lp.total > 0 ? (float)lp.current / (float)lp.total : -1.0f);
-            float w = 150.0f * theme::UiScale();
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::good());
-            if (frac >= 0.0f) {
-                ImGui::ProgressBar(frac, ImVec2(w, 0.0f));
-            } else {
-                float t = (float)ImGui::GetTime();
-                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), "");
-            }
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel##live")) ctx_.livescan.cancelPending();
-        }
-
-        // Trace coverage has two bounded asynchronous-looking phases: the Binary
-        // View incrementally derives block entries from its listing, then the
-        // debugger thread plants private one-shot sites. Both remain visible and
-        // cancellable after the user leaves the code pane.
-        const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
-        const size_t plantedDone = tr ? tr->armedSites + tr->hitSites + tr->skippedSites + tr->retiredSites : 0;
-        const bool planting = tr && tr->active && tr->plannedSites > plantedDone;
-        if (ctx_.traceSeedPlanning || planting) {
-            statusDot();
-            ImGui::TextColored(theme::col::good(), "%s",
-                               ctx_.traceSeedPlanning ? "Finding trace blocks" : "Planting trace sites");
-            ImGui::SameLine();
-            const size_t cur = ctx_.traceSeedPlanning ? ctx_.traceSeedCurrent : plantedDone;
-            const size_t total = ctx_.traceSeedPlanning ? ctx_.traceSeedTotal : tr->plannedSites;
-            const float frac = total ? (float)cur / (float)total : -1.0f;
-            const float w = 150.0f * theme::UiScale();
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::good());
-            if (frac >= 0.0f) ImGui::ProgressBar(std::min(frac, 1.0f), ImVec2(w, 0.0f));
-            else {
-                float t = (float)ImGui::GetTime();
-                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), "");
-            }
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (ctx_.traceSeedPlanning)
-                ImGui::TextDisabled("%zu block(s)", ctx_.traceSeedFound);
-            else
-                ImGui::TextDisabled("%zu/%zu", plantedDone, tr->plannedSites);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel##trace")) {
-                ctx_.requestedTraceCancel = true;
-                ctx_.requestedTraceCancelTarget = ctx_.frameDebugSnapshot
-                    ? DebugTargetIdentity{ ctx_.frameDebugSnapshot->pid,
-                                           ctx_.frameDebugSnapshot->sessionGeneration }
-                    : DebugTargetIdentity{};
-            }
-        } else if (tr && (tr->active || tr->blockHitTotal > 0)) {
+        if (tr && !ctx_.traceSeedPlanning && !planting && (tr->active || tr->blockHitTotal > 0)) {
             statusDot();
             ImGui::TextColored(theme::col::good(), "Trace %s  %zu blocks / %llu hits",
                                tr->active ? "on" : "stopped", tr->hitSites,
                                (unsigned long long)tr->blockHitTotal);
-        }
-
-        // Source export has its own single worker and remains visible/cancellable even
-        // after the user leaves Binary View's options/progress modal.
-        if (ctx_.staticCodeExport().pending()) {
-            CodeExportProgress ep = ctx_.staticCodeExport().progress();
-            statusDot();
-            ImGui::TextColored(theme::col::warn(), "%s", CodeExportPhaseName(ep.phase));
-            ImGui::SameLine();
-            float frac = ep.total > 0 ? (float)ep.current / (float)ep.total : -1.0f;
-            float w = 150.0f * theme::UiScale();
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, theme::col::warn());
-            if (frac >= 0.0f) ImGui::ProgressBar(std::min(frac, 1.0f), ImVec2(w, 0.0f));
-            else {
-                float t = (float)ImGui::GetTime();
-                ImGui::ProgressBar(t - (float)(long long)t, ImVec2(w, 0.0f), "");
-            }
-            ImGui::PopStyleColor();
-            if (ep.bytesWritten) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%llu B", (unsigned long long)ep.bytesWritten);
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel##export")) ctx_.staticCodeExport().cancel();
         }
 
         // Keep the analyst's current location anchored at the far edge when
@@ -5424,8 +5466,7 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             std::snprintf(cursorText, sizeof(cursorText), "Cursor 0x%llX",
                           (unsigned long long)ctx_.cursorVA);
             const float cursorW = ImGui::CalcTextSize(cursorText).x;
-            const float rightX = statusPos.x + ImGui::GetWindowSize().x -
-                                 12.0f * theme::UiScale() - cursorW;
+            const float rightX = summaryRight - cursorW;
             const float contentEnd = ImGui::GetItemRectMax().x;
             if (contentEnd + 24.0f * theme::UiScale() < rightX) {
                 const ImVec2 cursorPos(
@@ -5446,6 +5487,200 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                 ui::ItemTooltip("Click to copy the cursor virtual address", false);
             }
         }
+        ImGui::PopClipRect();
+
+        auto activityDetails = [&](bool controls) {
+            if (controls && ctx_.staticBinary().loaded()) {
+                ImGui::TextWrapped("%s", ctx_.staticBinary().path().c_str());
+                ImGui::TextDisabled("%s | %s | %s", ArchName(ctx_.staticArch()),
+                    ctx_.staticBinary().formatName(), ctx_.staticDisassembler()
+                        ? ctx_.staticDisassembler()->engineName() : "No decoder");
+            }
+            if (controls && d.attached()) {
+                ImGui::Text("PID %u | %s | %s 0x%llX", d.pid,
+                    d.state == DbgState::Running ? "Running" : d.state == DbgState::Paused ? "Paused"
+                        : d.state == DbgState::Terminated ? "Terminated" : "Attached",
+                    d.is32 ? "EIP" : "RIP", (unsigned long long)d.regs.rip);
+                if (!d.lastEvent.empty()) ImGui::TextWrapped("%s", d.lastEvent.c_str());
+                if (!d.dllTargetError.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::bad());
+                    ImGui::TextWrapped("%s", d.dllTargetError.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (d.jvmLoaded) ImGui::TextWrapped("JVM: %s", d.jvmPath.c_str());
+            }
+            if (controls && ctx_.hasCursor) {
+                ImGui::Text("Cursor 0x%llX", (unsigned long long)ctx_.cursorVA);
+                if (controls && ImGui::SmallButton("Copy cursor address")) {
+                    char cursorAddress[32];
+                    std::snprintf(cursorAddress, sizeof(cursorAddress), "0x%llX",
+                                  (unsigned long long)ctx_.cursorVA);
+                    ImGui::SetClipboardText(cursorAddress);
+                }
+            }
+            for (size_t i = 0; i < activityCount; ++i) {
+                const Activity& activity = activities[i];
+                ImGui::Separator();
+                ImGui::TextUnformatted(activity.label);
+                if (activity.total)
+                    ImGui::TextDisabled("%.1f%%  (%llu / %llu)",
+                        100.0 * (std::min)(1.0, (double)activity.current / (double)activity.total),
+                        (unsigned long long)activity.current, (unsigned long long)activity.total);
+                else if (activity.current)
+                    ImGui::TextDisabled("%llu processed", (unsigned long long)activity.current);
+                else
+                    ImGui::TextDisabled("In progress");
+                if (activity.kind == StatusActivity::Static) {
+                    if (analysisHealth.modulesTotal)
+                        ImGui::TextDisabled("Modules: %u/%u | %s", analysisHealth.modulesDone,
+                                             analysisHealth.modulesTotal, phaseLabel(analysisHealth.phase));
+                } else if (activity.kind == StatusActivity::Modules) {
+                    ImGui::TextDisabled("%zu live module%s | %s", modulesInFlight,
+                                         modulesInFlight == 1 ? "" : "s", phaseLabel(moduleHealth.phase));
+                } else if (activity.kind == StatusActivity::Trace && ctx_.traceSeedPlanning) {
+                    ImGui::TextDisabled("%zu blocks found", ctx_.traceSeedFound);
+                } else if (activity.kind == StatusActivity::Export && exportProgress.bytesWritten) {
+                    ImGui::TextDisabled("%llu bytes written", (unsigned long long)exportProgress.bytesWritten);
+                }
+                if (controls) {
+                    ImGui::PushID((int)activity.kind);
+                    // A held click cannot transfer to another document's job
+                    // when the active document changes between press/release.
+                    const void* owner = activity.kind == StatusActivity::Static
+                        ? static_cast<const void*>(&ctx_.staticAnalysis())
+                        : activity.kind == StatusActivity::Export
+                            ? static_cast<const void*>(&ctx_.staticCodeExport()) : static_cast<const void*>(&ctx_);
+                    ImGui::PushID(owner);
+                    if (ImGui::SmallButton(stopLabel(activity.kind))) stopActivity(activity.kind);
+                    ImGui::PopID();
+                    ImGui::PopID();
+                }
+            }
+            if (!activityCount) ImGui::TextDisabled("No background work");
+            auto healthDetails = [&](const char* owner, const ProgressSnapshot& health, const char* explanation) {
+                if (!health.jobsFailed && !health.resultsDropped) return;
+                ImGui::Separator();
+                ImGui::TextColored(health.jobsFailed ? theme::col::bad() : theme::col::warn(),
+                    "%s: %llu failed, %llu dropped", owner,
+                    (unsigned long long)health.jobsFailed, (unsigned long long)health.resultsDropped);
+                ImGui::TextDisabled("%llu request(s) coalesced", (unsigned long long)health.requestsCoalesced);
+                if (controls) ImGui::TextWrapped("%s", explanation);
+            };
+            healthDetails("Analysis", analysisHealth,
+                          "Dropped results mean the bounded UI result queue filled.");
+            healthDetails("Modules", moduleHealth, "Incomplete modules remain retryable.");
+            if (tr && (tr->active || tr->blockHitTotal > 0))
+                ImGui::Text("Trace %s: %zu blocks / %llu hits", tr->active ? "on" : "stopped",
+                            tr->hitSites, (unsigned long long)tr->blockHitTotal);
+            if (ctx_.projectSaveState == AppContext::ProjectSaveState::Dirty)
+                ImGui::TextColored(theme::col::warn(), "Project: unsaved");
+            else if (ctx_.projectSaveState == AppContext::ProjectSaveState::Saving)
+                ImGui::TextDisabled("Project: saving...");
+            else if (ctx_.projectSaveState == AppContext::ProjectSaveState::Failed) {
+                ImGui::TextColored(theme::col::bad(), "Project: save failed");
+                if (!ctx_.projectSaveError.empty()) ImGui::TextWrapped("%s", ctx_.projectSaveError.c_str());
+            }
+            if (!ctx_.projectSaveWarning.empty()) ImGui::TextWrapped("%s", ctx_.projectSaveWarning.c_str());
+            if (prefsSaveFailed_) {
+                ImGui::TextColored(theme::col::bad(), "Prefs: save failed");
+                if (!prefsSaveError_.empty()) ImGui::TextWrapped("%s", prefsSaveError_.c_str());
+            }
+        };
+
+        const ImVec2 activityPos(activityLeft, statusPos.y + (statusH - activityHeight) * 0.5f);
+        ImGui::SetCursorScreenPos(activityPos);
+        if (ImGui::InvisibleButton("##status_activity_details", ImVec2(labelWidth, activityHeight)))
+            ImGui::OpenPopup("##status_activity_popup");
+        const bool activityHovered = ImGui::IsItemHovered();
+        const ImVec4 issueColor = analysisHealth.jobsFailed || moduleHealth.jobsFailed || saveFailure
+            ? theme::col::bad() : theme::col::warn();
+        const ImVec4 jobColor = activityCount && (activities[0].kind == StatusActivity::Live ||
+                                                  activities[0].kind == StatusActivity::Trace)
+            ? theme::col::good()
+            : activityCount && activities[0].kind == StatusActivity::Export
+                ? theme::col::warn() : theme::col::accent();
+        const ImVec4 activityColor = statusIssues ? issueColor : jobColor;
+        const float dotX = activityPos.x + 7.0f * scale;
+        const float midY = activityPos.y + activityHeight * 0.5f;
+        if (activityCount || statusIssues) {
+            if (statusIssues) {
+                dl->AddText(ImVec2(dotX - ImGui::CalcTextSize("!").x * 0.5f,
+                                  midY - lh * 0.5f), ImGui::GetColorU32(activityColor), "!");
+            } else {
+                dl->AddCircleFilled(ImVec2(dotX, midY), 2.5f * scale, ImGui::GetColorU32(activityColor));
+            }
+            // Keep the stop hit target intact at narrow widths; only the label
+            // elides. Complete phase names and counters remain in hover details.
+            const float textWidth = (std::max)(0.0f, labelWidth - 19.0f * scale);
+            char displayLabel[sizeof(activityText)];
+            std::snprintf(displayLabel, sizeof(displayLabel), "%s", activityText);
+            const size_t fullLength = std::strlen(displayLabel);
+            size_t length = fullLength;
+            while (length && ImGui::CalcTextSize(displayLabel).x > textWidth) {
+                displayLabel[--length] = 0;
+            }
+            if (length < fullLength && length >= 3) {
+                displayLabel[length - 1] = '.';
+                displayLabel[length - 2] = '.';
+                displayLabel[length - 3] = '.';
+            }
+            dl->AddText(ImVec2(activityPos.x + 16.0f * scale, midY - lh * 0.5f),
+                        ImGui::GetColorU32(activityHovered ? theme::col::accent() : theme::col::muted()),
+                        displayLabel);
+        } else {
+            for (int i = -1; i <= 1; ++i)
+                dl->AddCircleFilled(ImVec2(activityPos.x + labelWidth * 0.5f + i * 4.0f * scale, midY),
+                                    1.1f * scale, ImGui::GetColorU32(theme::col::muted()));
+        }
+        if (activityHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f * scale, 10.0f * scale));
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                (std::max)(1.0f, (std::min)(430.0f * scale, vp->WorkSize.x - 48.0f * scale)));
+            activityDetails(false);
+            ImGui::Separator();
+            ImGui::TextDisabled("Click for details and individual stop controls");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+            ImGui::PopStyleVar();
+        }
+        if (activityCount) {
+            const ImVec2 stopPos(activityPos.x + labelWidth, activityPos.y);
+            ImGui::SetCursorScreenPos(stopPos);
+            ImGui::PushID((int)activities[0].kind);
+            const void* owner = activities[0].kind == StatusActivity::Static
+                ? static_cast<const void*>(&ctx_.staticAnalysis())
+                : activities[0].kind == StatusActivity::Export
+                    ? static_cast<const void*>(&ctx_.staticCodeExport()) : static_cast<const void*>(&ctx_);
+            ImGui::PushID(owner);
+            if (ImGui::InvisibleButton("##status_activity_stop", ImVec2(stopWidth, activityHeight)))
+                stopActivity(activities[0].kind);
+            const bool stopHovered = ImGui::IsItemHovered();
+            ImGui::PopID();
+            ImGui::PopID();
+            const float halfSide = 3.25f * scale;
+            const ImVec2 center(stopPos.x + stopWidth * 0.5f, midY);
+            dl->AddRectFilled(ImVec2(center.x - halfSide, center.y - halfSide),
+                              ImVec2(center.x + halfSide, center.y + halfSide),
+                              ImGui::GetColorU32(stopHovered ? theme::col::bad() : theme::col::muted()), scale);
+            if (stopHovered) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s", stopLabel(activities[0].kind));
+            }
+        }
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
+            ImVec2((std::max)(1.0f, (std::min)(480.0f * scale, vp->WorkSize.x - 24.0f * scale)),
+                   (std::max)(1.0f, vp->WorkSize.y - statusH - 16.0f * scale)));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f * scale, 10.0f * scale));
+        if (ImGui::BeginPopup("##status_activity_popup", ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                (std::max)(1.0f, (std::min)(440.0f * scale, vp->WorkSize.x - 64.0f * scale)));
+            activityDetails(true);
+            ImGui::PopTextWrapPos();
+            ImGui::EndPopup();
+        }
+        ImGui::PopStyleVar();
         ui::PopMono();
     }
     ImGui::End();
@@ -5455,9 +5690,7 @@ void App::renderStatusBar(const DbgSnapshot& d) {
 
 void App::renderRawLoadPopup() {
     if (openRawPopup_) { ImGui::OpenPopup("Open as Raw"); openRawPopup_ = false; }
-    ImVec2 c = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(c, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(680.0f * theme::UiScale(), 0), ImGuiCond_Appearing);
+    prepareWorkbenchDialog(680.0f, 0.0f);
     if (!ImGui::BeginPopupModal("Open as Raw", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
 
     ImGui::TextDisabled("Map a flat code blob with an explicit architecture and analysis entry.");
@@ -5524,7 +5757,8 @@ void App::renderRawLoadPopup() {
         size_t codeLandmarks = 0;
         for (const FirmwareLandmark& lm : rawFirmware_.landmarks) if (lm.code) ++codeLandmarks;
         if (codeLandmarks) {
-            ImGui::SameLine();
+            ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                               ImGui::CalcTextSize("Seed named code landmarks").x);
             ImGui::Checkbox("Seed named code landmarks", &rawSeedFirmwareLandmarks_);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Seed %zu bounded reset/boot/firmware-image root(s) into function discovery.", codeLandmarks);
@@ -5555,18 +5789,24 @@ void App::renderRawLoadPopup() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Editable mapped VA used as the first authoritative function root (VA 0 is valid).");
     ImGui::TextUnformatted("Architecture:");
-    ImGui::RadioButton("x86-16 real mode", &rawArchSel_, 0); ImGui::SameLine();
-    ImGui::RadioButton("x86", &rawArchSel_, 1); ImGui::SameLine();
-    ImGui::RadioButton("x64", &rawArchSel_, 2); ImGui::SameLine();
-    ImGui::RadioButton("ARM", &rawArchSel_, 3); ImGui::SameLine();
-    ImGui::RadioButton("Thumb/Thumb-2", &rawArchSel_, 4); ImGui::SameLine();
-    ImGui::RadioButton("ARM64", &rawArchSel_, 5);
-    ImGui::RadioButton("MIPS", &rawArchSel_, 6); ImGui::SameLine();
-    ImGui::RadioButton("MIPS64", &rawArchSel_, 7); ImGui::SameLine();
-    ImGui::RadioButton("PowerPC", &rawArchSel_, 8); ImGui::SameLine();
-    ImGui::RadioButton("PowerPC64", &rawArchSel_, 9);
-    ImGui::RadioButton("RISC-V 32", &rawArchSel_, 10); ImGui::SameLine();
-    ImGui::RadioButton("RISC-V 64", &rawArchSel_, 11);
+    auto architectureChoice = [&](const char* label, int selection, bool newRow = false) {
+        if (!newRow)
+            ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                               ImGui::CalcTextSize(label).x);
+        ImGui::RadioButton(label, &rawArchSel_, selection);
+    };
+    architectureChoice("x86-16 real mode", 0, true);
+    architectureChoice("x86", 1);
+    architectureChoice("x64", 2);
+    architectureChoice("ARM", 3);
+    architectureChoice("Thumb/Thumb-2", 4);
+    architectureChoice("ARM64", 5);
+    architectureChoice("MIPS", 6, true);
+    architectureChoice("MIPS64", 7);
+    architectureChoice("PowerPC", 8);
+    architectureChoice("PowerPC64", 9);
+    architectureChoice("RISC-V 32", 10, true);
+    architectureChoice("RISC-V 64", 11);
     const Arch selectedArch = rawArchFromSelection(rawArchSel_);
     const bool rawCanBeBigEndian = !ArchIsX86(selectedArch) &&
                                    selectedArch != Arch::RISCV32 &&
@@ -5690,9 +5930,7 @@ void App::renderDllDebugPopup() {
     }
 
     const float scale = theme::UiScale();
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing,
-                            ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(720.0f * scale, 610.0f * scale), ImGuiCond_Appearing);
+    prepareWorkbenchDialog(720.0f, 610.0f);
     if (!ImGui::BeginPopupModal("Debug DLL", nullptr, 0)) return;
 
     const DllInspection& inspection = dllDebugPopup_.inspection;
@@ -6367,8 +6605,7 @@ void App::renderUnpackPopup() {
         ImGui::OpenPopup("Adaptive Unpacker");
     }
     sampleUnpackObservation();
-    ImGui::SetNextWindowSize(ImVec2(760.0f * theme::UiScale(), 680.0f * theme::UiScale()),
-                             ImGuiCond_FirstUseEver);
+    prepareWorkbenchDialog(760.0f, 680.0f, ImGuiCond_FirstUseEver);
     if (!ImGui::BeginPopupModal("Adaptive Unpacker", nullptr, ImGuiWindowFlags_NoSavedSettings)) {
         if ((unpackPopup_.observing || unpackPopup_.waitingForInitialBreak) &&
             !ImGui::IsPopupOpen("Adaptive Unpacker")) {
@@ -6848,9 +7085,7 @@ void App::renderHelpWindow() {
     if (!showHelp_) return;
 
     const float s = theme::UiScale();
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(760.0f * s, 640.0f * s), ImGuiCond_FirstUseEver);
+    prepareWorkbenchDialog(760.0f, 640.0f, ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Keyboard Shortcuts & View Controls", &showHelp_)) {
         ImGui::TextColored(theme::col::accent(), "DisasmStudio quick reference");
         ImGui::SameLine();

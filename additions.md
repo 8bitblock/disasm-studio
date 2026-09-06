@@ -114,3 +114,40 @@ subject to Windows elevation/profile-policy constraints and reports those constr
 - Added resizable, persistent, DPI-aware Assembly/Live Assembly columns and updated disassembly/workflow documentation; expanded Core and production-object UI regression coverage.
 - Verified the completed workflow upgrade with 16 selected Core test binaries (instruction references, both native decoders, classification planning/service/cache, function analysis/annotations, triage, navigation/address parsing, project round-trips, lazy listing, and source export), plus the production-object headless ImGui suite with zero failures.
 - Confirmed x64 Release build and embedded GameMaker helper verification. Headless UI checks cover 100/150/200% scaling, an 820x560 narrow listing, saved table settings, pinned-reference stale-scope retirement, first-follow history, one-submission symbols, source-bound actions, NOP-padded Copy/Apply, disabled sets, and identity-rejected live mirroring. New UI debugger cases use simulated snapshots and do not attach to a target.
+
+### Binary loading performance — 2026-09-06
+
+- Reused already-loaded Raw bytes and their pristine hash when restoring saved base/entry/landmark mappings, eliminating a second file read; invalid remaps leave the staging image intact.
+- Moved initial content hashing to the binary-load worker so project staging does not hash a large image on the render thread.
+- Removed quadratic duplicate-name suffix searches and repeated whole-map import-thunk propagation while preserving inferred names and evidence.
+- Changed code/data padding scans to walk and skip covered spans, preserving the existing classification partition and ISA alignment.
+- Accelerated short exact signatures used by runtime/Java discovery with vectorized byte searching and a bounded dense-input fallback; wildcard matching retains its existing behavior.
+- Removed redundant function/string copies and repeated downstream xref hashing; rejected over-budget cache snapshots before allocating their copies and preserved scanned-string inputs for cached combined listing requests.
+- Added a reproducible production-decoder load benchmark with pass timings, empty/retained analysis-cache modes, source fingerprints, and output checks; see tools/binary_load_benchmark.md for measurement scope and results.
+- Generated a preview-only loading UI proposal with a ready-to-browse banner and per-stage progress details for user feedback; no visual redesign was applied.
+- Verified nine selected Core test binaries, the production-object headless listing integration, and a clean x64 Release build with embedded-helper freshness verification. Saved build/source hashes and validation details in build/binary-load-verification.json.
+- Confirmed identical function/string/call-edge/xref fingerprints across before/after production-decoder benchmarks. Focused stress fixtures show substantial reductions, but full-load timings varied with background machine activity; no general end-to-end speedup percentage is claimed.
+
+### Cleaner disassembly and quiet activity — 2026-09-06
+
+- Applied the approved cleaner Assembly and Live Assembly layout with softer column dividers and subtle alternating rows; retained saved column widths, visibility, controls, and all existing panels.
+- Preserved pulsing breakpoint-hit/RIP, cursor, jump-target, navigation-arrival, and trace glows, including foreground halos above the listing.
+- Unified static/live jump-arrow drawing with theme colors and DPI-scaled gutter geometry; retained backward/forward paths and off-screen destination indicators.
+- Kept strings, API names and purposes, symbols, decoder annotations, function notes, JVM stack explanations, and user comments in the listing, using the active theme's semantic colors.
+- Made conditional comments say jumps if the condition holds and otherwise falls through; paused live branches show jumps or falls through from current flags. Kept detailed static branch semantics honest and available on hover when the column clips text.
+- Replaced large analysis bars with quiet phase text and small stop controls; the bottom-right activity area exposes exact progress and individual job cancellation on hover/click, retaining errors, trace/export status, metadata, and cursor-copy.
+- Added production-object render regressions for static/live glow effects, breakpoint markers, trace, arrows at 100/150/200 percent scale in light/dark themes, and every existing annotation channel alongside conditional comments.
+- Passed native/JVM annotation tests and the production-object headless listing suite with zero failures; verified the x64 Release build and inspected real static loading and compact progress in the native app.
+
+### Full workbench UI overhaul — 2026-09-06
+
+- Applied a consistent graphite Midnight theme, quieter shared buttons/inputs/tables/tabs, clearer splitters, and compact empty states across all nine workspaces; retained every palette, DPI scale, density setting, and semantic glow color.
+- Reorganized the shell into document tabs, workspace tabs, grouped debugger commands, content, and compact status; added direct global search access, a full-name document list, and responsive document/debugger controls.
+- Moved Binary View's Functions/Strings/Bookmarks navigator to the left, added name-first function browsing, and wrapped navigation, representation, Assembly, Live Assembly, Hex, and GML controls to keep them accessible at smaller widths.
+- Kept all Binary View representations, metadata views, lower analysis/debug/data tools, context menus, annotations, API purposes, strings, user comments, jump arrows, branch wording, and breakpoint/RIP/cursor/target/arrival/trace glow effects.
+- Updated Projects, Communications, Network Monitor, Signature Scanner, Memory Tools, Binary Diff, Binary Tech, Cortex, and Prism with consistent headers, action rows, results sections, and responsive master/detail layouts; preserved existing jobs, cancellation, evidence, navigation, persistence, and live-target authority checks.
+- Redesigned Ctrl+K results with a second line of context and complete hover details; fixed overlay stacking so outside clicks dismiss search without activating the workbench underneath.
+- Layered static/live listing glows and arrows after the scrolling table's rows so they remain visible over the listing and are properly covered by search, menus, and modal windows.
+- Clamped App dialogs to the viewport, wrapped Raw architecture/firmware and symbol settings choices, kept the status strip inside the window, and widened the Memory Tools freeze interval input.
+- Added production-object workbench regression checks for all nine shortcuts, shell geometry at 820x560 and 1600x960 with 100/150/200 percent DPI and dark/light themes, palette geometry/input ownership, and retained listing signals. Documented feature access in docs/UI_OVERHAUL.md.
+- Passed the final x64 Release build with embedded-helper verification and the complete production-object ImGui integration suite with zero failures; inspected all nine native workspaces, populated static findings, and corrected search layering/dismissal. Saved the preview, logs, executable hash, and verification scope under build/ui-overhaul-*.

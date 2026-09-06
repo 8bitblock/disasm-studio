@@ -2874,6 +2874,20 @@ int main() {
         }
         CHECK(basePage && !eagerInstruction,
               "incremental: worker emits a lazy base page and no eager instruction rows");
+
+        const ProgressSnapshot beforeLayoutReuse = svc.progress();
+        svc.requestBulkWithListing(&bin, Engine::Zydis, Arch::X64,
+                                   K_Funcs | K_Listing, true, e, layout, 78);
+        AnalysisResult reused = collect(3000, e, [](const AnalysisResult& r) {
+            return r.funcsValid && r.listingValid;
+        });
+        CHECK(reused.funcsValid && reused.listingValid && reused.listingRevision == 78 &&
+              reused.listRows.size() == got.listRows.size() &&
+              reused.listingCodeBytes == got.listingCodeBytes,
+              "cached combined functions/listing request preserves the scanned-string layout");
+        CHECK(svc.progress().cacheMisses == beforeLayoutReuse.cacheMisses &&
+              svc.progress().cacheHits == beforeLayoutReuse.cacheHits + 3,
+              "combined layout reuse retains string inputs and hits the same listing cache");
     }
 
     // K_CrackmeTriage is a self-contained public request.  Asking for only that
@@ -4819,8 +4833,9 @@ int main() {
               targeted.xrefOverrideDigest == DigestAnalysisOverrides(data.get()) &&
               targeted.xrefDecoderSignature == AnalysisIsaSignature(Arch::X64, Engine::Zydis),
               "cached xrefs carry their exact image/decoder/override/classification identity");
-        CHECK(scopeService.progress().cacheHits >= afterBulk.cacheHits + 2,
-              "xref-only build reuses both function classification and xref caches");
+        CHECK(scopeService.progress().cacheHits == afterBulk.cacheHits + 2 &&
+              scopeService.progress().cacheMisses == afterBulk.cacheMisses,
+              "xref-only reuse fetches classification and xrefs without fetching strings");
         AnalysisResult defined = request(K_Xref, code);
         CHECK(defined.xref && defined.xref->sources(0) &&
               *defined.xref->sources(0) == std::vector<uint64_t>({0, 3}) &&

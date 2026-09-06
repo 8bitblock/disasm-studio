@@ -759,8 +759,7 @@ void BinaryDiffTab::pumpDiffResult() {
 void BinaryDiffTab::render(AppContext& ctx) {
     pumpDiffResult();
 
-    // Before a diff exists, show a centered "drop zone": two load containers
-    // forming one half-width block, centered horizontally and vertically.
+    // Keep source setup in the same full-width work area as the computed diff.
     if (!computed_) {
         renderLoadZone(ctx);
         return;
@@ -769,6 +768,9 @@ void BinaryDiffTab::render(AppContext& ctx) {
     // Source names stay within equal columns; long paths remain available in
     // tooltips instead of pushing the comparison controls off the window.
     const float scale = theme::UiScale();
+    ImGui::TextUnformatted("Binary Diff");
+    ui::SameLineIfFits(240.0f * scale);
+    ImGui::TextDisabled(semanticMode_ ? "Semantic function comparison" : "Byte comparison");
     if (ImGui::BeginTable("##diff_toolbar_sources", 2,
                           ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
         ImGui::TableNextRow();
@@ -1056,18 +1058,8 @@ void BinaryDiffTab::renderDiffAsm() {
 
 void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
     const float scale = theme::UiScale();
-    const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float panelW = std::min(avail.x, 820.0f * scale);
-    const float topPad = std::max(12.0f * scale,
-                                  std::min(52.0f * scale, avail.y * 0.14f));
-    ImGui::Dummy(ImVec2(0, topPad));
-    const float offX = (avail.x - panelW) * 0.5f;
-    if (offX > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offX);
-
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
-    ImGui::BeginChild("DiffLoadBlock", ImVec2(panelW, 0),
-                      ImGuiChildFlags_Borders);
-    ImGui::TextUnformatted("Binary comparison workspace");
+    ImGui::BeginChild("DiffLoadBlock", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::TextUnformatted("Binary Diff");
     ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
     ImGui::TextWrapped("Choose the baseline and candidate images, then compute a byte or semantic diff.");
     ImGui::PopStyleColor();
@@ -1077,7 +1069,7 @@ void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
             ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Side", ImGuiTableColumnFlags_WidthFixed,
-                                72.0f * scale);
+                                90.0f * scale);
         ImGui::TableSetupColumn("Source image");
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
                                 130.0f * scale);
@@ -1086,7 +1078,7 @@ void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
                              const std::string& path) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextColored(theme::col::accent(), "%s", side);
+            ImGui::TextUnformatted(side);
             ImGui::TableSetColumnIndex(1);
             if (path.empty()) ImGui::TextDisabled("No file selected");
             else {
@@ -1101,14 +1093,14 @@ void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
                               ImVec2(-FLT_MIN, 0)))
                 openInto(leftSide);
         };
-        sourceRow("OLD", true, selectedLeftPath_);
-        sourceRow("NEW", false, selectedRightPath_);
+        sourceRow("Baseline", true, selectedLeftPath_);
+        sourceRow("Candidate", false, selectedRightPath_);
         ImGui::EndTable();
     }
 
     const bool ready = !selectedLeftPath_.empty() && !selectedRightPath_.empty();
     const bool running = diffRunning_.load(std::memory_order_acquire);
-    ImGui::Dummy(ImVec2(0, 6.0f * scale));
+    ImGui::SeparatorText("Comparison");
     if (running) {
         ctx.wantContinuousRedraw = true;
         if (ImGui::Button("Cancel comparison")) cancelDiff();
@@ -1135,7 +1127,7 @@ void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
         if (ImGui::Button("Compute Diff")) computeDiff(&ctx);
         ImGui::EndDisabled();
         if (!diffError_.empty()) {
-            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + panelW - 24.0f * scale);
+            ImGui::PushTextWrapPos();
             ImGui::TextColored(theme::col::bad(), "%s", diffError_.c_str());
             ImGui::PopTextWrapPos();
         } else if (diffPhase_.load(std::memory_order_acquire) == DiffPhase::Cancelled) {
@@ -1144,7 +1136,6 @@ void BinaryDiffTab::renderLoadZone(AppContext& ctx) {
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleVar();
 }
 
 void BinaryDiffTab::applySelectedSemanticTransfers(AppContext& ctx) {

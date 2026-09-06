@@ -8,6 +8,7 @@
 #include "Disasm/IDisassembler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -67,7 +68,91 @@ static void put64be(std::vector<uint8_t>& bytes, size_t offset, uint64_t value) 
         bytes[offset + i] = static_cast<uint8_t>(value >> ((7u - i) * 8u));
 }
 
-int main() {
+static void checkPaddingScans(size_t count, bool reportTime) {
+    // Alternating large covered spans, padding, and one-byte unknown islands
+    // exercise both coverage skipping and resumption at exact claim boundaries.
+    constexpr size_t stride = 512, stringBytes = 256;
+    std::vector<uint8_t> bytes(count * stride, 0xCC);
+    std::vector<CodeDataStringInput> strings;
+    for (size_t i = 0; i < count; ++i) {
+        std::fill_n(bytes.begin() + i * stride, stringBytes, 0x41);
+        bytes[(i + 1) * stride - 1] = 0x42;
+        strings.push_back({kBase + i * stride, stringBytes, false});
+    }
+    const std::string path = "ds_codedata_padding_tmp.bin";
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+    BinaryFile bin;
+    CHECK(bin.loadRaw(path, kBase), "load alternating padding coverage fixture");
+    FixtureDis dis;
+    DecoderConfig decoder;
+    decoder.arch = Arch::X64;
+    const auto start = std::chrono::steady_clock::now();
+    const CodeDataMap map = ClassifyCodeData(bin, dis, decoder, {}, strings);
+    const double elapsedMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    CHECK(map.spans.size() == count * 3, "padding scans retain every covered and unclaimed boundary");
+    if (map.spans.size() == count * 3) {
+        for (size_t i = 0; i < count; ++i) {
+            const auto& string = map.spans[i * 3];
+            const auto& padding = map.spans[i * 3 + 1];
+            const auto& unknown = map.spans[i * 3 + 2];
+            CHECK(string.address == kBase + i * stride && string.size == stringBytes &&
+                  string.kind == CodeDataKind::String &&
+                  string.confidence == CodeDataConfidence::Medium &&
+                  string.evidence == "bounded printable string outside reachable code",
+                  "covered string evidence is preserved");
+            CHECK(padding.address == string.address + stringBytes &&
+                  padding.size == stride - stringBytes - 1 && padding.kind == CodeDataKind::Padding &&
+                  padding.confidence == CodeDataConfidence::High &&
+                  padding.evidence == "repeated INT3 linker fill",
+                  "padding begins and ends at the same exact byte boundaries");
+            CHECK(unknown.address == string.address + stride - 1 && unknown.size == 1 &&
+                  unknown.kind == CodeDataKind::Unknown,
+                  "single-byte unknown islands survive the scan");
+        }
+    }
+    CHECK(!map.truncated && map.functionSeeds.empty(), "padding optimization adds no inferred roots or truncation");
+    CHECK(map.stats.stringBytes == count * stringBytes &&
+          map.stats.paddingBytes == count * (stride - stringBytes - 1) &&
+          map.stats.unknownBytes == count, "all padding fixture bytes retain their classification");
+    if (reportTime)
+        std::printf("codedata benchmark: %zu bytes, %zu covered spans, %.3f ms\n",
+                    bytes.size(), count, elapsedMs);
+
+    // A claim may end between ISA-aligned positions. Skipping it must retain
+    // the original scan stride, including the deliberately unknown remainder.
+    for (Arch arch : {Arch::ARM, Arch::ARM64, Arch::THUMB}) {
+        const std::vector<uint8_t> nop = arch == Arch::ARM ? std::vector<uint8_t>{0x00, 0xF0, 0x20, 0xE3} :
+            arch == Arch::ARM64 ? std::vector<uint8_t>{0x1F, 0x20, 0x03, 0xD5} :
+                                 std::vector<uint8_t>{0x00, 0xBF};
+        const size_t width = nop.size(), firstEnd = width + 3;
+        const size_t resume = ((firstEnd + width - 1) / width) * width;
+        bytes.clear();
+        for (size_t i = 0; i < 8; ++i) bytes.insert(bytes.end(), nop.begin(), nop.end());
+        {
+            std::ofstream f(path, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        CHECK(bin.loadRaw(path, kBase), "load unaligned ARM padding coverage fixture");
+        decoder.arch = arch;
+        const auto arm = ClassifyCodeData(bin, dis, decoder, {},
+            {{kBase + 1, firstEnd - 1, false}, {kBase + 4 * width, width - 1, false}});
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            const bool covered = (i >= 1 && i < firstEnd) || (i >= 4 * width && i < 5 * width - 1);
+            const bool padding = i < width || (i >= resume && i < 4 * width) || i >= 5 * width;
+            const CodeDataKind expected = covered ? CodeDataKind::String :
+                padding ? CodeDataKind::Padding : CodeDataKind::Unknown;
+            CHECK(arm.find(kBase + i) && arm.find(kBase + i)->kind == expected,
+                  "ARM-family NOP scan preserves aligned starts around partial claims");
+        }
+    }
+    std::remove(path.c_str());
+}
+
+int main(int argc, char** argv) {
     std::vector<uint8_t> bytes(0x200, 0x42); // unclaimed bytes stay explicitly Unknown
     bytes[0x00] = 0xA0; bytes[0x01] = 0x00; // referenced string
     bytes[0x02] = 0xB0; bytes[0x03] = 0x00; // indirect jump through table
@@ -197,6 +282,9 @@ int main() {
     CHECK(cappedMap.find(kBase + kTargetOffset) &&
           cappedMap.find(kBase + kTargetOffset)->kind == CodeDataKind::Code,
           "bounded jump-table targets remain available to recursive traversal");
+
+    const bool benchmark = argc > 1 && std::string(argv[1]) == "--benchmark";
+    checkPaddingScans(benchmark ? 8192 : 128, benchmark);
 
     std::remove(path.c_str());
     std::remove(bePath.c_str());

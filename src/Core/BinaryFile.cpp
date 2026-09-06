@@ -458,6 +458,40 @@ bool BinaryFile::loadRaw(const std::string& path, uint64_t base,
     }
 }
 
+bool BinaryFile::remapRaw(uint64_t base, uint64_t entryVA, bool entryExplicit,
+                          std::vector<AnalysisLandmark> landmarks) {
+    if (format_ != BinFormat::Raw || mappedImage_ || data_.empty() ||
+        static_cast<uint64_t>(data_.size() - 1) >
+            std::numeric_limits<uint64_t>::max() - base ||
+        landmarks.size() > kMaxAnalysisLandmarks)
+        return false;
+    const auto mapped = [&](uint64_t va) {
+        return va >= base && va - base < data_.size();
+    };
+    if (entryExplicit && !mapped(entryVA)) return false;
+    for (const AnalysisLandmark& landmark : landmarks)
+        if (landmark.name.empty() || !mapped(landmark.address)) return false;
+
+    // Normalize the caller-owned temporary before committing any metadata.
+    // This uses the same ordering/deduplication contract as setAnalysisLandmarks.
+    std::sort(landmarks.begin(), landmarks.end(), [](const AnalysisLandmark& a,
+                                                    const AnalysisLandmark& b) {
+        if (a.address != b.address) return a.address < b.address;
+        return a.name < b.name;
+    });
+    landmarks.erase(std::unique(landmarks.begin(), landmarks.end(),
+                                [](const AnalysisLandmark& a, const AnalysisLandmark& b) {
+        return a.address == b.address && a.name == b.name;
+    }), landmarks.end());
+
+    imageBase_ = base;
+    entryRVA_ = entryExplicit ? entryVA - base : 0;
+    entryPointPresent_ = rawEntryExplicit_ = entryExplicit;
+    analysisLandmarks_ = std::move(landmarks);
+    ++imageRevision_;
+    return true;
+}
+
 bool BinaryFile::setRawEntryPointVA(uint64_t va) {
     if (format_ != BinFormat::Raw) return false;
     size_t avail = 0;

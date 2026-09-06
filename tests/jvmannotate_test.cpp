@@ -115,7 +115,19 @@ int main() {
         CHECK(has(JvmBranchMeaning(mk(0, "ifeq", "0x20", false, false, 0x20)), "zero"));
         CHECK(has(JvmBranchMeaning(mk(0, "if_icmpeq", "0x20", false, false, 0x20)), "equal"));
         CHECK(has(JvmBranchMeaning(mk(0, "ifnull", "0x20", false, false, 0x20)), "null"));
-        CHECK(has(JvmBranchMeaning(mk(0, "goto", "0x20", false, false, 0x20)), "always"));
+        CHECK(JvmBranchMeaning(mk(0, "goto", "0x20", false, false, 0x20)) == "jumps to 0x20");
+        CHECK(JvmBranchMeaning(mk(0, "ifne", "0x20", false, false, 0x20)) ==
+              "jumps to 0x20 if the top int is non-zero; otherwise falls through");
+        Instruction zeroTarget = mk(4, "ifeq", "0x0");
+        zeroTarget.flow.kind = FlowKind::ConditionalBranch;
+        zeroTarget.flow.directTargetValid = true;
+        zeroTarget.flow.directTarget = 0;
+        CHECK(JvmBranchMeaning(zeroTarget) ==
+              "jumps to 0x0 if the top int is zero; otherwise falls through");
+        zeroTarget.flow.directTargetValid = false;
+        CHECK(JvmBranchMeaning(zeroTarget) ==
+              "jumps if the top int is zero; otherwise falls through");
+        CHECK(JvmBranchMeaning(mk(0, "tableswitch", "")).find("falls through") == std::string::npos);
         CHECK(JvmBranchMeaning(mk(0, "iadd", "")).empty());
     }
 

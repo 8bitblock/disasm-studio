@@ -352,9 +352,10 @@ src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 li
   **branch target** = `jump` (violet; per-frame `hlJumpVA_`), plus a ~1s white-hot
   navigation-arrival flash (`navFlashVA_`, set in navigateTo/navBack/navForward). Each row
   keeps a flat RowBg fill (under the text) and pushes halo/outline/left-bar geometry into
-  `rowGlow_`; `drawRowGlows` paints it after EndTable on the FOREGROUND draw list (same
-  late-draw pattern as the branch arrows — an in-row rect would clip to the cell), glows
-  under, arrows on top. Operand tokens are syntax-colored in `renderHoverTokens`
+  `rowGlow_`; `drawRowGlows` appends it after EndTable merges the scrolling table child's
+  draw channels (an in-row rect would clip to the cell). Glows stay under the arrows;
+  both retain table-body clipping and normal window order below menus, tooltips, and
+  the command palette, so uncovered listing signals remain visible. Operand tokens are syntax-colored in `renderHoverTokens`
   (registers = `call`, immediates = `warn`, punctuation = `muted`).
 - **Pseudocode language selector**: the Pseudocode view renders pseudo-C or **Python**
   (`pseudoLang_`). The worker (K_Decompile) and the LRU always hold pseudo-C;

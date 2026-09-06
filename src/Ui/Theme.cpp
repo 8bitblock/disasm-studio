@@ -29,15 +29,13 @@ static Palette PaletteFor(ThemeId id) {
     switch (id) {
         default:
         case ThemeId::Midnight:
-            // DisasmStudio Midnight: near-black navy canvas, subtly lifted
-            // graphite panels, crisp blue-gray dividers, and one cyan-blue
-            // interaction accent.  The restrained surface contrast keeps dense
-            // disassembly and data tables readable without looking like a stack
-            // of unrelated cards.
-            p.bg0=V(0.024f,0.047f,0.066f); p.bg1=V(0.041f,0.078f,0.106f);
-            p.bg2=V(0.063f,0.129f,0.176f); p.bg3=V(0.082f,0.184f,0.255f);
-            p.child=V(0.029f,0.059f,0.082f); p.popup=V(0.020f,0.041f,0.058f,0.985f); p.menubar=V(0.027f,0.055f,0.075f);
-            p.text=V(0.855f,0.894f,0.925f); p.muted=V(0.500f,0.570f,0.630f); p.border=V(0.122f,0.196f,0.251f);
+            // Graphite surfaces keep code and data in the foreground. Preserve
+            // the established semantic colors: breakpoint, execution, call and
+            // branch glows must remain recognizable against the quieter chrome.
+            p.bg0=V(0.067f,0.075f,0.086f); p.bg1=V(0.094f,0.106f,0.122f);
+            p.bg2=V(0.137f,0.153f,0.176f); p.bg3=V(0.192f,0.212f,0.239f);
+            p.child=V(0.078f,0.086f,0.102f); p.popup=V(0.094f,0.106f,0.122f,0.995f); p.menubar=V(0.094f,0.106f,0.122f);
+            p.text=V(0.855f,0.878f,0.906f); p.muted=V(0.553f,0.596f,0.655f); p.border=V(0.180f,0.200f,0.231f);
             p.accent=V(0.055f,0.553f,0.890f); p.good=V(0.302f,0.773f,0.420f); p.warn=V(0.945f,0.690f,0.251f);
             p.bad=V(0.965f,0.294f,0.263f); p.call=V(0.235f,0.671f,0.973f); p.branch=V(0.945f,0.735f,0.345f);
             p.jump=V(0.690f,0.455f,0.941f);
@@ -107,7 +105,7 @@ static Palette PaletteFor(ThemeId id) {
             p.jump=V(0.35f,0.90f,0.80f);
             break;
         case ThemeId::Paper:
-            // Warm paper + ink with an amber accent (the wireframe palette):
+            // Warm paper + ink with an amber accent:
             // page = warm off-white, panels slightly brighter, lines are soft
             // warm grays, and the single accent is amber.
             p.bg0=V(0.925f,0.918f,0.894f); p.bg1=V(0.938f,0.931f,0.908f);
@@ -161,7 +159,9 @@ static void applyMetrics() {
 
     s.WindowBorderSize  = linePx;
     s.ChildBorderSize   = linePx;
-    s.FrameBorderSize   = linePx;
+    // Light palettes need a quiet keyline around white form fields. Dark
+    // controls are already separated by their raised surface color.
+    s.FrameBorderSize   = g_pal.light ? linePx : 0.0f;
     s.TabBorderSize     = 0.0f;
     s.PopupBorderSize   = linePx;
 
@@ -171,64 +171,71 @@ static void applyMetrics() {
     s.ItemSpacing       = ImVec2(7.0f * d, 4.0f * d);
     s.ItemInnerSpacing  = ImVec2(5.0f * d, 3.0f * d);
     s.IndentSpacing     = 16.0f * d;
-    s.ScrollbarSize     = 11.0f * d;
-    s.GrabMinSize       = 9.0f * d;
+    // Hit targets scale with DPI, even in Compact density. Density changes the
+    // information spacing without making scrolling or sliders harder to grab.
+    s.ScrollbarSize     = 11.0f * k;
+    s.GrabMinSize       = 10.0f * k;
 
     s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
     s.SeparatorTextBorderSize = separatorPx;
+    s.SeparatorTextPadding = ImVec2(0.0f, 3.0f * d);
+    s.SeparatorTextAlign = ImVec2(0.0f, 0.5f);
 }
 
 static void applyColors(const Palette& p) {
     ImVec4* c = ImGui::GetStyle().Colors;
     const ImVec4 acc    = p.accent;
     const ImVec4 accDim = ImVec4(acc.x, acc.y, acc.z, 0.34f);
-    const ImVec4 accSoft = mix(p.bg1, acc, 0.22f);
-    const ImVec4 rowAlt = mix(p.child, p.bg1, 0.34f);
+    const ImVec4 accSoft = mix(p.child, acc, p.light ? 0.17f : 0.15f);
+    const ImVec4 softBorder = mix(p.bg1, p.border, 0.60f);
 
     c[ImGuiCol_Text]                  = p.text;
     c[ImGuiCol_TextDisabled]          = p.muted;
     c[ImGuiCol_WindowBg]              = p.bg0;
     c[ImGuiCol_ChildBg]               = p.child;
     c[ImGuiCol_PopupBg]               = p.popup;
-    c[ImGuiCol_Border]                = p.border;
+    c[ImGuiCol_Border]                = softBorder;
     c[ImGuiCol_BorderShadow]          = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_FrameBg]               = p.bg1;
     c[ImGuiCol_FrameBgHovered]        = p.bg2;
-    c[ImGuiCol_FrameBgActive]         = p.bg3;
+    c[ImGuiCol_FrameBgActive]         = mix(p.bg2, acc, 0.10f);
     c[ImGuiCol_TitleBg]               = p.bg0;
     c[ImGuiCol_TitleBgActive]         = p.bg1;
     c[ImGuiCol_TitleBgCollapsed]      = p.bg0;
     c[ImGuiCol_MenuBarBg]             = p.menubar;
-    c[ImGuiCol_ScrollbarBg]           = mix(p.bg0, ImVec4(0, 0, 0, 1), p.light ? 0.04f : 0.20f);
+    c[ImGuiCol_ScrollbarBg]           = p.bg0;
     c[ImGuiCol_ScrollbarGrab]         = p.bg3;
-    c[ImGuiCol_ScrollbarGrabHovered]  = mix(p.bg3, acc, 0.40f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = mix(p.bg3, p.muted, 0.40f);
     c[ImGuiCol_ScrollbarGrabActive]   = acc;
     c[ImGuiCol_CheckMark]             = acc;
     c[ImGuiCol_SliderGrab]            = acc;
     c[ImGuiCol_SliderGrabActive]      = acc;
-    c[ImGuiCol_Button]                = mix(p.bg1, p.bg2, 0.38f);
-    c[ImGuiCol_ButtonHovered]         = mix(p.bg1, acc, 0.42f);
-    c[ImGuiCol_ButtonActive]          = mix(p.bg1, acc, 0.68f);
+    c[ImGuiCol_Button]                = mix(p.bg1, p.bg2, 0.30f);
+    c[ImGuiCol_ButtonHovered]         = mix(p.bg2, acc, 0.10f);
+    c[ImGuiCol_ButtonActive]          = mix(p.bg2, acc, 0.22f);
     c[ImGuiCol_Header]                = accSoft;
-    c[ImGuiCol_HeaderHovered]         = mix(p.bg1, acc, 0.42f);
-    c[ImGuiCol_HeaderActive]          = mix(p.bg1, acc, 0.58f);
-    c[ImGuiCol_Separator]             = p.border;
+    c[ImGuiCol_HeaderHovered]         = mix(p.bg2, acc, 0.14f);
+    c[ImGuiCol_HeaderActive]          = mix(p.bg2, acc, 0.25f);
+    c[ImGuiCol_Separator]             = softBorder;
     c[ImGuiCol_SeparatorHovered]      = accDim;
     c[ImGuiCol_SeparatorActive]       = acc;
     c[ImGuiCol_ResizeGrip]            = mix(p.bg2, p.bg0, 0.30f);
     c[ImGuiCol_ResizeGripHovered]     = accDim;
     c[ImGuiCol_ResizeGripActive]      = acc;
-    c[ImGuiCol_Tab]                   = mix(p.bg0, p.bg1, 0.58f);
-    c[ImGuiCol_TabHovered]            = mix(p.bg1, acc, 0.38f);
-    c[ImGuiCol_TabActive]             = mix(p.bg1, acc, 0.24f);
+    c[ImGuiCol_Tab]                   = p.menubar;
+    c[ImGuiCol_TabHovered]            = mix(p.bg2, acc, 0.10f);
+    c[ImGuiCol_TabActive]             = mix(p.child, p.bg2, 0.35f);
+    c[ImGuiCol_TabSelectedOverline]   = acc;
     c[ImGuiCol_TabUnfocused]          = p.bg0;
-    c[ImGuiCol_TabUnfocusedActive]    = mix(p.bg1, acc, 0.12f);
-    c[ImGuiCol_TableHeaderBg]         = mix(p.bg1, p.bg2, 0.34f);
-    c[ImGuiCol_TableBorderStrong]     = p.border;
-    c[ImGuiCol_TableBorderLight]      = mix(p.border, p.bg1, 0.38f);
+    c[ImGuiCol_TabUnfocusedActive]    = p.bg1;
+    c[ImGuiCol_TabDimmedSelectedOverline] = mix(p.muted, acc, 0.35f);
+    c[ImGuiCol_TableHeaderBg]         = mix(p.menubar, p.bg2, 0.18f);
+    c[ImGuiCol_TableBorderStrong]     = softBorder;
+    c[ImGuiCol_TableBorderLight]      = mix(p.bg1, p.border, 0.30f);
     c[ImGuiCol_TableRowBg]            = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]         = p.light ? ImVec4(0, 0, 0, 0.030f) : rowAlt;
+    c[ImGuiCol_TableRowBgAlt]         = p.light ? ImVec4(0, 0, 0, 0.020f)
+                                               : ImVec4(1, 1, 1, 0.018f);
     c[ImGuiCol_TextSelectedBg]        = accDim;
     c[ImGuiCol_DragDropTarget]        = p.warn;
     c[ImGuiCol_NavHighlight]          = acc;
@@ -301,7 +308,7 @@ namespace col {
     ImVec4 panel()       { return g_pal.child; }
     ImVec4 panelHeader() { return g_pal.menubar; }
     ImVec4 line()        { return ImVec4(g_pal.border.x, g_pal.border.y, g_pal.border.z, 1.0f); }
-    ImVec4 lineSoft()    { return mix(g_pal.border, g_pal.bg1, 0.45f); }
+    ImVec4 lineSoft()    { return mix(g_pal.border, g_pal.bg1, 0.60f); }
 }
 
 } // namespace ds::theme
