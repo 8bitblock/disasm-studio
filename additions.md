@@ -205,3 +205,9 @@ subject to Windows elevation/profile-policy constraints and reports those constr
 - Collected the accumulated debugger lifecycle, trace, live AOB scanning, GML inspection, address navigation and patch restoration fixes with their supporting workbench, analysis, signature library, tests and documentation.
 - Restored this source snapshot's Git history from `8bitblock/disasm-studio` so the changes can advance the existing `main` branch without replacing its history.
 - Verified a fresh Release x64 build and embedded helper, the 142-entry test manifest, five focused Core suites, and both production-object UI suites with zero failures; the full workbench run included live patch restoration. Logs: `build/push-main-*.log`.
+
+### Peggle helper integration — 2026-09-07
+
+- Added the standalone offline Peggle cursor controller, read-only probe and VS2022 build wrapper, with documented native capture/release behavior and collision verification.
+- Added the AOB trainer profile and release recipe, retaining the distinction between the helper's earlier live verification and the trainer group's untested gameplay behavior.
+- Rebuilt the helper and probe successfully with VS2022 `/W4`, checked all seven profile patches for valid byte syntax, equal original/replacement lengths and in-pattern offsets, and removed a trailing blank line from the JSON. This integration did not run either tool against the game.
