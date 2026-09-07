@@ -33,6 +33,9 @@ private:
     void pumpAnalysis(AppContext& ctx);     // bounded snapshot staging + result adoption
     void cancelAnalysis();
     void ask(AppContext& ctx, const std::string& q);
+    void renderBehaviors(AppContext& ctx);
+    void renderFunctions(AppContext& ctx);
+    void renderQuestions(AppContext& ctx);
     CortexInput inputFor(AppContext& ctx);  // CortexInput over the cached vectors
 
     // Kept behind a pimpl so thread/mutex details stay out of this UI-facing
@@ -61,6 +64,12 @@ private:
     char     input_[512]   = "";
     std::vector<std::pair<std::string, std::string>> chat_;   // (question, answer)
     bool     scrollChat_   = false;
+    bool     focusQuestion_ = false;
+    char     functionFilter_[192] = "";
+    bool     allFunctions_ = false;
+    bool     functionRowsDirty_ = true;
+    std::vector<size_t> functionRows_;
+    int      compactPane_ = 0;
 
     // Retained IDE-pane splits. Ratios survive resizes/DPI changes without
     // turning the report back into a rigid 50/50 dashboard on every frame.

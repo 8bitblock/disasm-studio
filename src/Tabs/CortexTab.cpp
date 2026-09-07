@@ -4,6 +4,7 @@
 #include "../Core/BinaryFile.h"
 #include "../Core/CFG.h"
 #include "../Core/FuncAnnotate.h"
+#include "../Core/FunctionFilter.h"
 #include "../Core/JumpTableResolver.h"
 #include "../Core/PatchSet.h"
 #include "../Disasm/DisassemblerFactory.h"
@@ -18,12 +19,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -1192,16 +1195,299 @@ void CortexTab::pumpAnalysis(AppContext& ctx) {
     analyzedEngine_ = completion.key.decoder.engine;
     analyzedArch_ = completion.key.decoder.arch;
     behSel_ = rep_.behaviors.empty() ? -1 : 0;
+    functionRowsDirty_ = true;
     chat_.clear();
     async_->notice = "Cortex analysis complete.";
     async_->error.clear();
 }
 
 void CortexTab::ask(AppContext& ctx, const std::string& q) {
-    if (q.empty() || !analyzed_) return;
-    std::string a = AskCortex(rep_, inputFor(ctx), q);
-    chat_.emplace_back(q, a);
+    const size_t first = q.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos || !analyzed_) return;
+    const std::string question = q.substr(first, q.find_last_not_of(" \t\r\n") - first + 1);
+    std::string a = AskCortex(rep_, inputFor(ctx), question);
+    // Keep long sessions bounded without dropping the newest answer.
+    if (chat_.size() >= 64) chat_.erase(chat_.begin());
+    chat_.emplace_back(question, std::move(a));
     scrollChat_ = true;
+}
+
+void CortexTab::renderBehaviors(AppContext& ctx) {
+    const float scale = theme::UiScale();
+    ImGui::SeparatorText("Behaviours");
+    ImGui::TextDisabled("%zu findings  |  Select to inspect evidence", rep_.behaviors.size());
+    if (rep_.behaviors.empty()) {
+        ui::EmptyState(DS_ICON_CODE, "No notable behaviours",
+            "The available static evidence did not identify a notable behaviour. Explore the function briefs or ask about imports and strings.");
+        return;
+    }
+
+    bool selectionChanged = false;
+    const float availableH = ImGui::GetContentRegionAvail().y;
+    const float tableH = std::max(ImGui::GetFrameHeight() * 2.0f,
+        availableH * 0.44f);
+    if (ImGui::BeginTable("cx_behtbl", 2,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
+            ImVec2(0.0f, tableH))) {
+        ImGui::TableSetupColumn("Finding", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Confidence", ImGuiTableColumnFlags_WidthFixed, 88.0f * scale);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(rep_.behaviors.size()));
+        while (clipper.Step()) for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            const CortexBehavior& behavior = rep_.behaviors[i];
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const ImVec2 titlePos = ImGui::GetCursorPos();
+            if (ImGui::Selectable("##cx_behavior_row", behSel_ == i,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                selectionChanged = behSel_ != i;
+                behSel_ = i;
+            }
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                !behavior.addresses.empty())
+                ctx.gotoAddress(behavior.addresses.front());
+            ui::ItemTooltip(behavior.explanation.c_str());
+            ImGui::SetCursorPos(titlePos);
+            ImGui::TextUnformatted(behavior.title.c_str());
+            ImGui::TableSetColumnIndex(1);
+            // Confidence describes the evidence, not whether the behaviour is good or bad.
+            const ImVec4 color = behavior.confidence > 0.80f ? theme::col::accent()
+                              : behavior.confidence > 0.60f ? theme::col::warn() : theme::col::muted();
+            ImGui::TextColored(color, "%.0f%%", behavior.confidence * 100.0f);
+            ui::ItemTooltip("Heuristic confidence from the available static evidence; this is not a runtime observation.");
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    if (behSel_ < 0 || static_cast<size_t>(behSel_) >= rep_.behaviors.size()) return;
+    if (selectionChanged) ImGui::SetNextWindowScroll(ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild("cx_evidence", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+    const CortexBehavior& selected = rep_.behaviors[behSel_];
+    ImGui::SeparatorText("Selected evidence");
+    ImGui::TextWrapped("%s", selected.title.c_str());
+    if (!selected.explanation.empty()) ImGui::TextWrapped("%s", selected.explanation.c_str());
+    if (!selected.specifics.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::accent());
+        ImGui::PushTextWrapPos(0.0f);
+        for (const std::string& specific : selected.specifics) ImGui::BulletText("%s", specific.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    if (!selected.evidence.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::TextWrapped("%s", selected.evidence.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (ImGui::SmallButton("Copy evidence")) {
+        std::string evidence = selected.title + "\n" + selected.explanation;
+        for (const std::string& specific : selected.specifics) evidence += "\n- " + specific;
+        evidence += "\n" + selected.evidence;
+        for (const uint64_t address : selected.addresses) {
+            char location[40];
+            std::snprintf(location, sizeof(location), "\nFILE:0x%llX", static_cast<unsigned long long>(address));
+            evidence += location;
+        }
+        ImGui::SetClipboardText(evidence.c_str());
+        ui::Toast(ui::ToastKind::Info, "Cortex evidence copied.");
+    }
+    if (selected.addresses.empty()) {
+        ImGui::TextDisabled("No representative FILE address was recorded.");
+    } else {
+        ImGui::TextDisabled("Representative FILE locations");
+        for (size_t i = 0; i < selected.addresses.size(); ++i) {
+            char label[32];
+            std::snprintf(label, sizeof(label), "0x%llX",
+                          static_cast<unsigned long long>(selected.addresses[i]));
+            if (i) ui::SameLineIfFits(ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::SmallButton(label)) ctx.gotoAddress(selected.addresses[i]);
+            ui::ItemTooltip("Open this static FILE location in Binary View.");
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+}
+
+void CortexTab::renderFunctions(AppContext& ctx) {
+    const float scale = theme::UiScale();
+    ImGui::SeparatorText("Function briefs");
+    ImGui::SetNextItemWidth(std::min(165.0f * scale, ImGui::GetContentRegionAvail().x));
+    int scope = allFunctions_ ? 1 : 0;
+    if (ImGui::Combo("##cx_function_scope", &scope, "Notable functions\0All functions\0")) {
+        allFunctions_ = scope == 1;
+        functionRowsDirty_ = true;
+    }
+    const auto& functions = allFunctions_ ? rep_.functions : rep_.highlights;
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ui::SearchBox("##cx_function_filter", "Filter name, address or summary...",
+                      functionFilter_, sizeof(functionFilter_)))
+        functionRowsDirty_ = true;
+    ui::ItemTooltip("Search terms are combined. Use quotes for a phrase and -term to exclude a match. Escape clears the filter.");
+
+    if (functionRowsDirty_) {
+        const FunctionFilter filter(functionFilter_);
+        functionRows_.clear();
+        functionRows_.reserve(functions.size());
+        for (size_t i = 0; i < functions.size(); ++i)
+            if (filter.matches(functions[i].name, functions[i].brief, functions[i].address))
+                functionRows_.push_back(i);
+        functionRowsDirty_ = false;
+    }
+    ImGui::TextDisabled("%zu of %zu  |  Click to open FILE location",
+                        functionRows_.size(), functions.size());
+    if (functionRows_.empty()) {
+        if (functions.empty()) {
+            ui::EmptyState(DS_ICON_CODE, allFunctions_ ? "No function briefs" : "No notable functions",
+                allFunctions_ ? "No function briefs were produced for this image."
+                              : "Switch to All functions to inspect every available brief.");
+        } else if (ui::EmptyState(DS_ICON_SEARCH, "No matching functions",
+                       "Try a shorter name, a hexadecimal address or a different summary term.", "Clear filter")) {
+            functionFilter_[0] = '\0';
+            functionRowsDirty_ = true;
+        }
+        return;
+    }
+
+    if (ImGui::BeginTable("cx_hitbl", 2,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthStretch, 0.44f);
+        ImGui::TableSetupColumn("Static interpretation", ImGuiTableColumnFlags_WidthStretch, 0.56f);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(std::min(functionRows_.size(), static_cast<size_t>(INT_MAX))));
+        while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const CortexFuncBrief& function = functions[functionRows_[row]];
+            ImGui::PushID(row);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const ImVec2 namePos = ImGui::GetCursorPos();
+            if (ImGui::Selectable("##cx_function_row", false, ImGuiSelectableFlags_SpanAllColumns))
+                ctx.gotoAddress(function.address); // FILE VA zero is valid.
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 420.0f * scale);
+                ImGui::Text("FILE:0x%llX", static_cast<unsigned long long>(function.address));
+                ImGui::TextUnformatted(function.name.c_str());
+                if (function.guessed) ImGui::TextColored(theme::col::warn(), "Inferred name");
+                ImGui::TextWrapped("%s", function.brief.c_str());
+                if (!function.basis.empty()) ImGui::TextWrapped("Evidence: %s", function.basis.c_str());
+                if (!function.convention.empty()) ImGui::TextWrapped("Convention: %s", function.convention.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            if (ImGui::BeginPopupContextItem("cx_function_actions")) {
+                if (ImGui::MenuItem("Open FILE location")) ctx.gotoAddress(function.address);
+                if (ImGui::MenuItem("Copy FILE address")) {
+                    char address[40];
+                    std::snprintf(address, sizeof(address), "FILE:0x%llX",
+                                  static_cast<unsigned long long>(function.address));
+                    ImGui::SetClipboardText(address);
+                }
+                if (ImGui::MenuItem("Copy function brief")) {
+                    const std::string brief = function.name + "\n" + function.brief + "\n" + function.basis;
+                    ImGui::SetClipboardText(brief.c_str());
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::SetCursorPos(namePos);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                function.guessed ? theme::col::warn() : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+            ImGui::TextUnformatted(function.name.c_str());
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextDisabled("%s", function.brief.c_str());
+            ui::ItemTooltip(function.brief.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+void CortexTab::renderQuestions(AppContext& ctx) {
+    const float scale = theme::UiScale();
+    ImGui::SeparatorText("Ask Cortex");
+    const float composerH = ImGui::GetFrameHeightWithSpacing() * 2.0f;
+    const float historyH = std::max(ImGui::GetTextLineHeightWithSpacing(),
+        ImGui::GetContentRegionAvail().y - composerH);
+    ImGui::BeginChild("cx_chatlog", ImVec2(0.0f, historyH), ImGuiChildFlags_None);
+    ImGui::PushTextWrapPos(0.0f);
+    if (chat_.empty()) {
+        ImGui::TextWrapped("Explore this report with a question or choose a topic below.");
+        ImGui::TextDisabled("Answers use the current static findings.");
+    }
+    for (size_t i = 0; i < chat_.size(); ++i) {
+        const auto& qa = chat_[i];
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::TextColored(theme::col::accent(), "%s", qa.first.c_str());
+        ImGui::TextWrapped("%s", qa.second.c_str());
+        if (ImGui::BeginPopupContextItem("cx_answer_actions")) {
+            if (ImGui::MenuItem("Copy answer")) ImGui::SetClipboardText(qa.second.c_str());
+            if (ImGui::MenuItem("Copy question and answer")) {
+                const std::string text = qa.first + "\n\n" + qa.second;
+                ImGui::SetClipboardText(text.c_str());
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::Spacing();
+        if (i + 1 < chat_.size()) ImGui::Separator();
+        ImGui::PopID();
+    }
+    if (scrollChat_) { ImGui::SetScrollHereY(1.0f); scrollChat_ = false; }
+    ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+
+    const float actionsW = ImGui::CalcTextSize("Quick questions").x + ImGui::CalcTextSize("Clear history").x +
+        ImGui::GetStyle().FramePadding.x * 4.0f + ImGui::GetStyle().ItemSpacing.x;
+    const bool clearFits = ImGui::GetContentRegionAvail().x >= actionsW;
+    if (ImGui::Button("Quick questions")) ImGui::OpenPopup("cx_topics");
+    if (ImGui::BeginPopup("cx_topics")) {
+        struct Topic { const char* label; const char* question; };
+        static constexpr Topic topics[] = {
+            {"Overview", "what does it do?"},
+            {"Cryptography", "does it use crypto?"},
+            {"Network APIs", "what network apis does it use?"},
+            {"Authorization", "where is access accepted or denied?"},
+            {"Persistent access", "how is valid user access remembered for the next launch?"},
+            {"Packing", "is it packed?"},
+            {"Notable strings", "show notable strings"},
+            {"Entry point", "where is the entry point?"},
+        };
+        for (const Topic& topic : topics)
+            if (ImGui::MenuItem(topic.label)) ask(ctx, topic.question);
+        if (!chat_.empty() && !clearFits) {
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear history")) { chat_.clear(); scrollChat_ = false; }
+        }
+        ImGui::EndPopup();
+    }
+    if (!chat_.empty() && clearFits) {
+        ImGui::SameLine();
+        if (ImGui::Button("Clear history")) { chat_.clear(); scrollChat_ = false; }
+        ui::ItemTooltip("Clear this report's question history. Cortex retains the most recent 64 questions.");
+    }
+    const float askW = std::max(56.0f * scale,
+        ImGui::CalcTextSize("Ask").x + ImGui::GetStyle().FramePadding.x * 2.0f);
+    ImGui::SetNextItemWidth(std::max(1.0f,
+        ImGui::GetContentRegionAvail().x - askW - ImGui::GetStyle().ItemSpacing.x));
+    if (focusQuestion_) { ImGui::SetKeyboardFocusHere(); focusQuestion_ = false; }
+    const bool enter = ImGui::InputTextWithHint("##cx_ask", "Ask about this binary...",
+        input_, sizeof(input_), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    const bool hasQuestion = std::string_view(input_).find_first_not_of(" \t\r\n") != std::string_view::npos;
+    ImGui::BeginDisabled(!hasQuestion);
+    const bool send = ImGui::Button("Ask", ImVec2(askW, 0.0f));
+    ImGui::EndDisabled();
+    if ((enter || send) && hasQuestion) {
+        ask(ctx, input_);
+        input_[0] = '\0';
+        focusQuestion_ = true;
+        ctx.wantContinuousRedraw = true;
+    }
 }
 
 void CortexTab::render(AppContext& ctx) {
@@ -1226,6 +1512,12 @@ void CortexTab::render(AppContext& ctx) {
         analyzedIdentity_ = {};
         behSel_ = -1;
         chat_.clear();
+        input_[0] = '\0';
+        functionFilter_[0] = '\0';
+        functionRows_.clear();
+        functionRowsDirty_ = true;
+        scrollChat_ = false;
+        focusQuestion_ = false;
         async_->notice.clear();
         async_->error.clear();
         observedIdentity_ = currentIdentity;
@@ -1300,11 +1592,11 @@ void CortexTab::render(AppContext& ctx) {
             const float fraction = std::min(1.0f, (float)current / (float)total);
             ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f));
         } else {
-            const float time = (float)ImGui::GetTime();
-            ImGui::ProgressBar(time - (float)(long long)time,
-                               ImVec2(-1.0f, 0.0f), "");
+            ImGui::TextDisabled("Working...");
         }
-        ImGui::TextDisabled("Analysis owns a private image and may be cancelled safely.");
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::TextWrapped("Cortex is analyzing the current binary. You can keep working in the other tabs.");
+        ImGui::PopStyleColor();
         return;
     }
     if (!async_->error.empty()) {
@@ -1313,7 +1605,9 @@ void CortexTab::render(AppContext& ctx) {
         ImGui::PopTextWrapPos();
         ImGui::Separator();
     } else if (!async_->notice.empty() && !analyzed_) {
+        ImGui::PushTextWrapPos(0.0f);
         ImGui::TextDisabled("%s", async_->notice.c_str());
+        ImGui::PopTextWrapPos();
         ImGui::Separator();
     }
 
@@ -1325,158 +1619,82 @@ void CortexTab::render(AppContext& ctx) {
         return;
     }
 
-    // ---- Verdict header ----
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::accent());
-    ImGui::TextUnformatted(rep_.headline.c_str());
-    ImGui::PopStyleColor();
-    ImGui::TextWrapped("%s", rep_.verdict.c_str());
-    ImGui::PopTextWrapPos();
-    if (!rep_.facts.empty()) {
-        std::string facts;
-        for (size_t i = 0; i < rep_.facts.size(); ++i) { if (i) facts += "    ·    "; facts += rep_.facts[i]; }
-        ImGui::PushTextWrapPos();
-        ImGui::TextColored(theme::col::muted(), "%s", facts.c_str());
+    // The overview can be folded to give the work area back to the analyst.
+    if (ImGui::CollapsingHeader("Overview", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(theme::col::accent(), "%s", rep_.headline.c_str());
+        ImGui::TextWrapped("%s", rep_.verdict.c_str());
+        if (!rep_.facts.empty()) {
+            std::string facts;
+            for (const std::string& fact : rep_.facts) {
+                if (!facts.empty()) facts += "   |   ";
+                facts += fact;
+            }
+            ImGui::TextColored(theme::col::muted(), "%s", facts.c_str());
+        }
         ImGui::PopTextWrapPos();
     }
-    ImGui::Separator();
 
-    // ---- Retained IDE panes: behaviours | functions, over Ask Cortex ----
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    avail.y = std::max(280.0f * scale, avail.y);
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    // A compact window gets one usable pane at a time. Keep the user's wide
+    // split ratios untouched so returning to a larger window restores the layout.
+    if (avail.x < 880.0f * scale || avail.y < 370.0f * scale) {
+        const char* panes[] = {"Behaviours", "Functions", "Ask Cortex"};
+        compactPane_ = ui::TabStrip("cx_compact_tabs", panes, 3, compactPane_);
+        ImGui::BeginChild("cx_compact_content", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+        switch (compactPane_) {
+            case 0: renderBehaviors(ctx); break;
+            case 1: renderFunctions(ctx); break;
+            case 2: renderQuestions(ctx); break;
+        }
+        ImGui::EndChild();
+        return;
+    }
+
     const ImVec2 layoutStart = ImGui::GetCursorPos();
     const float split = 6.0f * scale;
     const float contentH = std::max(1.0f, avail.y - split);
-    const float minUpper = std::min(120.0f * scale, contentH * 0.48f);
-    const float minChat = std::min(92.0f * scale, contentH * 0.38f);
+    const float minUpper = 210.0f * scale;
+    const float minChat = 150.0f * scale;
     const float minChatRatio = minChat / contentH;
-    const float maxChatRatio = std::max(minChatRatio, 1.0f - minUpper / contentH);
-    chatPaneRatio_ = std::clamp(chatPaneRatio_, minChatRatio, maxChatRatio);
-    const float upperH = contentH * (1.0f - chatPaneRatio_);
+    const float maxChatRatio = 1.0f - minUpper / contentH;
+    const float appliedChatRatio = std::clamp(chatPaneRatio_, minChatRatio, maxChatRatio);
+    const float upperH = contentH * (1.0f - appliedChatRatio);
     const float chatH = contentH - upperH;
 
     const float contentW = std::max(1.0f, avail.x - split);
-    const float minColumn = std::min(180.0f * scale, contentW * 0.44f);
-    const float minColumnRatio = minColumn / contentW;
-    behaviorPaneRatio_ = std::clamp(
-        behaviorPaneRatio_, minColumnRatio,
-        std::max(minColumnRatio, 1.0f - minColumnRatio));
-    const float behaviorW = contentW * behaviorPaneRatio_;
+    const float minColumnRatio = (330.0f * scale) / contentW;
+    const float maxColumnRatio = 1.0f - minColumnRatio;
+    const float appliedBehaviorRatio = std::clamp(behaviorPaneRatio_, minColumnRatio, maxColumnRatio);
+    const float behaviorW = contentW * appliedBehaviorRatio;
 
     ImGui::SetCursorPos(layoutStart);
     ImGui::BeginChild("cx_beh", ImVec2(behaviorW, upperH), ImGuiChildFlags_None);
-    ImGui::SeparatorText("Behaviours");
-    if (ImGui::BeginTable("cx_behtbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                                        ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Behaviour");
-        ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 40.0f * scale);
-        ImGui::TableSetupColumn("Evidence");
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableHeadersRow();
-        for (int i = 0; i < (int)rep_.behaviors.size(); ++i) {
-            const CortexBehavior& b = rep_.behaviors[i];
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            if (ImGui::Selectable(b.title.c_str(), behSel_ == i, ImGuiSelectableFlags_SpanAllColumns))
-                behSel_ = i;
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !b.addresses.empty())
-                ctx.gotoAddress(b.addresses.front());
-            if (ImGui::IsItemHovered() && !b.explanation.empty()) ImGui::SetTooltip("%s", b.explanation.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImVec4 col = b.confidence > 0.80f ? theme::col::good()
-                       : b.confidence > 0.60f ? theme::col::warn() : theme::col::bad();
-            ImGui::TextColored(col, "%.0f", b.confidence * 100.0f);
-            ImGui::TableSetColumnIndex(2);
-            if (!b.specifics.empty()) {
-                std::string sp;
-                for (size_t k = 0; k < b.specifics.size() && k < 4; ++k) { if (k) sp += ", "; sp += b.specifics[k]; }
-                ImGui::TextColored(theme::col::warn(), "%s", sp.c_str());
-                if (ImGui::IsItemHovered() && !b.evidence.empty()) ImGui::SetTooltip("%s", b.evidence.c_str());
-            } else {
-                ImGui::TextDisabled("%s", b.evidence.c_str());
-            }
-        }
-        ImGui::EndTable();
-    }
+    renderBehaviors(ctx);
     ImGui::EndChild();
 
+    float draggedBehaviorRatio = appliedBehaviorRatio;
     drawVerticalSplitter("##cx_report_split",
                          ImVec2(layoutStart.x + behaviorW, layoutStart.y),
-                         upperH, split, contentW, behaviorPaneRatio_,
-                         minColumnRatio,
-                         std::max(minColumnRatio, 1.0f - minColumnRatio));
+                         upperH, split, contentW, draggedBehaviorRatio,
+                         minColumnRatio, maxColumnRatio);
+    if (ImGui::IsItemActive()) behaviorPaneRatio_ = draggedBehaviorRatio;
+
     ImGui::SetCursorPos(ImVec2(layoutStart.x + behaviorW + split, layoutStart.y));
     ImGui::BeginChild("cx_hi", ImVec2(contentW - behaviorW, upperH), ImGuiChildFlags_None);
-    ImGui::SeparatorText("Notable functions");
-    if (ImGui::BeginTable("cx_hitbl", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                                       ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthFixed, 150.0f * scale);
-        ImGui::TableSetupColumn("What it looks like");
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableHeadersRow();
-        for (const CortexFuncBrief& f : rep_.highlights) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::PushStyleColor(ImGuiCol_Text, f.guessed ? theme::col::warn() : ImGui::GetStyleColorVec4(ImGuiCol_Text));
-            ImGui::PushID((void*)(uintptr_t)f.address);
-            bool clicked = ImGui::Selectable(f.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
-            ImGui::PopID();
-            ImGui::PopStyleColor();
-            if (clicked) ctx.gotoAddress(f.address); // VA 0 is valid for raw/ELF images
-            if (ImGui::IsItemHovered() && !f.basis.empty()) ImGui::SetTooltip("%s", f.basis.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("%s", f.brief.c_str());
-        }
-        ImGui::EndTable();
-    }
+    renderFunctions(ctx);
     ImGui::EndChild();
 
+    float draggedChatRatio = appliedChatRatio;
     drawHorizontalSplitter("##cx_chat_split",
                            ImVec2(layoutStart.x, layoutStart.y + upperH),
-                           avail.x, split, contentH, chatPaneRatio_,
+                           avail.x, split, contentH, draggedChatRatio,
                            minChatRatio, maxChatRatio);
+    if (ImGui::IsItemActive()) chatPaneRatio_ = draggedChatRatio;
 
-    // ---- Ask Cortex: flat lower pane with a two-row compact composer ----
     ImGui::SetCursorPos(ImVec2(layoutStart.x, layoutStart.y + upperH + split));
     ImGui::BeginChild("cx_chat", ImVec2(avail.x, chatH), ImGuiChildFlags_None);
-    ImGui::SeparatorText("Ask Cortex");
-
-    const float composerH = ImGui::GetFrameHeightWithSpacing() * 2.0f;
-    ImGui::BeginChild("cx_chatlog", ImVec2(0, -composerH), ImGuiChildFlags_None);
-    ImGui::PushTextWrapPos(0.0f);
-    for (const auto& qa : chat_) {
-        ImGui::TextColored(theme::col::accent(), "you: %s", qa.first.c_str());
-        ImGui::TextWrapped("%s", qa.second.c_str());
-        ImGui::Spacing();
-    }
-    if (scrollChat_) { ImGui::SetScrollHereY(1.0f); scrollChat_ = false; }
-    ImGui::PopTextWrapPos();
-    ImGui::EndChild();
-
-    // Quick-ask chips.
-    struct Chip { const char* label; const char* q; };
-    static const Chip chips[] = {
-        { "Summary",  "what does it do?" },
-        { "Crypto?",  "does it use crypto?" },
-        { "Network?", "what network apis does it use?" },
-        { "Packed?",  "is it packed?" },
-        { "Strings",  "show notable strings" },
-    };
-    for (int i = 0; i < (int)(sizeof(chips) / sizeof(chips[0])); ++i) {
-        if (i) ImGui::SameLine();
-        if (ImGui::SmallButton(chips[i].label)) ask(ctx, chips[i].q);
-    }
-
-    ImGui::SetNextItemWidth(-70.0f * scale);
-    bool enter = ImGui::InputTextWithHint("##cx_ask", "ask about this binary...", input_, sizeof(input_),
-                                          ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    bool send = ImGui::Button("Ask", ImVec2(60.0f * scale, 0));
-    if (enter || send) {
-        ask(ctx, input_);
-        input_[0] = '\0';
-        ImGui::SetKeyboardFocusHere(-1);
-    }
+    renderQuestions(ctx);
     ImGui::EndChild();
 }
 

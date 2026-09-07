@@ -281,6 +281,10 @@ bool DocumentContext::installStaged(BinaryFile&& image, ProjectState&& project,
                                     DocumentInstallPersistence persistence,
                                     DocumentRuntimeMetadata&& metadata) {
     if (!open() || !image.loaded() || !decoder || !decoder->ready()) return false;
+    if (typeDraftPending_) {
+        saveError_ = "Save or discard the unsaved Types draft before replacing this image.";
+        return false;
+    }
     const DecoderConfig config = DecoderConfigForImage(image, requestedConfig);
     if (!flush()) return false;
     quiesceWorkers();
@@ -481,6 +485,10 @@ bool DocumentContext::commitPatchedImage(
 
 bool DocumentContext::clearImage(std::string* error) {
     if (!open()) return false;
+    if (typeDraftPending_) {
+        if (error) *error = "Save or discard the unsaved Types draft before clearing this image.";
+        return false;
+    }
     BinaryFile emptyImage;
     std::unique_ptr<IDisassembler> emptyDecoder;
     try {
@@ -507,6 +515,10 @@ bool DocumentContext::clearImage(std::string* error) {
 
 bool DocumentContext::close(std::string* error) {
     if (lifecycle_ == DocumentLifecycle::Closed) return true;
+    if (typeDraftPending_) {
+        if (error) *error = "Save or discard the unsaved Types draft before closing this document.";
+        return false;
+    }
     if (lifecycle_ == DocumentLifecycle::Closing) {
         if (error) *error = "document is already closing";
         return false;
@@ -697,6 +709,14 @@ bool DocumentManager::clear(PrepareTransition prepare, std::string* error) {
         if (isActive) {
             if (!prepareAndFlush(*document, prepare, error)) return false;
         } else if (!document->flush(&lastError_)) {
+            if (error) *error = lastError_;
+            return false;
+        }
+    }
+    // A later draft must not leave earlier documents closed in the collection.
+    for (const auto& document : documents_) {
+        if (document->typeDraftPending()) {
+            lastError_ = "Save or discard unsaved Types drafts before closing the workspace.";
             if (error) *error = lastError_;
             return false;
         }

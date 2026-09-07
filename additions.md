@@ -151,3 +151,57 @@ subject to Windows elevation/profile-policy constraints and reports those constr
 - Clamped App dialogs to the viewport, wrapped Raw architecture/firmware and symbol settings choices, kept the status strip inside the window, and widened the Memory Tools freeze interval input.
 - Added production-object workbench regression checks for all nine shortcuts, shell geometry at 820x560 and 1600x960 with 100/150/200 percent DPI and dark/light themes, palette geometry/input ownership, and retained listing signals. Documented feature access in docs/UI_OVERHAUL.md.
 - Passed the final x64 Release build with embedded-helper verification and the complete production-object ImGui integration suite with zero failures; inspected all nine native workspaces, populated static findings, and corrected search layering/dismissal. Saved the preview, logs, executable hash, and verification scope under build/ui-overhaul-*.
+
+### Compact workbench refinement — 2026-09-07
+
+- Made the narrow evidence rail open a viewport-bounded inspector popup, retaining manual pane choices and width and closing on navigation or drawer handoffs.
+- Kept the containing function highlighted for internal instructions and exact owned chunks, with checked LIVE-to-FILE mapping and no highlight for unrelated addresses.
+- Moved Strings counts, scan progress, partial-result warnings and empty-search guidance above results; added consistent Escape-to-clear search and retained clipped, generation-cached lists.
+- Kept FILE/LIVE/FILE-offset labels and addresses visible in the breadcrumb, elided long context, enabled Tab/Space copying with confirmation, and measured workflow controls before wrapping.
+- Passed the Release build with embedded-helper verification and the focused production-object UI suite; checked the refined static workflow in the native app. Candidate: build/x64/UIRefinement/DisasmStudio.exe. Details and verification scope: docs/UI_REFINEMENT.md.
+- Passed the full production-object UI suite with zero failures and relinked the final candidate from the same 118 verified objects. Recorded source/executable hashes and test logs in build/ui-refinement-verification.json.
+
+### Feature UI production polish — 2026-09-07
+
+- Added selected Cortex evidence, complete evidence copy and FILE location actions, searchable notable/all function briefs with cached clipped rows, responsive pane tabs that preserve split preferences, and bounded question history with quick topics and clear/copy actions.
+- Refined Signature Scanner with explicit FILE/LIVE targets, inline pattern validation and byte/wildcard counts, offline library access, retained result/function search, copy/navigation actions and useful empty states. Current Scan retains the pattern and target that actually produced its results.
+- Improved Binary Tech evidence/occurrence presentation, image-and-decoder-keyed previews and retained filtering; added mapped-location navigation and FILE-address copy.
+- Improved Binary Diff baseline/candidate setup, compact hex panes and horizontal preview access; added semantic result search, changed-only filtering, fixed headers and empty-state guidance, and prevented unrelated matched details from appearing under Added/Removed/Transfers.
+- Made project metadata wrap and stack in narrow panes, clipped recent rows, preserved literal names, and added clear-search, reveal-hidden-selection and copy-path controls.
+- Added populated production-object feature UI regressions and multi-scale detail-row checks. Build/test/native verification and release scope are recorded in docs/UI_PRODUCTION_POLISH.md.
+
+### Automatic analysis and tracing improvements — 2026-09-07
+
+- Fixed global analysis admission so work queued behind a busy document worker does not stall other documents; retained interactive preemption and the process-wide worker limit.
+- Corrected call-graph, triage and decompiler cache identity for inferred non-returning functions, and preserved those inputs when unrelated requests coalesce.
+- Fixed paused trace start/stop/restart servicing, checked instruction-pointer restoration, and simultaneous queued one-shot hits from multiple threads.
+- Added executable-page admission, retained ownership and retry controls after restoration failure, and module-unload invalidation for historical trace addresses.
+- Enforced the 65,536-site trace bound and removed repeated vector copying/sorting from unchanged per-frame trace snapshots.
+- Bounded planner root/descriptor work per frame, excluded invalid decoder rows, retired boundary authority after decoding failures until independent roots, and prevented coverage from spanning data/folded/undecoded gaps.
+- Added analysis, pure trace-plan, real x64/WOW64 debugger and production-object UI regressions; built a coherent isolated candidate without replacing the user's running Release session. Details and exact verification scope: docs/AUTO_ANALYSIS_TRACING.md.
+
+### Feature UI final verification — 2026-09-07
+
+- Final UI verification: packaged build/x64/UIProduction/DisasmStudio.exe; feature and full workbench suites passed with zero failures against 121 matching production objects per suite. Native Cortex, scanner, tech, diff and Projects flows passed; exact build/source hashes and QA scope are recorded in build/ui-production-verification.json and docs/UI_PRODUCTION_POLISH.md.
+
+### GML value and live AOB scanning — 2026-09-07
+
+- Replaced the synchronous live byte search with an asynchronous masked-pattern worker. `?` and `??` now remain real wildcard bytes instead of silently ending the parsed pattern, and matches spanning 1 MiB read boundaries are found exactly once.
+- Removed the legacy 256 MiB Binary View and 512 MiB Sig Scanner AOB coverage cutoffs, retained a bounded 4,096-result cap, used breakpoint-masked exact-session reads, and surfaced complete byte coverage plus partial memory-map, short-read, unreadable-chunk, cancellation, and cap status.
+- Kept Pattern completions bound to their requesting Binary View token so another document cannot consume them, and added targeted cancellation for replaced, cleared, or retired searches without stopping sibling live work.
+- Made uncapped Pattern work cancel promptly during service teardown, retained token-owned completions independently of the bounded shared-result queue, and cancel a document's pending Pattern requests when that document closes.
+- Extended GML numeric handoffs so Inspect selects the real 4- or 8-byte payload and an explicit **Prepare typed scan in Memory Tools (session)** action configures Exact Float64/Int32/Int64 scanning without auto-running or replacing the analyst's scope.
+- Added worker regressions for wildcards, chunk boundaries, caps, partial reads, epochs, per-document routing, and targeted cancellation; added production-object UI coverage for retained search status and GML typed-scan ownership/selection behavior.
+
+### Patch byte restoration — 2026-09-07
+
+- Fixed live patch originals and rollback captures retaining physical debugger INT3 bytes; ordinary patches, hot patches and revert rollback now use exact-session breakpoint-masked reads.
+- Fixed overlapping live patch restoration overwriting surviving patches outside the reverted span; compose only survivor intersections, with matching session and patch-set ownership and independent FILE set state.
+- Added pure restoration regressions and opt-in production UI/debugger tests for armed breakpoints, breakpoint removal before revert and recovery after a rejected static commit. Details: docs/PATCH_BYTE_RESTORATION.md.
+- Verified the x64 Release build with embedded-helper verification, all four focused patch test binaries, and the full production-object UI suite with live restoration tests enabled (zero failures). Built candidate: build/x64/PatchRestoration/DisasmStudio.exe.
+
+### Main integration — 2026-09-07
+
+- Collected the accumulated debugger lifecycle, trace, live AOB scanning, GML inspection, address navigation and patch restoration fixes with their supporting workbench, analysis, signature library, tests and documentation.
+- Restored this source snapshot's Git history from `8bitblock/disasm-studio` so the changes can advance the existing `main` branch without replacing its history.
+- Verified a fresh Release x64 build and embedded helper, the 142-entry test manifest, five focused Core suites, and both production-object UI suites with zero failures; the full workbench run included live patch restoration. Logs: `build/push-main-*.log`.

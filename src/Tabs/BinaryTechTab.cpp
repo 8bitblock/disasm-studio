@@ -24,6 +24,8 @@ static DocumentResultIdentity currentTechIdentity(const AppContext& ctx) {
 
 void BinaryTechTab::runTechScan(AppContext& ctx) {
     caps_.clear();
+    filterDirty_ = true;
+    previewOwner_ = {};
     owner_ = {};
     selected_ = -1;
     scanned_ = false;
@@ -156,6 +158,8 @@ void BinaryTechTab::pollTechScan(const DocumentResultIdentity& currentIdentity) 
         return;
     }
     caps_ = std::move(ready->capabilities);
+    filterDirty_ = true;
+    previewOwner_ = {};
     selected_ = caps_.empty() ? -1 : 0;
     owner_ = ready->owner;
     scanned_ = true;
@@ -188,6 +192,9 @@ void BinaryTechTab::render(AppContext& ctx) {
     pollTechScan(currentIdentity);
     if (owner_ && !SameDocumentResultImage(owner_, currentIdentity)) {
         caps_.clear();
+        visible_.clear();
+        filterDirty_ = true;
+        previewOwner_ = {};
         owner_ = {};
         selected_ = -1;
         scanned_ = false;
@@ -239,7 +246,8 @@ void BinaryTechTab::render(AppContext& ctx) {
     ImGui::Separator();
 
     if (pending_) {
-        ImGui::TextDisabled("Scanning imports, sections, runtime wrappers, and byte signatures...");
+        ImGui::TextWrapped("Scanning imports, sections, runtime wrappers, and byte signatures...");
+        ImGui::TextDisabled("You can keep working in other tabs while the scan runs.");
         return;
     }
     if (!scanned_) {
@@ -255,24 +263,31 @@ void BinaryTechTab::render(AppContext& ctx) {
         return;
     }
 
-    std::vector<int> visible;
-    const auto matches = [&](const std::string& text) {
-        return std::search(text.begin(), text.end(), filter_, filter_ + std::char_traits<char>::length(filter_),
-            [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); }) != text.end();
-    };
-    for (int i = 0; i < static_cast<int>(caps_.size()); ++i) {
-        const auto& cap = caps_[i];
-        if (!filter_[0] || matches(cap.name) || matches(cap.category) ||
-            matches(cap.detail) || matches(cap.analyzer)) visible.push_back(i);
+    // Results are immutable until publication or image invalidation. Retain the
+    // filtered indices so idle frames do not rescan every evidence string.
+    if (filterDirty_ || appliedFilter_ != filter_) {
+        appliedFilter_ = filter_;
+        visible_.clear();
+        const auto matches = [&](const std::string& text) {
+            return std::search(text.begin(), text.end(), appliedFilter_.begin(), appliedFilter_.end(),
+                [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); }) != text.end();
+        };
+        for (int i = 0; i < static_cast<int>(caps_.size()); ++i) {
+            const auto& cap = caps_[i];
+            if (!filter_[0] || matches(cap.name) || matches(cap.category) ||
+                matches(cap.detail) || matches(cap.analyzer)) visible_.push_back(i);
+        }
+        if (std::find(visible_.begin(), visible_.end(), selected_) == visible_.end())
+            selected_ = visible_.empty() ? -1 : visible_.front();
+        filterDirty_ = false;
     }
+    const auto& visible = visible_;
     if (filter_[0] && visible.empty()) {
         if (ui::EmptyState(DS_ICON_SEARCH, "No matching capabilities",
                            "Try a capability name, category, or a word from the evidence.", "Clear filter"))
             filter_[0] = 0;
         return;
     }
-    if (std::find(visible.begin(), visible.end(), selected_) == visible.end())
-        selected_ = visible.empty() ? -1 : visible.front();
 
     // Resizable master/detail workspace: the findings list remains compact while
     // the evidence/disassembly preview receives the rest of the viewport.
@@ -294,8 +309,8 @@ void BinaryTechTab::render(AppContext& ctx) {
     if (ImGui::BeginTable("caps", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                    ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Capability");
-        ImGui::TableSetupColumn("Cat", ImGuiTableColumnFlags_WidthFixed, 84 * scale);
-        ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 46 * scale);
+        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 84 * scale);
+        ImGui::TableSetupColumn("Confidence", ImGuiTableColumnFlags_WidthFixed, 76 * scale);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         ImGuiListClipper clip;
@@ -308,14 +323,17 @@ void BinaryTechTab::render(AppContext& ctx) {
             ImGui::TableSetColumnIndex(0);
             if (ImGui::Selectable(c.name.c_str(), selected_ == i, ImGuiSelectableFlags_SpanAllColumns))
                 selected_ = i;
+            ui::ItemTooltip(c.name.c_str());
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && c.addressValid)
                 ctx.gotoAddress(c.address);
             ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.category.c_str());
+            ui::ItemTooltip(c.category.c_str());
             ImGui::TableSetColumnIndex(2);
             ImVec4 col = c.confidence > 0.85f ? theme::col::good()
                        : c.confidence > 0.65f ? theme::col::warn()
-                                              : theme::col::bad();
+                                              : theme::col::muted();
             ImGui::TextColored(col, "%.0f%%", c.confidence * 100.0f);
+            ui::ItemTooltip("Heuristic confidence in this finding. Review its supporting evidence.");
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -332,13 +350,20 @@ void BinaryTechTab::render(AppContext& ctx) {
         ImGui::TextUnformatted(c.name.c_str());
         ImGui::PopTextWrapPos();
         ui::KeyValueRow("Category", "%s", c.category.c_str());
-        ui::KeyValueRow("Confidence", "%.0f%%", c.confidence * 100.0f);
+        ui::KeyValueRow("Confidence", "%.0f%% (heuristic)", c.confidence * 100.0f);
         if (c.addressValid)
             ui::KeyValueRow("Address", "0x%llX", (unsigned long long)c.address);
         else
             ui::KeyValueRow("Address", "%s", "unavailable");
         if (c.addressValid) {
-            if (ImGui::SmallButton("View in disassembly")) ctx.gotoAddress(c.address);
+            if (ImGui::SmallButton("Open in Binary View")) ctx.gotoAddress(c.address);
+            ui::SameLineIfFits(ImGui::CalcTextSize("Copy address").x + ImGui::GetStyle().FramePadding.x * 2);
+            if (ImGui::SmallButton("Copy address")) {
+                char address[40]{};
+                std::snprintf(address, sizeof(address), "FILE:0x%llX", (unsigned long long)c.address);
+                ImGui::SetClipboardText(address);
+                ui::Toast(ui::ToastKind::Success, "Copied FILE address");
+            }
         }
         if (c.category == "network") {
             ui::SameLineIfFits(ImGui::CalcTextSize("Open network trail").x + ImGui::GetStyle().FramePadding.x * 2);
@@ -349,6 +374,29 @@ void BinaryTechTab::render(AppContext& ctx) {
             ImGui::TextColored(theme::col::muted(), "Source: %s", c.analyzer.c_str());
         ImGui::SeparatorText("Evidence");
         ImGui::TextWrapped("%s", c.detail.c_str());
+        if (c.hitCount) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextDisabled("%zu observed occurrence%s; %zu mapped location%s",
+                c.hitCount, c.hitCount == 1 ? "" : "s",
+                c.addresses.size(), c.addresses.size() == 1 ? "" : "s");
+            ImGui::PopTextWrapPos();
+        }
+        if (c.addresses.size() > 1 && ImGui::TreeNode("Mapped locations")) {
+            ImGui::BeginChild("##tech_locations", ImVec2(0, std::min(120.0f * scale,
+                ImGui::GetTextLineHeightWithSpacing() * static_cast<float>(c.addresses.size()) + 8.0f * scale)),
+                ImGuiChildFlags_Borders);
+            ImGuiListClipper locations;
+            locations.Begin(static_cast<int>(c.addresses.size()));
+            while (locations.Step()) for (int i = locations.DisplayStart; i < locations.DisplayEnd; ++i) {
+                char address[40]{};
+                std::snprintf(address, sizeof(address), "FILE:0x%llX", (unsigned long long)c.addresses[i]);
+                ImGui::PushID(i);
+                if (ImGui::Selectable(address)) ctx.gotoAddress(c.addresses[i]);
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            ImGui::TreePop();
+        }
         ImGui::Separator();
 
         if (c.addressValid && ctx.staticBinary().loaded()) {
@@ -359,16 +407,34 @@ void BinaryTechTab::render(AppContext& ctx) {
             } else if (vaIsExecutable(ctx.staticBinary(), c.address) &&
                        ctx.staticDisassembler()) {
                 ImGui::TextDisabled("Disassembly at 0x%llX:", (unsigned long long)c.address);
-                ui::PushMono();
-                auto insns = ctx.staticDisassembler()->disassemble(
-                    p, std::min<size_t>(avail, 80), c.address, 10);
-                for (auto& in : insns) {
-                    const std::string text = InstructionText(in);
-                    ImGui::Text("0x%llX  %s", (unsigned long long)in.address, text.c_str());
+                const DecoderConfig decoder = ctx.staticDecoderConfig();
+                if (!SameDocumentResultImage(previewOwner_, currentIdentity) ||
+                    previewAddress_ != c.address || previewDecoder_ != decoder) {
+                    previewLines_.clear();
+                    for (const auto& in : ctx.staticDisassembler()->disassemble(
+                             p, std::min<size_t>(avail, 80), c.address, 10))
+                        previewLines_.emplace_back(in.address, InstructionText(in));
+                    previewOwner_ = currentIdentity;
+                    previewAddress_ = c.address;
+                    previewDecoder_ = decoder;
                 }
+                ImGui::BeginChild("##tech_code", ImVec2(0, std::max(1.0f, std::min(200.0f * scale,
+                    ImGui::GetContentRegionAvail().y))), ImGuiChildFlags_None,
+                    ImGuiWindowFlags_HorizontalScrollbar);
+                ui::PushMono();
+                for (const auto& [address, text] : previewLines_)
+                    ImGui::Text("0x%llX  %s", (unsigned long long)address, text.c_str());
+                if (previewLines_.empty()) ImGui::TextDisabled("No instruction could be decoded at this address.");
                 ui::PopMono();
+                ImGui::EndChild();
             } else {
-                ImGui::TextDisabled("Data at 0x%llX (use Find references in the Binary View for call sites):", (unsigned long long)c.address);
+                ImGui::TextDisabled("Data at 0x%llX", (unsigned long long)c.address);
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+                ImGui::TextWrapped("Use Find references in Binary View to inspect call sites.");
+                ImGui::PopStyleColor();
+                ImGui::BeginChild("##tech_data", ImVec2(0, std::max(1.0f, std::min(120.0f * scale,
+                    ImGui::GetContentRegionAvail().y))), ImGuiChildFlags_None,
+                    ImGuiWindowFlags_HorizontalScrollbar);
                 ui::PushMono();
                 size_t n = std::min<size_t>(avail, 64);
                 for (size_t r = 0; r < n; r += 16) {
@@ -379,6 +445,7 @@ void BinaryTechTab::render(AppContext& ctx) {
                     ImGui::TextUnformatted(line);
                 }
                 ui::PopMono();
+                ImGui::EndChild();
             }
         }
     } else {

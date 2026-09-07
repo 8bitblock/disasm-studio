@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -48,7 +49,18 @@ enum class DbgState { Detached, Running, Paused, Terminated };
 // Lifecycle work has its own state: Starting/Stopping never grant authority to
 // read or modify a target. DbgState continues to describe the actual session.
 enum class DbgLifecycleState { Detached, Starting, Attached, Paused, Stopping, Failed };
-enum class DbgLifecycleCommand { None, Attach, Detach };
+enum class DbgLifecycleCommand { None, Attach, Detach, Launch, LaunchDll };
+
+// Values are retained by the lifecycle queue; no caller-owned plan or path is
+// borrowed after requestLaunch returns.
+struct DbgLaunchRequest {
+    std::string executable;
+    bool breakAtEntry = true;
+    bool containedJob = false;
+    std::optional<AuthorizationWatchPlan> authorizationPlan;
+    AuthorizationWatchOptions authorizationOptions{};
+    bool prelaunchNetworkObservation = false;
+};
 struct DbgLifecycleSnapshot {
     DbgLifecycleState state = DbgLifecycleState::Detached;
     DbgLifecycleCommand command = DbgLifecycleCommand::None;
@@ -98,6 +110,22 @@ struct MemRegion {
     uint32_t protect = 0, state = 0, type = 0;
     bool     read = false, write = false, exec = false;
 };
+
+struct DbgRegionResult {
+    DebugTargetIdentity target{};
+    std::vector<MemRegion> regions;
+    bool complete = false; // false retains only a useful prefix, never full scope
+    uint64_t coveredUntil = 0;
+    std::string error;
+};
+
+namespace debugger_detail {
+enum class RegionQueryStatus { Region, End, Failed };
+using RegionQuery = std::function<RegionQueryStatus(uint64_t, MemRegion&, std::string&)>;
+// Shared enumeration policy, injectable for failure/limit tests without a target.
+DbgRegionResult CollectMemoryRegions(uint64_t maximumAddress, const RegionQuery& query,
+                                     size_t regionLimit = 100'000);
+}
 
 // One independently verified live-memory mutation.  Batch submission is used
 // by Memory Tools' freeze scheduler so scattered address-table rows share one
@@ -208,6 +236,7 @@ TempBreakpointCleanupDisposition ClassifyTempBreakpointCleanup(
 } // namespace debugger_detail
 
 struct DbgSnapshot {
+    size_t traceOwnedSites = 0; // physical owners, including a failed older-generation restore
     DbgState                 state = DbgState::Detached;
     uint32_t                 pid = 0, tid = 0;     // tid = active/displayed thread
     uint64_t                 sessionGeneration = 0; // changes on every successful attach/launch
@@ -256,6 +285,8 @@ public:
     // means rejected (busy, stale identity, or invalid input). No join, Win32
     // attach, or cleanup executes on the caller. Poll completion by requestId.
     uint64_t requestAttach(uint32_t pid);
+    uint64_t requestLaunch(DbgLaunchRequest request, std::string* error = nullptr);
+    uint64_t requestLaunchDll(DllDebugLaunchPlan plan, std::string* error = nullptr);
     uint64_t requestDetach(DebugTargetIdentity expected = {});
     bool cancelLifecycle(uint64_t requestId);
     DbgLifecycleSnapshot lifecycleSnapshot();
@@ -319,6 +350,7 @@ public:
     void clearTraceCoverage();
     bool clearTraceCoverageForSession(DebugTargetIdentity expected);
     TraceCoverageSnapshot traceCoverageSnapshot() const;
+    bool traceCoverageSnapshotIfChanged(TraceCoverageSnapshot& retained) const;
 
     // ---- authorization / remembered-access observation --------------------
     // Plans use main-image RVAs and are bound atomically to a PID + debugger
@@ -524,6 +556,8 @@ public:
 
     // Snapshot of committed memory regions (VirtualQueryEx walk).
     std::vector<MemRegion> regions();
+    DbgRegionResult queryRegionsForSession(uint32_t expectedPid,
+                                           uint64_t expectedSessionGeneration);
     // Identity-checked counterpart for scan jobs whose region map belongs to a
     // captured debugger session. Selection, identity validation, and the
     // VirtualQueryEx walk share hProcMtx_, so a detach/reattach cannot relabel a
@@ -689,7 +723,7 @@ private:
     bool     ctxReadFull(void* hThread, Registers& out);
     bool     ctxWriteFull(void* hThread, const Registers& r);   // get-modify-set
     uint64_t ctxReadRip(void* hThread);
-    void     ctxSetRip(void* hThread, uint64_t rip);
+    bool     ctxSetRip(void* hThread, uint64_t rip);
 
     // Decode just enough about the instruction at `va` to drive stepping
     // (length + call/ret/rep classification). Reads debuggee memory.
@@ -745,6 +779,8 @@ private:
     std::thread lifecycleThread_;
     DbgLifecycleSnapshot lifecycle_{};
     DebugTargetIdentity lifecycleExpected_{};
+    std::optional<DbgLaunchRequest> lifecycleLaunch_;
+    std::optional<DllDebugLaunchPlan> lifecycleDllLaunch_;
     uint64_t nextLifecycleRequest_ = 0;
     bool lifecycleQueued_ = false;
     bool lifecycleShutdown_ = false;
@@ -813,7 +849,11 @@ private:
 
     // ---- invisible one-shot execution coverage breakpoints ----
     TraceCoverage                    traceCoverage_;
-    struct TraceBp { uint8_t orig = 0; uint64_t generation = 0; };
+    struct TraceBp {
+        uint8_t orig = 0;
+        uint64_t generation = 0;
+        uint64_t imageBase = 0; // MEM_IMAGE allocation, retired without writes on unload
+    };
     std::unordered_map<uint64_t, TraceBp> traceBps_;      // guarded by mtx_, not UI-visible bps_
     std::vector<uint64_t>            traceBpAddrs_;       // sorted mirror for readMemoryMasked
     bool                             pendingTraceStart_ = false;

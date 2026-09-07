@@ -23,7 +23,11 @@ public:
     // document is still addressable through the static compatibility accessors.
     bool prepareDocumentTransition(AppContext& ctx, DocumentId id, bool closing,
                                    std::string& error);
-    void retireDocument(DocumentId id);
+    void retireDocument(AppContext& ctx, DocumentId id);
+    bool prepareTypeDraftsForExit(AppContext& ctx);
+    // Global modal: must render even when a different feature tab is visible.
+    // Returns true to resume the app's ordinary verified exit path.
+    bool renderTypeDraftPrompt(AppContext& ctx);
 
     void advanceInvestigationSnapshot(
         AppContext& ctx,
@@ -59,6 +63,10 @@ private:
     uint64_t activeImageGeneration_ = 0;
     uint64_t activeChildInvestigationGeneration_ = 0;
     bool awaitingActiveRevalidation_ = false;
+    DocumentId pendingTypeDraft_{};
+    bool typeDraftExit_ = false;
+    bool openTypeDraftPrompt_ = false;
+    std::string typeDraftPromptError_;
 
     std::shared_ptr<const InvestigationSnapshot> investigationPublished_;
     uint64_t investigationGeneration_ = 0;

@@ -31,6 +31,49 @@ until that frame is left. For a top-level event without a GML caller, Out stops 
 the next verified GML boundary after the event leaves the active chain. A native breakpoint is a separate native pause and
 provides no GML variable-edit authority.
 
+## Read the instructions
+
+- **Readable GML** is on by default in Assembly and Graph. For example,
+  `push.v self.money` appears as **Read variable self.money**; `pop.v.v`
+  becomes **Write variable**, and `bf` becomes **Jump if false**.
+- GML keeps intermediate values on a temporary stack. A read or load adds a
+  value; arithmetic combines prepared values; a write assigns a prepared value
+  to a variable. `.v` means a dynamic GameMaker value whose type travels with it.
+- **Explain** adds each instruction's meaning alongside existing annotations.
+  Hover the instruction or select it in the evidence inspector for the full
+  explanation, expanded type names, and original bytecode. Resolved strings
+  appear as quoted text, and call arguments use ordinary words.
+- Turn off **Readable GML** for the original mnemonic and operands. This changes
+  presentation only: addresses, selections, breakpoints, and stepping are the
+  same. **Copy instruction** copies raw bytecode text; **Copy readable GML** in
+  an instruction's context menu copies the readable operation.
+- These labels explain individual bytecode operations. They do not reconstruct
+  source code or imply that unknown variable names, indices, or live values have
+  been resolved.
+
+## Resolve a value before scanning
+
+The `FILE` address beside an instruction such as **Read variable
+builtin.TotalNum** identifies that bytecode instruction inside the opened
+`data.win`; it is not the address of `builtin.TotalNum`'s current runtime storage.
+Use **Live variables** or a resolved **Watch** at a matching GML pause to obtain a
+canonical live slot and its value.
+
+For an available canonical numeric slot, explicitly right-click the value and
+choose **Prepare typed scan in Memory Tools (session)**. The current adapter
+prepares Real and Boolean payloads as 8-byte Float64 values, Int32 as a signed
+4-byte value, and Int64 as a signed 8-byte value. The handoff is bound to the
+current debugger session, retains the existing Memory Tools scope filters and
+address range, and prepares an exact first scan without running it; review the
+scope, then choose **First scan** yourself.
+
+For a manual live AOB search, select **LIVE** in **Sig Scanner**, or enable
+**Live process memory** in **Binary View > Search**, and enter hex bytes with `?`
+or `??` for each wildcard byte. Both searches run asynchronously across readable
+committed memory. Their status reports bytes read, incomplete or unreadable
+coverage, and the result cap, so a partial zero-match result is not presented as
+a complete search.
+
 ## Inspect, edit, and save watches
 
 - **Live frames** selects a verified frame. **Live variables** shows its locals,

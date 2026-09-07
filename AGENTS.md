@@ -13,6 +13,7 @@
 - `InstructionSemantics.h` retains typed machine effects in DataFlow results. Preserve unknown-operation inputs, LOCK/REP semantics, authoritative FlowInfo targets and line maps in both decompiler modes. Authorization evidence with conflicting comparison/destination/completeness claims cannot become proven branch evidence.
 - UI Attach/Detach use the bounded debugger lifecycle worker. Consume lifecycle completion before taking the confirming debugger snapshot, then validate exact target ownership. Starting/Stopping do not grant target authority. Network file operations use a bounded writer; queue drops/errors remain visible. Existing synchronous launch APIs fail fast during queued lifecycle work.
 - See `docs/WORKBENCH_PROGRESS.md` for the implemented scope, generated concept, verification and remaining architecture work. The optional `DsPowerShell` MSBuild property lets the build wrapper preserve its PowerShell Core host for resource verification.
+- GML instruction wording uses the display-only `Core/GmlInstructionText.h` helper. Assembly and Graph default to readable operations; the evidence inspector and tooltips retain full explanations and raw bytecode. Keep decoder mnemonics, operands, references, and flow authoritative for breakpoints/navigation. `.v` means a dynamic GameMaker value, `rem` is GML integer division, and unknown reference/stack identities stay unresolved. Explanations must not suppress or push ahead of destination links and analyst comments. See `docs/GAMEMAKER_DEBUGGING.md` and the decoder/production-object GML regressions.
 
 > Persistent context for this project. What we're building, why, where things are,
 > and the conventions to respect. Read this first in any new session.
@@ -431,3 +432,43 @@ src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 li
   (e.g. a header truncated mid-line). That's the mount, not the real file — the Read/Edit/Grep
   tools operate on the true Windows files. Work around it by testing the actual logic via a small
   standalone copy if needed.
+
+## September 2026 — five fixes and two additions
+
+- Fixed long project notes being truncated by the editor; dynamic UTF-8 text retains complete contents, with lossless rejection above the existing 1 MiB JSON token budget (including escapes) and explicit dirty tracking. The editor uses the shared project budget rather than the looser per-field notes bound.
+- Preserved dirty Types definitions across document switches and close/exit/replacement attempts; Save/Discard/Cancel addresses the exact owning image, keeps drafts on validation/storage failure, and refuses a durable Save for session-only live images.
+- Moved EXE, DLL, Authorization Watch and Adaptive Unpack launches onto the cancellable debugger lifecycle worker, preserving owned launch options and checking source-document ownership before completion navigation.
+- Added validity-bearing memory-region enumeration and carried incomplete coverage and query errors through Memory Tools scans, refinements and pointer results.
+- Removed the 3,000-row pinned FILE-reference truncation; retain the immutable complete source list, clip display, and filter incrementally with publication/name/function/ownership invalidation.
+- Added a persistent signature library with atomic JSON saves, backup recovery, native import/export, collision-safe merge and retryable errors. Target-specific match health remains ephemeral.
+- Added worker-backed x86/x64 register value origins before a selected FILE instruction, with source navigation/highlights and explicit call, memory, join, unknown-effect and budget boundaries. This is local static dependency evidence, not a runtime value prediction.
+- Implementation and verification details: `docs/SEVEN_IMPROVEMENTS_IMPLEMENTATION.md`; production-object regressions include `seven_improvements_fixture.inc`, `notes_editor_fixture.inc` and `value_origin_ui_fixture.inc`.
+
+## September 2026 — automatic analysis and tracing
+
+- Shared analysis scheduling publishes only runnable local capacity to the global arbiter; preserve same-owner interactive yielding, owner admission accounting, and borrowed-image mutation barriers.
+- Inferred non-returning target sets are canonical cache inputs for graph/triage/decompiler work. Coalescing unrelated passes must preserve pending CFG inputs; an explicit newer consuming request can clear them.
+- Trace requests wake the paused debug-event owner and drain before execution. Failed restoration retains physical trace ownership and a retryable Stop action, including across a failed restart. Traced image unloads retire address-only coverage.
+- Concurrent one-shot INT3 events require exact per-thread queued-hit provenance and checked RIP rewind; a restored one-shot does not need a new TF step. Preserve pre-existing user stepping and report incomplete detach cleanup honestly.
+- Trace planning uses independent decoder roots after invalid bytes: listing fallback alignment and inherited prefixes are presentation, not invisible-breakpoint authority. Candidate validation requires a proven decoded span. Keep per-frame work bounded and do not shade data, folded, provisional, or unavailable gaps as executed.
+- App retains revision-aware trace snapshots. Unchanged refreshes must not copy/sort the 65,536-site report; sort changed reports outside the recording lock. See docs/AUTO_ANALYSIS_TRACING.md and the production-object trace_workflow_fixture.inc regression.
+
+## September 2026 — live instruction address navigation
+
+- Fixed shared Binary View goto and Ctrl+G so bare numeric addresses follow the current FILE/LIVE view; explicit FILE:/VA:/LIVE: prefixes retain their meaning. The dedicated Live Assembly field uses the same routing.
+- Added exact debugger-snapshot module+hex-offset navigation, including quoted names and full paths. Reject missing/ambiguous modules, unknown extents, offsets outside the module, overflow and WOW64 address truncation; failures preserve the cursor/history and never become fuzzy symbol lookups.
+- Clarified that Memory Tools' Open in Live Assembly decodes the found storage bytes; accessing code requires its own instruction address. Direct scan-result read/write instruction capture remains unimplemented. See docs/LIVE_ADDRESS_NAVIGATION.md and navigation_workflow_fixture.inc.
+- Stabilized the navigator progress-bar regression by observing a bounded animation cycle; a legitimate zero-fill phase must not fail the draw assertion.
+- Verified the Release x64 build and full production-object static_listing_actions_test (zero failures); logs are build/peggle-live-navigation-build.log and build/peggle-live-navigation-tests.log. The later Peggle open-session verification is recorded below.
+
+## September 2026 — Peggle live target verification
+
+- Verified the reported missing signature against the open apps: `Peggle.exe` was the launcher, while its child `popcapgame1.exe` owned the actual game window. The identical 19-byte signature had zero launcher matches and one game match at 0045D88C.
+- Corrected the live attachment through Communications, repeated the unchanged LIVE signature scan successfully, and opened 0045D88F (`add [esi+eax*4+0x17C], ecx`) in Live Assembly. Resumed execution with that instruction selected; no game memory edits or breakpoints were made.
+- Added a bounded read-only, executable-path-checked diagnostic under build/peggle-target-diagnostic.ps1 and recorded the session evidence in docs/LIVE_ADDRESS_NAVIGATION.md. Game PIDs/addresses in that record are session observations, not durable target identities. Current process pickers do not expose parent relationships, so a name-only launcher search can hide the real game process.
+
+## September 2026 — patch byte restoration
+
+- Live patch originals and rollback buffers contain breakpoint-masked logical bytes, matching the checked debugger writer; never retain physical debugger INT3 overlays as original code.
+- Live revert composes only the removed span using PlanLivePatchRestoration. Whole-survivor replay can corrupt a third patch outside that span. Require exact session and patch-set ownership; FILE set toggles do not undo live writes.
+- See docs/PATCH_BYTE_RESTORATION.md, live_patch_original_test and the opt-in production-object patch_restoration_fixture.inc for regression coverage.

@@ -94,6 +94,7 @@ private:
         bool coverageTruncated = false;
         bool adopt = false;
         std::string status;
+        std::string mapWarning;
     };
 
     struct PointerRow {
@@ -184,6 +185,7 @@ private:
     void pumpScanCompletion();
     void clearScan(const char* status = nullptr);
     void rebuildScanPage();
+    bool applyScanPreset(const MemoryScanValue& value);
 
     // Viewer / region browser / pointer scanner ----------------------------
     void renderInspector(AppContext& ctx, const TargetToken& target);
@@ -191,7 +193,9 @@ private:
     void renderRegionBrowser(AppContext& ctx, const TargetToken& target);
     void renderPointerScanner(AppContext& ctx, const TargetToken& target);
     void refreshViewer(AppContext& ctx, const TargetToken& target, bool force);
-    void navigateViewer(uint64_t address, bool recordHistory = true);
+    void navigateViewer(uint64_t address, bool recordHistory = true,
+                        uint32_t selectionBytes = 1);
+    void consumeMemoryRequest(AppContext& ctx, const TargetToken& target);
     void startPointerScan(AppContext& ctx, const TargetToken& target);
     void cancelPointerScan();
     void pumpPointerCompletion();
@@ -272,6 +276,7 @@ private:
     uint64_t scanPageRevision_ = UINT64_MAX;
     uint64_t scanPageCachedStart_ = UINT64_MAX;
     std::string scanStatus_;
+    std::string scanMapWarning_; // retained across refinements of the same scope
     std::thread scanThread_;
     std::atomic<bool> scanRunning_{false};
     std::atomic<bool> scanCancel_{false};

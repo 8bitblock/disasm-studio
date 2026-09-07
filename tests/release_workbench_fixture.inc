@@ -100,8 +100,77 @@ static void checkReleaseWorkbench(const std::string& path) {
         CHECK(!f.tab->evidenceInspectorCollapsed_ && !f.tab->lowerDockCollapsed_);
         CHECK(f.tab->evidenceInspectorW_ == retainedEvidenceWidth);
         permanentNavigator();
+
+        // Responsive collapse must leave evidence reachable. The real rail
+        // button opens the same inspector in a bounded popup without changing
+        // any retained splitter or manual pane choice.
+        auto evidencePopup = [&]() -> ImGuiWindow* {
+            const auto& popups = ImGui::GetCurrentContext()->OpenPopupStack;
+            return popups.empty() ? nullptr : popups.back().Window;
+        };
+        auto popupBounds = [&] {
+            ImGuiWindow* popup = evidencePopup();
+            CHECK(popup != nullptr);
+            if (!popup) return;
+            const ImGuiViewport* host = ImGui::GetMainViewport();
+            CHECK(popup->Pos.x >= host->WorkPos.x);
+            CHECK(popup->Pos.y >= host->WorkPos.y);
+            CHECK(popup->Pos.x + popup->Size.x <= host->WorkPos.x + host->WorkSize.x + 1.0f);
+            CHECK(popup->Pos.y + popup->Size.y <= host->WorkPos.y + host->WorkSize.y + 1.0f);
+            CHECK(visibleText.find("Evidence inspector") != std::string::npos);
+            CHECK(visibleText.find("Open register editor") != std::string::npos);
+            CHECK(visibleText.find("Open Authorization trail") != std::string::npos);
+        };
+        auto openEvidencePopup = [&] {
+            releaseActivate(releaseWindow("##evidence_inspector"), "###evidence_toggle");
+            settle();
+            popupBounds();
+            CHECK(f.tab->evidenceInspectorW_ == retainedEvidenceWidth);
+        };
+        openEvidencePopup();
+        CHECK(!f.tab->evidenceInspectorCollapsed_ && !f.tab->lowerDockCollapsed_);
+        releaseActivate(evidencePopup(), "Close##evidence_popup");
+        settle();
+        CHECK(evidencePopup() == nullptr);
+        CHECK(!f.tab->evidenceInspectorCollapsed_);
+
+        // Dismissal and resize are presentation-only, including when the
+        // analyst had already collapsed the pane manually.
+        f.tab->evidenceInspectorCollapsed_ = true;
+        openEvidencePopup();
+        size = ImVec2(820, 560);
+        settle();
+        popupBounds();
+        CHECK(f.tab->evidenceInspectorCollapsed_);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, true);
+        paint();
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_Escape, false);
+        settle();
+        CHECK(evidencePopup() == nullptr);
+        CHECK(f.tab->evidenceInspectorCollapsed_);
+        size = ImVec2(1200.0f * scale, 800.0f * scale);
+        settle();
+
+        // Handoffs close the popup so its destination can be used immediately.
+        f.tab->lowerDockCollapsed_ = true;
+        openEvidencePopup();
+        releaseActivate(evidencePopup(), "Open register editor");
+        settle();
+        CHECK(evidencePopup() == nullptr);
+        CHECK(!f.tab->lowerDockCollapsed_ && !f.tab->lowerAdvancedMode_);
+        CHECK(f.tab->evidenceInspectorCollapsed_);
+        openEvidencePopup();
+        releaseActivate(evidencePopup(), "Open Authorization trail");
+        settle();
+        CHECK(evidencePopup() == nullptr);
+        CHECK(!f.tab->lowerDockCollapsed_ && f.tab->lowerAdvancedMode_);
+        CHECK(f.tab->evidenceInspectorCollapsed_);
+        f.tab->lowerAdvancedMode_ = false;
+        f.tab->evidenceInspectorCollapsed_ = false;
+        openEvidencePopup();
         size = wideSize;
         settle();
+        CHECK(evidencePopup() == nullptr);
         evidence = releaseWindow("##evidence_inspector");
         CHECK(evidence != nullptr);
         if (evidence) CHECK(evidence->Size.x >= 245.0f * scale);

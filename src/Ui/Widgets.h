@@ -74,7 +74,8 @@ int TabStrip(const char* id, const char* const* labels, int count, int active,
 // Thin vertical divider for the status bar segments.
 void StatusDivider();
 
-// "Key   value" row with a fixed-width muted key column (printf-style value).
+// Muted key + wrapping value (printf-style). Stacks in narrow detail panes;
+// the value remains the last item for caller tooltips.
 void KeyValueRow(const char* key, const char* fmt, ...);
 
 // Compact unboxed guidance for empty views: small glyph, title, muted subtitle,

@@ -2,7 +2,9 @@
 #include "../Core/FunctionFilter.h"
 #include "../Ui/Theme.h"
 #include "../Ui/Widgets.h"
+#include "../Ui/Fonts.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -129,6 +131,9 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
         "Live assembly and registers, or choose a process to attach",
         "Live memory tools when attached; FILE hex and types otherwise",
         "Compare baseline and candidate binaries"};
+    const auto nextSmallButton = [](const char* label) {
+        ui::SameLineIfFits(ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+    };
     const bool compact = ImGui::GetContentRegionAvail().x < 720.0f * scale;
     if (compact) {
         ImGui::SetNextItemWidth(130.0f * scale);
@@ -137,44 +142,49 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
         ui::ItemTooltip(hints[workflowPreset_]);
     }
     for (int i = 0; !compact && i < 4; ++i) {
-        if (i) ui::SameLineIfFits(ImGui::CalcTextSize(labels[i]).x + 24.0f * scale);
+        ui::PushMono();
+        const float pillWidth = ImGui::CalcTextSize(labels[i]).x +
+            (ImGui::GetStyle().FramePadding.x + 2.0f * scale) * 2.0f;
+        ui::PopMono();
+        if (i) ui::SameLineIfFits(pillWidth);
         const ImVec4 accent = theme::col::accent();
         if (ui::Pill(labels[i], labels[i], i == workflowPreset_ ? &accent : nullptr, hints[i])) applyWorkflow(ctx, i);
     }
-    ui::SameLineIfFits(110.0f * scale);
+    nextSmallButton("Activation trail");
     if (ImGui::SmallButton("Activation trail")) {
         lowerAdvancedMode_ = true;
         lowerDockCollapsed_ = false;
         ctx.openCrackmeTriage(TriageWorkspaceView::Authorization);
     }
-    ui::SameLineIfFits(55.0f * scale);
+    nextSmallButton("Registers");
     if (ImGui::SmallButton("Registers")) {
         focusRegistersTab_ = true;
         lowerAdvancedMode_ = false;
         lowerDockCollapsed_ = false;
     }
     ui::ItemTooltip("Show live registers. Double-click a value to edit while paused.");
-    ui::SameLineIfFits(55.0f * scale);
+    nextSmallButton("Types");
     if (ImGui::SmallButton("Types")) {
         focusTypesTab_ = lowerAdvancedMode_ = true;
         lowerDockCollapsed_ = false;
     }
-    ui::SameLineIfFits(120.0f * scale);
     const bool canPin = navigation_ && navigation_->current().valid && mainView_ >= 0 && mainView_ <= 5;
-    ImGui::BeginDisabled(!canPin);
     const bool pinned = mainView_ >= 0 && mainView_ < 8 && viewPins_[mainView_].valid;
+    nextSmallButton(pinned ? "Unpin view" : "Pin view");
+    ImGui::BeginDisabled(!canPin);
     if (ImGui::SmallButton(pinned ? "Unpin view" : "Pin view"))
         viewPins_[mainView_] = pinned ? DocumentLocation{} : navigation_->current();
     ImGui::EndDisabled();
     ui::ItemTooltip("A pinned representation retains its location when switching views. Unpinned FILE views share selection; LIVE keeps its own target location.");
-    ui::SameLineIfFits(110.0f * scale);
+    nextSmallButton(evidenceInspectorCollapsed_ && lowerDockCollapsed_ ? "Expand panes" : "Focus code");
     if (ImGui::SmallButton(evidenceInspectorCollapsed_ && lowerDockCollapsed_ ? "Expand panes" : "Focus code")) {
         const bool collapse = !(evidenceInspectorCollapsed_ && lowerDockCollapsed_);
         evidenceInspectorCollapsed_ = lowerDockCollapsed_ = collapse;
         analysisQueueCollapsed_ = collapse;
     }
 
-    // One clipped breadcrumb keeps the address visible even with long symbols.
+    // Source and address retain their own space; long filenames/symbols may
+    // shorten the context, but must never hide whether this is FILE or LIVE.
     std::string path = ctx.staticBinary().path();
     const size_t slash = path.find_last_of("/\\");
     if (slash != std::string::npos) path.erase(0, slash + 1);
@@ -184,7 +194,8 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
     const bool offset = location.valid && location.addressSpace == DocumentAddressSpace::FileOffset;
     const uint64_t address = location.valid ? location.va : cursorVA_;
     const bool valid = location.valid || cursorValid_;
-    std::string detail = path + (live ? " / LIVE" : offset ? " / FILE offset" : " / FILE");
+    const char* source = live ? "LIVE" : offset ? "FILE offset" : "FILE";
+    std::string detail = path;
     uint64_t fileVA = address;
     const bool mapped = !offset && (!live || exactLiveToStaticVA(ctx, address, fileVA));
     if (live && frameSnap_) {
@@ -215,20 +226,54 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
     else std::snprintf(addressText, sizeof(addressText), "Select a location");
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const float padding = 4.0f * scale;
+    const float gap = 10.0f * scale;
+    const float lineHeight = ImGui::GetTextLineHeight();
+    const float sourceWidth = ImGui::CalcTextSize(source).x;
     const float rightWidth = ImGui::CalcTextSize(addressText).x;
+    // At exceptionally narrow widths keep the address on its own second line.
+    const bool twoLines = width < sourceWidth + rightWidth + gap + padding * 2.0f;
+    const float height = lineHeight * (twoLines ? 2.0f : 1.0f) + padding * 2.0f;
+    ImGui::BeginDisabled(!valid);
+    const bool copied = ImGui::InvisibleButton("##location_breadcrumb", ImVec2(width, height),
+                                               ImGuiButtonFlags_EnableNav);
+    ImGui::EndDisabled();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool focused = ImGui::IsItemFocused();
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->PushClipRect(origin, ImVec2(origin.x + std::max(1.0f, width - rightWidth - 12.0f * scale), origin.y + ImGui::GetTextLineHeight()), true);
-    draw->AddText(origin, ImGui::GetColorU32(theme::col::muted()), detail.c_str());
+    if (hovered || focused) {
+        draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height),
+                            ImGui::GetColorU32(theme::col::panelHeader()), 2.0f * scale);
+        if (focused) draw->AddRect(origin, ImVec2(origin.x + width, origin.y + height),
+                                   ImGui::GetColorU32(theme::col::accent()), 2.0f * scale);
+    }
+    const ImVec2 textOrigin(origin.x + padding, origin.y + padding);
+    const float right = origin.x + width - padding;
+    const float addressX = twoLines ? textOrigin.x : right - rightWidth;
+    const float contextLeft = textOrigin.x + sourceWidth + gap;
+    const float contextRight = twoLines ? right : addressX - gap;
+    draw->PushClipRect(origin, ImVec2(origin.x + width, origin.y + height), true);
+    const ImU32 sourceColor = ImGui::GetColorU32(live ? theme::col::warn() : theme::col::accent());
+    draw->AddText(textOrigin, sourceColor, source);
+    if (contextRight > contextLeft) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::RenderTextEllipsis(draw, ImVec2(contextLeft, textOrigin.y),
+            ImVec2(contextRight, textOrigin.y + lineHeight), contextRight, contextRight,
+            detail.c_str(), detail.c_str() + detail.size(), nullptr);
+        ImGui::PopStyleColor();
+    }
+    draw->AddText(ImVec2(addressX, textOrigin.y + (twoLines ? lineHeight : 0.0f)),
+                  sourceColor, addressText);
     draw->PopClipRect();
-    draw->AddText(ImVec2(origin.x + std::max(0.0f, width - rightWidth), origin.y),
-        ImGui::GetColorU32(live ? theme::col::warn() : theme::col::accent()), addressText);
-    ImGui::InvisibleButton("##location_breadcrumb", ImVec2(width, ImGui::GetTextLineHeight()));
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s / %s\nClick to copy the location.", detail.c_str(), addressText);
-    if (valid && ImGui::IsItemClicked()) {
+    const std::string hint = std::string(source) + " / " + detail + " / " + addressText +
+        (valid ? "\nClick or focus and press Space to copy the location." : "");
+    ui::ItemTooltip(hint.c_str());
+    if (valid && copied) {
         char copy[64];
         std::snprintf(copy, sizeof(copy), "%s:0x%llX", live ? "LIVE" : offset ? "FILEOFF" : "FILE",
             static_cast<unsigned long long>(address));
         ImGui::SetClipboardText(copy);
+        ui::Toast(ui::ToastKind::Success, std::string("Copied ") + copy);
     }
 }
 

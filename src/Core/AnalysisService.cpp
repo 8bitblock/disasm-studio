@@ -364,6 +364,19 @@ static uint64_t xrefPolicyDigest() {
     return digest.finish();
 }
 
+static uint64_t noreturnInputsDigest(const std::vector<uint64_t>* targets) {
+    PassDigest digest;
+    // The resolver treats this snapshot as a set. Equivalent discovery order
+    // and duplicate entries must retain the same derived-result identity.
+    std::vector<uint64_t> ordered;
+    if (targets) ordered = *targets;
+    std::sort(ordered.begin(), ordered.end());
+    ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+    digest.u64(static_cast<uint64_t>(ordered.size()));
+    for (uint64_t target : ordered) digest.u64(target);
+    return digest.finish();
+}
+
 static uint64_t decompileInputsDigest(uint64_t lo, uint64_t hi,
                                       const DecompileNameMap* names,
                                       std::string_view signature,
@@ -380,9 +393,7 @@ static uint64_t decompileInputsDigest(uint64_t lo, uint64_t hi,
         digest.u64(chunk.address);
         digest.u64(chunk.size);
     }
-    digest.u64(noreturnTargets ? static_cast<uint64_t>(noreturnTargets->size()) : 0);
-    if (noreturnTargets)
-        for (uint64_t target : *noreturnTargets) digest.u64(target);
+    digest.u64(noreturnInputsDigest(noreturnTargets));
     std::vector<std::pair<uint64_t, std::string_view>> ordered;
     if (names) {
         ordered.reserve(names->size());
@@ -2049,31 +2060,40 @@ size_t EstimateAnalysisResultBytes(const AnalysisResult& result) {
 // preventing eight documents from each consuming a full eight-worker CPU pool.
 // No scheduler lock is held while decoding or while acquiring an owner mutex.
 struct AnalysisService::SharedScheduler {
+    struct Owner {
+        AnalysisService* service = nullptr;
+        unsigned capacity = 0;
+        unsigned admitted = 0; // includes the interval before the queue is claimed
+    };
     std::mutex mutex;
     std::condition_variable changed;
-    std::vector<AnalysisService*> owners;
+    std::vector<Owner> owners;
     unsigned running = 0;
-    std::atomic<unsigned> bestPending{3}; // interaction / active / background / idle
+    // Only owners with an available local worker can consume shared admission.
+    std::atomic<unsigned> bestRunnablePriority{3}; // interaction / active / background / idle
 
     static unsigned priority(const AnalysisService& service) {
-        if (!service.queuedJobs_.load(std::memory_order_acquire)) return 3;
+        if (service.quit_.load(std::memory_order_acquire) ||
+            !service.queuedJobs_.load(std::memory_order_acquire)) return 3;
         if (service.queuedInteractive_.load(std::memory_order_acquire)) return 0;
         return service.activeDocument_.load(std::memory_order_acquire) ? 1u : 2u;
     }
     void refreshLocked() {
         unsigned best = 3;
-        for (const AnalysisService* owner : owners)
-            best = (std::min)(best, priority(*owner));
-        bestPending.store(best, std::memory_order_release);
+        for (const Owner& owner : owners)
+            if (owner.admitted < owner.capacity)
+                best = (std::min)(best, priority(*owner.service));
+        bestRunnablePriority.store(best, std::memory_order_release);
     }
-    void add(AnalysisService* service) {
+    void add(AnalysisService* service, unsigned capacity) {
         std::lock_guard<std::mutex> lock(mutex);
-        owners.push_back(service);
+        owners.push_back({service, capacity, 0});
         refreshLocked();
     }
     void remove(AnalysisService* service) {
         std::lock_guard<std::mutex> lock(mutex);
-        owners.erase(std::remove(owners.begin(), owners.end(), service), owners.end());
+        owners.erase(std::remove_if(owners.begin(), owners.end(),
+            [service](const Owner& owner) { return owner.service == service; }), owners.end());
         refreshLocked();
         changed.notify_all();
     }
@@ -2084,20 +2104,33 @@ struct AnalysisService::SharedScheduler {
     }
     bool acquire(AnalysisService& service) {
         std::unique_lock<std::mutex> lock(mutex);
+        // Re-find after each wait: another service may register or unregister
+        // while changed.wait releases the scheduler mutex.
+        auto owner = [&]() -> Owner& {
+            return *std::find_if(owners.begin(), owners.end(),
+                [&service](const Owner& item) { return item.service == &service; });
+        };
         changed.wait(lock, [&] {
             return service.quit_.load(std::memory_order_acquire) ||
                 priority(service) == 3 ||
                 (running < AnalysisService::globalWorkerLimit() &&
-                 priority(service) <= bestPending.load(std::memory_order_acquire));
+                 owner().admitted < owner().capacity &&
+                 priority(service) <= bestRunnablePriority.load(std::memory_order_acquire));
         });
         if (service.quit_.load(std::memory_order_acquire) || priority(service) == 3)
             return false;
+        ++owner().admitted;
         ++running;
+        refreshLocked();
         return true;
     }
-    void release() {
+    void release(AnalysisService& service) {
         std::lock_guard<std::mutex> lock(mutex);
+        auto owner = std::find_if(owners.begin(), owners.end(),
+            [&service](const Owner& item) { return item.service == &service; });
+        --owner->admitted;
         --running;
+        refreshLocked();
         changed.notify_all();
     }
 };
@@ -2131,7 +2164,7 @@ AnalysisService::AnalysisService(DecoderFactory factory, unsigned workerCount)
     }
     n = (std::max)(1u, (std::min)(n, kMaxWorkerCount));
     threads_.reserve(n);
-    scheduler().add(this);
+    scheduler().add(this, n);
     try {
         for (unsigned i = 0; i < n; ++i)
             threads_.emplace_back([this, i] { threadMain(i); });
@@ -2318,7 +2351,7 @@ void AnalysisService::requestBulkImpl(const BinaryFile* bin, const DecoderConfig
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (epoch != epoch_.load(std::memory_order_acquire) || quit_.load()) return;
-        constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix;
+        constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin;
         // Do not let whole-image dependencies delay a requested function even
         // when a caller supplied both kinds in one request.
         if ((kinds & kTargeted) && (kinds & ~kTargeted)) {
@@ -2342,13 +2375,38 @@ void AnalysisService::requestBulkImpl(const BinaryFile* bin, const DecoderConfig
     cv_.notify_all();
 }
 
+void AnalysisService::requestValueOrigin(const BinaryFile* bin, const DecoderConfig& decoder,
+                                        uint64_t epoch, std::shared_ptr<const ValueOriginRequest> request) {
+    if (!request) return;
+    BulkJob job;
+    job.bin = bin;
+    job.decoder = bin ? DecoderConfigForImage(*bin, decoder) : decoder;
+    job.epoch = epoch;
+    job.kinds = K_ValueOrigin;
+    job.regionLo = request->functionVA;
+    job.regionHi = request->instructionVA;
+    job.regionValid = true;
+    job.valueOrigin = std::move(request);
+    std::vector<BulkJob> rejected;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (epoch != epoch_.load(std::memory_order_acquire) || quit_.load()) return;
+        enqueueLocked(std::move(job), rejected);
+        for (const auto& refused : rejected) finishModuleLocked(refused);
+        refreshPendingLocked();
+    }
+    for (const auto& refused : rejected)
+        publishFailure(refused, "analysis scheduler capacity reached; retry the request");
+    cv_.notify_all();
+}
+
 bool AnalysisService::interactive(const BulkJob& job) {
-    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix;
+    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin;
     return (job.kinds & kTargeted) != 0 || job.kinds == K_Listing;
 }
 
 void AnalysisService::enqueueLocked(BulkJob job, std::vector<BulkJob>& rejected) {
-    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix;
+    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin;
     for (BulkJob& queued : queue_) {
         if (queued.bin != job.bin || queued.modBase != job.modBase ||
             queued.epoch != job.epoch || queued.decoder != job.decoder ||
@@ -2359,6 +2417,12 @@ void AnalysisService::enqueueLocked(BulkJob job, std::vector<BulkJob>& rejected)
         // New snapshots win, including explicitly empty override definitions.
         // A request without project state must preserve the pending snapshot.
         if (!job.analysisOverrides) job.analysisOverrides = queued.analysisOverrides;
+        constexpr uint32_t kNoreturnConsumers = K_CallGraph | K_CrackmeTriage |
+                                               K_Decompile | K_Synthesis | K_PathExplore;
+        // A string/listing/xref refresh says nothing about another pass's CFG
+        // inputs. Only a newer consuming request may replace (or clear) them.
+        if (!(job.kinds & kNoreturnConsumers))
+            job.noreturnTargets = queued.noreturnTargets;
         if (!(job.kinds & K_Listing) && (queued.kinds & K_Listing)) {
             job.listingLayout = std::move(queued.listingLayout);
             job.listingRevision = queued.listingRevision;
@@ -2490,6 +2554,7 @@ void AnalysisService::publishFailure(const BulkJob& job, const char* message) no
         failure.regionLo = job.regionLo;
         failure.regionHi = job.regionHi;
         failure.regionValid = job.regionValid;
+        if (job.valueOrigin) failure.valueOriginRequestId = job.valueOrigin->requestId;
         failure.listingRevision = job.listingRevision;
         failure.listingTopologyGeneration = job.listingTopologyGeneration;
         if (job.kinds & K_ListingPrefix) {
@@ -2521,7 +2586,7 @@ void AnalysisService::threadMain(unsigned workerIndex) {
         {
             std::lock_guard<std::mutex> lk(mtx_);
             if (quit_.load() || queue_.empty()) {
-                scheduler().release();
+                scheduler().release(*this);
                 if (quit_.load()) return;
                 continue;
             }
@@ -2565,7 +2630,7 @@ void AnalysisService::threadMain(unsigned workerIndex) {
                 progPhase_.store((uint32_t)AnalysisPhase::Idle, std::memory_order_relaxed);
             }
         }
-        scheduler().release();
+        scheduler().release(*this);
         cv_.notify_all();
         cvIdle_.notify_all();
     }
@@ -2577,7 +2642,11 @@ void AnalysisService::runJob(BulkJob& job) {
             epoch_.load(std::memory_order_acquire) != job.epoch) return true;
         const unsigned priority = interactive(job) ? 0u :
             (activeDocument_.load(std::memory_order_acquire) ? 1u : 2u);
-        if (scheduler().bestPending.load(std::memory_order_acquire) < priority)
+        // An interaction queued behind this owner's busy workers needs one of
+        // those workers to yield. Other owners only yield to runnable work;
+        // a full local pool cannot consume their free global slots yet.
+        if ((!interactive(job) && queuedInteractive_.load(std::memory_order_acquire)) ||
+            scheduler().bestRunnablePriority.load(std::memory_order_acquire) < priority)
             job.yielded = true;
         return job.yielded;
     };
@@ -2623,6 +2692,7 @@ void AnalysisService::runJob(BulkJob& job) {
         if (r.synthValid) pass |= K_Synthesis;
         if (r.pathValid) pass |= K_PathExplore;
         if (r.decompValid) pass |= K_Decompile;
+        if (r.valueOrigin) pass |= K_ValueOrigin;
         if (pass && (job.publishedKinds & pass) == pass) return;
         r.epoch   = job.epoch;
         r.kinds   = job.kinds;
@@ -2636,9 +2706,25 @@ void AnalysisService::runJob(BulkJob& job) {
         job.publishedKinds |= pass;
     };
 
+    if ((job.kinds & K_ValueOrigin) && job.valueOrigin) {
+        const auto& request = *job.valueOrigin;
+        auto cancelled = [&] {
+            return superseded() || (request.cancellation && request.cancellation->load(std::memory_order_acquire));
+        };
+        auto value = BuildValueOrigin(*job.bin, *dis, job.decoder.arch, request, cancelled);
+        if (!cancelled() && !value.cancelled) {
+            AnalysisResult result;
+            result.valueOrigin = std::make_shared<const ValueOriginResult>(std::move(value));
+            result.valueOriginRequestId = request.requestId;
+            emit(std::move(result));
+        }
+        if (job.kinds == K_ValueOrigin) return;
+    }
+
     const uint64_t pristineHash = job.bin->contentHash();
     const uint64_t mappingInputs = binaryMappingInputsDigest(*job.bin);
     const uint64_t overrideDigest = DigestAnalysisOverrides(job.analysisOverrides.get());
+    const uint64_t noreturnDigest = noreturnInputsDigest(job.noreturnTargets.get());
     auto cacheKey = [&](AnalysisCachePass pass, uint64_t passInputs = 0) {
         PassDigest framedInputs;
         framedInputs.u64(mappingInputs);
@@ -2839,7 +2925,7 @@ void AnalysisService::runJob(BulkJob& job) {
     }
 
     if ((job.kinds & K_CallGraph) && !superseded()) {
-        const AnalysisCacheKey key = cacheKey(AnalysisCachePass::CallGraph);
+        const AnalysisCacheKey key = cacheKey(AnalysisCachePass::CallGraph, noreturnDigest);
         AnalysisResult cached;
         if (cacheLookup(key, cached) && cached.callGraphValid) {
             callEdges = cached.callEdges;
@@ -2975,6 +3061,9 @@ void AnalysisService::runJob(BulkJob& job) {
                      job.bin->bytes().size(), (std::numeric_limits<uint32_t>::max)())),
                  job.modBase);
         PassDigest inputs;
+        // Local decision CFGs also consume this snapshot even when their
+        // changed fallthrough does not alter the function-level call edges.
+        inputs.u64(noreturnDigest);
         inputs.u64(downstreamFunctionsDigest);
         inputs.u64(downstreamXrefDigest);
         inputs.u64(static_cast<uint64_t>(callEdges.size()));

@@ -69,6 +69,40 @@ private:
 };
 
 int main() {
+    // Notes share the parser's encoded-token budget, rather than an unrelated
+    // raw-text cap. The exact boundary must survive a real project round trip.
+    {
+        ProjectState notesState;
+        notesState.notes.assign(kProjectJsonStringTokenBytes, 'n');
+        CHECK(ProjectNotesFitPersistenceBudget(notesState.notes));
+        ProjectState reopenedNotes;
+        CHECK(DeserializeProject(SerializeProject(notesState), reopenedNotes));
+        CHECK(reopenedNotes.notes == notesState.notes);
+        notesState.notes.push_back('n');
+        CHECK(!ProjectNotesFitPersistenceBudget(notesState.notes));
+        CHECK(!DeserializeProject(SerializeProject(notesState), reopenedNotes));
+
+        // Exercise every control character, every short escape, literal slash,
+        // quotes/backslashes, and multi-byte UTF-8 against the real JSON encoder.
+        std::string block;
+        for (int c = 0; c < 0x20; ++c) block.push_back(static_cast<char>(c));
+        block += "\"\\/\xCE\xA9";
+        const size_t escapedBlockBytes = json::Dump(json::Value::Str(block), false).size() - 2;
+        notesState.notes.clear();
+        for (size_t i = 0; i < kProjectJsonStringTokenBytes / escapedBlockBytes; ++i)
+            notesState.notes += block;
+        notesState.notes.append(kProjectJsonStringTokenBytes % escapedBlockBytes, 'a');
+        CHECK(notesState.notes.size() < kProjectJsonStringTokenBytes);
+        CHECK(json::Dump(json::Value::Str(notesState.notes), false).size() ==
+              kProjectJsonStringTokenBytes + 2);
+        CHECK(ProjectNotesFitPersistenceBudget(notesState.notes));
+        CHECK(DeserializeProject(SerializeProject(notesState), reopenedNotes));
+        CHECK(reopenedNotes.notes == notesState.notes);
+        notesState.notes.push_back('\n');
+        CHECK(notesState.notes.size() < kProjectJsonStringTokenBytes);
+        CHECK(!ProjectNotesFitPersistenceBudget(notesState.notes));
+        CHECK(!DeserializeProject(SerializeProject(notesState), reopenedNotes));
+    }
     ProjectState st;
     st.hash       = 0xDEADBEEFCAFEF00Dull;     // exercise full 64-bit precision
     st.binaryPath = "C:/work/blob.bin";

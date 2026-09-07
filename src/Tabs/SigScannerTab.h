@@ -1,10 +1,16 @@
 #pragma once
 #include "ITab.h"
 #include "../Core/DocumentResultIdentity.h"
+#include "../Core/SigMatch.h"
+#include "../Core/SignatureLibrary.h"
 #include <atomic>
+#include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -27,6 +33,12 @@ private:
     void pollWorker(AppContext& ctx, const DocumentResultIdentity& currentIdentity,
                     const DbgSnapshot& snapshot);
     void cancelWorker(const char* status = "Scan cancelled.");
+    SignatureLibrary librarySnapshot() const;
+    void adoptLibrary(SignatureLibrary library);
+    void pollLibrary(AppContext& ctx);
+    void saveLibrary(SignatureLibrary candidate, std::string success);
+    void importLibrary();
+    void exportLibrary();
 
     struct Result   {
         uint64_t address;
@@ -34,10 +46,8 @@ private:
         std::string module;
         bool live = false; // result ownership is immutable; the toolbar may change later
     };
-    struct Sig      {
-        std::string name;
-        std::string pattern;
-        std::string health;
+    struct Sig : LibrarySignature {
+        std::string health = "n/a";
         int count = -1;
         bool countCapped = false;
     };
@@ -62,28 +72,74 @@ private:
         std::string summary;
         std::string error;
         bool truncated = false;
+        bool memoryMapComplete = true;
+        std::string memoryMapWarning;
+        uint64_t scopeBytes = 0;
+        uint64_t attemptedBytes = 0;
         uint64_t scannedBytes = 0;
+        size_t partialChunks = 0;
+        size_t unreadableChunks = 0;
     };
+
+    struct LivePatternRange {
+        uint64_t base = 0;
+        uint64_t size = 0;
+        std::string source;
+    };
+    using LivePatternReader =
+        std::function<size_t(uint64_t address, void* output, size_t size)>;
+    using LivePatternSourceCurrent = std::function<bool()>;
+    using LivePatternProgress =
+        std::function<void(uint64_t completed, uint64_t total)>;
+
+    // Win32-free scan core used by the LIVE jthread. Each bounded read owns a
+    // non-overlap prefix and includes only enough lookahead for boundary starts.
+    // False means cooperative cancellation; target/session failures are returned
+    // as a publishable WorkerResult error.
+    static bool scanLivePatternRanges(
+        const std::vector<LivePatternRange>& ranges,
+        const SigPattern& pattern, std::string_view patternText,
+        const LivePatternReader& reader,
+        const LivePatternSourceCurrent& sourceCurrent,
+        const LivePatternProgress& progress, const std::stop_token& stop,
+        WorkerResult& result, size_t hitCap, size_t chunkBytes);
+    static std::string formatLiveCoverage(const WorkerResult& result,
+                                          bool& partial);
 
     // Big enough to hold the largest signature buildSignature can hand off
     // (its 512-instruction x 16-byte cap -> ~24.5k chars of "XX " tokens), so a
     // multi-instruction "Create signature from selection" is never silently clipped.
     char patternInput_[32768] = "48 89 5C 24 ?? 57 48 83 EC 20";
-    char sigName_[64]       = "fn_init";
+    char sigName_[kMaxLibraryNameBytes + 1] = "fn_init";
     bool live_              = false;   // scan the attached process's memory instead of the file
     bool patternClipped_   = false;   // a handed-off signature was longer than patternInput_ (defensive; shows a warning)
-    // Starter example patterns; health/count are computed against the loaded binary.
-    std::vector<Sig>      sigs_{
-        { "fn_init",     "48 89 5C 24 ?? 57 48 83 EC 20", "?", -1 },
-        { "g_world_ptr", "48 8B 05 ?? ?? ?? ?? 48 85 C0", "?", -1 },
-        { "tick_hook",   "E8 ?? ?? ?? ?? 84 C0 74",       "?", -1 },
+    // Definitions survive restart; health and result ownership remain ephemeral.
+    std::vector<Sig> sigs_;
+    uint64_t libraryLastId_ = 0;
+    uint64_t selectedSignatureId_ = 0;
+    bool libraryStarted_ = false;
+    bool libraryReady_ = false;
+    bool libraryFailed_ = false;
+    std::string libraryStatus_;
+    std::optional<SignatureLibrary> libraryRetry_;
+    struct LibraryIoResult {
+        bool publish = false;
+        bool failed = false;
+        SignatureLibrary library;
+        std::optional<SignatureLibrary> retry;
+        std::string status;
     };
+    // One bounded I/O operation at a time; it owns its complete input and never
+    // accesses the UI or BinaryFile. Destruction joins before member storage dies.
+    std::future<LibraryIoResult> libraryIo_;
     std::vector<Result>   results_;
     bool                  resultsLive_ = false;
     uint32_t              resultsLivePid_ = 0;
     uint64_t              resultsLiveGeneration_ = 0;
     DocumentResultIdentity staticResultsOwner_;
     bool                  truncated_ = false;   // results hit the display cap (4096)
+    bool                  scanPartial_ = false; // LIVE map/read gaps or the result cap
+    std::string           scanCoverageStatus_; // retained, truthful LIVE coverage summary
     std::vector<Function> functions_;
     DocumentResultIdentity functionsOwner_;
     Engine                functionsEngine_ = Engine::Zydis;
@@ -91,7 +147,19 @@ private:
     DocumentResultIdentity healthOwner_;
     std::string           analyzeSummary_;
     std::string           workerStatus_;
-    char  fnFilter_[64] = "";
+    // Search indexes rebuild only when their publication or query changes.
+    char                  resultFilter_[128] = "";
+    char                  fnFilter_[128] = "";
+    std::string           cachedResultFilter_;
+    std::string           cachedFnFilter_;
+    std::vector<int>      visibleResults_;
+    std::vector<int>      visibleFunctions_;
+    bool                  resultsFilterDirty_ = true;
+    bool                  functionsFilterDirty_ = true;
+    int                   selectedResult_ = -1;
+    std::string           scanPattern_;
+    std::string           scanTarget_;
+    bool                  scanCompleted_ = false;
     int  requestedSub_ = -1;
     float progress_ = 0.0f;
 

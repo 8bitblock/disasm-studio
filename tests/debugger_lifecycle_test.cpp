@@ -44,9 +44,59 @@ static std::string read(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
 
+static void regionCoverageChecks(Debugger& debugger) {
+    using namespace ds::debugger_detail;
+    auto region = [](uint64_t at, MemRegion& out) {
+        out.base = at; out.size = 0x1000; out.state = 0x1000; out.read = true;
+    };
+    auto failure = CollectMemoryRegions(0xffff,
+        [&](uint64_t at, MemRegion& out, std::string& error) {
+            if (at == 0x2000) {
+                error = "injected query failure";
+                return RegionQueryStatus::Failed;
+            }
+            region(at, out); return RegionQueryStatus::Region;
+        });
+    check(!failure.complete && failure.regions.size() == 2 &&
+          failure.coveredUntil == 0x2000 && failure.error == "injected query failure",
+          "query failure must retain a labelled useful prefix");
+    const auto capped = CollectMemoryRegions(0xffff,
+        [&](uint64_t at, MemRegion& out, std::string&) {
+            region(at, out); return RegionQueryStatus::Region;
+        }, 2);
+    check(!capped.complete && capped.regions.size() == 2 &&
+          capped.coveredUntil == 0x2000 && !capped.error.empty(),
+          "region cap must never report complete scope");
+    const auto ended = CollectMemoryRegions(0xffff,
+        [&](uint64_t at, MemRegion& out, std::string&) {
+            if (at == 0x2000) return RegionQueryStatus::End;
+            region(at, out); return RegionQueryStatus::Region;
+        }, 2);
+    check(ended.complete && ended.regions.size() == 2 && ended.error.empty(),
+          "normal address-space end at the exact cap must remain complete");
+    const auto bounded = CollectMemoryRegions(0x1fff,
+        [&](uint64_t at, MemRegion& out, std::string&) {
+            region(at, out); return RegionQueryStatus::Region;
+        });
+    check(bounded.complete && bounded.coveredUntil == 0x2000,
+          "native address-space bound must complete normally");
+    const auto invalid = CollectMemoryRegions(UINT64_MAX,
+        [](uint64_t, MemRegion& out, std::string&) {
+            out.base = UINT64_MAX - 5; out.size = 10;
+            return RegionQueryStatus::Region;
+        });
+    check(!invalid.complete && invalid.regions.empty() && !invalid.error.empty(),
+          "overflow/non-advancing ranges must not become complete scope");
+    const auto stale = debugger.queryRegionsForSession(17, 19);
+    check(!stale.complete && stale.regions.empty() && !stale.error.empty() &&
+          DebugTargetIdentityMatches(stale.target, {17, 19}),
+          "stale memory map request must retain identity and report failure");
+}
+
 int main() {
     try {
         Debugger debugger;
+        regionCoverageChecks(debugger);
         check(debugger.requestAttach(0) == 0, "invalid PID must be rejected immediately");
         uint64_t cancelledRequest = 0;
         {
@@ -79,6 +129,73 @@ int main() {
         check(debugger.snapshot().state == DbgState::Paused && debugger.snapshot().pid == 17,
               "cancelling a queued attachment must preserve the previous session");
         debugger_detail::LifecycleTestAccess::syntheticSession(debugger, false);
+
+        // Both launch variants return immediately even while the lifecycle owner
+        // is unavailable. Cancellation before ownership never creates a target.
+        for (const bool dll : {false, true}) {
+            uint64_t launchId = 0;
+            {
+                auto owner = debugger_detail::LifecycleTestAccess::holdOwner(debugger);
+                const auto start = Clock::now();
+                std::string error;
+                if (dll) {
+                    DllDebugLaunchPlan plan;
+                    plan.valid = true;
+                    plan.executable = "never-launched-host.exe";
+                    plan.commandLine = "never-launched-host.exe fixture.dll";
+                    launchId = debugger.requestLaunchDll(plan, &error);
+                    plan.commandLine.clear();
+                } else {
+                    DbgLaunchRequest request;
+                    request.executable = "never-launched.exe";
+                    request.containedJob = true;
+                    request.prelaunchNetworkObservation = true;
+                    launchId = debugger.requestLaunch(request, &error);
+                    request.executable.clear();
+                }
+                check(launchId && error.empty(), "launch request was not admitted");
+                const auto pending = debugger.lifecycleSnapshot();
+                check(pending.busy && pending.state == DbgLifecycleState::Starting &&
+                      pending.command == (dll ? DbgLifecycleCommand::LaunchDll : DbgLifecycleCommand::Launch),
+                      "queued launch must publish its startup state");
+                check(debugger.requestAttach(UINT32_MAX) == 0, "launch queue must be single-flight");
+                check(!debugger.cancelLifecycle(launchId + 1), "stale launch cancellation accepted");
+                check(debugger.cancelLifecycle(launchId), "queued launch cancellation rejected");
+                check(Clock::now() - start < std::chrono::milliseconds(500),
+                      "launch request/cancellation blocked behind owner");
+            }
+            waitUntil([&] { return !debugger.lifecycleSnapshot().busy; },
+                      "cancelled launch did not finish");
+            const auto cancelled = debugger.lifecycleSnapshot();
+            check(cancelled.requestId == launchId && cancelled.cancelled &&
+                  !cancelled.succeeded && !cancelled.target.valid(),
+                  "cancelled launch acquired target authority");
+        }
+        {
+            debugger_detail::LifecycleTestAccess::syntheticSession(debugger, true);
+            std::string error;
+            check(debugger.requestLaunch({"never-launched.exe"}, &error) == 0,
+                  "async launch must not replace an existing attachment");
+            check(!debugger.launchAndAttachDll({}, error), "invalid DLL plan accepted");
+            check(debugger.snapshot().state == DbgState::Paused && debugger.snapshot().pid == 17,
+                  "invalid DLL plan must not tear down the existing session");
+            debugger_detail::LifecycleTestAccess::syntheticSession(debugger, false);
+        }
+        {
+            std::string error;
+            const auto missing = std::filesystem::temp_directory_path() /
+                ("ds_missing_launch_" + std::to_string(Clock::now().time_since_epoch().count())) /
+                "never.exe";
+            check(!std::filesystem::exists(missing), "missing-executable fixture unexpectedly exists");
+            const auto id = debugger.requestLaunch({missing.string()}, &error);
+            check(id != 0, "invalid executable startup was not queued");
+            waitUntil([&] { return !debugger.lifecycleSnapshot().busy; },
+                      "invalid executable startup did not finish");
+            const auto failed = debugger.lifecycleSnapshot();
+            check(failed.requestId == id && failed.completed && !failed.succeeded &&
+                  !failed.cancelled && !failed.target.valid() && !failed.error.empty(),
+                  "launch failure must retain an actionable completion");
+        }
 
         const auto failedRequest = debugger.requestAttach(UINT32_MAX);
         check(failedRequest > cancelledRequest, "request IDs must be monotone");

@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace ds {
@@ -40,6 +41,13 @@ private:
     bool  pending_  = false;
     std::string status_;
     char  filter_[64] = "";
+    std::string appliedFilter_;
+    std::vector<int> visible_;
+    bool filterDirty_ = true;
+    DocumentResultIdentity previewOwner_;
+    DecoderConfig previewDecoder_;
+    uint64_t previewAddress_ = 0;
+    std::vector<std::pair<uint64_t, std::string>> previewLines_;
 
     // Declared last so its destructor requests stop and joins before the mutex
     // and ready-result storage are destroyed.

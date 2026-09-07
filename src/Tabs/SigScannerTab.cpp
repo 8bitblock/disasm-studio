@@ -1,6 +1,7 @@
 #include "SigScannerTab.h"
 #include "../Core/BinaryFile.h"
 #include "../Core/FunctionAnalyzer.h"
+#include "../Core/FunctionFilter.h"
 #include "../Core/PatchSet.h"
 #include "../Core/ProcessManager.h"
 #include "../Core/Project.h"
@@ -17,8 +18,186 @@
 #include <limits>
 #include <memory>
 #include <utility>
+#include <chrono>
+#include <windows.h>
+#include <commdlg.h>
 
 namespace ds {
+
+namespace {
+bool signatureLibraryDialog(bool save, std::filesystem::path& path, std::string& error) {
+    std::vector<wchar_t> file(32768, L'\0');
+    if (save) wcscpy_s(file.data(), file.size(), L"signatures.dssig.json");
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = GetActiveWindow();
+    dialog.lpstrFilter = L"DisasmStudio signature library\0*.dssig.json;*.json\0All files\0*.*\0";
+    dialog.lpstrFile = file.data();
+    dialog.nMaxFile = static_cast<DWORD>(file.size());
+    dialog.lpstrDefExt = L"json";
+    dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    if (!(save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog))) {
+        if (const DWORD code = CommDlgExtendedError()) error = "Signature file dialog failed (" + std::to_string(code) + ").";
+        return false;
+    }
+    path = std::filesystem::path(file.data());
+    return true;
+}
+} // namespace
+
+SignatureLibrary SigScannerTab::librarySnapshot() const {
+    SignatureLibrary library;
+    library.lastId = libraryLastId_;
+    for (const auto& signature : sigs_) library.entries.push_back(signature);
+    return library;
+}
+
+void SigScannerTab::adoptLibrary(SignatureLibrary library) {
+    if (workerPending_ && activeWorkerKind_ == WorkerKind::Health)
+        cancelWorker("Signature library changed; recompute health for the new definitions.");
+    libraryLastId_ = library.lastId;
+    sigs_.clear();
+    sigs_.reserve(library.entries.size());
+    for (auto& entry : library.entries) {
+        Sig signature;
+        static_cast<LibrarySignature&>(signature) = std::move(entry);
+        sigs_.push_back(std::move(signature));
+    }
+    healthOwner_ = {};
+    if (std::none_of(sigs_.begin(), sigs_.end(), [&](const auto& entry) { return entry.id == selectedSignatureId_; }))
+        selectedSignatureId_ = 0;
+}
+
+void SigScannerTab::pollLibrary(AppContext& ctx) {
+    if (!libraryStarted_) {
+        libraryStarted_ = true;
+        libraryStatus_ = "Loading signature library...";
+        try {
+            libraryIo_ = std::async(std::launch::async, [] {
+                LibraryIoResult result;
+                const auto path = DefaultSignatureLibraryPath();
+                const auto loaded = LoadSignatureLibraryFile(path, result.library);
+                if (loaded.source != atomic_file::ReadSource::None) {
+                    result.publish = true;
+                    result.status = loaded.source == atomic_file::ReadSource::Backup
+                        ? "Recovered the signature library from its backup."
+                        : "Signature library loaded.";
+                } else if (loaded.missing) {
+                    result.library = StarterSignatureLibrary();
+                    result.publish = true;
+                    result.failed = !SaveSignatureLibraryFile(path, result.library, result.status);
+                    if (result.failed) result.retry = result.library;
+                    else result.status = "Created a persistent library with three example signatures.";
+                } else {
+                    result.failed = true;
+                    result.status = loaded.error + " Import a valid library or save a new signature to recover.";
+                }
+                return result;
+            });
+        } catch (const std::exception& error) {
+            libraryFailed_ = true; libraryReady_ = true;
+            libraryStatus_ = std::string("Could not start library loading: ") + error.what();
+        }
+    }
+    if (!libraryIo_.valid()) return;
+    ctx.wantContinuousRedraw = true;
+    if (libraryIo_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return;
+    try {
+        auto result = libraryIo_.get();
+        if (result.publish) adoptLibrary(std::move(result.library));
+        libraryFailed_ = result.failed;
+        libraryStatus_ = std::move(result.status);
+        if (result.publish || result.retry) libraryRetry_ = std::move(result.retry);
+    } catch (const std::exception& error) {
+        libraryFailed_ = true;
+        libraryStatus_ = std::string("Signature library operation failed: ") + error.what();
+    }
+    libraryReady_ = true;
+}
+
+void SigScannerTab::saveLibrary(SignatureLibrary candidate, std::string success) {
+    if (libraryIo_.valid()) return;
+    libraryRetry_ = candidate;
+    libraryStatus_ = "Saving signature library...";
+    libraryFailed_ = false;
+    try {
+        libraryIo_ = std::async(std::launch::async, [candidate = std::move(candidate), success = std::move(success)]() mutable {
+            LibraryIoResult result;
+            result.failed = !SaveSignatureLibraryFile(DefaultSignatureLibraryPath(), candidate, result.status);
+            if (result.failed) result.retry = std::move(candidate);
+            else {
+                result.publish = true;
+                result.library = std::move(candidate);
+                result.status = std::move(success);
+            }
+            return result;
+        });
+    } catch (const std::exception& error) {
+        libraryFailed_ = true;
+        libraryStatus_ = std::string("Could not start library saving: ") + error.what();
+    }
+}
+
+void SigScannerTab::importLibrary() {
+    std::filesystem::path path;
+    std::string error;
+    if (!signatureLibraryDialog(false, path, error)) {
+        if (!error.empty()) { libraryStatus_ = error; libraryFailed_ = true; }
+        return;
+    }
+    const auto current = librarySnapshot();
+    libraryStatus_ = "Importing and saving signature library...";
+    libraryFailed_ = false;
+    libraryRetry_.reset();
+    try {
+        libraryIo_ = std::async(std::launch::async, [path, current] {
+            LibraryIoResult result;
+            std::string text;
+            SignatureLibrary imported;
+            result.failed = true;
+            if (!atomic_file::Read(path, text, kMaxSignatureLibraryBytes)) {
+                result.status = "Cannot read the import file, or it exceeds 4 MiB.";
+                return result;
+            }
+            if (!ParseSignatureLibrary(text, imported, result.status) ||
+                !MergeSignatureLibrary(current, imported, result.library, result.status)) return result;
+            if (!SaveSignatureLibraryFile(DefaultSignatureLibraryPath(), result.library, result.status)) {
+                result.retry = result.library;
+                return result;
+            }
+            result.failed = false; result.publish = true;
+            result.status = "Imported " + std::to_string(result.library.entries.size() - current.entries.size()) +
+                " new signatures. Existing definitions were preserved; duplicates were skipped.";
+            return result;
+        });
+    } catch (const std::exception& exception) {
+        libraryFailed_ = true;
+        libraryStatus_ = std::string("Could not start library import: ") + exception.what();
+    }
+}
+
+void SigScannerTab::exportLibrary() {
+    std::filesystem::path path;
+    std::string error;
+    if (!signatureLibraryDialog(true, path, error)) {
+        if (!error.empty()) { libraryStatus_ = error; libraryFailed_ = true; }
+        return;
+    }
+    const auto current = librarySnapshot();
+    libraryStatus_ = "Exporting signature library...";
+    libraryFailed_ = false;
+    try {
+        libraryIo_ = std::async(std::launch::async, [path, current] {
+            LibraryIoResult result;
+            result.failed = !SaveSignatureLibraryFile(path, current, result.status);
+            if (!result.failed) result.status = "Signature library exported. Match counts and live addresses are excluded.";
+            return result;
+        });
+    } catch (const std::exception& exception) {
+        libraryFailed_ = true;
+        libraryStatus_ = std::string("Could not start library export: ") + exception.what();
+    }
+}
 
 // Parse "48 89 ?? 24" into a SigPattern (bytes + wildcard mask) via the shared
 // masked matcher's parser, which keeps identical semantics (single/double '?'
@@ -228,7 +407,169 @@ static uint64_t saturatingMultiply(uint64_t left, uint64_t right) {
     return left * right;
 }
 
+static std::string formatScanBytes(uint64_t bytes) {
+    constexpr const char* units[] = { "B", "KiB", "MiB", "GiB", "TiB" };
+    if (bytes < 1024) return std::to_string(bytes) + " B";
+    double value = static_cast<double>(bytes);
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < std::size(units)) {
+        value /= 1024.0;
+        ++unit;
+    }
+    char text[48]{};
+    std::snprintf(text, sizeof(text), "%.1f %s", value, units[unit]);
+    return text;
+}
+
 } // namespace
+
+bool SigScannerTab::scanLivePatternRanges(
+    const std::vector<LivePatternRange>& ranges,
+    const SigPattern& pattern, std::string_view patternText,
+    const LivePatternReader& reader,
+    const LivePatternSourceCurrent& sourceCurrent,
+    const LivePatternProgress& progress, const std::stop_token& stop,
+    WorkerResult& result, size_t hitCap, size_t chunkBytes) {
+    result.results.clear();
+    result.truncated = false;
+    result.scopeBytes = 0;
+    result.attemptedBytes = 0;
+    result.scannedBytes = 0;
+    result.partialChunks = 0;
+    result.unreadableChunks = 0;
+    result.error.clear();
+
+    if (pattern.empty() || pattern.mask.size() != pattern.size()) {
+        result.error = "live signature scan received an invalid or empty pattern";
+        return true;
+    }
+    if (!reader) {
+        result.error = "live signature scan has no target-memory reader";
+        return true;
+    }
+    if (sourceCurrent && !sourceCurrent()) {
+        result.error = "the debugger target changed before the live scan started";
+        return true;
+    }
+
+    for (const LivePatternRange& range : ranges) {
+        if (range.size && range.base > UINT64_MAX - range.size) {
+            result.error = "live signature scan range overflows the address space";
+            return true;
+        }
+        result.scopeBytes = result.scopeBytes > UINT64_MAX - range.size
+            ? UINT64_MAX : result.scopeBytes + range.size;
+    }
+    if (progress) progress(0, result.scopeBytes);
+
+    chunkBytes = (std::max<size_t>)(1, chunkBytes);
+    const size_t lookaheadMax = pattern.size() - 1;
+    if (chunkBytes > (std::numeric_limits<size_t>::max)() - lookaheadMax)
+        chunkBytes = (std::numeric_limits<size_t>::max)() - lookaheadMax;
+    if (!chunkBytes) chunkBytes = 1;
+
+    std::vector<uint8_t> buffer;
+    for (const LivePatternRange& range : ranges) {
+        for (uint64_t offset = 0; offset < range.size;) {
+            if (stop.stop_requested()) return false;
+            if (sourceCurrent && !sourceCurrent()) {
+                result.error = "the debugger target changed during the live scan";
+                return true;
+            }
+
+            const uint64_t remaining = range.size - offset;
+            const size_t owned = static_cast<size_t>((std::min<uint64_t>)(
+                remaining, static_cast<uint64_t>(chunkBytes)));
+            const size_t lookahead = static_cast<size_t>((std::min<uint64_t>)(
+                lookaheadMax, remaining - owned));
+            const size_t wanted = owned + lookahead;
+            buffer.resize(wanted);
+
+            size_t got = reader(range.base + offset, buffer.data(), wanted);
+            if (got > wanted) got = wanted;
+            if (stop.stop_requested()) return false;
+            if (sourceCurrent && !sourceCurrent()) {
+                result.error = "the debugger target changed during the live scan";
+                return true;
+            }
+
+            result.attemptedBytes = result.attemptedBytes > UINT64_MAX - owned
+                ? UINT64_MAX : result.attemptedBytes + owned;
+            const size_t ownedRead = (std::min)(got, owned);
+            result.scannedBytes = result.scannedBytes > UINT64_MAX - ownedRead
+                ? UINT64_MAX : result.scannedBytes + ownedRead;
+            if (!got) ++result.unreadableChunks;
+            else if (got < wanted) ++result.partialChunks;
+
+            if (got >= pattern.size()) {
+                size_t localLimit = 0;
+                if (hitCap) {
+                    localLimit = result.results.size() >= hitCap
+                        ? 1 : hitCap - result.results.size() + 1;
+                }
+                const auto hits = FindAllMaskedAccepted(
+                    buffer.data(), got, pattern, localLimit,
+                    [owned](size_t local) { return local < owned; });
+                for (const size_t local : hits) {
+                    result.results.push_back({
+                        range.base + offset + local,
+                        std::string(patternText), range.source, true });
+                    if (hitCap && result.results.size() > hitCap) {
+                        result.results.resize(hitCap);
+                        result.truncated = true;
+                        if (progress)
+                            progress(result.attemptedBytes, result.scopeBytes);
+                        return true;
+                    }
+                }
+            }
+
+            offset += owned;
+            if (progress) progress(result.attemptedBytes, result.scopeBytes);
+        }
+    }
+    return true;
+}
+
+std::string SigScannerTab::formatLiveCoverage(const WorkerResult& result,
+                                              bool& partial) {
+    const bool missingReadBytes = result.scannedBytes < result.attemptedBytes;
+    const bool unattemptedBytes = result.attemptedBytes < result.scopeBytes;
+    partial = result.truncated || !result.memoryMapComplete ||
+              result.partialChunks != 0 || result.unreadableChunks != 0 ||
+              missingReadBytes || unattemptedBytes;
+
+    std::string status = "LIVE coverage: " + formatScanBytes(result.scannedBytes) +
+        " read from " + formatScanBytes(result.scopeBytes) +
+        " enumerated readable committed memory";
+    if (!partial) return status + "; complete.";
+
+    status += "; partial";
+    if (result.truncated)
+        status += " (4,096-match cap reached; remaining memory may contain more matches)";
+    if (unattemptedBytes && !result.truncated)
+        status += "; not all enumerated memory was attempted";
+    if (result.partialChunks) {
+        status += "; " + std::to_string(result.partialChunks) + " short read";
+        if (result.partialChunks != 1) status += 's';
+    }
+    if (result.unreadableChunks) {
+        status += "; " + std::to_string(result.unreadableChunks) +
+            " unreadable chunk";
+        if (result.unreadableChunks != 1) status += 's';
+    }
+    if (missingReadBytes) {
+        status += "; " + formatScanBytes(result.attemptedBytes - result.scannedBytes) +
+            " of attempted memory was not returned";
+    }
+    if (!result.memoryMapComplete) {
+        status += "; memory map incomplete";
+        if (!result.memoryMapWarning.empty())
+            status += ": " + result.memoryMapWarning;
+    }
+    status += '.';
+    return status;
+}
 
 static DocumentResultIdentity currentStaticIdentity(const AppContext& ctx) {
     const BinaryFile& binary = ctx.staticBinary();
@@ -253,8 +594,9 @@ void SigScannerTab::cancelWorker(const char* status) {
 void SigScannerTab::scan(AppContext& ctx) {
     SigPattern pattern;
     const std::string patternText(patternInput_);
-    if (!parsePattern(patternText, pattern)) {
-        workerStatus_ = "Malformed signature pattern.";
+    if (patternClipped_ || !parsePattern(patternText, pattern)) {
+        workerStatus_ = patternClipped_ ? "The signature was truncated. Edit or replace it before scanning."
+                                       : "Use hex byte pairs and ? or ?? wildcard bytes, for example: 48 89 ?? 24.";
         ui::Toast(ui::ToastKind::Error, workerStatus_);
         return;
     }
@@ -269,9 +611,16 @@ void SigScannerTab::scan(AppContext& ctx) {
         ready_.reset();
     }
     results_.clear();
+    resultsFilterDirty_ = true;
+    selectedResult_ = -1;
+    scanPattern_ = patternText;
+    scanTarget_ = live_ ? "LIVE process memory" : ctx.staticBinary().path();
+    scanCompleted_ = false;
     staticResultsOwner_ = {};
     resultsLive_ = live_;
     truncated_ = false;
+    scanPartial_ = false;
+    scanCoverageStatus_.clear();
     progress_ = 0.0f;
     workerDone_.store(0, std::memory_order_release);
     workerTotal_.store(1, std::memory_order_release);
@@ -287,6 +636,7 @@ void SigScannerTab::scan(AppContext& ctx) {
         Debugger* debugger = &ctx.debug;
         const uint32_t pid = snapshot.pid;
         const uint64_t generation = snapshot.sessionGeneration;
+        scanTarget_ = "LIVE process " + std::to_string(pid);
         workerPending_ = true;
         activeWorkerKind_ = WorkerKind::LiveScan;
         activeWorkerOwner_ = {};
@@ -309,98 +659,98 @@ void SigScannerTab::scan(AppContext& ctx) {
                         if (!sameLiveSession(debugger, pid, generation)) {
                             result.error = "the debugger target changed before the live scan started";
                         } else {
-                            std::vector<MemRegion> regions = debugger->regions();
+                            DbgRegionResult mapped = debugger->queryRegionsForSession(
+                                pid, generation);
                             if (!sameLiveSession(debugger, pid, generation)) {
                                 result.error = "the debugger target changed while memory regions were collected";
-                            }
-                            ProcessManager manager;
-                            const std::vector<ModuleInfo> modules = manager.modules(pid);
-                            auto moduleAt = [&](uint64_t address) {
-                                for (const ModuleInfo& module : modules) {
-                                    if (address >= module.base && address - module.base < module.size)
-                                        return module.name.empty() ? module.path : module.name;
+                            } else {
+                                result.memoryMapComplete = mapped.complete;
+                                if (!mapped.complete) {
+                                    result.memoryMapWarning = mapped.error.empty()
+                                        ? "enumeration ended before the full address space"
+                                        : mapped.error;
                                 }
-                                return std::string("live");
-                            };
-                            auto protection = [](const MemRegion& region) {
-                                std::string text = " [";
-                                text += region.read ? 'r' : '-';
-                                text += region.write ? 'w' : '-';
-                                text += region.exec ? 'x' : '-';
-                                text += ']';
-                                return text;
-                            };
 
-                            constexpr size_t kChunk = 1u << 20;
-                            constexpr uint64_t kByteBudget = 512ull << 20;
-                            uint64_t total = 0;
-                            for (const MemRegion& region : regions) {
-                                if (!region.read || region.state != 0x1000 ||
-                                    region.size < pattern.size()) continue;
-                                const uint64_t room = kByteBudget - total;
-                                total += std::min(region.size, room);
-                                if (total == kByteBudget) break;
-                            }
-                            workerTotal_.store(std::max<uint64_t>(1, total),
-                                               std::memory_order_release);
-                            const size_t overlap = pattern.size() - 1;
-                            uint64_t scanned = 0;
-                            std::vector<uint8_t> buffer;
-                            for (const MemRegion& region : regions) {
-                                if (stop.stop_requested()) return;
-                                if (!region.read || region.state != 0x1000 ||
-                                    region.size < pattern.size()) continue;
-                                if (scanned >= kByteBudget) {
-                                    result.truncated = true;
-                                    break;
+                                ProcessManager manager;
+                                const std::vector<ModuleInfo> modules =
+                                    manager.modules(pid);
+                                auto moduleAt = [&](uint64_t address) {
+                                    for (const ModuleInfo& module : modules) {
+                                        if (address >= module.base &&
+                                            address - module.base < module.size)
+                                            return module.name.empty()
+                                                ? module.path : module.name;
+                                    }
+                                    return std::string("live");
+                                };
+                                auto protection = [](const MemRegion& region) {
+                                    std::string text = " [";
+                                    text += region.read ? 'r' : '-';
+                                    text += region.write ? 'w' : '-';
+                                    text += region.exec ? 'x' : '-';
+                                    text += ']';
+                                    return text;
+                                };
+                                auto appendMapWarning = [&](std::string_view warning) {
+                                    result.memoryMapComplete = false;
+                                    if (!result.memoryMapWarning.empty())
+                                        result.memoryMapWarning += "; ";
+                                    result.memoryMapWarning.append(warning);
+                                };
+
+                                std::vector<LivePatternRange> ranges;
+                                ranges.reserve(mapped.regions.size());
+                                for (const MemRegion& region : mapped.regions) {
+                                    if (!region.size || !region.read ||
+                                        region.state != MEM_COMMIT ||
+                                        (region.protect &
+                                            (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+                                        continue;
+                                    if (region.base > UINT64_MAX - region.size) {
+                                        appendMapWarning(
+                                            "an invalid overflowing region was skipped");
+                                        continue;
+                                    }
+                                    ranges.push_back({
+                                        region.base, region.size,
+                                        moduleAt(region.base) + protection(region) });
                                 }
-                                for (uint64_t offset = 0; offset < region.size;) {
-                                    if (stop.stop_requested()) return;
-                                    if (!sameLiveSession(debugger, pid, generation)) {
-                                        result.error = "the debugger target changed during the live scan";
-                                        break;
-                                    }
-                                    if (scanned >= kByteBudget) {
-                                        result.truncated = true;
-                                        break;
-                                    }
-                                    size_t want = (size_t)std::min<uint64_t>(
-                                        kChunk, std::min<uint64_t>(region.size - offset,
-                                                                  kByteBudget - scanned));
-                                    buffer.resize(want);
-                                    const size_t got = debugger->readMemoryMasked(
-                                        region.base + offset, buffer.data(), want);
-                                    if (!sameLiveSession(debugger, pid, generation)) {
-                                        result.error = "the debugger target changed during the live scan";
-                                        break;
-                                    }
-                                    scanned += got;
-                                    workerDone_.store(scanned, std::memory_order_release);
-                                    if (got >= pattern.size()) {
-                                        const size_t room = kResultCap + 1 - result.results.size();
-                                        for (size_t local : FindAllMasked(
-                                                 buffer.data(), got, pattern, room)) {
-                                            const uint64_t address = region.base + offset + local;
-                                            result.results.push_back({
-                                                address, patternText,
-                                                moduleAt(address) + protection(region), true });
-                                            if (result.results.size() > kResultCap) {
-                                                result.truncated = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (!result.error.empty() ||
-                                        result.results.size() > kResultCap) break;
-                                    if (got < want) break;
-                                    offset += want > overlap ? want - overlap : want;
+
+                                if (!sameLiveSession(debugger, pid, generation)) {
+                                    result.error =
+                                        "the debugger target changed while memory regions were prepared";
+                                } else {
+                                    LivePatternReader reader =
+                                        [debugger, pid, generation](
+                                            uint64_t address, void* output,
+                                            size_t size) {
+                                            return debugger->readMemoryMaskedForSession(
+                                                pid, generation, address,
+                                                output, size);
+                                        };
+                                    LivePatternSourceCurrent sourceCurrent =
+                                        [debugger, pid, generation] {
+                                            return sameLiveSession(
+                                                debugger, pid, generation);
+                                        };
+                                    LivePatternProgress reportProgress =
+                                        [this](uint64_t completed,
+                                               uint64_t total) {
+                                            workerTotal_.store(
+                                                (std::max<uint64_t>)(1, total),
+                                                std::memory_order_release);
+                                            workerDone_.store(
+                                                completed,
+                                                std::memory_order_release);
+                                        };
+                                    if (!scanLivePatternRanges(
+                                            ranges, pattern, patternText,
+                                            reader, sourceCurrent,
+                                            reportProgress, stop, result,
+                                            kResultCap, 1u << 20))
+                                        return;
                                 }
-                                if (!result.error.empty() ||
-                                    result.results.size() > kResultCap) break;
                             }
-                            result.scannedBytes = scanned;
-                            if (result.results.size() > kResultCap)
-                                result.results.resize(kResultCap);
                         }
                     } catch (const std::exception& exception) {
                         result.error = std::string("live signature scan failed: ") + exception.what();
@@ -640,6 +990,7 @@ void SigScannerTab::analyzeFunctions(AppContext& ctx) {
         return;
     }
     functions_.clear();
+    functionsFilterDirty_ = true;
     functionsOwner_ = {};
     analyzeSummary_.clear();
     workerDone_.store(0, std::memory_order_release);
@@ -762,16 +1113,27 @@ void SigScannerTab::pollWorker(AppContext& ctx,
         case WorkerKind::StaticScan:
         case WorkerKind::LiveScan: {
             results_ = std::move(ready->results);
+            resultsFilterDirty_ = true;
+            selectedResult_ = -1;
+            scanCompleted_ = true;
             resultsLive_ = ready->kind == WorkerKind::LiveScan;
             resultsLivePid_ = resultsLive_ ? ready->livePid : 0;
             resultsLiveGeneration_ = resultsLive_ ? ready->liveGeneration : 0;
             staticResultsOwner_ = resultsLive_ ? DocumentResultIdentity{} : ready->owner;
             truncated_ = ready->truncated;
-            char message[96];
-            std::snprintf(message, sizeof(message), "%s scan: %d match(es)%s.",
-                          resultsLive_ ? "Live" : "File", (int)results_.size(),
-                          truncated_ ? " (capped or byte-budget limited)" : "");
-            ui::Toast(truncated_ ? ui::ToastKind::Warn : ui::ToastKind::Info, message);
+            if (resultsLive_) {
+                scanCoverageStatus_ = formatLiveCoverage(*ready, scanPartial_);
+            } else {
+                scanPartial_ = truncated_;
+                scanCoverageStatus_ = truncated_
+                    ? "Partial results: the 4,096-match cap was reached. Refine the pattern; additional FILE matches may exist."
+                    : std::string{};
+            }
+            const std::string message = std::string(resultsLive_ ? "Live" : "File") +
+                " scan: " + std::to_string(results_.size()) + " match(es)" +
+                (scanPartial_ ? " (partial)." : ".");
+            ui::Toast(scanPartial_ ? ui::ToastKind::Warn : ui::ToastKind::Info,
+                      message);
             break;
         }
         case WorkerKind::Health:
@@ -789,6 +1151,7 @@ void SigScannerTab::pollWorker(AppContext& ctx,
             break;
         case WorkerKind::Functions:
             functions_ = std::move(ready->functions);
+            functionsFilterDirty_ = true;
             analyzeSummary_ = std::move(ready->summary);
             functionsOwner_ = ready->owner;
             functionsEngine_ = ctx.staticEngine();
@@ -804,6 +1167,7 @@ void SigScannerTab::pollWorker(AppContext& ctx,
 }
 
 void SigScannerTab::render(AppContext& ctx) {
+    pollLibrary(ctx);
     const DocumentResultIdentity currentIdentity = currentStaticIdentity(ctx);
     const DbgSnapshot snap = ctx.debug.snapshot();
     pollWorker(ctx, currentIdentity, snap);
@@ -816,21 +1180,35 @@ void SigScannerTab::render(AppContext& ctx) {
     if (staticResultsOwner_ &&
         !SameDocumentResultImage(staticResultsOwner_, currentIdentity)) {
         results_.clear();
+        resultsFilterDirty_ = true;
+        selectedResult_ = -1;
+        scanPattern_.clear();
+        scanTarget_.clear();
+        scanCompleted_ = false;
         staticResultsOwner_ = {};
         resultsLive_ = false;
         resultsLivePid_ = 0;
         resultsLiveGeneration_ = 0;
         truncated_ = false;
+        scanPartial_ = false;
+        scanCoverageStatus_.clear();
         progress_ = 0.0f;
     }
     if (resultsLive_ &&
         (!snap.attached() || snap.pid != resultsLivePid_ ||
          snap.sessionGeneration != resultsLiveGeneration_)) {
         results_.clear();
+        resultsFilterDirty_ = true;
+        selectedResult_ = -1;
+        scanPattern_.clear();
+        scanTarget_.clear();
+        scanCompleted_ = false;
         resultsLive_ = false;
         resultsLivePid_ = 0;
         resultsLiveGeneration_ = 0;
         truncated_ = false;
+        scanPartial_ = false;
+        scanCoverageStatus_.clear();
         progress_ = 0.0f;
     }
     if (functionsOwner_ &&
@@ -838,6 +1216,7 @@ void SigScannerTab::render(AppContext& ctx) {
          functionsEngine_ != ctx.staticEngine() ||
          functionsArch_ != ctx.staticArch())) {
         functions_.clear();
+        functionsFilterDirty_ = true;
         functionsOwner_ = {};
         analyzeSummary_.clear();
     }
@@ -869,6 +1248,7 @@ void SigScannerTab::render(AppContext& ctx) {
             ui::Toast(ui::ToastKind::Warn,
                       "Discarded a signature from an older static document image.");
         } else {
+            selectedSignatureId_ = 0;
             std::string signature = std::move(ctx.pendingSignature);
             ctx.clearPendingSignature();
             live_ = pendingLive;
@@ -878,80 +1258,161 @@ void SigScannerTab::render(AppContext& ctx) {
         }
     }
     ImGui::TextUnformatted("Signature Scanner");
-    ui::SameLineIfFits(300.0f * theme::UiScale());
-    ImGui::TextDisabled("Byte patterns, match health and functions");
+    ImGui::PushTextWrapPos();
+    ImGui::TextDisabled("Find byte patterns, check uniqueness and browse functions.");
+    ImGui::PopTextWrapPos();
 
     if (!ctx.staticBinary().loaded() && !snap.attached()) {
-        if (ui::EmptyState(DS_ICON_SEARCH, "Nothing to scan",
-                           "Open a binary to scan for byte patterns, or attach a process for live scans.",
-                           "Open Binary..."))
-            ctx.openBinaryDialog();
-        return;
+        if (ImGui::Button("Open Binary...")) ctx.openBinaryDialog();
+        ui::SameLineIfFits(ImGui::CalcTextSize("Your saved signature library is available below.").x);
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("Your saved signature library is available below.");
+        ImGui::PopTextWrapPos();
     }
 
-    // ---- Toolbar: pattern + scan + live | name + save | progress / warnings ----
+    // Source is chosen before computing availability, so mode changes cannot
+    // leave the Scan button enabled against the previous source for one frame.
     const float s = theme::UiScale();
-    const bool canScan = live_ ? snap.attached() : ctx.staticBinary().loaded();
-    ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x - 190.0f * s));
-    const bool enterScan = ImGui::InputTextWithHint("##pattern", "AA BB ?? DD pattern...", patternInput_,
-        sizeof(patternInput_), ImGuiInputTextFlags_EnterReturnsTrue);
-    if (ImGui::IsItemEdited()) patternClipped_ = false;
-    if (enterScan && canScan && !workerPending_) scan(ctx);
-    ui::SameLineIfFits(90.0f * s);
-    ImGui::BeginDisabled(!canScan || workerPending_);
-    if (ui::ToolbarIconButton(DS_ICON_SEARCH, "Scan",
-                              live_ ? "Scan the attached process's memory" : "Scan the loaded file"))
-        scan(ctx);
-    ImGui::EndDisabled();
-    ui::SameLineIfFits(70.0f * s);
-    if (ImGui::Checkbox("Live", &live_)) {
+    const auto buttonWidth = [](const char* label) {
+        return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    };
+    const bool previousLive = live_;
+    ImGui::Separator();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Scan target");
+    ui::SameLineIfFits(buttonWidth("FILE") + ImGui::GetFrameHeight());
+    if (ImGui::RadioButton("FILE", !live_)) live_ = false;
+    ui::SameLineIfFits(buttonWidth("LIVE") + ImGui::GetFrameHeight());
+    if (ImGui::RadioButton("LIVE", live_)) live_ = true;
+    ui::ItemTooltip("Scan readable committed memory in the attached debugger session, paused or running.");
+    if (previousLive != live_) {
         if (workerPending_) cancelWorker("Scan mode changed; scan cancelled.");
         results_.clear();
+        resultsFilterDirty_ = true;
+        selectedResult_ = -1;
+        scanPattern_.clear();
+        scanTarget_.clear();
+        scanCompleted_ = false;
         staticResultsOwner_ = {};
         resultsLive_ = live_;
         resultsLivePid_ = 0;
         resultsLiveGeneration_ = 0;
         truncated_ = false;
+        scanPartial_ = false;
+        scanCoverageStatus_.clear();
         progress_ = 0.0f;
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Scan the attached process's committed memory (works paused or running) instead of the file on disk.");
-    if (!canScan) ImGui::TextDisabled(live_ ? "Attach a process in Communications to scan live memory."
-                                                        : "Open a binary to scan file bytes.");
-    ImGui::SetNextItemWidth(std::min(190.0f * s, ImGui::GetContentRegionAvail().x));
-    ImGui::InputTextWithHint("##signame", "signature name", sigName_, sizeof(sigName_));
-    ui::SameLineIfFits(105.0f * s);
+    const bool canScan = live_ ? snap.attached() : ctx.staticBinary().loaded();
+    ui::SameLineIfFits(270.0f * s);
+    ImGui::PushTextWrapPos();
+    if (canScan && live_) ImGui::TextDisabled("Attached process %lu", static_cast<unsigned long>(snap.pid));
+    else if (canScan) ImGui::TextDisabled("Current image, including active patches");
+    else ImGui::TextDisabled(live_ ? "Attach a process in Communications."
+                                  : "Open a binary to scan file bytes.");
+    ImGui::PopTextWrapPos();
+
+    ImGui::TextDisabled("Byte pattern");
+    const float scanWidth = buttonWidth("Scan") +
+        (ui::IconsLoaded() ? ImGui::CalcTextSize(DS_ICON_SEARCH " ").x : 0.0f);
+    const float inputWidth = ImGui::GetContentRegionAvail().x;
+    const bool scanFits = inputWidth >= 360.0f * s + scanWidth;
+    ImGui::SetNextItemWidth(std::max(1.0f, inputWidth -
+        (scanFits ? scanWidth + ImGui::GetStyle().ItemSpacing.x : 0.0f)));
+    const bool enterScan = ImGui::InputTextWithHint("##pattern", "48 89 ?? 24  |  ? or ?? matches any byte", patternInput_,
+        sizeof(patternInput_), ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemEdited()) patternClipped_ = false;
+    ui::ItemTooltip("Hex byte pairs, with ? or ?? for any byte. Spaces are optional. Press Enter to scan.");
     SigPattern savePattern;
     const bool validPattern = !patternClipped_ && parsePattern(patternInput_, savePattern);
-    ImGui::BeginDisabled(workerPending_ || !validPattern);
-    if (ui::ToolbarIconButton(DS_ICON_SAVE, "Save Sig", validPattern
-        ? "Keep this pattern in Sig Health for this session"
-        : "Enter a valid byte pattern before saving")) {
-        if (healthOwner_ &&
-            !SameDocumentResultImage(healthOwner_, currentIdentity)) {
-            for (auto& signature : sigs_) {
-                signature.count = -1;
-                signature.health = "n/a";
-                signature.countCapped = false;
-            }
-            healthOwner_ = {};
+    if (enterScan && canScan && validPattern && !workerPending_) scan(ctx);
+    if (scanFits) ImGui::SameLine();
+    ImGui::BeginDisabled(!canScan || !validPattern || workerPending_);
+    if (ui::ToolbarIconButton(DS_ICON_SEARCH, "Scan", !canScan ? "Choose an available FILE or LIVE target."
+            : !validPattern ? "Enter valid hex byte pairs and optional ? or ?? wildcards."
+            : workerPending_ ? "Wait for the current work or cancel it first."
+            : live_ ? "Scan every readable committed region in the captured debugger session."
+                    : "Scan the current file image, including enabled patches.")) scan(ctx);
+    ImGui::EndDisabled();
+    ImGui::PushTextWrapPos();
+    if (patternClipped_) ImGui::TextColored(theme::col::warn(), "Pattern was truncated. Edit or replace it before scanning.");
+    else if (patternInput_[0] && !validPattern)
+        ImGui::TextColored(theme::col::warn(), "Use complete hex byte pairs and ? or ?? wildcard bytes.");
+    else if (validPattern) {
+        const size_t fixed = static_cast<size_t>(std::count(savePattern.mask.begin(), savePattern.mask.end(), true));
+        ImGui::TextDisabled("%zu bytes  /  %zu fixed  /  %zu wildcards", savePattern.size(), fixed, savePattern.size() - fixed);
+        if (!fixed) {
+            ui::SameLineIfFits(250.0f * s);
+            ImGui::TextColored(theme::col::warn(), "All wildcards: every offset can match.");
         }
-        Sig s2{ sigName_, patternInput_, ctx.staticBinary().loaded() ? "pending" : "n/a", -1 };
-        sigs_.push_back(std::move(s2));
-        if (ctx.staticBinary().loaded()) refreshHealth(ctx);
-        requestedSub_ = 2;
-        ui::Toast(ui::ToastKind::Success, "Signature added to Sig Health for this session.");
+    }
+    ImGui::PopTextWrapPos();
+
+    ImGui::SetNextItemWidth(std::min(190.0f * s, ImGui::GetContentRegionAvail().x));
+    ImGui::InputTextWithHint("##signame", "signature name", sigName_, sizeof(sigName_));
+    ui::SameLineIfFits(buttonWidth(selectedSignatureId_ ? "Update Sig" : "Save Sig") + ImGui::GetFrameHeight());
+    ImGui::BeginDisabled(workerPending_ || libraryIo_.valid() || !libraryReady_ || !validPattern || !sigName_[0]);
+    if (ui::ToolbarIconButton(DS_ICON_SAVE, selectedSignatureId_ ? "Update Sig" : "Save Sig",
+        "Save this named pattern in your persistent signature library")) {
+        auto candidate = librarySnapshot();
+        auto existing = std::find_if(candidate.entries.begin(), candidate.entries.end(),
+            [&](const auto& entry) { return entry.id == selectedSignatureId_; });
+        const bool creating = existing == candidate.entries.end();
+        if (creating && (candidate.lastId == UINT64_MAX || candidate.entries.size() >= kMaxLibrarySignatures)) {
+            libraryFailed_ = true;
+            libraryStatus_ = "The signature library is full or its identities are exhausted.";
+        } else {
+            LibrarySignature signature;
+            if (!creating) signature = *existing;
+            else signature.id = ++candidate.lastId;
+            signature.name = sigName_; signature.pattern = patternInput_;
+            // A changed pattern has new provenance. Retaining just its name
+            // preserves the original source instead of relabeling it on reuse.
+            if (creating || existing->pattern != signature.pattern) {
+                signature.architecture.clear(); signature.sourceHash.clear();
+                if (!live_ && ctx.staticBinary().loaded()) {
+                    signature.architecture = ArchName(ctx.staticArch());
+                    char hash[17]{};
+                    std::snprintf(hash, sizeof(hash), "%016llX", static_cast<unsigned long long>(ctx.staticBinary().contentHash()));
+                    signature.sourceHash = hash;
+                }
+            }
+            if (creating) candidate.entries.push_back(std::move(signature));
+            else *existing = std::move(signature);
+            saveLibrary(std::move(candidate), "Signature saved to the library. Recompute health for the current FILE image.");
+            requestedSub_ = 2;
+        }
     }
     ImGui::EndDisabled();
+    if (selectedSignatureId_) {
+        ui::SameLineIfFits(buttonWidth("New / save copy"));
+        if (ImGui::Button("New / save copy")) selectedSignatureId_ = 0;
+    }
+    ui::SameLineIfFits(buttonWidth("Import library"));
+    ImGui::BeginDisabled(!libraryReady_ || libraryIo_.valid() || workerPending_);
+    if (ImGui::Button("Import library")) importLibrary();
+    ImGui::EndDisabled();
+    ui::SameLineIfFits(buttonWidth("Export library"));
+    ImGui::BeginDisabled(!libraryReady_ || libraryIo_.valid());
+    if (ImGui::Button("Export library")) exportLibrary();
+    ImGui::EndDisabled();
+    if (!libraryStatus_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, libraryFailed_ ? theme::col::bad() : theme::col::muted());
+        ImGui::TextWrapped("%s", libraryStatus_.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (libraryRetry_ && !libraryIo_.valid()) {
+        if (ImGui::Button("Retry library save")) saveLibrary(*libraryRetry_, "Signature library saved.");
+        ui::SameLineIfFits(200.0f * s);
+        if (ImGui::Button("Discard pending library change")) {
+            libraryRetry_.reset(); libraryFailed_ = false;
+            libraryStatus_ = "Pending library change discarded; displayed definitions were kept.";
+        }
+    }
     if (workerPending_) {
         ui::SameLineIfFits(140.0f * s);
         ImGui::ProgressBar(progress_, ImVec2(140.0f * s, 0));
         ui::SameLineIfFits(80.0f * s);
         if (ImGui::SmallButton("Cancel##sigworker")) cancelWorker();
-    }
-    if (patternClipped_) {
-        ui::SameLineIfFits(170.0f * s);
-        ui::Badge("signature truncated", theme::col::warn());
     }
     if (!workerStatus_.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
@@ -969,43 +1430,91 @@ void SigScannerTab::render(AppContext& ctx) {
     if (ImGui::BeginTabBar("sigsub")) {
         const int selectSub = std::exchange(requestedSub_, -1);
         if (ImGui::BeginTabItem("Results", nullptr, selectSub == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
-            ImGui::Text("%d match(es)", (int)results_.size());
-            ui::SameLineIfFits(180.0f * s);
-            ImGui::TextDisabled(resultsLive_ ? "(live process memory)" : "(file on disk)");
-            if (truncated_) {
-                ui::SameLineIfFits(280.0f * s);
-                ImGui::TextColored(theme::col::warn(), "(capped at %d \xE2\x80\x94 refine the pattern)",
-                                   (int)results_.size());
+            ui::SearchBox("##resultfilter", "Filter address, module or pattern...", resultFilter_,
+                          sizeof(resultFilter_), std::min(310.0f * s, ImGui::GetContentRegionAvail().x));
+            if (resultsFilterDirty_ || cachedResultFilter_ != resultFilter_) {
+                const FunctionFilter filter(resultFilter_);
+                visibleResults_.clear();
+                visibleResults_.reserve(results_.size());
+                for (size_t i = 0; i < results_.size(); ++i) {
+                    const auto& result = results_[i];
+                    if (filter.matches(result.module, result.sig, result.address))
+                        visibleResults_.push_back(static_cast<int>(i));
+                }
+                cachedResultFilter_ = resultFilter_;
+                resultsFilterDirty_ = false;
             }
-            if (ImGui::BeginTable("res", 3,
+            ui::SameLineIfFits(225.0f * s);
+            ImGui::TextDisabled("%zu of %zu matches  /  %s", visibleResults_.size(), results_.size(),
+                                resultsLive_ ? "LIVE memory" : "FILE image");
+            if (!scanCoverageStatus_.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    scanPartial_ ? theme::col::warn() : theme::col::muted());
+                ImGui::TextWrapped("%s", scanCoverageStatus_.c_str());
+                ImGui::PopStyleColor();
+            }
+            if (!visibleResults_.empty()) {
+                ImGui::PushTextWrapPos();
+                ImGui::TextDisabled("Select a match to open its address. Right-click for copy actions.");
+                ImGui::PopTextWrapPos();
+            } else if (!results_.empty()) {
+                if (ui::EmptyState(DS_ICON_SEARCH, "No matches in this filter",
+                        "Try an address, module name or a shorter search. Escape clears the search field.", "Clear filter"))
+                    resultFilter_[0] = '\0';
+            } else if (workerPending_ && (activeWorkerKind_ == WorkerKind::StaticScan || activeWorkerKind_ == WorkerKind::LiveScan)) {
+                ui::EmptyState(DS_ICON_SEARCH, "Scanning for matches",
+                    "Results appear when the scan finishes. You can cancel above.");
+            } else if (scanCompleted_) {
+                ui::EmptyState(DS_ICON_SEARCH, "No byte-pattern matches",
+                    scanPartial_ ? "This scan was partial. Review its coverage status before treating zero matches as absence."
+                                 : "Check the selected target, shorten the pattern or use ?? for bytes that can change.");
+            } else {
+                ui::EmptyState(DS_ICON_SEARCH, "Find a byte pattern",
+                    "Enter hex bytes above and choose Scan, or select a saved pattern in Sig Health.");
+            }
+            if (!visibleResults_.empty() && ImGui::BeginTable("res", 3,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
-                    ImGuiTableFlags_Resizable,
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
                 ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 160.0f * s);
-                ImGui::TableSetupColumn("Signature");
-                ImGui::TableSetupColumn("Module");
+                ImGui::TableSetupColumn("Module / source", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                ImGui::TableSetupColumn("Pattern", ImGuiTableColumnFlags_WidthStretch, 1.0f);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 ImGuiListClipper clip;   // up to 4096 rows -> only build widgets for the visible ones
-                clip.Begin((int)results_.size());
+                clip.Begin((int)visibleResults_.size());
                 while (clip.Step())
-                    for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                    for (int vi = clip.DisplayStart; vi < clip.DisplayEnd; ++vi) {
+                        const int i = visibleResults_[static_cast<size_t>(vi)];
                         auto& r = results_[(size_t)i];
                         ImGui::TableNextRow();
-                        ImGui::PushID((void*)(uintptr_t)r.address);
+                        ImGui::PushID(i);
                         ImGui::TableSetColumnIndex(0);
                         char al[24]; std::snprintf(al, sizeof(al), "0x%llX", (unsigned long long)r.address);
                         // Live hits are runtime VAs -> open the live view; file hits are file VAs.
-                        if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        const auto navigate = [&] {
+                            selectedResult_ = i;
                             if (r.live)
                                 ctx.gotoAddressLive(
                                     r.address,
                                     { resultsLivePid_, resultsLiveGeneration_ });
                             else
                                 ctx.gotoAddress(r.address);
+                        };
+                        if (ImGui::Selectable(al, selectedResult_ == i, ImGuiSelectableFlags_SpanAllColumns)) navigate();
+                        if (ImGui::BeginPopupContextItem("##result_actions")) {
+                            if (ImGui::MenuItem(r.live ? "Open in Live Assembly" : "Open in Binary View")) navigate();
+                            ImGui::Separator();
+                            if (ImGui::MenuItem("Copy address")) ImGui::SetClipboardText(al);
+                            if (ImGui::MenuItem("Copy pattern")) ImGui::SetClipboardText(r.sig.c_str());
+                            if (ImGui::MenuItem("Copy module / source")) ImGui::SetClipboardText(r.module.c_str());
+                            ImGui::EndPopup();
                         }
-                        ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(r.sig.c_str());
-                        ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", r.module.c_str());
+                        ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(r.module.c_str());
+                        ui::ItemTooltip(r.module.c_str());
+                        ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", r.sig.c_str());
+                        // Signatures can be large; the table keeps one clipped row,
+                        // and copy preserves the complete pattern without a huge tooltip.
                         ImGui::PopID();
                     }
                 ImGui::EndTable();
@@ -1013,37 +1522,72 @@ void SigScannerTab::render(AppContext& ctx) {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Current Scan", nullptr, selectSub == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
-            ImGui::TextWrapped("Pattern: %s", patternInput_);
-            if (live_) ImGui::Text("Live process: %lu", static_cast<unsigned long>(snap.pid));
-            else ImGui::Text("Bytes loaded: %zu", ctx.staticBinary().bytes().size());
-            ImGui::ProgressBar(progress_, ImVec2(-1, 0));
+            // The editor stays available while work runs. Display the captured
+            // request here, never its subsequently edited name/pattern/target.
             if (workerPending_) {
+                const char* activity = activeWorkerKind_ == WorkerKind::Health ? "Checking signature health"
+                                     : activeWorkerKind_ == WorkerKind::Functions ? "Analyzing functions"
+                                     : activeWorkerKind_ == WorkerKind::LiveScan ? "Scanning LIVE memory"
+                                     : "Scanning FILE image";
+                ImGui::TextUnformatted(activity);
+                ImGui::ProgressBar(progress_, ImVec2(-1, 0));
                 const uint64_t done = workerDone_.load(std::memory_order_acquire);
                 const uint64_t total = workerTotal_.load(std::memory_order_acquire);
-                ImGui::TextDisabled("Background worker: %llu / %llu work units",
+                ImGui::TextDisabled("Progress: %llu / %llu work units",
                                     (unsigned long long)done,
                                     (unsigned long long)total);
                 if (ImGui::Button("Cancel current work")) cancelWorker();
             } else if (!workerStatus_.empty()) {
-                ImGui::TextColored(theme::col::bad(), "%s", workerStatus_.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
+                ImGui::TextWrapped("%s", workerStatus_.c_str());
+                ImGui::PopStyleColor();
+            } else if (scanCompleted_) {
+                ui::StatePill(scanPartial_ ? "PARTIAL" : "COMPLETE",
+                              scanPartial_ ? theme::col::warn() : theme::col::good());
+                ImGui::Text("%zu matches", results_.size());
+                if (!scanCoverageStatus_.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        scanPartial_ ? theme::col::warn() : theme::col::muted());
+                    ImGui::TextWrapped("%s", scanCoverageStatus_.c_str());
+                    ImGui::PopStyleColor();
+                }
             } else {
                 ImGui::TextDisabled("No signature work is currently queued.");
+            }
+            if (!scanPattern_.empty() && (!workerPending_ || activeWorkerKind_ == WorkerKind::StaticScan || activeWorkerKind_ == WorkerKind::LiveScan)) {
+                ImGui::Separator();
+                ImGui::TextDisabled("Captured scan target");
+                ImGui::TextWrapped("%s", scanTarget_.c_str());
+                ImGui::TextDisabled("Captured byte pattern");
+                if (ImGui::SmallButton("Copy scanned pattern")) ImGui::SetClipboardText(scanPattern_.c_str());
+                ImGui::BeginChild("##captured_pattern", ImVec2(0, std::max(ImGui::GetFrameHeight(),
+                                  std::min(130.0f * s, ImGui::GetContentRegionAvail().y))),
+                                  ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::TextUnformatted(scanPattern_.c_str());
+                ImGui::EndChild();
             }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Sig Health", nullptr, selectSub == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
-            ImGui::BeginDisabled(!ctx.staticBinary().loaded() || workerPending_);
+            ImGui::BeginDisabled(!ctx.staticBinary().loaded() || workerPending_ || !libraryReady_ || libraryIo_.valid());
             if (ImGui::Button("Recompute health")) refreshHealth(ctx);
             ImGui::EndDisabled();
+            ui::ItemTooltip("Count each saved pattern against the current FILE image, including active patches. A unique match is a useful signature candidate.");
             ui::SameLineIfFits(300.0f * s);
-            ImGui::TextDisabled(ctx.staticBinary().loaded() ? "FILE match counts: none / unique / multiple"
-                                                     : "Load a binary to score signatures.");
+            ImGui::TextDisabled("%zu saved signatures  /  %s", sigs_.size(), ctx.staticBinary().loaded()
+                ? "FILE match counts" : "Open a binary to check uniqueness");
             ImGui::PushTextWrapPos();
-            ImGui::TextDisabled("Session signatures: select to edit, double-click to scan in the selected FILE / Live mode.");
+            ImGui::TextDisabled("Saved library: select to edit, double-click to scan, right-click to remove. Counts belong to the current FILE image.");
             ImGui::PopTextWrapPos();
-            if (ImGui::BeginTable("health", 4,
+            uint64_t removeSignature = 0;
+            if (sigs_.empty()) {
+                ui::EmptyState(DS_ICON_SEARCH, libraryReady_ ? "Your signature library is empty" : "Loading signature library",
+                    libraryReady_ ? "Name and save a pattern above, or import an existing signature library."
+                                  : "Saved definitions will appear here when loading finishes.");
+            }
+            if (!sigs_.empty() && ImGui::BeginTable("health", 4,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
-                    ImGuiTableFlags_Resizable,
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 140.0f * s);
                 ImGui::TableSetupColumn("Pattern");
@@ -1058,13 +1602,33 @@ void SigScannerTab::render(AppContext& ctx) {
                     ImGui::PushID(index);
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
-                    if (ImGui::Selectable(s.name.empty() ? "(unnamed)" : s.name.c_str(), false,
+                    if (ImGui::Selectable(s.name.empty() ? "(unnamed)" : s.name.c_str(), s.id == selectedSignatureId_,
                             ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                        selectedSignatureId_ = s.id;
                         std::snprintf(patternInput_, sizeof(patternInput_), "%s", s.pattern.c_str());
                         std::snprintf(sigName_, sizeof(sigName_), "%s", s.name.c_str());
                         patternClipped_ = s.pattern.size() >= sizeof(patternInput_);
                         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && canScan && !workerPending_)
                             scan(ctx);
+                    }
+                    if (ImGui::IsItemHovered() && (!s.architecture.empty() || !s.sourceHash.empty())) {
+                        ImGui::SetTooltip("Source architecture: %s\nSource FILE hash: %s\nProvenance is descriptive; scanning uses the selected FILE / Live target.",
+                            s.architecture.empty() ? "unspecified" : s.architecture.c_str(),
+                            s.sourceHash.empty() ? "unspecified" : s.sourceHash.c_str());
+                    }
+                    if (ImGui::BeginPopupContextItem("##signature_actions")) {
+                        if (ImGui::MenuItem("Scan this pattern", nullptr, false, canScan && !workerPending_)) {
+                            selectedSignatureId_ = s.id;
+                            std::snprintf(patternInput_, sizeof(patternInput_), "%s", s.pattern.c_str());
+                            std::snprintf(sigName_, sizeof(sigName_), "%s", s.name.c_str());
+                            patternClipped_ = s.pattern.size() >= sizeof(patternInput_);
+                            scan(ctx);
+                        }
+                        if (ImGui::MenuItem("Copy pattern")) ImGui::SetClipboardText(s.pattern.c_str());
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("Remove from library", nullptr, false, !libraryIo_.valid() && !workerPending_))
+                            removeSignature = s.id;
+                        ImGui::EndPopup();
                     }
                     ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", s.pattern.c_str());
                     ImGui::TableSetColumnIndex(2);
@@ -1081,6 +1645,11 @@ void SigScannerTab::render(AppContext& ctx) {
                 }
                 ImGui::EndTable();
             }
+            if (removeSignature) {
+                auto candidate = librarySnapshot();
+                std::erase_if(candidate.entries, [&](const auto& entry) { return entry.id == removeSignature; });
+                saveLibrary(std::move(candidate), "Signature removed from the saved library.");
+            }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("All Functions", nullptr, selectSub == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
@@ -1090,42 +1659,71 @@ void SigScannerTab::render(AppContext& ctx) {
                 analyzeFunctions(ctx);
             }
             ImGui::EndDisabled();
-            ui::SameLineIfFits(200.0f * s);
-            ImGui::SetNextItemWidth(std::min(200.0f * s, ImGui::GetContentRegionAvail().x));
-            ImGui::InputTextWithHint("##fnfilter", "filter name...", fnFilter_, sizeof(fnFilter_));
-            ui::SameLineIfFits(330.0f * s);
+            ui::SameLineIfFits(290.0f * s);
+            ui::SearchBox("##fnfilter", "Filter function name or address...", fnFilter_, sizeof(fnFilter_),
+                          std::min(290.0f * s, ImGui::GetContentRegionAvail().x));
+            ui::ItemTooltip("Search names and hex addresses, ignoring case. Space-separated terms are combined; use -term to exclude and quotes for phrases. Escape clears the search.");
+            if (functionsFilterDirty_ || cachedFnFilter_ != fnFilter_) {
+                const FunctionFilter filter(fnFilter_);
+                visibleFunctions_.clear();
+                visibleFunctions_.reserve(functions_.size());
+                for (size_t i = 0; i < functions_.size(); ++i) {
+                    const auto& function = functions_[i];
+                    if (filter.matches(function.name, {}, function.address))
+                        visibleFunctions_.push_back(static_cast<int>(i));
+                }
+                cachedFnFilter_ = fnFilter_;
+                functionsFilterDirty_ = false;
+            }
+            ui::SameLineIfFits(190.0f * s);
+            ImGui::TextDisabled("%zu of %zu functions", visibleFunctions_.size(), functions_.size());
             ImGui::PushTextWrapPos();
             if (!analyzeSummary_.empty()) ImGui::TextDisabled("%s", analyzeSummary_.c_str());
-            else ImGui::TextDisabled("Recursive-descent + prologue + export sweep.");
+            else ImGui::TextDisabled("Discover function candidates in the current FILE image, then select an address to inspect it.");
             ImGui::PopTextWrapPos();
 
-            if (ImGui::BeginTable("fns", 3,
+            if (visibleFunctions_.empty()) {
+                if (!functions_.empty()) {
+                    if (ui::EmptyState(DS_ICON_SEARCH, "No functions match this filter",
+                            "Try a shorter name or a hex address. Escape clears the search field.", "Clear filter"))
+                        fnFilter_[0] = '\0';
+                } else if (workerPending_ && activeWorkerKind_ == WorkerKind::Functions) {
+                    ui::EmptyState(DS_ICON_SEARCH, "Discovering functions", "The analysis runs in the background. You can cancel above.");
+                } else {
+                    ui::EmptyState(DS_ICON_SEARCH, functionsOwner_ ? "No function candidates found" : "Explore the file's functions",
+                        !ctx.staticBinary().loaded() ? "Open a binary, then choose Analyze Functions."
+                        : functionsOwner_ ? "Check the selected architecture and the file's executable mappings."
+                                          : "Choose Analyze Functions to build the list for this FILE image.");
+                }
+            }
+            if (!visibleFunctions_.empty() && ImGui::BeginTable("fns", 3,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
-                    ImGuiTableFlags_Resizable,
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
                 ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 160.0f * s);
                 ImGui::TableSetupColumn("Name");
                 ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 70.0f * s);
                 ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
-                // Pre-filter into a dense index list so a uniform-height clipper can
-                // skip the off-screen rows (this list can hold thousands of entries).
-                std::vector<int> vis;
-                vis.reserve(functions_.size());
-                for (int i = 0; i < (int)functions_.size(); ++i)
-                    if (!fnFilter_[0] || functions_[(size_t)i].name.find(fnFilter_) != std::string::npos)
-                        vis.push_back(i);
                 ImGuiListClipper clip;
-                clip.Begin((int)vis.size());
+                clip.Begin((int)visibleFunctions_.size());
                 while (clip.Step())
                     for (int vi = clip.DisplayStart; vi < clip.DisplayEnd; ++vi) {
-                        auto& f = functions_[(size_t)vis[(size_t)vi]];
+                        auto& f = functions_[(size_t)visibleFunctions_[(size_t)vi]];
                         ImGui::TableNextRow();
                         ImGui::PushID((void*)(uintptr_t)f.address);
                         ImGui::TableSetColumnIndex(0);
                         char al[24]; std::snprintf(al, sizeof(al), "0x%llX", (unsigned long long)f.address);
                         if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns)) ctx.gotoAddress(f.address);
+                        if (ImGui::BeginPopupContextItem("##function_actions")) {
+                            if (ImGui::MenuItem("Open in Binary View")) ctx.gotoAddress(f.address);
+                            ImGui::Separator();
+                            if (ImGui::MenuItem("Copy address")) ImGui::SetClipboardText(al);
+                            if (ImGui::MenuItem("Copy function name")) ImGui::SetClipboardText(f.name.c_str());
+                            ImGui::EndPopup();
+                        }
                         ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(f.name.c_str());
+                        ui::ItemTooltip(f.name.c_str());
                         ImGui::TableSetColumnIndex(2); ImGui::Text("%u", f.size);
                         ImGui::PopID();
                     }

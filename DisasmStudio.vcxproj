@@ -152,6 +152,8 @@
     <ClCompile Include="src\Core\Project.cpp" />
     <ClCompile Include="src\Core\Decompiler.cpp" />
     <ClCompile Include="src\Core\DataFlow.cpp" />
+    <ClCompile Include="src\Core\ValueOrigin.cpp" />
+    <ClCompile Include="src\Core\SignatureLibrary.cpp" />
     <ClCompile Include="src\Core\TechScan.cpp" />
     <ClCompile Include="src\Core\ResourceDecode.cpp" />
     <ClCompile Include="src\Core\JavaScan.cpp" />
@@ -225,6 +227,7 @@
     <ClCompile Include="src\Tabs\BinaryViewOverview.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewWorkflow.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewTypes.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewValueOrigin.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewGml.cpp" />
     <ClCompile Include="src\Tabs\MemoryToolsTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryDiffTab.cpp" />
@@ -249,6 +252,7 @@
     <ClInclude Include="src\Ui\Fonts.h" />
     <ClInclude Include="src\Ui\Icons.h" />
     <ClInclude Include="src\Ui\Widgets.h" />
+    <ClInclude Include="src\Ui\NotesEditor.h" />
     <ClInclude Include="src\Ui\GraphViewport.h" />
     <ClInclude Include="src\Ui\CommandPalette.h" />
     <ClInclude Include="src\Ui\Splitter.h" />
@@ -295,6 +299,9 @@
     <ClInclude Include="src\Core\LivePatchOriginal.h" />
     <ClInclude Include="src\Core\Decompiler.h" />
     <ClInclude Include="src\Core\DataFlow.h" />
+    <ClInclude Include="src\Core\ValueOrigin.h" />
+    <ClInclude Include="src\Core\SignatureLibrary.h" />
+    <ClInclude Include="src\Tabs\BinaryViewValueOrigin.h" />
     <ClInclude Include="src\Core\TechScan.h" />
     <ClInclude Include="src\Core\JavaScan.h" />
     <ClInclude Include="src\Core\Inflate.h" />
@@ -302,6 +309,7 @@
     <ClInclude Include="src\Core\Findings.h" />
     <ClInclude Include="src\Core\JvmClass.h" />
     <ClInclude Include="src\Core\GameMakerArchive.h" />
+    <ClInclude Include="src\Core\GmlInstructionText.h" />
     <ClInclude Include="src\Core\GameMakerDebug.h" />
     <ClInclude Include="src\Core\GameMakerDebugProtocol.h" />
     <ClInclude Include="src\Core\GameMakerHelperImage.h" />
@@ -328,6 +336,7 @@
     <ClInclude Include="src\Core\CodeExport.h" />
     <ClInclude Include="src\Core\FirmwareSniffer.h" />
     <ClInclude Include="src\Core\TraceCoverage.h" />
+    <ClInclude Include="src\Core\TracePlan.h" />
     <ClInclude Include="src\Core\DllDebugPlan.h" />
     <ClInclude Include="src\Core\UnpackEngine.h" />
     <ClInclude Include="src\Core\PeUnpack.h" />

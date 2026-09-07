@@ -8,8 +8,10 @@
 // is backed by real data.
 //
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -20,6 +22,27 @@
 #include "../Disasm/IDisassembler.h"
 
 namespace ds {
+
+// The reader limits each encoded string token, excluding its surrounding quotes.
+// Notes must fit the same budget after json::Dump escapes their bytes. This is
+// a size check only; complete project validation still belongs to the store.
+inline constexpr size_t kProjectJsonStringTokenBytes = 1u * 1024u * 1024u;
+
+inline bool ProjectNotesFitPersistenceBudget(std::string_view notes) noexcept {
+    if (notes.size() > kProjectJsonStringTokenBytes) return false;
+    size_t encodedBytes = 0;
+    for (unsigned char c : notes) {
+        size_t cost = 1;
+        switch (c) {
+            case '"': case '\\': case '\n': case '\r': case '\t':
+            case '\b': case '\f': cost = 2; break;
+            default: if (c < 0x20) cost = 6; break;
+        }
+        if (cost > kProjectJsonStringTokenBytes - encodedBytes) return false;
+        encodedBytes += cost;
+    }
+    return true;
+}
 
 struct PjBookmark   { uint64_t address = 0; std::string label; };
 struct PjBreakpoint { uint64_t address = 0; std::string condition; };

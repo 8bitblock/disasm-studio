@@ -2106,7 +2106,7 @@ Responsiveness is engineered throughout: the full listing keeps a 64-bit virtual
 - Guessed function names, the inferred `guessSignature`, the instruction gloss, and the API-purpose strings are all **heuristic** and labelled as such (amber tint, "guessed name" tooltips, "signature is heuristic" banner).
 - **Keystone** assembly patching covers only x86/x64/A32/Thumb/A64; other arches can be disassembled (Capstone) but not assembled.
 - Conditional-branch evaluation, register hints, and the live string/pointer dereferences are **x86/x64 only** — consistent with the Win32 debugger, which never targets other arches.
-- Live string scanning and the various sweeps are **byte-capped** (256 MB strings/value search, 64 MB code search) and **hit-capped** for responsiveness; results may be truncated with a status note.
+- Live strings remain byte-capped at 256 MB and live code-reference sweeps at 64 MB. Live byte-pattern searches instead stream every captured readable committed region, retain a 4,096-hit cap, and report incomplete memory maps, short/unreadable reads, cancellation, and result truncation explicitly.
 - The naive live "Pseudo" line translator (`pseudoLine`/`buildPseudo`) is separate from the structured decompiler used by the Pseudocode views; the structured pipeline is the primary one.
 ## 08. The Other Workbench Tabs
 

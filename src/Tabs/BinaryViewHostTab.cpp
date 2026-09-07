@@ -1,6 +1,7 @@
 #include "BinaryViewHostTab.h"
 
 #include "imgui.h"
+#include "../Ui/Theme.h"
 
 #include <cstdio>
 #include <utility>
@@ -129,14 +130,24 @@ bool BinaryViewHostTab::prepareDocumentTransition(AppContext& ctx, DocumentId id
         return false;
     }
 
+    if (closing && child.hasUnsavedTypeDraft()) {
+        ctx.setTypeDraftPending(id, true);
+        pendingTypeDraft_ = id;
+        typeDraftExit_ = false;
+        openTypeDraftPrompt_ = true;
+        typeDraftPromptError_.clear();
+        error = "Resolve the unsaved Types draft to close this document.";
+        return false;
+    }
+
     if (ctx.staticDocumentId() == id)
         return child.prepareDocumentTransition(ctx, closing, error);
 
     // An inactive child was mirrored during its last deactivation. Its Project
     // cannot be touched through ctx (which now names another document), but close
-    // still must join its symbol worker before Core releases binary ownership.
+    // still must retire its document-owned workers before Core releases ownership.
     if (closing) {
-        child.retireDocument();
+        child.retireDocument(ctx);
         return true;
     }
 
@@ -144,11 +155,69 @@ bool BinaryViewHostTab::prepareDocumentTransition(AppContext& ctx, DocumentId id
     return false;
 }
 
-void BinaryViewHostTab::retireDocument(DocumentId id) {
+bool BinaryViewHostTab::prepareTypeDraftsForExit(AppContext& ctx) {
+    for (const auto& document : ctx.staticDocuments()) {
+        const auto found = children_.find(document.id.value);
+        if (found == children_.end() || !found->second || !found->second->hasUnsavedTypeDraft()) continue;
+        pendingTypeDraft_ = document.id;
+        ctx.setTypeDraftPending(document.id, true);
+        typeDraftExit_ = true;
+        openTypeDraftPrompt_ = true;
+        typeDraftPromptError_.clear();
+        return false;
+    }
+    return true;
+}
+
+bool BinaryViewHostTab::renderTypeDraftPrompt(AppContext& ctx) {
+    if (openTypeDraftPrompt_) {
+        ImGui::OpenPopup("Unsaved Types definition");
+        openTypeDraftPrompt_ = false;
+    }
+    bool resumeExit = false;
+    ImGui::SetNextWindowSize(ImVec2(480.0f * theme::UiScale(), 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Unsaved Types definition", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto found = children_.find(pendingTypeDraft_.value);
+        BinaryViewTab* child = found == children_.end() ? nullptr : found->second.get();
+        if (!child) {
+            pendingTypeDraft_ = {};
+            ImGui::CloseCurrentPopup();
+        } else {
+            std::string title;
+            for (const auto& document : ctx.staticDocuments())
+                if (document.id == pendingTypeDraft_) title = document.title;
+            ImGui::TextWrapped("%s has an unsaved definition: %s", title.c_str(), child->typeDraftName().c_str());
+            ImGui::TextWrapped("Save the definition, discard the draft, or cancel %s.", typeDraftExit_ ? "exit" : "closing this document");
+            if (!typeDraftPromptError_.empty())
+                ImGui::TextColored(theme::col::bad(), "%s", typeDraftPromptError_.c_str());
+            bool resolved = false;
+            if (ImGui::Button("Save")) resolved = child->saveTypeDraft(ctx, true, typeDraftPromptError_);
+            ImGui::SameLine();
+            if (ImGui::Button("Discard")) { child->discardTypeDraft(ctx); resolved = true; }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                pendingTypeDraft_ = {};
+                typeDraftPromptError_.clear();
+                ImGui::CloseCurrentPopup();
+            } else if (resolved) {
+                if (typeDraftExit_ || ctx.queueCloseStaticDocument(pendingTypeDraft_)) {
+                    resumeExit = typeDraftExit_;
+                    pendingTypeDraft_ = {};
+                    typeDraftPromptError_.clear();
+                    ImGui::CloseCurrentPopup();
+                } else typeDraftPromptError_ = ctx.documentCommandError();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    return resumeExit;
+}
+
+void BinaryViewHostTab::retireDocument(AppContext& ctx, DocumentId id) {
     if (!id) return;
     auto it = children_.find(id.value);
     if (it != children_.end()) {
-        if (it->second) it->second->retireDocument();
+        if (it->second) it->second->retireDocument(ctx);
         children_.erase(it);
     }
     if (activeDocument_ == id) {

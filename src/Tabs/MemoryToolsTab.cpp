@@ -135,6 +135,27 @@ MemoryValueType valueTypeForKind(int kind, bool signedInteger) {
     }
 }
 
+bool controlsForValueType(MemoryValueType type, int& kind,
+                          bool& signedInteger) noexcept {
+    signedInteger = false;
+    switch (type) {
+        case MemoryValueType::UInt8:    kind = 0; return true;
+        case MemoryValueType::Int8:     kind = 0; signedInteger = true; return true;
+        case MemoryValueType::UInt16:   kind = 1; return true;
+        case MemoryValueType::Int16:    kind = 1; signedInteger = true; return true;
+        case MemoryValueType::UInt32:   kind = 2; return true;
+        case MemoryValueType::Int32:    kind = 2; signedInteger = true; return true;
+        case MemoryValueType::UInt64:   kind = 3; return true;
+        case MemoryValueType::Int64:    kind = 3; signedInteger = true; return true;
+        case MemoryValueType::Float32:  kind = 4; return true;
+        case MemoryValueType::Float64:  kind = 5; return true;
+        case MemoryValueType::ByteArray:kind = 6; return true;
+        case MemoryValueType::Utf8:     kind = 7; return true;
+        case MemoryValueType::Utf16Le:  kind = 8; return true;
+        default: return false;
+    }
+}
+
 bool scanModeNeedsValue(MemoryScanMode mode) {
     return mode == MemoryScanMode::Exact || mode == MemoryScanMode::NotEqual ||
            mode == MemoryScanMode::GreaterThanValue ||
@@ -525,9 +546,9 @@ std::vector<MemoryToolsTab::TargetRegion> MemoryToolsTab::collectRegions(
         return output;
     }
     if (target.source == TargetSource::Debugger && debugger) {
-        const auto regions = debugger->regionsForSession(target.pid, target.generation);
-        output.reserve(regions.size());
-        for (const MemRegion& region : regions) {
+        const auto result = debugger->queryRegionsForSession(target.pid, target.generation);
+        output.reserve(result.regions.size());
+        for (const MemRegion& region : result.regions) {
             output.push_back({ region.base, region.size, region.allocationBase,
                 region.protect, region.state, region.type, region.read,
                 region.write, region.exec,
@@ -535,6 +556,8 @@ std::vector<MemoryToolsTab::TargetRegion> MemoryToolsTab::collectRegions(
                 (region.protect & PAGE_GUARD) != 0,
                 (region.protect & 0xFFu) == PAGE_NOACCESS });
         }
+        if (!result.complete) error = "Incomplete scope: " +
+            (result.error.empty() ? std::string("debugger memory map is partial") : result.error);
     } else if (target.source == TargetSource::Passive && passive) {
         ProcessMemoryRegionResult result = passive->committedRegions(
             { target.pid, target.creationTime, target.generation });
@@ -545,8 +568,8 @@ std::vector<MemoryToolsTab::TargetRegion> MemoryToolsTab::collectRegions(
                 region.writable, region.executable, region.copyOnWrite,
                 region.guarded, region.noAccess });
         }
-        if (!result.complete) error = result.error.empty()
-            ? "memory map is partial" : result.error;
+        if (!result.complete) error = "Incomplete scope: " +
+            (result.error.empty() ? std::string("memory map is partial") : result.error);
     }
     std::sort(output.begin(), output.end(),
               [](const TargetRegion& a, const TargetRegion& b) {
@@ -583,6 +606,7 @@ void MemoryToolsTab::handleTargetTransition(const TargetToken& target) {
     ++scanEpoch_;
     ++pointerEpoch_;
     scanSnapshot_.reset();
+    scanMapWarning_.clear();
     scanPage_ = {};
     scanLiveRows_.clear();
     scanLiveOwner_ = {};
@@ -873,6 +897,7 @@ bool MemoryToolsTab::buildScanScope(ScanScope& scope, std::string& error) const 
 }
 
 void MemoryToolsTab::clearScan(const char* status) {
+    scanMapWarning_.clear();
     scanCancel_.store(true, std::memory_order_release);
     ++scanEpoch_;
     if (!scanEpoch_) ++scanEpoch_;
@@ -887,10 +912,40 @@ void MemoryToolsTab::clearScan(const char* status) {
     else scanStatus_.clear();
 }
 
+bool MemoryToolsTab::applyScanPreset(const MemoryScanValue& value) {
+    int kind = 0;
+    bool signedInteger = false;
+    if (!value.valid() ||
+        !controlsForValueType(value.type, kind, signedInteger)) {
+        scanStatus_ = "The incoming scan value was invalid.";
+        return false;
+    }
+    const std::string formatted = FormatMemoryScanValue(value);
+    if (formatted.empty() || formatted.size() >= sizeof(scanValue_)) {
+        scanStatus_ = "The incoming scan value was too large for the scanner.";
+        return false;
+    }
+
+    // Replacing scanner inputs is reserved for an explicit preparation request.
+    // Preserve the analyst's scope filters/range and never start target reads here.
+    clearScan();
+    valueKind_ = kind;
+    signedIntegers_ = signedInteger;
+    scanHex_ = false;
+    nullTerminateText_ = value.nullTerminated;
+    scanMode_ = static_cast<int>(MemoryScanMode::Exact);
+    std::snprintf(scanValue_, sizeof(scanValue_), "%s", formatted.c_str());
+    scanValue2_[0] = '\0';
+    floatTolerance_ = false;
+    alignment_ = 1;
+    scanStatus_ = "Typed value prepared for an exact first scan; existing scope retained.";
+    return true;
+}
+
 void MemoryToolsTab::cancelScan() {
     if (!scanRunning_.load(std::memory_order_acquire)) return;
     scanCancel_.store(true, std::memory_order_release);
-    scanStatus_ = "Cancelling scan; the previous complete snapshot remains available...";
+    scanStatus_ = "Cancelling scan; the previous snapshot remains available...";
 }
 
 void MemoryToolsTab::pumpScanCompletion() {
@@ -907,6 +962,7 @@ void MemoryToolsTab::pumpScanCompletion() {
     if (completed.adopt && completed.snapshot) {
         scanSnapshot_ = std::move(completed.snapshot);
         scanShape_ = completed.config;
+        if (!completed.mapWarning.empty()) scanMapWarning_ = std::move(completed.mapWarning);
         firstScanDone_ = true;
         scanPageStart_ = 0;
         ++scanRevision_;
@@ -948,6 +1004,7 @@ void MemoryToolsTab::firstScan(AppContext& ctx, const TargetToken& target) {
                 std::string mapError;
                 std::vector<TargetRegion> regions = collectRegions(
                     debugger, passive, target, mapError);
+                done.mapWarning = mapError;
                 uint64_t eligibleBytes = 0;
                 for (const TargetRegion& region : regions) {
                     uint64_t begin = 0, end = 0;
@@ -1025,7 +1082,6 @@ void MemoryToolsTab::firstScan(AppContext& ctx, const TargetToken& target) {
                         done.unreadableChunks ? "; unreadable chunks skipped" : "",
                         done.partialChunks ? "; partial chunks kept only through their readable prefix" : "");
                     done.status = status;
-                    if (!mapError.empty()) done.status += " Memory map: " + mapError;
                 }
             } catch (const std::exception& exception) {
                 done.status = std::string("Scan failed: ") + exception.what();
@@ -1118,7 +1174,7 @@ void MemoryToolsTab::nextScan(AppContext& ctx, const TargetToken& target) {
                     scanMatches_.store(working->candidateCount(), std::memory_order_relaxed);
                 }
                 if (scanCancel_.load(std::memory_order_acquire)) {
-                    done.status = "Next scan cancelled; previous complete results preserved.";
+                    done.status = "Next scan cancelled; previous results preserved.";
                 } else if (!failed) {
                     done.snapshot = std::move(working);
                     done.adopt = true;
@@ -1274,6 +1330,11 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
         ImGui::TextDisabled("%s", scanStatus_.c_str());
         ImGui::PopTextWrapPos();
     }
+    if (!scanMapWarning_.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(theme::col::warn(), "%s", scanMapWarning_.c_str());
+        ImGui::PopTextWrapPos();
+    }
 
     if (!firstScanDone_ || !scanSnapshot_) return;
 
@@ -1379,6 +1440,8 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
                                         debuggerOwned))
                         ctx.gotoAddressLive(
                             match.address, { target.pid, target.generation });
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Decodes the bytes stored at this address. To inspect code that accesses the value, navigate to the accessing instruction's address.");
                     if (ImGui::MenuItem("Copy address"))
                         ImGui::SetClipboardText(address.c_str());
                     ImGui::EndPopup();
@@ -1405,7 +1468,8 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
     }
 }
 
-void MemoryToolsTab::navigateViewer(uint64_t address, bool recordHistory) {
+void MemoryToolsTab::navigateViewer(uint64_t address, bool recordHistory,
+                                    uint32_t selectionBytes) {
     if (recordHistory) {
         if (viewHistory_.empty()) {
             viewHistory_.push_back(address);
@@ -1429,7 +1493,10 @@ void MemoryToolsTab::navigateViewer(uint64_t address, bool recordHistory) {
     std::snprintf(viewAddress_, sizeof(viewAddress_), "%llX",
                   static_cast<unsigned long long>(address));
     viewSelectionBegin_ = static_cast<int>(address - viewBase_);
-    viewSelectionEnd_ = viewSelectionBegin_;
+    const uint32_t available = static_cast<uint32_t>(viewBytes_.size()) -
+                               static_cast<uint32_t>(viewSelectionBegin_);
+    const uint32_t selected = (std::min)((std::max)(selectionBytes, 1u), available);
+    viewSelectionEnd_ = viewSelectionBegin_ + static_cast<int>(selected) - 1;
     viewLastRefresh_ = 0.0;
     viewNeedsRefresh_ = true;
 }
@@ -2810,6 +2877,8 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
                                         false, debuggerOwned))
                         ctx.gotoAddressLive(
                             row.resolvedAddress, { target.pid, target.generation });
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Decodes the bytes stored at this address. To inspect code that accesses the value, navigate to the accessing instruction's address.");
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();
@@ -2823,39 +2892,51 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
     }
 }
 
+void MemoryToolsTab::consumeMemoryRequest(AppContext& ctx,
+                                          const TargetToken& target) {
+    if (!ctx.requestedMemory.pending) return;
+    MemoryToolsRequest request = std::move(ctx.requestedMemory);
+    ctx.requestedMemory = {};
+
+    const bool ownerRequested = request.target.pid != 0 ||
+                                request.target.sessionGeneration != 0;
+    const bool identityMatches = target.valid() &&
+        (!ownerRequested ||
+         (request.target.valid() && target.source == TargetSource::Debugger &&
+          DebugTargetIdentityMatches(
+              { target.pid, target.generation }, request.target)));
+    // A scan preset is never accepted without an exact debugger owner, even if
+    // a malformed caller constructs the request fields directly.
+    const bool scanOwnerMatches = !request.prepareScan ||
+        (request.target.valid() && target.source == TargetSource::Debugger &&
+         DebugTargetIdentityMatches(
+             { target.pid, target.generation }, request.target));
+    if (identityMatches && scanOwnerMatches) {
+        navigateViewer(request.address, true, request.selectionBytes);
+        inspectorSelectRequest_ = 0;
+        if (request.prepareScan) applyScanPreset(request.scanValue);
+    } else {
+        targetStatus_ = "Memory navigation request expired because the debugger target changed.";
+    }
+}
+
 void MemoryToolsTab::render(AppContext& ctx) {
     pumpScanCompletion();
     pumpPointerCompletion();
     pumpFreezeCompletion();
 
-    if (ctx.hasMemoryRequest && ctx.requestedMemoryPid) {
+    if (ctx.requestedMemory.pending && ctx.requestedMemory.target.pid) {
         DbgSnapshot fallback;
         const DbgSnapshot* debug = ctx.frameDebugSnapshot;
         if (!debug) { fallback = ctx.debug.snapshot(); debug = &fallback; }
         if ((debug->state == DbgState::Running || debug->state == DbgState::Paused) &&
-            debug->pid == ctx.requestedMemoryPid &&
-            debug->sessionGeneration == ctx.requestedMemoryGeneration)
+            debug->pid == ctx.requestedMemory.target.pid &&
+            debug->sessionGeneration == ctx.requestedMemory.target.sessionGeneration)
             targetSource_ = TargetSource::Debugger;
     }
     TargetToken target = currentTarget(ctx);
     handleTargetTransition(target);
-    if (ctx.hasMemoryRequest) {
-        const bool identityMatches = target.valid() &&
-            (!ctx.requestedMemoryPid ||
-             (target.source == TargetSource::Debugger &&
-              target.pid == ctx.requestedMemoryPid &&
-              target.generation == ctx.requestedMemoryGeneration));
-        if (identityMatches) {
-            navigateViewer(ctx.requestedMemoryVA);
-            inspectorSelectRequest_ = 0;
-        } else {
-            targetStatus_ = "Memory navigation request expired because the debugger target changed.";
-        }
-        ctx.hasMemoryRequest = false;
-        ctx.requestedMemoryVA = 0;
-        ctx.requestedMemoryPid = 0;
-        ctx.requestedMemoryGeneration = 0;
-    }
+    consumeMemoryRequest(ctx, target);
     renderTargetBar(ctx, target);
     renderProcessPicker(ctx);
     // Target controls can close or replace a session in this frame. Retire its

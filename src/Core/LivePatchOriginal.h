@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DebugTargetIdentity.h"
+#include "PatchSet.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -40,6 +41,10 @@ enum class LivePatchOriginalError : uint8_t {
     RecordLimit,
     ByteLimit,
     AccountingMismatch,
+    OriginalUnavailable,
+    PatchSetOwnerConflict,
+    SpanMismatch,
+    AllocationFailure,
 };
 
 struct LivePatchOriginalPlan {
@@ -47,6 +52,13 @@ struct LivePatchOriginalPlan {
     LivePatchOriginalError error = LivePatchOriginalError::None;
     LivePatchOriginal original;
     size_t retainedBytesAfter = 0;
+};
+
+struct LivePatchRestorationPlan {
+    bool success = false;
+    LivePatchOriginalError error = LivePatchOriginalError::None;
+    uint64_t runtimeVA = 0;
+    std::vector<uint8_t> bytes;
 };
 
 inline const char* LivePatchOriginalErrorText(LivePatchOriginalError error) {
@@ -62,6 +74,10 @@ inline const char* LivePatchOriginalErrorText(LivePatchOriginalError error) {
     case LivePatchOriginalError::RecordLimit:            return "the runtime-original record limit was reached";
     case LivePatchOriginalError::ByteLimit:              return "the runtime-original byte budget was reached";
     case LivePatchOriginalError::AccountingMismatch:     return "the runtime-original byte accounting is inconsistent";
+    case LivePatchOriginalError::OriginalUnavailable:    return "the exact-session runtime original is unavailable";
+    case LivePatchOriginalError::PatchSetOwnerConflict:  return "the patch set does not own the retained live write";
+    case LivePatchOriginalError::SpanMismatch:           return "a retained runtime original has a different patch span";
+    case LivePatchOriginalError::AllocationFailure:      return "there was not enough memory to plan runtime byte restoration";
     }
     return "unknown runtime-original error";
 }
@@ -163,6 +179,100 @@ inline bool LivePatchSpansOverlap(uint64_t a, size_t aSize,
     if (!aSize || !bSize) return false;
     return a <= b ? b - a < static_cast<uint64_t>(aSize)
                   : a - b < static_cast<uint64_t>(bSize);
+}
+
+// Restore only the removed runtime span. Replaying a whole intersecting
+// survivor would also overwrite bytes outside this span, including later
+// patches that overlap that survivor without overlapping the removed record.
+// The FILE enabled state is deliberately absent: toggling a static set does
+// not remove a write already made to the live process in this session.
+inline LivePatchRestorationPlan PlanLivePatchRestoration(
+    const LivePatchOriginalMap& retained,
+    const std::unordered_map<uint64_t, uint64_t>& setOwners,
+    DebugTargetIdentity owner,
+    const PjPatch& removed,
+    const std::vector<PjPatch>& remaining) {
+    auto fail = [](LivePatchOriginalError error) {
+        LivePatchRestorationPlan failed;
+        failed.error = error;
+        return failed;
+    };
+    if (!owner.valid()) return fail(LivePatchOriginalError::InvalidIdentity);
+    if (remaining.size() > kMaxPatchSetRecords ||
+        retained.size() > kMaxLivePatchOriginalRecords ||
+        setOwners.size() > kMaxLivePatchOriginalRecords)
+        return fail(LivePatchOriginalError::RecordLimit);
+    if (removed.bytes.empty()) return fail(LivePatchOriginalError::EmptySpan);
+    if (removed.bytes.size() > kMaxLivePatchOriginalSpan)
+        return fail(LivePatchOriginalError::SpanTooLarge);
+    if (removed.orig.size() != removed.bytes.size())
+        return fail(LivePatchOriginalError::SpanMismatch);
+
+    const auto removedOwner = setOwners.find(removed.address);
+    if (removedOwner == setOwners.end() ||
+        removedOwner->second != removed.patchSetId)
+        return fail(LivePatchOriginalError::PatchSetOwnerConflict);
+    const auto original = retained.find(removed.address);
+    if (original == retained.end())
+        return fail(LivePatchOriginalError::OriginalUnavailable);
+    if (!DebugTargetIdentityMatches(original->second.owner, owner))
+        return fail(LivePatchOriginalError::OwnerConflict);
+    if (original->second.bytes.size() != removed.bytes.size())
+        return fail(LivePatchOriginalError::SpanMismatch);
+
+    const uint64_t runtimeVA = original->second.runtimeVA;
+    const uint64_t size = static_cast<uint64_t>(removed.bytes.size());
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (removed.address > maximum - size || runtimeVA > maximum - size)
+        return fail(LivePatchOriginalError::AddressOverflow);
+
+    LivePatchRestorationPlan result;
+    try {
+        result.bytes = original->second.bytes;
+        size_t composedBytes = 0;
+        for (const PjPatch& patch : remaining) {
+            if (!LivePatchSpansOverlap(removed.address, removed.bytes.size(),
+                                       patch.address, patch.bytes.size()))
+                continue;
+            const auto setOwner = setOwners.find(patch.address);
+            const auto prior = retained.find(patch.address);
+            if (setOwner == setOwners.end() ||
+                setOwner->second != patch.patchSetId ||
+                prior == retained.end() ||
+                !DebugTargetIdentityMatches(prior->second.owner, owner))
+                continue;
+            if (prior->second.bytes.size() != patch.bytes.size() ||
+                patch.orig.size() != patch.bytes.size())
+                return fail(LivePatchOriginalError::SpanMismatch);
+            if (patch.bytes.size() > kMaxLivePatchOriginalSpan)
+                return fail(LivePatchOriginalError::SpanTooLarge);
+            const uint64_t patchSize = static_cast<uint64_t>(patch.bytes.size());
+            if (patch.address > maximum - patchSize ||
+                prior->second.runtimeVA > maximum - patchSize)
+                return fail(LivePatchOriginalError::AddressOverflow);
+
+            const uint64_t overlapBegin = std::max(removed.address, patch.address);
+            const uint64_t overlapEnd = std::min(removed.address + size,
+                                                 patch.address + patchSize);
+            const size_t outOffset = static_cast<size_t>(overlapBegin - removed.address);
+            const size_t priorOffset = static_cast<size_t>(overlapBegin - patch.address);
+            if (runtimeVA + outOffset != prior->second.runtimeVA + priorOffset)
+                return fail(LivePatchOriginalError::RuntimeMappingConflict);
+            const size_t count = static_cast<size_t>(overlapEnd - overlapBegin);
+            if (count > kMaxLivePatchOriginalBytes - composedBytes)
+                return fail(LivePatchOriginalError::ByteLimit);
+            composedBytes += count;
+            std::copy_n(patch.bytes.begin() + priorOffset, count,
+                        result.bytes.begin() + outOffset);
+        }
+    } catch (const std::bad_alloc&) {
+        return fail(LivePatchOriginalError::AllocationFailure);
+    } catch (const std::length_error&) {
+        return fail(LivePatchOriginalError::AllocationFailure);
+    }
+    result.success = true;
+    result.runtimeVA = runtimeVA;
+    return result;
 }
 
 } // namespace ds

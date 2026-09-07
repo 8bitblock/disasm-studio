@@ -1,8 +1,9 @@
 param([ValidateSet('Release')][string]$Configuration = 'Release', [switch]$CompileOnly,
-      [switch]$ReleaseWorkbenchOnly)
+      [switch]$ReleaseWorkbenchOnly, [switch]$FeatureTabsOnly, [string]$ObjectRoot)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
-$objectRoot = Join-Path $taskRoot "build\int\x64\$Configuration"
+$objectRoot = if ($ObjectRoot) { [IO.Path]::GetFullPath($ObjectRoot) }
+              else { Join-Path $taskRoot "build\int\x64\$Configuration" }
 $dependencyRoot = Join-Path $taskRoot 'vcpkg_installed\x64-windows-static\x64-windows-static'
 if (!(Test-Path -LiteralPath (Join-Path $objectRoot 'BinaryViewTab.obj'))) {
     throw 'Build DisasmStudio.sln Release|x64 first; this integration harness links the production app objects.'
@@ -28,7 +29,7 @@ foreach ($line in $environmentLines) {
 }
 $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ('ds_static_listing_' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($outputRoot) | Out-Null
-$source = Join-Path $PSScriptRoot $(if ($ReleaseWorkbenchOnly) { 'release_workbench_test.cpp' } else { 'static_listing_actions_test.cpp' })
+$source = Join-Path $PSScriptRoot $(if ($FeatureTabsOnly) { 'feature_tabs_ui_test.cpp' } elseif ($ReleaseWorkbenchOnly) { 'release_workbench_test.cpp' } else { 'static_listing_actions_test.cpp' })
 $testObject = Join-Path $outputRoot 'static_listing_actions_test.obj'
 $executable = Join-Path $outputRoot 'static_listing_actions_test.exe'
 $compileLog = Join-Path $outputRoot 'compile.log'
@@ -62,16 +63,23 @@ if (!$CompileOnly) {
 if ($LASTEXITCODE) { Get-Content -LiteralPath $compileLog; throw 'Integration harness compilation failed.' }
 if ($CompileOnly) { Write-Host 'Integration harness compilation passed.'; return }
 $linkArguments = @('/NOLOGO', '/LTCG', '/INCREMENTAL:NO', '/OPT:REF', '/OPT:ICF', '/MACHINE:X64', '/SUBSYSTEM:CONSOLE', ('/OUT:"' + $executable + '"'), ('"' + $testObject + '"'))
-# MSVC encodes private/public access in decorated method names even though the
-# calling convention and object layout are identical. Alias only this fixture's
-# exposed BinaryViewTab references back to the unchanged private app symbols.
+    # MSVC encodes private/public access in decorated method names even though the
+    # calling convention and object layout are identical. Alias only this fixture's
+    # exposed tab references back to the unchanged private app symbols.
 $symbols = & dumpbin.exe /nologo /symbols $testObject
 foreach ($line in $symbols) {
     if ($line -match 'UNDEF.*External\s+\|\s+(\?\S+)') {
         $symbol = $matches[1]
-        if ($symbol.Contains('@BinaryViewTab@ds@@QE')) {
-            $original = $symbol.Replace('@BinaryViewTab@ds@@QE', '@BinaryViewTab@ds@@AE')
-            $linkArguments += ('/ALTERNATENAME:' + $symbol + '=' + $original)
+        foreach ($fixtureClass in @('BinaryViewTab', 'CortexTab', 'SigScannerTab', 'BinaryTechTab', 'BinaryDiffTab', 'ProjectsTab', 'MemoryToolsTab')) {
+            if ($symbol.Contains('@' + $fixtureClass + '@ds@@QE')) {
+                $original = $symbol.Replace('@' + $fixtureClass + '@ds@@QE', '@' + $fixtureClass + '@ds@@AE')
+                $linkArguments += ('/ALTERNATENAME:' + $symbol + '=' + $original)
+            }
+            if ($fixtureClass -eq 'SigScannerTab' -and
+                $symbol.Contains('@SigScannerTab@ds@@SA')) {
+                $original = $symbol.Replace('@SigScannerTab@ds@@SA', '@SigScannerTab@ds@@CA')
+                $linkArguments += ('/ALTERNATENAME:' + $symbol + '=' + $original)
+            }
         }
     }
 }

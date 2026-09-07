@@ -2507,6 +2507,91 @@ int main() {
         CHECK(reachableCalls.size() == 1 && reachableCalls[0].from == 0 &&
               reachableCalls[0].to == 8,
               "call graph excludes calls decoded only in a noreturn dead tail");
+        AnalysisService callGraphCache([](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<RawFlowDisasm>(0);
+        }, 1);
+        auto graphRequest = [&](std::shared_ptr<const std::vector<uint64_t>> targets) {
+            callGraphCache.requestBulk(&deadCallBin, Engine::Zydis, Arch::X64,
+                K_CallGraph, false, callGraphCache.epoch(), 0, 0, 0, false,
+                {}, {}, 0, {}, 0, {}, false, std::move(targets));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            AnalysisResult found;
+            while (std::chrono::steady_clock::now() < deadline) {
+                AnalysisResult result;
+                while (callGraphCache.tryTakeBulk(result))
+                    if (result.callGraphValid) found = std::move(result);
+                if (found.callGraphValid) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return found;
+        };
+        auto hasDeadTail = [](const AnalysisResult& graph) {
+            return std::any_of(graph.callEdges.begin(), graph.callEdges.end(),
+                [](const CallEdgeR& edge) { return edge.from == 0 && edge.to == 12; });
+        };
+        const AnalysisResult returningGraph = graphRequest({});
+        const ProgressSnapshot afterReturning = callGraphCache.progress();
+        const AnalysisResult terminalGraph = graphRequest(
+            std::make_shared<const std::vector<uint64_t>>(std::vector<uint64_t>{8}));
+        const ProgressSnapshot afterTerminal = callGraphCache.progress();
+        CHECK(returningGraph.callGraphValid && hasDeadTail(returningGraph) &&
+              terminalGraph.callGraphValid && !hasDeadTail(terminalGraph),
+              "call graph cache observes a changed inferred noreturn target snapshot");
+        CHECK(afterTerminal.cacheMisses > afterReturning.cacheMisses,
+              "changed call-graph noreturn inputs require a derived-cache miss");
+        const AnalysisResult duplicateTerminalGraph = graphRequest(
+            std::make_shared<const std::vector<uint64_t>>(std::vector<uint64_t>{8, 8}));
+        CHECK(duplicateTerminalGraph.callGraphValid && !hasDeadTail(duplicateTerminalGraph) &&
+              callGraphCache.progress().cacheMisses == afterTerminal.cacheMisses &&
+              callGraphCache.progress().cacheHits == afterTerminal.cacheHits + 1,
+              "equivalent noreturn target sets reuse the completed call graph");
+        const AnalysisResult restoredGraph = graphRequest({});
+        CHECK(restoredGraph.callGraphValid && hasDeadTail(restoredGraph) &&
+              callGraphCache.progress().cacheHits > afterTerminal.cacheHits,
+              "clearing inferred noreturn targets restores the exact cached returning graph");
+        callGraphCache.cancelAndWaitIdle();
+        // An unrelated strings request must not erase the queued graph's CFG
+        // inputs; a new graph request with an explicitly empty snapshot must.
+        for (bool replaceGraph : {false, true}) {
+            auto release = std::make_shared<std::atomic<bool>>(false);
+            auto entered = std::make_shared<std::atomic<int>>(0);
+            auto attempts = std::make_shared<std::atomic<unsigned>>(0);
+            AnalysisService coalescing([=](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+                if (attempts->fetch_add(1) == 0)
+                    return std::make_unique<GateDisasm>(release, entered);
+                return std::make_unique<RawFlowDisasm>(0);
+            }, 1);
+            const uint64_t epoch = coalescing.epoch();
+            coalescing.requestBulk(&deadCallBin, Engine::Zydis, Arch::X64,
+                K_Decompile, false, epoch, 1, 0, 2, true);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!entered->load() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            CHECK(entered->load() == 1, "noreturn coalescing fixture holds its sole worker");
+            coalescing.requestBulk(&deadCallBin, Engine::Zydis, Arch::X64,
+                K_CallGraph, false, epoch, 0, 0, 0, false, {}, {}, 0, {}, 0, {}, false,
+                std::make_shared<const std::vector<uint64_t>>(std::vector<uint64_t>{8}));
+            coalescing.requestBulk(&deadCallBin, Engine::Zydis, Arch::X64,
+                replaceGraph ? K_CallGraph : K_Strings, false, epoch);
+            CHECK(coalescing.progress().queuedJobs == 1 &&
+                  coalescing.progress().requestsCoalesced == 1,
+                  "compatible graph requests merge while their worker is occupied");
+            release->store(true, std::memory_order_release);
+            deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (coalescing.bulkPending() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            AnalysisResult graph, result;
+            bool gotStrings = false;
+            while (coalescing.tryTakeBulk(result)) {
+                gotStrings |= result.stringsValid;
+                if (result.callGraphValid) graph = std::move(result);
+            }
+            CHECK(graph.callGraphValid && hasDeadTail(graph) == replaceGraph,
+                  replaceGraph ? "a new graph request can clear pending inferred noreturn targets"
+                               : "an unrelated coalesced pass preserves pending noreturn targets");
+            CHECK(replaceGraph || gotStrings, "coalescing still publishes the requested strings pass");
+            coalescing.cancelAndWaitIdle();
+        }
         std::remove(deadCallPath.c_str());
         std::remove(flowPath.c_str());
     }
@@ -4712,6 +4797,51 @@ int main() {
         identity.cancelAndWaitIdle();
     }
 
+    // A selected-view request waiting behind its owner's occupied sole worker
+    // cannot use a second global slot yet. It must not block another document
+    // from progressing while that slot is otherwise idle.
+    if (AnalysisService::globalWorkerLimit() > 1) {
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService occupied([release, entered](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<GateDisasm>(release, entered);
+        }, 1);
+        AnalysisService available([](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<StubDisasm>();
+        }, 1);
+        occupied.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, occupied.epoch(), 1, base, base + 2, true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK(entered->load() == 1, "runnable-capacity fixture occupies its sole local worker");
+        occupied.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, occupied.epoch(), 2, base + 4, base + 8, true);
+        available.setActiveDocument(false);
+        available.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings,
+                              false, available.epoch());
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (available.bulkPending() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        AnalysisResult result;
+        bool completed = false;
+        while (available.tryTakeBulk(result)) completed |= result.stringsValid;
+        CHECK(completed && !release->load(),
+              "queued work without local capacity does not strand a free global worker slot");
+        CHECK(available.progress().jobsYielded == 0,
+              "background analysis does not churn yielding to work which cannot run yet");
+        release->store(true, std::memory_order_release);
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (occupied.bulkPending() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        unsigned completedViews = 0;
+        while (occupied.tryTakeBulk(result)) completedViews += result.decompValid ? 1u : 0u;
+        CHECK(completedViews == 2,
+              "releasing an owner's admission wakes its next selected-view request");
+        occupied.cancelAndWaitIdle();
+        available.cancelAndWaitIdle();
+    }
+
     // Separate document pools share one bounded CPU arbiter. Keep all but one
     // global slot occupied so observed factory order is deterministic, then verify
     // requested-view > active-document > background-document admission.
@@ -5067,6 +5197,55 @@ int main() {
               "returning to the data decision restores its exact cached index");
         scopeService.cancelAndWaitIdle();
         std::remove(scopePath.c_str());
+    }
+
+    // Value-origin work shares bounded interaction admission, preserves request
+    // identity through failures, coalesces queued selections, and cancels without
+    // cancelling unrelated image analysis.
+    {
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService origins([release, entered](Engine, Arch) {
+            return std::make_unique<GateDisasm>(release, entered);
+        }, 1);
+        auto request = [&](uint64_t id) {
+            auto value = std::make_shared<ValueOriginRequest>();
+            value->requestId = id; value->functionVA = base; value->instructionVA = base + 2;
+            value->registerName = "eax"; value->chunks.push_back({base, 3});
+            value->cancellation = std::make_shared<std::atomic<bool>>(false);
+            return value;
+        };
+        auto first = request(101);
+        origins.requestValueOrigin(&bin, {Engine::Zydis, Arch::X64}, origins.epoch(), first);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!entered->load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        CHECK(entered->load() != 0, "value-origin worker begins decoding");
+        CHECK((origins.pendingKinds() & K_ValueOrigin) != 0, "value-origin participates in pending kinds");
+        origins.requestValueOrigin(&bin, {Engine::Zydis, Arch::X64}, origins.epoch(), request(102));
+        origins.requestValueOrigin(&bin, {Engine::Zydis, Arch::X64}, origins.epoch(), request(103));
+        first->cancellation->store(true);
+        release->store(true);
+        while (origins.bulkPending() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        CHECK(!origins.bulkPending(), "value-origin work completes within timeout");
+        AnalysisResult result; int received = 0;
+        while (origins.tryTakeBulk(result)) {
+            ++received;
+            CHECK(result.valueOriginRequestId == 103 && result.valueOrigin && result.valueOrigin->valid,
+                  "only newest queued value-origin request publishes with exact identity");
+            CHECK(result.valueOrigin && !result.valueOrigin->complete,
+                  "value-origin keeps an uninitialized function input visibly partial");
+        }
+        CHECK(received == 1 && origins.progress().requestsCoalesced != 0,
+              "cancelled and coalesced value-origin requests do not publish");
+        origins.cancelAndWaitIdle();
+
+        AnalysisService failed([](Engine, Arch) -> std::unique_ptr<IDisassembler> { return {}; }, 1);
+        failed.requestValueOrigin(&bin, {Engine::Zydis, Arch::X64}, failed.epoch(), request(104));
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (failed.bulkPending() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        CHECK(failed.tryTakeBulk(result) && result.failureValid && result.valueOriginRequestId == 104 &&
+              (result.kinds & K_ValueOrigin), "value-origin decoder failure retains the pending request identity");
+        failed.cancelAndWaitIdle();
     }
 
     // cancelAndWaitIdle leaves the pool idle (no pending work, progress back to Idle).

@@ -311,13 +311,22 @@ void StatusDivider() {
 }
 
 void KeyValueRow(const char* key, const char* fmt, ...) {
-    const float keyW = 110.0f * theme::UiScale();
+    const float scale = theme::UiScale();
+    const float origin = ImGui::GetCursorPosX();
+    const float available = ImGui::GetContentRegionAvail().x;
+    const float keyW = std::max(110.0f * scale,
+        ImGui::CalcTextSize(key).x + ImGui::GetStyle().ItemSpacing.x);
+    // Keep long paths and evidence readable in details panes. Use the row's
+    // own origin so an indented/grouped caller does not overlap its key.
+    ImGui::PushTextWrapPos(origin + std::max(1.0f, available));
     ImGui::TextColored(theme::col::muted(), "%s", key);
-    ImGui::SameLine(keyW);
+    if (available >= keyW + 150.0f * scale)
+        ImGui::SameLine(origin + keyW);
     va_list args;
     va_start(args, fmt);
     ImGui::TextV(fmt, args);
     va_end(args);
+    ImGui::PopTextWrapPos();
 }
 
 bool EmptyState(const char* icon, const char* title, const char* subtitle,

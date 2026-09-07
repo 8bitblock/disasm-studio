@@ -42,6 +42,7 @@
 #include "AlgoScan.h"                   // AlgoMatch (K_Intent results)
 #include "Synthesis.h"                  // SynthResult (K_Synthesis results)
 #include "PathExplore.h"                // PathTree (K_PathExplore results)
+#include "ValueOrigin.h"
 #include "CrackmeTriage.h"              // CrackmeTriageReport (offline network trail)
 #include "../Disasm/IDisassembler.h"   // Engine, Arch, IDisassembler
 
@@ -70,7 +71,7 @@ class BinaryFile;
 enum BulkKind : uint32_t {
     K_Funcs = 1, K_Strings = 2, K_Listing = 4, K_Xref = 8, K_Intent = 16, K_CallGraph = 32,
     K_Synthesis = 64, K_PathExplore = 128, K_Decompile = 256, K_ListingPrefix = 512,
-    K_CrackmeTriage = 1024
+    K_CrackmeTriage = 1024, K_ValueOrigin = 2048
 };
 
 // Coarse "what is the pool doing right now" indicator for the progress bar.
@@ -135,6 +136,8 @@ struct AnalysisResult {
     std::vector<DecompileDiagnostic> decompDiagnostics;
     uint64_t                decompVA      = 0;                          // function start the pseudocode is for
     uint64_t                decompContext = 0; // caller name generation; rejects stale renamed output
+    std::shared_ptr<const ValueOriginResult> valueOrigin;
+    uint64_t                valueOriginRequestId = 0;
     uint64_t                regionLo = 0, regionHi = 0;                // the region these targeted
     bool                    regionValid = false; // a targeted region may begin at VA 0
 };
@@ -173,9 +176,13 @@ public:
     // A process-wide admission arbiter bounds executing analysis across all
     // services. Interaction runs first, then active-document bulk, then other
     // documents. Owners should update this after committing a document switch.
+    // A queued request whose owner's workers are busy does not strand another
+    // owner's available global slot; same-owner interaction still preempts bulk.
     // Existing per-owner threads and image lifetime barriers remain unchanged.
     void setActiveDocument(bool active);
     static unsigned globalWorkerLimit();
+    void requestValueOrigin(const BinaryFile* bin, const DecoderConfig& decoder,
+                            uint64_t epoch, std::shared_ptr<const ValueOriginRequest> request);
 
     // Monotone cancellation token. A result is accepted by the consumer only when
     // result.epoch == epoch(); bumpEpoch() invalidates everything older.
@@ -298,6 +305,7 @@ private:
         std::shared_ptr<const std::vector<FunctionChunk>> decompChunks;
         bool              decompOwnershipTruncated = false;
         std::shared_ptr<const std::vector<uint64_t>> noreturnTargets;
+        std::shared_ptr<const ValueOriginRequest> valueOrigin;
         std::shared_ptr<const ListingLayout> listingLayout;
         std::shared_ptr<const std::vector<StrResult>> listingStrings;
         std::shared_ptr<const CodeDataMap> listingCodeData;

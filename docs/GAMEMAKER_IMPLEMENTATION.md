@@ -146,3 +146,31 @@ The original helper/runner adapter is implemented in this repository. The pause
 protocol follows [Windows debug-event semantics](https://learn.microsoft.com/en-us/windows/win32/debug/debugging-events):
 all target threads stay suspended until the event is continued, so host reads
 and queued resume commands never depend on a frozen helper acknowledging work.
+
+## GML instruction readability — 7 September 2026
+
+- Added the display-only `Core/GmlInstructionText.h` formatter for all supported
+  GML operations, type suffixes, resolved strings/functions, and conservative
+  unresolved references. `push.v self.money` becomes `Read variable self.money`;
+  `bf` becomes `Jump if false`. Quotient/remainder and special stack encodings
+  retain their distinct meanings.
+- Assembly and Graph default to **Readable GML**. Instruction tooltips and the
+  evidence inspector show the full explanation and raw bytecode. **Explain**
+  works alongside existing metadata; destination links and analyst comments
+  retain priority within the clipped comment column. Raw decoding, addresses,
+  branch destinations, selections, and symbolic breakpoint identities remain
+  unchanged. Added **Copy readable GML** and documented the controls.
+- `gml_disasm_test` passed with zero failures, including type meanings, resolved
+  and unresolved references, comparisons, conversions, zero/invalid branch
+  targets, array operations, stack rearrangements, and unsupported encodings.
+- The production-object `static_listing_actions_test` GML checks passed:
+  readable/raw toolbar switching, explanations beside metadata, exact operand
+  preservation, selection, symbolic breakpoint controls, and branch navigation.
+  The wider suite reported one separate existing keyboard-copy failure in
+  `workbench_workflow_fixture.inc` (`FILE:0x0` breadcrumb clipboard check); it is
+  not a clean pass of the entire integration suite. See
+  `build/gml-readable-ui-tests.log`.
+- The Release executable is built in
+  `build/x64/GmlReadableRelease/DisasmStudio.exe` for use without replacing the
+  running app. Build and embedded-helper verification output is recorded in
+  `build/gml-readable-release.log`.

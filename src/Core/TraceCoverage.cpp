@@ -1,7 +1,10 @@
 #include "TraceCoverage.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
+#include <set>
+#include <utility>
 
 namespace ds {
 
@@ -12,35 +15,59 @@ void bump(std::unordered_map<uint64_t, uint64_t>& counts, uint64_t va) {
     if (n != std::numeric_limits<uint64_t>::max()) ++n;
 }
 
-std::vector<TraceHitCount> sortedCounts(
-    const std::unordered_map<uint64_t, uint64_t>& counts) {
-    std::vector<TraceHitCount> out;
+void copyCounts(const std::unordered_map<uint64_t, uint64_t>& counts,
+                std::vector<TraceHitCount>& out, uint64_t& total) {
     out.reserve(counts.size());
-    for (const auto& [va, hits] : counts) out.push_back({ va, hits });
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
-        return a.va < b.va;
-    });
-    return out;
+    for (const auto& [va, hits] : counts) {
+        out.push_back({ va, hits });
+        if (std::numeric_limits<uint64_t>::max() - total < hits)
+            total = std::numeric_limits<uint64_t>::max();
+        else
+            total += hits;
+    }
 }
 
-uint64_t totalOf(const std::unordered_map<uint64_t, uint64_t>& counts) {
-    uint64_t total = 0;
-    for (const auto& [_, hits] : counts) {
-        if (std::numeric_limits<uint64_t>::max() - total < hits)
-            return std::numeric_limits<uint64_t>::max();
-        total += hits;
-    }
-    return total;
+void sortSnapshot(TraceCoverageSnapshot& snapshot) {
+    const auto byAddress = [](const auto& a, const auto& b) {
+        return a.va < b.va;
+    };
+    std::sort(snapshot.instructions.begin(), snapshot.instructions.end(), byAddress);
+    std::sort(snapshot.blocks.begin(), snapshot.blocks.end(), byAddress);
+    std::sort(snapshot.armed.begin(), snapshot.armed.end());
 }
 
 } // namespace
 
 uint64_t TraceCoverage::begin(const std::vector<uint64_t>& basicBlockStarts,
                               size_t maxSites) {
-    std::vector<uint64_t> starts = basicBlockStarts;
-    std::sort(starts.begin(), starts.end());
-    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
-    if (starts.size() > maxSites) starts.resize(maxSites);
+    const size_t limit = std::min(maxSites, kMaxSites);
+    std::vector<uint64_t> starts;
+    bool truncated = false;
+    if (basicBlockStarts.size() <= limit) {
+        starts = basicBlockStarts;
+        std::sort(starts.begin(), starts.end());
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    } else if (limit == 0) {
+        truncated = !basicBlockStarts.empty();
+    } else {
+        // A caller can supply arbitrarily many seeds. Never copy the whole
+        // request only to discard most of it after sorting. The bounded set
+        // preserves the existing lowest-address admission policy and tells us
+        // whether unique sites, rather than merely duplicates, were omitted.
+        std::set<uint64_t> selected;
+        for (const uint64_t va : basicBlockStarts) {
+            if (selected.size() == limit && va > *selected.rbegin()) {
+                truncated = true;
+                continue;
+            }
+            selected.insert(va);
+            if (selected.size() > limit) {
+                selected.erase(std::prev(selected.end()));
+                truncated = true;
+            }
+        }
+        starts.assign(selected.begin(), selected.end());
+    }
 
     std::lock_guard<std::mutex> lock(mtx_);
     ++generation_;
@@ -48,6 +75,7 @@ uint64_t TraceCoverage::begin(const std::vector<uint64_t>& basicBlockStarts,
     active_ = true;
     ++revision_;
     requestedSites_ = basicBlockStarts.size();
+    planTruncated_ = truncated;
     sites_.clear();
     instructionHits_.clear();
     blockHits_.clear();
@@ -63,6 +91,7 @@ void TraceCoverage::stop() {
 
 void TraceCoverage::clearHits() {
     std::lock_guard<std::mutex> lock(mtx_);
+    if (instructionHits_.empty() && blockHits_.empty()) return;
     instructionHits_.clear();
     blockHits_.clear();
     for (auto& [_, state] : sites_)
@@ -77,6 +106,7 @@ void TraceCoverage::reset() {
     ++revision_;
     active_ = false;
     requestedSites_ = 0;
+    planTruncated_ = false;
     sites_.clear();
     instructionHits_.clear();
     blockHits_.clear();
@@ -115,7 +145,7 @@ void TraceCoverage::markSkipped(uint64_t generation, uint64_t va) {
     if (generation != generation_) return;
     auto it = sites_.find(va);
     if (it != sites_.end() && it->second != SiteState::Hit &&
-        it->second != SiteState::Retired)
+        it->second != SiteState::Retired && it->second != SiteState::Skipped)
         { it->second = SiteState::Skipped; ++revision_; }
 }
 
@@ -143,18 +173,16 @@ void TraceCoverage::recordInstructionHit(uint64_t generation, uint64_t va) {
     if (active_ && generation == generation_) { bump(instructionHits_, va); ++revision_; }
 }
 
-TraceCoverageSnapshot TraceCoverage::snapshot() const {
-    std::lock_guard<std::mutex> lock(mtx_);
+TraceCoverageSnapshot TraceCoverage::snapshotLocked() const {
     TraceCoverageSnapshot out;
     out.active = active_;
     out.generation = generation_;
     out.revision = revision_;
     out.requestedSites = requestedSites_;
     out.plannedSites = sites_.size();
-    out.instructions = sortedCounts(instructionHits_);
-    out.blocks = sortedCounts(blockHits_);
-    out.instructionHitTotal = totalOf(instructionHits_);
-    out.blockHitTotal = totalOf(blockHits_);
+    out.planTruncated = planTruncated_;
+    copyCounts(instructionHits_, out.instructions, out.instructionHitTotal);
+    copyCounts(blockHits_, out.blocks, out.blockHitTotal);
     for (const auto& [va, state] : sites_) {
         switch (state) {
             case SiteState::Armed: ++out.armedSites; out.armed.push_back(va); break;
@@ -164,8 +192,32 @@ TraceCoverageSnapshot TraceCoverage::snapshot() const {
             case SiteState::Pending: break;
         }
     }
-    std::sort(out.armed.begin(), out.armed.end());
     return out;
+}
+
+TraceCoverageSnapshot TraceCoverage::snapshot() const {
+    TraceCoverageSnapshot out;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        out = snapshotLocked();
+    }
+    // Sorting a large report must not hold up the debug-event owner recording
+    // hits. All vectors and totals above already belong to one coherent revision.
+    sortSnapshot(out);
+    return out;
+}
+
+bool TraceCoverage::snapshotIfChanged(TraceCoverageSnapshot& retained) const {
+    TraceCoverageSnapshot out;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (retained.generation == generation_ && retained.revision == revision_)
+            return false;
+        out = snapshotLocked();
+    }
+    sortSnapshot(out);
+    retained = std::move(out);
+    return true;
 }
 
 } // namespace ds

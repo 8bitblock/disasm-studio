@@ -265,7 +265,36 @@ static int networkDebuggeeMain() {
 static bool launchSelf(Debugger& debugger, const char* self, std::string& error,
                        const char* mode = "1") {
     SetEnvironmentVariableA("DS_X64_DEBUGGEE", mode);
-    const bool launched = debugger.launchAndAttach(self, error, /*breakAtEntry=*/true);
+    DbgLaunchRequest request;
+    request.executable = self;
+    const ULONGLONG requestedAt = GetTickCount64();
+    const uint64_t requestId = debugger.requestLaunch(std::move(request), &error);
+    CHECK(GetTickCount64() - requestedAt < 500);
+    bool launched = false;
+    if (requestId) {
+        for (int elapsed = 0; elapsed < 35000; elapsed += 10) {
+            const auto lifecycle = debugger.lifecycleSnapshot();
+            if (lifecycle.requestId == requestId && lifecycle.completed) {
+                launched = lifecycle.succeeded && !lifecycle.cancelled;
+                error = lifecycle.error;
+                if (launched) {
+                    const auto snapshot = debugger.snapshot();
+                    CHECK(DebugTargetIdentityMatches(lifecycle.target,
+                        {snapshot.pid, snapshot.sessionGeneration}));
+                    CHECK(!snapshot.modules.empty());
+                    const auto regions = debugger.queryRegionsForSession(
+                        snapshot.pid, snapshot.sessionGeneration);
+                    CHECK(regions.complete && regions.error.empty() && !regions.regions.empty());
+                }
+                break;
+            }
+            Sleep(10);
+        }
+        if (!launched && error.empty()) {
+            debugger.cancelLifecycle(requestId);
+            error = "queued fixture launch did not complete";
+        }
+    }
     SetEnvironmentVariableA("DS_X64_DEBUGGEE", nullptr);
     return launched;
 }
@@ -417,6 +446,127 @@ static void checkPausedBreakpointMutation(Debugger& debugger, const DbgSnapshot&
           after.regs.rip == before.regs.rip && after.is32 == before.is32);
 }
 
+// Trace requests are target mutations too. Exercise the real held-event owner,
+// byte masking, rejection of data/native INT3 sites, generation replacement and
+// recovery from an unreadable page without issuing an execution command.
+static void checkPausedTraceMutation(Debugger& debugger, const DbgSnapshot& before) {
+    const DebugTargetIdentity target{before.pid, before.sessionGeneration};
+    HANDLE process = static_cast<HANDLE>(debugger.duplicateProcessHandleForSession(target));
+    CHECK(process != nullptr);
+    if (!process) return;
+    void* codePage = VirtualAllocEx(process, nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+                                   PAGE_EXECUTE_READWRITE);
+    void* dataPage = VirtualAllocEx(process, nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+                                   PAGE_READWRITE);
+    CHECK(codePage != nullptr && dataPage != nullptr);
+    if (codePage && dataPage) {
+        const uint64_t code = reinterpret_cast<uintptr_t>(codePage);
+        const uint64_t data = reinterpret_cast<uintptr_t>(dataPage);
+        const uint8_t original[] = {0x90, 0xC3, 0xCC};
+        SIZE_T written = 0;
+        CHECK(WriteProcessMemory(process, codePage, original, sizeof(original), &written) &&
+              written == sizeof(original));
+        bool pauseStayedOwned = true;
+        auto waitTrace = [&](auto predicate) {
+            const ULONGLONG deadline = GetTickCount64() + 4000;
+            do {
+                const auto current = debugger.snapshot();
+                pauseStayedOwned &= current.state == DbgState::Paused &&
+                    current.pid == before.pid && current.sessionGeneration == before.sessionGeneration &&
+                    current.activeTid == before.activeTid && current.regs.rip == before.regs.rip;
+                if (predicate(debugger.traceCoverageSnapshot())) return true;
+                Sleep(5);
+            } while (GetTickCount64() < deadline);
+            return false;
+        };
+        auto byteEquals = [&](uint64_t address, uint8_t rawExpected, uint8_t maskedExpected) {
+            uint8_t raw = 0, masked = 0;
+            return debugger.readMemory(address, &raw, 1) == 1 && raw == rawExpected &&
+                debugger.readMemoryMasked(address, &masked, 1) == 1 && masked == maskedExpected;
+        };
+        CHECK(debugger.startTraceCoverageForSession(target,
+            {code, code + 1, code + 2, data, 1, code}));
+        CHECK(waitTrace([](const auto& trace) {
+            return trace.active && trace.plannedSites == 5 &&
+                trace.armedSites == 2 && trace.skippedSites == 3;
+        }));
+        CHECK(byteEquals(code, 0xCC, original[0]));
+        CHECK(byteEquals(code + 1, 0xCC, original[1]));
+        CHECK(byteEquals(code + 2, 0xCC, original[2]));
+        CHECK(byteEquals(data, 0, 0));
+        TraceCoverageSnapshot retained;
+        CHECK(debugger.traceCoverageSnapshotIfChanged(retained));
+        CHECK(!debugger.traceCoverageSnapshotIfChanged(retained));
+        const uint64_t generation = retained.generation;
+        const DebugTargetIdentity stale{target.pid, target.sessionGeneration + 1};
+        CHECK(!debugger.startTraceCoverageForSession(stale, {code}));
+        CHECK(!debugger.stopTraceCoverageForSession(stale));
+        CHECK(!debugger.clearTraceCoverageForSession(stale));
+        CHECK(debugger.traceCoverageSnapshot().generation == generation);
+
+        // A user breakpoint takes physical ownership of a trace site. Stopping
+        // the trace must preserve the user's trap and its pristine-byte mask.
+        CHECK(debugger.addBreakpointForSession(target, code));
+        CHECK(waitBreakpointResult(debugger, code, true, nullptr, 4000));
+        CHECK(waitTrace([](const auto& trace) { return trace.armedSites == 1; }));
+        CHECK(debugger.stopTraceCoverageForSession(target));
+        CHECK(waitTrace([](const auto& trace) { return !trace.active && trace.armedSites == 0; }));
+        CHECK(byteEquals(code, 0xCC, original[0]));
+        CHECK(byteEquals(code + 1, original[1], original[1]));
+        CHECK(debugger.removeBreakpointForSession(target, code));
+        CHECK(waitBreakpointCount(debugger, 0, 4000));
+        CHECK(byteEquals(code, original[0], original[0]));
+
+        CHECK(debugger.startTraceCoverageForSession(target, {code}));
+        CHECK(waitTrace([](const auto& trace) { return trace.active && trace.armedSites == 1; }));
+        DWORD priorProtection = 0;
+        const bool protectedPage = VirtualProtectEx(process, codePage, 4096,
+                                                    PAGE_NOACCESS, &priorProtection) != FALSE;
+        CHECK(protectedPage);
+        if (protectedPage) {
+            CHECK(debugger.stopTraceCoverageForSession(target));
+            CHECK(waitPausedEvent(debugger, "trace restore incomplete", 4000));
+            const auto failedRestore = debugger.traceCoverageSnapshot();
+            CHECK(!failedRestore.active && failedRestore.armedSites == 1);
+            CHECK(debugger.snapshot().traceOwnedSites == 1);
+            CHECK(debugger.startTraceCoverageForSession(target, {code + 1}));
+            CHECK(waitTrace([&](const auto& trace) {
+                return !trace.active && trace.generation != failedRestore.generation;
+            }));
+            CHECK(debugger.traceCoverageSnapshot().armedSites == 0);
+            CHECK(debugger.snapshot().traceOwnedSites == 1); // old generation still owns its byte
+            DWORD ignoredProtection = 0;
+            CHECK(VirtualProtectEx(process, codePage, 4096, priorProtection,
+                                   &ignoredProtection) != FALSE);
+            CHECK(byteEquals(code, 0xCC, original[0]));
+        }
+        CHECK(debugger.stopTraceCoverageForSession(target));
+        CHECK(waitTrace([&](const auto& trace) {
+            return !trace.active && trace.armedSites == 0 && debugger.snapshot().traceOwnedSites == 0;
+        }));
+        CHECK(byteEquals(code, original[0], original[0]));
+
+        // Restart replaces a live generation only after restoring its bytes.
+        CHECK(debugger.startTraceCoverageForSession(target, {code}));
+        CHECK(waitTrace([](const auto& trace) { return trace.active && trace.armedSites == 1; }));
+        const auto oldGeneration = debugger.traceCoverageSnapshot().generation;
+        CHECK(debugger.startTraceCoverageForSession(target, {code + 1}));
+        CHECK(waitTrace([&](const auto& trace) {
+            return trace.active && trace.generation != oldGeneration && trace.armedSites == 1 &&
+                trace.armed.size() == 1 && trace.armed.front() == code + 1;
+        }));
+        CHECK(byteEquals(code, original[0], original[0]));
+        CHECK(byteEquals(code + 1, 0xCC, original[1]));
+        CHECK(debugger.stopTraceCoverageForSession(target));
+        CHECK(waitTrace([](const auto& trace) { return !trace.active && trace.armedSites == 0; }));
+        CHECK(byteEquals(code + 1, original[1], original[1]));
+        CHECK(pauseStayedOwned);
+    }
+    if (codePage) CHECK(VirtualFreeEx(process, codePage, 0, MEM_RELEASE) != FALSE);
+    if (dataPage) CHECK(VirtualFreeEx(process, dataPage, 0, MEM_RELEASE) != FALSE);
+    CloseHandle(process);
+}
+
 int main() {
     char marker[8]{};
     if (GetEnvironmentVariableA("DS_X64_DEBUGGEE", marker,
@@ -425,6 +575,8 @@ int main() {
              : marker[0] == '3' ? fixtureDebuggeeMain()
              : marker[0] == '4' ? networkDebuggeeMain()
                                 : debuggeeMain();
+
+    std::setvbuf(stdout, nullptr, _IONBF, 0); // retain useful diagnostics if a live check stalls
 
     using debugger_detail::ClassifyTempBreakpointCleanup;
     using debugger_detail::TempBreakpointByteState;
@@ -602,6 +754,7 @@ int main() {
         CHECK(debugger.readMemoryMasked(before.regs.rip, &instructionByte, 1) == 1);
 
         checkPausedBreakpointMutation(debugger, before);
+        checkPausedTraceMutation(debugger, before);
         debugger.stepInto();
         bool advanced = false;
         for (int elapsed = 0; elapsed < 4000; elapsed += 10) {
@@ -997,7 +1150,18 @@ int main() {
                 CHECK(debugger.removeBreakpoint(callAddress));
                 CHECK(debugger.addBreakpoint(leafAddress));
                 debugger.cont();
-                CHECK(waitSoftwareStop(debugger, leafAddress, 1, 5000));
+                const bool leafStopped = waitSoftwareStop(debugger, leafAddress, 1, 5000);
+                if (!leafStopped) {
+                    DWORD exitCode = STILL_ACTIVE;
+                    GetExitCodeProcess(fixtureProcess.hProcess, &exitCode);
+                    const auto failed = debugger.snapshot();
+                    std::printf("[diag] leaf stop state=%u rip=0x%llX leaf=0x%llX call=0x%llX return=0x%llX exit=0x%lX event=%s\n",
+                        static_cast<unsigned>(failed.state), static_cast<unsigned long long>(failed.regs.rip),
+                        static_cast<unsigned long long>(leafAddress), static_cast<unsigned long long>(callAddress),
+                        static_cast<unsigned long long>(callReturn), static_cast<unsigned long>(exitCode),
+                        failed.lastEvent.c_str());
+                }
+                CHECK(leafStopped);
                 const uint32_t stepOutOwner = debugger.snapshot().activeTid;
                 CHECK(stepOutOwner != 0);
                 debugger.stepOut();
@@ -1045,6 +1209,113 @@ int main() {
         WaitForSingleObject(fixtureProcess.hProcess, 2000);
         CloseHandle(fixtureProcess.hProcess);
         CloseHandle(fixtureReady);
+    }
+
+    // Detach may race the first trace hit while another worker has already
+    // queued the same INT3. Drain those exact events before surrendering the
+    // debugger, then prove both the process and its workload keep running.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        PROCESS_INFORMATION traceProcess{};
+        HANDLE traceReady = nullptr;
+        const bool traceStarted = spawnAttachFixture(self, traceProcess, traceReady);
+        CHECK(traceStarted);
+        if (!traceStarted) continue;
+        error.clear();
+        const bool attached = debugger.attach(traceProcess.dwProcessId, error);
+        CHECK(attached && waitPaused(debugger, 8000));
+        uint64_t stopAddress = 0;
+        uint64_t hitsAddress = 0;
+        if (attached && debugger.snapshot().state == DbgState::Paused) {
+            const auto owner = debugger.snapshot();
+            const uint8_t* localCall = directFixtureCall();
+            const uint64_t call = localCall ? remoteAddress(owner, localCall) : 0;
+            const uint64_t leaf = remoteAddress(owner, reinterpret_cast<const void*>(&fixtureLeaf));
+            stopAddress = remoteAddress(owner, const_cast<const LONG*>(&g_fixtureStop));
+            hitsAddress = remoteAddress(owner, const_cast<const LONG*>(&g_fixtureHits));
+            CHECK(call && leaf && stopAddress && hitsAddress);
+            if (call && leaf) {
+                const DebugTargetIdentity traceSession{owner.pid, owner.sessionGeneration};
+                // Start + Continue in one control epoch must arm the full plan
+                // before either hot worker resumes. One-shot hits stay invisible
+                // and each pristine instruction remains executable afterwards.
+                for (int iteration = 0; iteration < 4; ++iteration) {
+                    CHECK(debugger.startTraceCoverageForSession(traceSession,
+                        {call, leaf, call + 5}));
+                    debugger.cont();
+                    bool traced = false;
+                    for (int elapsed = 0; elapsed < 4000; elapsed += 5) {
+                        const auto coverage = debugger.traceCoverageSnapshot();
+                        const auto state = debugger.snapshot().state;
+                        if (coverage.hitSites == 3 && coverage.armedSites == 0 &&
+                            state == DbgState::Running) {
+                            traced = true;
+                            break;
+                        }
+                        if (state == DbgState::Terminated || state == DbgState::Detached) break;
+                        Sleep(5);
+                    }
+                    if (!traced) {
+                        const auto failed = debugger.snapshot();
+                        const auto coverage = debugger.traceCoverageSnapshot();
+                        DWORD exitCode = STILL_ACTIVE;
+                        GetExitCodeProcess(traceProcess.hProcess, &exitCode);
+                        std::printf("[diag] trace iteration=%d state=%u hits=%zu armed=%zu exit=0x%lX exception=0x%X at=0x%llX event=%s\n",
+                            iteration, static_cast<unsigned>(failed.state), coverage.hitSites,
+                            coverage.armedSites, static_cast<unsigned long>(exitCode),
+                            failed.exceptionCode, static_cast<unsigned long long>(failed.exceptionAddress),
+                            failed.lastEvent.c_str());
+                    }
+                    CHECK(traced);
+                    if (!traced) break;
+                    debugger.pause();
+                    CHECK(waitPaused(debugger, 3000));
+                    CHECK(debugger.stopTraceCoverageForSession(traceSession));
+                    uint8_t actualCall = 0;
+                    CHECK(debugger.readMemory(call, &actualCall, 1) == 1 && actualCall == 0xE8);
+                    CHECK(debugger.traceCoverageSnapshot().blockHitTotal >= 3);
+                }
+
+                CHECK(debugger.startTraceCoverageForSession(
+                    {owner.pid, owner.sessionGeneration}, {call, leaf, call + 5}));
+                debugger.cont();
+                const ULONGLONG deadline = GetTickCount64() + 4000;
+                bool sawHit = false;
+                do {
+                    if (debugger.traceCoverageSnapshot().hitSites) { sawHit = true; break; }
+                    SwitchToThread();
+                } while (GetTickCount64() < deadline);
+                CHECK(sawHit);
+            }
+        }
+        debugger.detach();
+        CHECK(debugger.snapshot().lastEvent.find("queued trace") == std::string::npos);
+        CHECK(WaitForSingleObject(traceProcess.hProcess, 100) == WAIT_TIMEOUT);
+        LONG beforeHits = 0, afterHits = 0;
+        SIZE_T read = 0;
+        CHECK(hitsAddress && ReadProcessMemory(traceProcess.hProcess, (LPCVOID)hitsAddress,
+            &beforeHits, sizeof(beforeHits), &read) && read == sizeof(beforeHits));
+        Sleep(50);
+        CHECK(hitsAddress && ReadProcessMemory(traceProcess.hProcess, (LPCVOID)hitsAddress,
+            &afterHits, sizeof(afterHits), &read) && read == sizeof(afterHits));
+        CHECK(afterHits > beforeHits);
+        const LONG stop = 1;
+        SIZE_T wrote = 0;
+        CHECK(stopAddress && WriteProcessMemory(traceProcess.hProcess, (LPVOID)stopAddress,
+            &stop, sizeof(stop), &wrote) && wrote == sizeof(stop));
+        const bool exited = WaitForSingleObject(traceProcess.hProcess, 5000) == WAIT_OBJECT_0;
+        CHECK(exited);
+        DWORD exitCode = STILL_ACTIVE;
+        if (!GetExitCodeProcess(traceProcess.hProcess, &exitCode) || exitCode != 0)
+            std::printf("[diag] trace detach attempt=%d exit=0x%lX event=%s beforeHits=%ld afterHits=%ld\n",
+                attempt, static_cast<unsigned long>(exitCode), debugger.snapshot().lastEvent.c_str(),
+                static_cast<long>(beforeHits), static_cast<long>(afterHits));
+        CHECK(GetExitCodeProcess(traceProcess.hProcess, &exitCode) && exitCode == 0);
+        if (!exited) {
+            TerminateProcess(traceProcess.hProcess, 1);
+            WaitForSingleObject(traceProcess.hProcess, 2000);
+        }
+        CloseHandle(traceProcess.hProcess);
+        CloseHandle(traceReady);
     }
 
     // Removing a user breakpoint parked on a shared network-probe byte while

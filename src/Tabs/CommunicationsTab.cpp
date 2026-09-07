@@ -301,11 +301,11 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
     if (lifecycle.busy) {
         ImGui::TextColored(theme::col::warn(), "%s",
             lifecycle.state == DbgLifecycleState::Starting
-                ? "Starting debugger attachment..." : "Stopping debugger; restoring owned state...");
-        if (lifecycle.command == DbgLifecycleCommand::Attach &&
+                ? "Starting debugger..." : "Stopping debugger; restoring owned state...");
+        if (lifecycle.command != DbgLifecycleCommand::Detach &&
             lifecycle.state == DbgLifecycleState::Starting) {
             ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel attachment"))
+            if (ImGui::SmallButton("Cancel startup"))
                 ctx.debug.cancelLifecycle(lifecycle.requestId);
         }
     } else if (lifecycle.completed && !lifecycle.error.empty()) {

@@ -161,8 +161,9 @@ void ProjectsTab::render(AppContext& ctx) {
             if (ctx.openBinaryDialog()) ctx.requestedTab = "Binary View";
         }
     } else if (visibleRecents.empty()) {
-        ui::EmptyState(DS_ICON_SEARCH, "No matching projects",
-                       "Try a different name, path, architecture, or status.");
+        if (ui::EmptyState(DS_ICON_SEARCH, "No matching projects",
+                          "Search by name, path, architecture, or status.", "Clear search"))
+            filter_[0] = '\0';
     } else if (ImGui::BeginTable("projects", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable)) {
@@ -172,7 +173,10 @@ void ProjectsTab::render(AppContext& ctx) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         int removeAt = -1;
-        for (int i : visibleRecents) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visibleRecents.size()));
+        while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const int i = visibleRecents[row];
             const auto& r = recents_[i];
             const bool active = binaryLoaded && r.hash == activeHash;
             ImGui::TableNextRow();
@@ -183,11 +187,15 @@ void ProjectsTab::render(AppContext& ctx) {
             if (active) rowLabel = ui::IconsLoaded() ? DS_ICON_CHECK " Active  " : "Active  ";
             rowLabel += disp;
             if (active) ImGui::PushStyleColor(ImGuiCol_Text, theme::col::good());
-            if (ImGui::Selectable(rowLabel.c_str(), selectedHashValid_ && selectedHash_ == r.hash,
+            // The path/name is data, so literal ## characters must remain
+            // visible and cannot define a hidden ImGui label or unstable ID.
+            const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+            if (ImGui::Selectable("##recent", selectedHashValid_ && selectedHash_ == r.hash,
                                   ImGuiSelectableFlags_SpanAllColumns)) {
                 selectedHash_ = r.hash;
                 selectedHashValid_ = true;
             }
+            ImGui::GetWindowDrawList()->AddText(rowPos, ImGui::GetColorU32(ImGuiCol_Text), rowLabel.c_str());
             if (active) ImGui::PopStyleColor();
             const bool rowHovered = ImGui::IsItemHovered();
             ui::ItemTooltip(r.path.c_str(), false);
@@ -224,6 +232,12 @@ void ProjectsTab::render(AppContext& ctx) {
     const int selectedIndex = selectedHashValid_ ? recentIndexForHash(recents_, selectedHash_) : -1;
     if (selectedIndex >= 0) {
         const auto& r = recents_[selectedIndex];
+        if (!recentMatches(r, filter_)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+            ImGui::TextWrapped("The selected project is hidden by your search.");
+            ImGui::PopStyleColor();
+            if (ImGui::SmallButton("Show selected project")) filter_[0] = '\0';
+        }
         if (binaryLoaded && r.hash == activeHash) {
             ui::Badge("ACTIVE", theme::col::good());
             ImGui::SameLine();
@@ -238,8 +252,15 @@ void ProjectsTab::render(AppContext& ctx) {
         if (ImGui::Button("Open this project")) {
             openRecent(r);
         }
+        ui::SameLineIfFits(ImGui::CalcTextSize("Copy path").x + ImGui::GetStyle().FramePadding.x * 2);
+        if (ImGui::Button("Copy path")) {
+            ImGui::SetClipboardText(r.path.c_str());
+            ui::Toast(ui::ToastKind::Success, "Project path copied.");
+        }
     } else {
-        ImGui::TextDisabled("Select a project (double-click to open).");
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::TextWrapped("Select a project to inspect it. Double-click a row or press Enter to open it.");
+        ImGui::PopStyleColor();
     }
 
     ImGui::SeparatorText("Active binary and saved analysis");
@@ -290,10 +311,14 @@ void ProjectsTab::render(AppContext& ctx) {
                     ui::Toast(ui::ToastKind::Success, "Project is already saved.");
             }
             ImGui::EndDisabled();
-            ImGui::TextDisabled("Autosaves after edits, on close, and on exit.");
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+            ImGui::TextWrapped("Autosaves after edits, on close, and on exit.");
+            ImGui::PopStyleColor();
         }
     } else {
-        ImGui::TextDisabled("No binary loaded. Use Open Binary, or double-click a recent project.");
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::TextWrapped("No binary loaded. Use Open Binary, or double-click a recent project.");
+        ImGui::PopStyleColor();
     }
     ImGui::EndChild();
 }

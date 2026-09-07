@@ -34,7 +34,7 @@ static constexpr json::JsonParseLimits kProjectJsonLimits{
     1'000'000,  // complete Value nodes
     64u * 1024u * 1024u, // decoded key/value string bytes
     131'072,    // entries in any one array/object
-    1u * 1024u * 1024u, // bytes in any one encoded/decoded string token
+    kProjectJsonStringTokenBytes, // bytes in any one encoded/decoded string token
     128         // numeric token bytes
 };
 static constexpr size_t kMaxProjectSidecarBytes = 64u * 1024u * 1024u;
@@ -691,7 +691,7 @@ static bool DeserializeProjectImpl(const std::string& text, ProjectState& out) {
         !optionalBoundedString(root, "engine", st.engine, 64) ||
         !optionalBoundedString(root, "name", st.name, 4096) ||
         !optionalBoundedString(root, "status", st.status, 64, "analyzed") ||
-        !optionalBoundedString(root, "notes", st.notes, 16u * 1024u * 1024u) ||
+        !optionalBoundedString(root, "notes", st.notes, kProjectJsonStringTokenBytes) ||
         !optionalInt64(root, "lastOpenedUnix", st.lastOpenedUnix))
         return false;
     // Old sidecars had no explicit flag; preserve their non-zero cursor while

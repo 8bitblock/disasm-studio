@@ -1,5 +1,6 @@
 #pragma once
 #include "ITab.h"
+#include "BinaryViewValueOrigin.h"
 #include "../Core/ProcessManager.h"    // ModuleInfo (Functions sub-tab)
 #include "../Core/SymbolService.h"     // asynchronous DbgHelp / PDB ownership
 #include "../Core/DocumentContext.h"   // one bounded navigation history per document
@@ -26,6 +27,7 @@
 #include "../Core/Synthesis.h"         // SynthResult ("Synthesis" lower tab)
 #include "../Core/PathExplore.h"       // PathTree ("Path Explorer" lower tab)
 #include "../Core/Cond.h"              // CondOperand (compiled Watch expressions)
+#include "../Core/TracePlan.h"         // exact, gap-preserving native trace coverage
 #include <cstdint>
 #include <deque>
 #include <list>
@@ -33,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -92,11 +95,15 @@ public:
 
     // Called while this document is still AppContext's active static owner.
     // Mirrors all tab-local analyst state before DocumentManager serializes it.
-    // Closing additionally joins this child's PDB/symbol worker before its
-    // BinaryFile storage may be released.
+    // Closing additionally joins this child's PDB/symbol worker and retires its
+    // token-owned live pattern requests before retained state may be released.
     bool prepareDocumentTransition(AppContext& ctx, bool closing,
                                    std::string& error);
-    void retireDocument();
+    void retireDocument(AppContext& ctx);
+    bool hasUnsavedTypeDraft() const { return typeDraftDirty_; }
+    const std::string& typeDraftName() const { return typeDraft_.name; }
+    bool saveTypeDraft(AppContext& ctx, bool persist, std::string& error);
+    void discardTypeDraft(AppContext& ctx);
 
     // Incrementally copy the UI-owned analysis/live state into an immutable
     // investigation snapshot.  The bounded slice is intentionally callable even
@@ -118,7 +125,7 @@ public:
 private:
     bool documentMatches(const AppContext& ctx) const;
     bool synchronizeDocumentImage(AppContext& ctx);
-    void retireUnloadedImage();
+    void retireUnloadedImage(AppContext& ctx);
     void retireChangedLiveSession(AppContext& ctx);
     void updateAuthorizationExperiment(AppContext& ctx,
                                        const struct DbgSnapshot& snap);
@@ -127,7 +134,14 @@ private:
     void renderWelcome(AppContext& ctx);
     void applyWorkflow(AppContext& ctx, int preset);
     void renderWorkflowContext(AppContext& ctx);
-    void renderEvidenceInspector(AppContext& ctx, bool collapsed);
+    void renderEvidenceInspector(AppContext& ctx, bool collapsed, bool widthConstrained = false);
+    void renderEvidenceInspectorContent(AppContext& ctx, bool popup = false);
+    ValueOriginViewState valueOrigin_;
+    bool valueOriginCurrent(AppContext& ctx) const;
+    bool valueOriginHighlights(AppContext& ctx, uint64_t va) const;
+    void adoptValueOriginResult(AppContext& ctx, const AnalysisResult& result);
+    void requestValueOrigin(AppContext& ctx, const std::string& registerName);
+    void renderValueOriginInspector(AppContext& ctx);
     void selectRepresentation(AppContext& ctx, int view);
     void renderTypeWorkbench(AppContext& ctx);
     void renderTypedLocation(AppContext& ctx, uint64_t va);
@@ -312,6 +326,10 @@ private:
     void saveProjectState(AppContext& ctx);     // tab members -> ctx.staticProject() (each frame)
     std::string annName(AppContext& ctx, uint64_t addr);  // user rename for addr, or ""
     void runByteSearch(AppContext& ctx);
+    // Queue the shared masked-pattern worker for a captured debugger session.
+    // `popup` selects the Live Search modal rather than the Navigator results.
+    void startLivePatternSearch(AppContext& ctx, std::string_view query, int kind,
+                                DebugTargetIdentity owner, bool popup);
     void analyzeFunctions(AppContext& ctx);            // run FunctionAnalyzer -> functions_ list
     void guessFunctionNames(AppContext& ctx);          // heuristically name sub_ functions (read_file, j_CreateFileW, ...)
     void scanStrings(AppContext& ctx);                 // ASCII/UTF-8 + UTF-16LE -> strings_ list
@@ -392,6 +410,7 @@ private:
     float    evidenceInspectorW_ = 300.0f;
     TypeDefinition typeDraft_;
     uint64_t typeDraftImage_ = 0;
+    uint64_t typeDraftGeneration_ = 0;
     bool typeDraftDirty_ = false;
     std::string typeStatus_;
     char typeFilter_[96]{};
@@ -627,6 +646,10 @@ private:
     uint64_t byteSearchImageSerial_ = 0;
     uint64_t byteSearchSessionGeneration_ = 0;
     uint32_t byteSearchPid_ = 0;
+    uint64_t byteSearchLiveToken_ = 0;
+    uint64_t byteSearchLiveEpoch_ = 0;
+    std::string byteSearchStatus_;
+    std::string byteSearchMapWarning_;
 
     // Unified investigation workspace. Collection is a bounded, version-checked
     // state machine because functions/strings/xrefs are owned by this tab and may
@@ -755,6 +778,10 @@ private:
     int                   liveFindKind_  = 0;   // 0=ASCII 1=UTF-16 2=hex 3=u64
     std::vector<uint64_t> liveFindHits_;
     std::string           liveFindStatus_;
+    std::string           liveFindMapWarning_;
+    DebugTargetIdentity   liveFindOwner_{};
+    uint64_t              liveFindPatternToken_ = 0;
+    uint64_t              liveFindPatternEpoch_ = 0;
     bool                  openFindPopup_ = false;
 
     // Live patching (write bytes straight into the debuggee).
@@ -950,6 +977,7 @@ private:
     // Inline string/data comments + cross-reference (xref) search.
     bool                  showStringComments_ = true;
     bool                  showHints_          = true;   // inline "what it does" gloss per instruction
+    bool                  gmlReadableInstructions_ = true; // display labels; decoded bytecode stays exact
     uint64_t              xrefTarget_ = 0;
     bool                  xrefTargetValid_ = false;
     bool                  xrefPinned_ = false;
@@ -959,12 +987,17 @@ private:
     uint64_t              xrefResultsVersion_ = 0;
     uint64_t              xrefFilterVersion_ = ~0ull;
     uint32_t              xrefFilterNames_ = ~0u;
+    uint64_t              xrefFilterFunctions_ = ~uint64_t{0};
+    size_t                xrefFilterCursor_ = 0;
     char                  xrefFilter_[192] = "";
     std::string           xrefAppliedFilter_;
     std::vector<size_t>   xrefVisible_;
     uint64_t              xrefSelectedSource_ = 0;
     bool                  xrefSelectedValid_ = false;
     std::vector<uint64_t> xrefHits_;
+    std::shared_ptr<const std::vector<uint64_t>> xrefFileHits_;
+    const std::vector<uint64_t>& pinnedXrefSources() const;
+    void advancePinnedXrefFilter(AppContext& ctx, size_t budget = 512);
     bool                  xrefHitsLive_ = false;   // hits are runtime VAs (searched the debuggee)
     std::string           xrefStatus_;
     bool                  openXrefPopup_ = false; // retained name: requests focus of the nonmodal Xrefs panel
@@ -1125,17 +1158,33 @@ private:
     size_t                   traceSeedRow_ = 0;   // current descriptor
     size_t                   traceSeedInsn_ = 0;  // instruction within decoded page
     size_t                   traceSeedCandidatePos_ = 0;
+    size_t                   traceSeedFunctionPos_ = 0;
+    size_t                   traceSeedSkippedPages_ = 0;
+    size_t                   traceSeedInvalidRows_ = 0;
     bool                     tracePrevEndsBlock_ = true;
+    bool                     traceSeedStreamExact_ = false;
     uint64_t                 tracePlanImageRevision_ = 0;
     uint64_t                 tracePlanListingSig_ = 0;
+    uint64_t                 tracePlanTopology_ = 0;
+    uint64_t                 tracePlanDecoder_ = 0;
+    uint64_t                 tracePlanModuleBase_ = 0;
+    uint64_t                 tracePlanModuleSize_ = 0;
+    uint64_t                 tracePlanModuleGeneration_ = 0;
     std::vector<uint64_t>    traceSeedFile_;
+    std::vector<TraceCodeSpan> traceSeedSpans_;
     std::unordered_set<uint64_t> traceSeedDedup_;
     std::vector<std::pair<size_t, uint64_t>> traceSeedCandidates_; // (CodePage descriptor, VA)
     std::unordered_set<uint64_t> traceCandidateDedup_;
     std::vector<uint64_t>    traceBlockStartsFile_;
     std::vector<uint64_t>    traceBlockStartsLive_;
-    uint64_t                 traceBlockCoverageEndFile_ = 0;
-    uint64_t                 traceBlockCoverageEndLive_ = 0;
+    std::vector<TraceCodeSpan> traceBlockSpansFile_;
+    std::vector<TraceCodeSpan> traceBlockSpansLive_;
+    uint64_t                 traceBlockGeneration_ = 0;
+    uint64_t                 traceBlockImageRevision_ = 0;
+    uint64_t                 traceBlockDecoder_ = 0;
+    DebugTargetIdentity      traceBlockTarget_{};
+    uint64_t                 traceBlockModuleBase_ = 0;
+    uint64_t                 traceBlockModuleGeneration_ = 0;
     std::unordered_map<uint64_t, uint64_t> traceInstructionHitsFile_;
     std::unordered_map<uint64_t, uint64_t> traceInstructionHitsLive_;
     std::unordered_map<uint64_t, uint64_t> traceBlockHitsFile_;
@@ -1238,7 +1287,9 @@ private:
     uint64_t              stringsToken_   = 0;      // matches the in-flight LiveScanService request
     uint32_t              stringsAutoPid_ = 0;     // exact debugger identity already auto-scanned
     uint64_t              stringsAutoSessionGeneration_ = 0;
-    char                  notes_[4096] = "";
+    std::string           notes_;
+    bool                  notesDirty_ = false;
+    bool                  notesReloadEditor_ = false;
 
     // Algorithm recognition (AlgoScan / K_Intent): crypto/encoding matches from the
     // background recognizer, shown in the "Algorithms" lower sub-tab. algoLabels_ is the

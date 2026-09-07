@@ -268,6 +268,76 @@ uint64_t Debugger::requestAttach(uint32_t pid) {
     lifecycle_.state = DbgLifecycleState::Starting;
     lifecycle_.busy = true;
     lifecycleExpected_ = {};
+    lifecycleLaunch_.reset();
+    lifecycleDllLaunch_.reset();
+    lifecycleCancel_.store(false);
+    lifecycleQueued_ = true;
+    lifecycleCv_.notify_one();
+    return lifecycle_.requestId;
+}
+
+uint64_t Debugger::requestLaunch(DbgLaunchRequest request, std::string* error) {
+    if (error) error->clear();
+    auto reject = [&](const char* reason) -> uint64_t {
+        if (error) *error = reason;
+        return 0;
+    };
+    if (request.executable.empty() || request.executable.size() > 32767 ||
+        request.executable.find('\0') != std::string::npos)
+        return reject("the debugger launch requires a valid executable path");
+    if (request.authorizationPlan &&
+        (request.authorizationPlan->sites.empty() ||
+         !CompleteAuthorizationWatchSourceEvidence(request.authorizationPlan->launchSource)))
+        return reject("authorization watch plan has no complete retained source-file evidence");
+    std::lock_guard lock(lifecycleMtx_);
+    if (lifecycleShutdown_ || lifecycle_.busy) return reject("debugger lifecycle is busy");
+    {
+        std::lock_guard sessionLock(mtx_);
+        if (state_ == DbgState::Running || state_ == DbgState::Paused)
+            return reject("detach the current debugger target before launching another process");
+    }
+    lifecycle_ = {};
+    lifecycle_.requestId = ++nextLifecycleRequest_;
+    if (!lifecycle_.requestId) lifecycle_.requestId = ++nextLifecycleRequest_;
+    lifecycle_.command = DbgLifecycleCommand::Launch;
+    lifecycle_.state = DbgLifecycleState::Starting;
+    lifecycle_.busy = true;
+    lifecycleExpected_ = {};
+    lifecycleLaunch_ = std::move(request);
+    lifecycleDllLaunch_.reset();
+    lifecycleCancel_.store(false);
+    lifecycleQueued_ = true;
+    lifecycleCv_.notify_one();
+    return lifecycle_.requestId;
+}
+
+uint64_t Debugger::requestLaunchDll(DllDebugLaunchPlan plan, std::string* error) {
+    if (error) error->clear();
+    auto reject = [&](const char* reason) -> uint64_t {
+        if (error) *error = reason;
+        return 0;
+    };
+    if (!plan.valid || plan.executable.empty() || plan.commandLine.empty() ||
+        plan.executable.size() > 32767 || plan.commandLine.size() > 32767 ||
+        plan.executable.find('\0') != std::string::npos ||
+        plan.commandLine.find('\0') != std::string::npos)
+        return reject("invalid DLL debug launch plan");
+    std::lock_guard lock(lifecycleMtx_);
+    if (lifecycleShutdown_ || lifecycle_.busy) return reject("debugger lifecycle is busy");
+    {
+        std::lock_guard sessionLock(mtx_);
+        if (state_ == DbgState::Running || state_ == DbgState::Paused)
+            return reject("detach the current debugger target before launching a DLL host");
+    }
+    lifecycle_ = {};
+    lifecycle_.requestId = ++nextLifecycleRequest_;
+    if (!lifecycle_.requestId) lifecycle_.requestId = ++nextLifecycleRequest_;
+    lifecycle_.command = DbgLifecycleCommand::LaunchDll;
+    lifecycle_.state = DbgLifecycleState::Starting;
+    lifecycle_.busy = true;
+    lifecycleExpected_ = {};
+    lifecycleLaunch_.reset();
+    lifecycleDllLaunch_ = std::move(plan);
     lifecycleCancel_.store(false);
     lifecycleQueued_ = true;
     lifecycleCv_.notify_one();
@@ -290,6 +360,8 @@ uint64_t Debugger::requestDetach(DebugTargetIdentity expected) {
     lifecycle_.state = DbgLifecycleState::Stopping;
     lifecycle_.busy = true;
     lifecycleExpected_ = expected;
+    lifecycleLaunch_.reset();
+    lifecycleDllLaunch_.reset();
     lifecycleCancel_.store(false);
     lifecycleQueued_ = true;
     lifecycleCv_.notify_one();
@@ -299,9 +371,9 @@ uint64_t Debugger::requestDetach(DebugTargetIdentity expected) {
 bool Debugger::cancelLifecycle(uint64_t requestId) {
     std::lock_guard lock(lifecycleMtx_);
     // Detach cleanup must finish restoring target-owned state; cancellation is
-    // only meaningful while starting an attachment.
+    // only meaningful while starting an attachment or launch.
     if (!requestId || requestId != lifecycle_.requestId || !lifecycle_.busy ||
-        lifecycle_.command != DbgLifecycleCommand::Attach) return false;
+        lifecycle_.command == DbgLifecycleCommand::Detach) return false;
     lifecycleCancel_.store(true);
     lifecycle_.state = DbgLifecycleState::Stopping;
     cmdCv_.notify_all();
@@ -324,12 +396,18 @@ void Debugger::lifecycleWorkerLoop() {
     for (;;) {
         DbgLifecycleSnapshot request;
         DebugTargetIdentity expected;
+        std::optional<DbgLaunchRequest> launch;
+        std::optional<DllDebugLaunchPlan> dllLaunch;
         {
             std::unique_lock lock(lifecycleMtx_);
             lifecycleCv_.wait(lock, [this] { return lifecycleShutdown_ || lifecycleQueued_; });
             if (lifecycleShutdown_) return;
             request = lifecycle_;
             expected = lifecycleExpected_;
+            launch = std::move(lifecycleLaunch_);
+            dllLaunch = std::move(lifecycleDllLaunch_);
+            lifecycleLaunch_.reset();
+            lifecycleDllLaunch_.reset();
             lifecycleQueued_ = false;
         }
         bool succeeded = false;
@@ -337,10 +415,21 @@ void Debugger::lifecycleWorkerLoop() {
         DebugTargetIdentity target;
         std::lock_guard ownerLock(lifecycleOwnerMtx_);
         try {
-            if (request.command == DbgLifecycleCommand::Attach) {
+            if (request.command != DbgLifecycleCommand::Detach) {
                 lifecycleAttaching_.store(true);
                 const bool attemptedAttach = !lifecycleCancel_.load();
-                if (attemptedAttach) succeeded = attach(request.requestedPid, error);
+                if (attemptedAttach) {
+                    if (request.command == DbgLifecycleCommand::Attach)
+                        succeeded = attach(request.requestedPid, error);
+                    else if (request.command == DbgLifecycleCommand::Launch && launch)
+                        succeeded = launchAndAttach(launch->executable, error,
+                            launch->breakAtEntry, launch->containedJob,
+                            launch->authorizationPlan ? &*launch->authorizationPlan : nullptr,
+                            launch->authorizationOptions, launch->prelaunchNetworkObservation);
+                    else if (request.command == DbgLifecycleCommand::LaunchDll && dllLaunch)
+                        succeeded = launchAndAttachDll(*dllLaunch, error);
+                    else error = "debugger launch request is missing its owned plan";
+                }
                 // Cancellation also covers the race after Win32 succeeded but
                 // before completion publication. Only the owner performs cleanup.
                 if (lifecycleCancel_.load()) {
@@ -348,7 +437,7 @@ void Debugger::lifecycleWorkerLoop() {
                     // never tears down an existing unrelated attachment.
                     if (attemptedAttach) detach();
                     succeeded = false;
-                    error = "attachment cancelled";
+                    error = "debugger startup cancelled";
                 }
                 if (succeeded) {
                     std::lock_guard sessionLock(mtx_);
@@ -367,7 +456,7 @@ void Debugger::lifecycleWorkerLoop() {
             lifecycleAttaching_.store(false);
         }
         std::unique_lock lock(lifecycleMtx_);
-        if (succeeded && request.command == DbgLifecycleCommand::Attach &&
+        if (succeeded && request.command != DbgLifecycleCommand::Detach &&
             lifecycleCancel_.load()) {
             // Commit and cancellation share this lock. Keep the operation busy
             // while cleanup runs, but release it so UI polling never waits on IO.
@@ -375,17 +464,17 @@ void Debugger::lifecycleWorkerLoop() {
             detach();
             succeeded = false;
             target = {};
-            error = "attachment cancelled";
+            error = "debugger startup cancelled";
             lock.lock();
         }
         lifecycle_.busy = false;
         lifecycle_.completed = true;
         lifecycle_.succeeded = succeeded;
         lifecycle_.cancelled = lifecycleCancel_.load() &&
-            request.command == DbgLifecycleCommand::Attach;
+            request.command != DbgLifecycleCommand::Detach;
         lifecycle_.error = std::move(error);
         lifecycle_.target = target;
-        lifecycle_.state = succeeded ? (request.command == DbgLifecycleCommand::Attach
+        lifecycle_.state = succeeded ? (request.command != DbgLifecycleCommand::Detach
             ? DbgLifecycleState::Attached : DbgLifecycleState::Detached)
             : lifecycle_.cancelled ? DbgLifecycleState::Detached : DbgLifecycleState::Failed;
     }
@@ -539,7 +628,9 @@ bool Debugger::launchAndAttach(const std::string& exePath, std::string& err,
     if (!ownerLock.owns_lock()) { err = "debugger lifecycle is busy"; return false; }
     {
         std::lock_guard lock(lifecycleMtx_);
-        if (lifecycle_.busy) { err = "debugger lifecycle is busy"; return false; }
+        if (lifecycle_.busy && std::this_thread::get_id() != lifecycleThread_.get_id()) {
+            err = "debugger lifecycle is busy"; return false;
+        }
     }
     // UTF-8 path -> UTF-16 for CreateProcessW.
     std::wstring wpath;
@@ -612,9 +703,10 @@ bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& e
     if (!ownerLock.owns_lock()) { err = "debugger lifecycle is busy"; return false; }
     {
         std::lock_guard lock(lifecycleMtx_);
-        if (lifecycle_.busy) { err = "debugger lifecycle is busy"; return false; }
+        if (lifecycle_.busy && std::this_thread::get_id() != lifecycleThread_.get_id()) {
+            err = "debugger lifecycle is busy"; return false;
+        }
     }
-    detach();
     if (!plan.valid) {
         err = plan.errors.empty() ? "invalid DLL debug launch plan" : plan.errors.front();
         return false;
@@ -626,6 +718,7 @@ bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& e
         return false;
     }
 
+    detach();
     const uint64_t controlEpoch = beginSessionControl();
     try {
         thread_ = std::thread([this, applicationPath, commandLine, plan, controlEpoch] {
@@ -981,7 +1074,7 @@ void Debugger::startTraceCoverage(const std::vector<uint64_t>& basicBlockStarts,
                                   size_t maxSites) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return;
+        if (state_ != DbgState::Running && state_ != DbgState::Paused) return;
         traceCoverage_.begin(basicBlockStarts, maxSites);
         pendingTraceStop_ = false;
         pendingTraceStart_ = true;
@@ -1067,6 +1160,10 @@ bool Debugger::clearTraceCoverageForSession(DebugTargetIdentity expected) {
 
 TraceCoverageSnapshot Debugger::traceCoverageSnapshot() const {
     return traceCoverage_.snapshot();
+}
+
+bool Debugger::traceCoverageSnapshotIfChanged(TraceCoverageSnapshot& retained) const {
+    return traceCoverage_.snapshotIfChanged(retained);
 }
 
 bool Debugger::startAuthorizationWatch(
@@ -4561,51 +4658,128 @@ std::vector<size_t> Debugger::writeMemoryBatchForSession(
     return results;
 }
 
-static std::vector<MemRegion> enumerateCommittedRegions(HANDLE process) {
-    std::vector<MemRegion> out;
-    if (!process) return out;
-    MEMORY_BASIC_INFORMATION mbi{};
-    uint64_t addr = 0;
-    while (VirtualQueryEx(process, (LPCVOID)addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
-        if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) && !(mbi.Protect & PAGE_NOACCESS)) {
-            MemRegion r;
-            r.base = (uint64_t)mbi.BaseAddress;
-            r.size = (uint64_t)mbi.RegionSize;
-            r.allocationBase = (uint64_t)mbi.AllocationBase;
-            r.protect = mbi.Protect; r.state = mbi.State; r.type = mbi.Type;
-            DWORD p = mbi.Protect & 0xFF;
-            r.read  = p & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
-            r.write = p & (PAGE_READWRITE | PAGE_WRITECOPY |
-                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
-            r.exec  = p & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
-            out.push_back(r);
-        }
-        uint64_t next = (uint64_t)mbi.BaseAddress + (uint64_t)mbi.RegionSize;
-        if (next <= addr) break;
-        addr = next;
-        if (out.size() > 100000) break;
+DbgRegionResult debugger_detail::CollectMemoryRegions(
+    uint64_t maximumAddress, const RegionQuery& query, size_t regionLimit) {
+    DbgRegionResult result;
+    if (!query || !regionLimit) {
+        result.error = "invalid memory-region enumeration request";
+        return result;
     }
-    return out;
+    uint64_t address = 0;
+    while (address <= maximumAddress) {
+        MemRegion region;
+        std::string error;
+        const auto status = query(address, region, error);
+        if (status == RegionQueryStatus::End) {
+            result.complete = true;
+            return result;
+        }
+        if (status == RegionQueryStatus::Failed) {
+            result.error = error.empty() ? "memory-region query failed" : std::move(error);
+            return result;
+        }
+        if (!region.size || region.base > address ||
+            region.base > UINT64_MAX - region.size || region.base + region.size <= address) {
+            result.error = "memory-region query returned a non-advancing or invalid range";
+            return result;
+        }
+        if (region.state == MEM_COMMIT) {
+            if (result.regions.size() == regionLimit) {
+                result.error = "memory-region enumeration reached the defensive region limit";
+                return result;
+            }
+            result.regions.push_back(region);
+        }
+        address = region.base + region.size;
+        result.coveredUntil = address;
+    }
+    result.complete = true;
+    return result;
+}
+
+static DbgRegionResult enumerateCommittedRegions(HANDLE process) {
+    if (!process) {
+        DbgRegionResult result;
+        result.error = "the debugger memory target is unavailable";
+        return result;
+    }
+    if (WaitForSingleObject(process, 0) != WAIT_TIMEOUT) {
+        DbgRegionResult result;
+        result.error = "the debugger process exited or cannot be queried";
+        return result;
+    }
+    SYSTEM_INFO info{};
+    GetNativeSystemInfo(&info);
+    auto result = debugger_detail::CollectMemoryRegions(
+        reinterpret_cast<uint64_t>(info.lpMaximumApplicationAddress),
+        [process](uint64_t address, MemRegion& region, std::string& error) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            SetLastError(ERROR_SUCCESS);
+            if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &mbi,
+                               sizeof(mbi)) != sizeof(mbi)) {
+                const DWORD code = GetLastError();
+                if (code == ERROR_INVALID_PARAMETER && address &&
+                    WaitForSingleObject(process, 0) == WAIT_TIMEOUT)
+                    return debugger_detail::RegionQueryStatus::End;
+                error = "VirtualQueryEx failed (error " + std::to_string(code) + ")";
+                return debugger_detail::RegionQueryStatus::Failed;
+            }
+            region.base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+            region.size = mbi.RegionSize;
+            region.allocationBase = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+            region.protect = mbi.Protect;
+            region.state = mbi.State;
+            region.type = mbi.Type;
+            const DWORD p = mbi.Protect & 0xFF;
+            region.read = p & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
+            region.write = p & (PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
+            region.exec = p & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY);
+            return debugger_detail::RegionQueryStatus::Region;
+        });
+    if (result.complete && WaitForSingleObject(process, 0) != WAIT_TIMEOUT) {
+        result.complete = false;
+        result.error = "the debugger process exited during memory-region enumeration";
+    }
+    return result;
+}
+
+static std::vector<MemRegion> legacyAccessibleRegions(DbgRegionResult result) {
+    std::erase_if(result.regions, [](const MemRegion& region) {
+        return (region.protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0;
+    });
+    return std::move(result.regions);
 }
 
 std::vector<MemRegion> Debugger::regions() {
     std::lock_guard<std::mutex> lk(hProcMtx_);
-    return enumerateCommittedRegions(
-        static_cast<HANDLE>(hProcessShared_.load()));
+    return legacyAccessibleRegions(enumerateCommittedRegions(
+        static_cast<HANDLE>(hProcessShared_.load())));
 }
 
 std::vector<MemRegion> Debugger::regionsForSession(
+    uint32_t expectedPid, uint64_t expectedSessionGeneration) {
+    return legacyAccessibleRegions(queryRegionsForSession(expectedPid, expectedSessionGeneration));
+}
+
+DbgRegionResult Debugger::queryRegionsForSession(
     uint32_t expectedPid, uint64_t expectedSessionGeneration) {
     std::lock_guard<std::mutex> lk(hProcMtx_);
     HANDLE process = static_cast<HANDLE>(hProcessShared_.load());
     const DebugTargetIdentity expected{
         expectedPid, expectedSessionGeneration
     };
-    if (!processHandleMatchesIdentity(process, hProcessIdentity_, expected))
-        return {};
-    return enumerateCommittedRegions(process);
+    DbgRegionResult result;
+    result.target = expected;
+    if (!processHandleMatchesIdentity(process, hProcessIdentity_, expected)) {
+        result.error = "memory-region query no longer owns the debugger target session";
+        return result;
+    }
+    result = enumerateCommittedRegions(process);
+    result.target = expected;
+    return result;
 }
 
 std::vector<DbgModule> Debugger::modulesForSession(
@@ -4693,6 +4867,7 @@ DbgSnapshot Debugger::snapshot() {
     s.sessionGeneration = sessionGeneration_;
     s.regs = regs_;
     s.lastEvent = lastEvent_;
+    s.traceOwnedSites = traceBps_.size();
     s.breakpoints.reserve(bps_.size() + failedBpInstalls_.size());
     for (auto& kv : bps_)
         s.breakpoints.push_back({ kv.first, kv.second.cond, kv.second.hits,
@@ -4733,7 +4908,8 @@ Debugger::CommandEnvelope Debugger::waitForCommand(uint64_t controlEpoch) {
     const auto hasBreakpointEdits = [this, controlEpoch] {
         return controlEpoch_ == controlEpoch &&
             (!pendingBpAdds_.empty() || !pendingBpRems_.empty() ||
-             !pendingBpConds_.empty() || !pendingBpEveryN_.empty());
+             !pendingBpConds_.empty() || !pendingBpEveryN_.empty() ||
+             pendingTraceStart_ || pendingTraceStop_);
     };
     const auto ready = [this, controlEpoch, &hasBreakpointEdits] {
         return quit_ || (pendingCommand_.command != Cmd::None &&
@@ -6008,17 +6184,20 @@ uint64_t Debugger::ctxReadRip(void* hThread) {
     return GetThreadContext((HANDLE)hThread, &c) ? (uint64_t)c.Rip : 0;
 }
 
-void Debugger::ctxSetRip(void* hThread, uint64_t rip) {
+bool Debugger::ctxSetRip(void* hThread, uint64_t rip) {
     if (isWow64_.load()) {
+        if (rip > UINT32_MAX) return false;
         WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_CONTROL;
         if (Wow64GetThreadContext((HANDLE)hThread, &c)) {
             c.Eip = (DWORD)rip; c.ContextFlags = WOW64_CONTEXT_CONTROL;
-            Wow64SetThreadContext((HANDLE)hThread, &c);
+            return Wow64SetThreadContext((HANDLE)hThread, &c) != FALSE;
         }
-        return;
+        return false;
     }
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
-    if (GetThreadContext((HANDLE)hThread, &c)) { c.Rip = rip; SetThreadContext((HANDLE)hThread, &c); }
+    if (!GetThreadContext((HANDLE)hThread, &c)) return false;
+    c.Rip = rip;
+    return SetThreadContext((HANDLE)hThread, &c) != FALSE;
 }
 
 void Debugger::clearBreakpointInstallFailureLocked(uint64_t va) {
@@ -6780,6 +6959,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     ReArmOwner tempReArmOwner = ReArmOwner::User;
     bool   breakpointTransitionFailed = false;
     bool   breakpointCleanupComplete = true;
+    bool   traceEventCleanupComplete = true;
 
     // A software breakpoint is process-wide. While its original instruction is
     // exposed for one owner thread, suspend peers so none can execute through the
@@ -6810,21 +6990,86 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     // (a step's temp bp may be in flight when jvm.dll loads).
     uint64_t pendingJvmInitVA = 0;
 
-    auto removeAllTraceBps = [&]() {
+    // Keep module identity after a one-shot is consumed: its historical hit must
+    // never color a later image loaded at the same address.
+    std::unordered_set<uint64_t> traceImageBases;
+    struct QueuedTraceHit { uint64_t address = 0; TraceBp site; };
+    // Windows can queue another thread's INT3 before the first event freezes
+    // the process. Retain only peers proved to be at this exact trap's RIP+1.
+    // One outstanding event per known thread bounds this metadata by the target's
+    // existing thread set, independently of trace restarts and plan length.
+    std::unordered_map<uint32_t, QueuedTraceHit> queuedTraceHits;
+    std::unordered_map<uint64_t, size_t> queuedTraceAddressRefs;
+    auto retireQueuedTraceHit = [&](uint32_t tid) {
+        const auto it = queuedTraceHits.find(tid);
+        if (it == queuedTraceHits.end()) return;
+        if (auto refs = queuedTraceAddressRefs.find(it->second.address);
+            refs != queuedTraceAddressRefs.end() && --refs->second == 0)
+            queuedTraceAddressRefs.erase(refs);
+        queuedTraceHits.erase(it);
+    };
+    auto captureQueuedTracePeers = [&](uint32_t excludedTid = 0) {
+        for (const auto& [peerTid, peerHandle] : threads_) {
+            if (peerTid == excludedTid || !peerHandle || queuedTraceHits.count(peerTid)) continue;
+            const uint64_t rip = ctxReadRip(peerHandle);
+            if (!rip) continue;
+            TraceBp site;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                const auto owned = traceBps_.find(rip - 1);
+                if (owned == traceBps_.end()) continue;
+                site = owned->second;
+            }
+            queuedTraceHits.emplace(peerTid, QueuedTraceHit{rip - 1, site});
+            ++queuedTraceAddressRefs[rip - 1];
+        }
+    };
+
+    auto removeAllTraceBps = [&]() -> bool {
+        // A Stop/Restart/Detach event may arrive before any peer's trace event.
+        // Capture these already-trapped contexts before bulk byte restoration.
+        captureQueuedTracePeers();
         std::vector<std::pair<uint64_t, TraceBp>> owned;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             owned.reserve(traceBps_.size());
             for (const auto& kv : traceBps_) owned.push_back(kv);
-            traceBps_.clear();
-            traceBpAddrs_.clear();
         }
+        bool complete = true;
         for (const auto& [va, bp] : owned) {
-            breakpointCleanupComplete =
-                restoreDebuggerOwnedByte((HANDLE)hProcess_, va, bp.orig) &&
-                breakpointCleanupComplete;
+            bool restored = restoreDebuggerOwnedByte((HANDLE)hProcess_, va, bp.orig);
+            if (!restored) {
+                // A proved unmap has no byte left to restore. A temporarily
+                // unreadable committed page must retain its sole metadata owner.
+                MEMORY_BASIC_INFORMATION region{};
+                restored = VirtualQueryEx((HANDLE)hProcess_, (LPCVOID)va,
+                    &region, sizeof(region)) == sizeof(region) &&
+                    region.State != MEM_COMMIT;
+            }
+            if (!restored) {
+                complete = false;
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                traceBps_.erase(va);
+            }
             traceCoverage_.markDisarmed(bp.generation, va);
         }
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            traceBpAddrs_.erase(std::remove_if(traceBpAddrs_.begin(), traceBpAddrs_.end(),
+                [&](uint64_t va) { return !traceBps_.count(va); }), traceBpAddrs_.end());
+        }
+        return complete;
+    };
+    auto prepareTraceDetach = [&]() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            pendingTraceStart_ = pendingTraceStop_ = false;
+            traceCoverage_.stop();
+        }
+        breakpointCleanupComplete = removeAllTraceBps() && breakpointCleanupComplete;
     };
 
     // Consume UI trace requests only on the debug-event thread, while the target
@@ -6841,38 +7086,83 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
 
         // A restart owns a new generation, so restore every site from the old one
         // before planting the replacement plan. Stop is restoration-only.
-        removeAllTraceBps();
+        if (!removeAllTraceBps()) {
+            traceCoverage_.stop();
+            std::lock_guard<std::mutex> lk(mtx_);
+            lastEvent_ = "trace restore incomplete; byte ownership retained; retry Stop Trace";
+            return;
+        }
         if (!start || !traceCoverage_.active()) return;
+        traceImageBases.clear();
 
         const uint64_t generation = traceCoverage_.generation();
         const std::vector<uint64_t> sites = traceCoverage_.pendingSites(generation);
         for (uint64_t va : sites) {
             if (!traceCoverage_.active() || traceCoverage_.generation() != generation) break;
 
+            MEMORY_BASIC_INFORMATION region{};
+            const bool queried = VirtualQueryEx((HANDLE)hProcess_, (LPCVOID)va,
+                &region, sizeof(region)) == sizeof(region);
+            const DWORD protection = region.Protect & 0xFFu;
+            const bool executable = protection == PAGE_EXECUTE ||
+                protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE ||
+                protection == PAGE_EXECUTE_WRITECOPY;
+            if (!queried || region.State != MEM_COMMIT || !executable ||
+                (region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                traceCoverage_.markSkipped(generation, va);
+                continue;
+            }
+            const uint64_t imageBase = region.Type == MEM_IMAGE
+                ? (uint64_t)(uintptr_t)region.AllocationBase : 0;
+            if (imageBase) traceImageBases.insert(imageBase);
+
             // Never borrow a byte already owned by another debugger mechanism.
             // A user breakpoint at a planned block is counted when that bp fires.
             bool ownedConflict = false;
             { std::lock_guard<std::mutex> lk(mtx_);
               ownedConflict = gameMakerOwnsRangeLocked(va,1) || bps_.count(va) != 0 || dllTargetBps_.count(va) != 0 ||
+                              antiTraps_.count(va) != 0 ||
                               networkProbeBps_.count(va) != 0 ||
                               networkReturnBps_.count(va) != 0 ||
                               authorizationBps_.count(va) != 0 ||
                               authorizationReturnBps_.count(va) != 0; }
-            if (ownedConflict || (tempBpSet && tempBpAddr == va)) {
+            if (ownedConflict || queuedTraceAddressRefs.count(va) ||
+                (tempBpSet && tempBpAddr == va)) {
                 traceCoverage_.markSkipped(generation, va);
                 continue;
             }
 
             uint8_t orig = 0;
-            if (!readByteRPM((HANDLE)hProcess_, va, orig) || orig == 0xCC ||
-                !writeByteRPM((HANDLE)hProcess_, va, 0xCC)) {
+            if (!readByteRPM((HANDLE)hProcess_, va, orig) || orig == 0xCC) {
                 traceCoverage_.markSkipped(generation, va);
                 continue;
             }
             {
                 std::lock_guard<std::mutex> lk(mtx_);
-                traceBps_[va] = TraceBp{ orig, generation };
-                traceBpAddrs_.push_back(va); // sites is sorted
+                // Allocate ownership before changing the byte so an allocation
+                // failure cannot strand an INT3 without teardown metadata.
+                traceBps_.emplace(va, TraceBp{ orig, generation, imageBase });
+                try {
+                    traceBpAddrs_.push_back(va); // sites is sorted
+                } catch (...) {
+                    traceBps_.erase(va);
+                    throw;
+                }
+            }
+            if (!replaceByteIfEqual((HANDLE)hProcess_, va, orig, 0xCC)) {
+                if (restoreDebuggerOwnedByte((HANDLE)hProcess_, va, orig)) {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    traceBps_.erase(va);
+                    traceBpAddrs_.pop_back();
+                    traceCoverage_.markSkipped(generation, va);
+                } else {
+                    traceCoverage_.markArmed(generation, va);
+                    traceCoverage_.stop();
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    lastEvent_ = "trace install verification failed; byte ownership retained; retry Stop Trace";
+                    break;
+                }
+                continue;
             }
             traceCoverage_.markArmed(generation, va);
         }
@@ -8259,10 +8549,39 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     while (alive) {
         if (!WaitForDebugEvent(&ev, 100)) {
             serviceGameMaker(false);
+            // A timeout does not prove that an exception has drained. Retire a
+            // conservative RIP+1 candidate only after a balanced thread sample
+            // proves that it moved, or its thread is proved to have exited.
+            for (auto it = queuedTraceHits.begin(); it != queuedTraceHits.end(); ) {
+                const uint32_t pendingTid = it->first;
+                const uint64_t pendingRip = it->second.address + 1;
+                ++it;
+                const auto thread = threads_.find(pendingTid);
+                bool retired = thread == threads_.end();
+                if (!retired) {
+                    DWORD exitCode = STILL_ACTIVE;
+                    retired = GetExitCodeThread((HANDLE)thread->second, &exitCode) &&
+                        exitCode != STILL_ACTIVE;
+                    if (!retired && SuspendThread((HANDLE)thread->second) != DWORD(-1)) {
+                        Registers context{};
+                        const bool read = ctxReadFull(thread->second, context);
+                        const bool resumed = ResumeThread((HANDLE)thread->second) != DWORD(-1);
+                        retired = read && context.rip != pendingRip;
+                        if (!resumed) traceEventCleanupComplete = false;
+                    }
+                }
+                if (retired) retireQueuedTraceHit(pendingTid);
+            }
             // Running detach requests an internal debug break first. Wait for
             // that event so cleanup owns a stopped process; if injection failed,
             // the cleanup path explicitly suspends the known threads instead.
-            if (quit_ && !traceSyncBreakRequested_.load()) break;
+            if (quit_ && !traceSyncBreakRequested_.load()) {
+                // The existing lifecycle always completes detach after bounded
+                // cleanup. Preserve that contract while making any unresolved
+                // event ownership explicit instead of claiming a proven drain.
+                if (!queuedTraceHits.empty()) traceEventCleanupComplete = false;
+                break;
+            }
             continue;
         }
         // ContinueDebugEvent resumes the target; WaitForDebugEvent stops it again.
@@ -8292,6 +8611,25 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             }
         }
         DWORD contStatus = DBG_CONTINUE;
+        std::optional<QueuedTraceHit> delayedTraceHit;
+        if (const auto queued = queuedTraceHits.find(ev.dwThreadId);
+            queued != queuedTraceHits.end()) {
+            const auto& saved = queued->second;
+            const bool breakpoint = ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
+                ev.u.Exception.dwFirstChance &&
+                (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT ||
+                 ev.u.Exception.ExceptionRecord.ExceptionCode == kStatusWx86Breakpoint);
+            uint8_t current = 0;
+            const auto thread = threads_.find(ev.dwThreadId);
+            if (breakpoint &&
+                (uint64_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == saved.address &&
+                thread != threads_.end() && saved.address != UINT64_MAX &&
+                ctxReadRip(thread->second) == saved.address + 1 &&
+                readByteRPM((HANDLE)hProcess_, saved.address, current) && current == saved.site.orig)
+                delayedTraceHit = saved;
+            // Any other event proves this thread's old window no longer applies.
+            retireQueuedTraceHit(ev.dwThreadId);
+        }
         bool  pause = false;
         bool  gmlEvent = false;
         bool  preserveLoaderPhaseOnPause = false;
@@ -8742,6 +9080,35 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                   if (auto module = std::find_if(dbgModules_.begin(), dbgModules_.end(),
                           [b](const DbgModule& value) { return value.base == b; });
                       module != dbgModules_.end()) unloadedSize = module->size; }
+                if (b && traceImageBases.count(b)) {
+                    // The unload event has already retired these physical bytes.
+                    // Never restore them into a disappearing or reused mapping.
+                    // Retire the full report because address-only historical hits
+                    // cannot distinguish this image from its next incarnation.
+                    {
+                        std::lock_guard<std::mutex> lk(mtx_);
+                        for (auto it = traceBps_.begin(); it != traceBps_.end(); ) {
+                            if (it->second.imageBase == b) it = traceBps_.erase(it);
+                            else ++it;
+                        }
+                        traceBpAddrs_.erase(std::remove_if(traceBpAddrs_.begin(),
+                            traceBpAddrs_.end(), [&](uint64_t va) {
+                                return !traceBps_.count(va);
+                            }), traceBpAddrs_.end());
+                        traceCoverage_.reset();
+                        pendingTraceStart_ = false;
+                        pendingTraceStop_ = true;
+                    }
+                    traceImageBases.erase(b);
+                    setEvent("trace cleared: a traced module unloaded");
+                }
+                for (auto it = queuedTraceHits.begin(); it != queuedTraceHits.end(); ) {
+                    if (it->second.site.imageBase == b) {
+                        const uint32_t pendingTid = it->first;
+                        ++it;
+                        retireQueuedTraceHit(pendingTid);
+                    } else ++it;
+                }
                 if (b && b == jvmBase) { jvmBase = 0; jvmSize = 0; }
                 uint64_t targetSize = 0;
                 bool targetUnload = false;
@@ -9275,11 +9642,27 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                             publishDllTargetHit(target);
                             pause = true;
                         }
+                    } else if (delayedTraceHit) {
+                        // A peer had already executed our now-restored INT3.
+                        // Rewind only the exact saved thread/address/byte tuple;
+                        // stale generations may resume safely but never gain hits.
+                        const auto th = threads_.find(ev.dwThreadId);
+                        if (th == threads_.end() || !ctxSetRip(th->second, addr) ||
+                            ctxReadRip(th->second) != addr) {
+                            breakpointTransitionFailed = true;
+                            pause = true;
+                            setEvent("queued trace breakpoint instruction-pointer rewind failed");
+                        } else {
+                            traceCoverage_.recordBlockHit(delayedTraceHit->site.generation, addr);
+                        }
                     } else if (traceBps_.count(addr)) {
                         // Invisible one-shot coverage bp: restore the pristine byte,
-                        // back up RIP, account the hit, and execute it once under TF.
-                        // There is deliberately no re-arm.
+                        // back up RIP, and account the hit. There is no re-arm, so
+                        // no extra TF step is needed. Preserve any pre-existing TF
+                        // owned by a user step; creating a new process-global trace
+                        // step here lets simultaneous hits overwrite its owner.
                         TraceBp trace;
+                        captureQueuedTracePeers(ev.dwThreadId);
                         if (takeTraceSite(addr, trace)) {
                             if (!restoreDebuggerOwnedByte((HANDLE)hProcess_, addr, trace.orig)) {
                                 {
@@ -9294,12 +9677,16 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                                 setEvent("trace breakpoint restore failed");
                                 break;
                             }
-                            if (auto th = threads_.find(ev.dwThreadId); th != threads_.end())
-                                ctxSetRip(th->second, addr);
+                            const auto th = threads_.find(ev.dwThreadId);
+                            if (th == threads_.end() || !ctxSetRip(th->second, addr) ||
+                                ctxReadRip(th->second) != addr) {
+                                traceCoverage_.markDisarmed(trace.generation, addr);
+                                breakpointTransitionFailed = true;
+                                pause = true;
+                                setEvent("trace breakpoint instruction-pointer rewind failed");
+                                break;
+                            }
                             traceCoverage_.recordBlockHit(trace.generation, addr);
-                            traceStepTid = ev.dwThreadId;
-                            traceStepFreeRun = !(reArmAddr || stepPause || steppingOut || stepOutFinishing);
-                            setTrapFlag(ev.dwThreadId, true);
                         }
                     } else if (hasArmedUserBreakpoint(addr)) {
                         if (handleUserBp(addr, ev.dwThreadId)) pause = true;
@@ -9792,11 +10179,12 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             Cmd c = command.command;
             if (c == Cmd::Detach || quit_) {
                 abandonAntiRearms(true);
-                if (traceSyncBreakRequested_.load()) {
+                prepareTraceDetach();
+                if (traceSyncBreakRequested_.load() || !queuedTraceHits.empty()) {
                     // A running detach may have raced an already-pending event.
-                    // Let that event go and consume the injected DbgBreakPoint
-                    // before detaching; otherwise its helper could execute an
-                    // unserviced INT3 immediately after DebugActiveProcessStop.
+                    // Drain both the injected DbgBreakPoint and proved queued
+                    // trace peers before detaching; otherwise an unserviced INT3
+                    // could be delivered after DebugActiveProcessStop.
                     pausedOnBp = false;
                     pausedOnBpAddr = 0;
                     { std::lock_guard<std::mutex> lk(mtx_);
@@ -9839,7 +10227,10 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             // Running and asks DebugBreakProcess for a fresh event.
             bool serviceBreakpointEdits = false;
             for (;;) {
-                if (serviceBreakpointEdits) applyPendingBps();
+                if (serviceBreakpointEdits) {
+                    applyPendingBps();
+                    applyPendingTrace();
+                }
                 servicePendingWrites(controlEpoch);
                 std::lock_guard<std::mutex> lk(mtx_);
                 const bool pendingForThisEpoch = std::any_of(
@@ -9849,7 +10240,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     });
                 serviceBreakpointEdits = !pendingBpAdds_.empty() ||
                     !pendingBpRems_.empty() || !pendingBpConds_.empty() ||
-                    !pendingBpEveryN_.empty();
+                    !pendingBpEveryN_.empty() || pendingTraceStart_ || pendingTraceStop_;
                 if (!pendingForThisEpoch && !serviceBreakpointEdits) {
                     state_ = DbgState::Running;
                     break;
@@ -10039,7 +10430,8 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         }
 
         if (quit_ && alive) {
-            if (!traceSyncBreakRequested_.load()) {
+            prepareTraceDetach();
+            if (!traceSyncBreakRequested_.load() && queuedTraceHits.empty()) {
                 debugEventHeldForCleanup = true;
                 heldContinueStatus = contStatus;
                 break;
@@ -10100,7 +10492,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         remoteRegisterBuffers_.clear();
     }
     traceCoverage_.stop();
-    removeAllTraceBps();
+    breakpointCleanupComplete = removeAllTraceBps() && breakpointCleanupComplete;
     authorizationWatch_.stop();
     removeAllAuthorizationBps();
     removeDllTargets(/*all=*/0, 0);
@@ -10197,7 +10589,12 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
               ? "detached with incomplete breakpoint-byte and hardware-register cleanup"
               : (!hardwareCleanupComplete
                     ? "detached with incomplete hardware-breakpoint cleanup"
-                    : "detached with incomplete breakpoint-byte cleanup"); }
+                    : "detached with incomplete breakpoint-byte cleanup");
+      if (alive && !traceEventCleanupComplete) {
+          if (!hardwareCleanupComplete || !breakpointCleanupComplete)
+              lastEvent_ += "; queued trace-event cleanup unresolved";
+          else lastEvent_ = "detached with unresolved queued trace breakpoint events";
+      } }
 }
 
 } // namespace ds

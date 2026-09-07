@@ -235,6 +235,33 @@ static bool waitForPausedDebugger(Debugger& debugger, int timeoutMs) {
     return debugger.snapshot().state == DbgState::Paused;
 }
 
+static bool launchOwnedWatch(Debugger& debugger, AuthorizationWatchPlan plan,
+                             bool breakAtEntry, bool network, std::string& error) {
+    DbgLaunchRequest request;
+    request.executable = plan.imagePath;
+    request.breakAtEntry = breakAtEntry;
+    request.authorizationPlan = std::move(plan);
+    request.prelaunchNetworkObservation = network;
+    const uint64_t id = debugger.requestLaunch(request, &error);
+    // Retiring the caller's plan immediately must not alter queued startup.
+    request.authorizationPlan.reset();
+    request.executable.clear();
+    if (!id) return false;
+    for (int elapsed = 0; elapsed < 35000; elapsed += 10) {
+        const auto lifecycle = debugger.lifecycleSnapshot();
+        if (lifecycle.requestId == id && lifecycle.completed) {
+            error = lifecycle.error;
+            const auto snapshot = debugger.snapshot();
+            return lifecycle.succeeded && !lifecycle.cancelled &&
+                DebugTargetIdentityMatches(lifecycle.target, {snapshot.pid, snapshot.sessionGeneration});
+        }
+        Sleep(10);
+    }
+    debugger.cancelLifecycle(id);
+    error = "queued Authorization Watch startup timed out";
+    return false;
+}
+
 static bool waitForUserBreakpointStop(Debugger& debugger, uint64_t address,
                                       uint32_t minimumHits,
                                       const std::string& condition,
@@ -375,10 +402,8 @@ static void runLiveDebuggerIntegration() {
         *livePlan.launchSource.bytes);
     differentBytes->front() ^= 0xFF;
     rejectedPlan.launchSource.bytes = std::move(differentBytes);
-    const bool rejectedLaunch = debugger.launchAndAttach(
-        rejectedPlan.imagePath, error, /*breakAtEntry=*/false,
-        /*containedJob=*/false, &rejectedPlan, {},
-        /*prelaunchNetworkObservation=*/true);
+    const bool rejectedLaunch = launchOwnedWatch(debugger, rejectedPlan,
+        /*breakAtEntry=*/false, /*network=*/true, error);
     assert(rejectedLaunch && error.empty());
     assert(waitForAuthorizationSourceRejection(debugger, 5000));
     const AuthorizationWatchSnapshot rejected =
@@ -400,9 +425,8 @@ static void runLiveDebuggerIntegration() {
     debugger.detach();
     error.clear();
 
-    const bool launched = debugger.launchAndAttach(
-        livePlan.imagePath, error, /*breakAtEntry=*/true,
-        /*containedJob=*/false, &livePlan, {});
+    const bool launched = launchOwnedWatch(debugger, livePlan,
+        /*breakAtEntry=*/true, /*network=*/false, error);
     if (previousLength > 0 && previousLength < sizeof(previous))
         SetEnvironmentVariableA("DS_AUTHORIZATION_WATCH_TEST_CHILD", previous);
     else

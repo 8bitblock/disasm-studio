@@ -63,6 +63,33 @@ int main() {
     }
     assert(foundEmpty);
 
+    // Details must retain long paths at narrow widths, including inside an
+    // indented group. Values stay within the content bounds at every scale.
+    for (float scale : {1.0f, 1.5f, 2.0f}) {
+        ds::theme::SetUiScale(scale);
+        ds::theme::ApplyTheme();
+        for (float paneWidth : {240.0f, 520.0f}) {
+            frame(paneWidth * scale, [&] {
+                ImGui::Indent(24.0f * scale);
+                const ImVec2 origin = ImGui::GetCursorScreenPos();
+                const float right = origin.x + ImGui::GetContentRegionAvail().x;
+                ds::ui::KeyValueRow("Project path", "%s",
+                    "C:\\Analyses\\firmware-and-library-investigation\\release\\reference-image-with-a-long-name.bin");
+                assert(ImGui::GetItemRectMin().x >= origin.x - 1.0f);
+                assert(ImGui::GetItemRectMax().x <= right + 1.0f);
+                if (paneWidth < 300.0f) {
+                    assert(ImGui::GetItemRectSize().y > ImGui::GetTextLineHeight());
+                    assert(ImGui::GetItemRectMin().y > origin.y);
+                } else
+                    assert(ImGui::GetItemRectMin().y >= origin.y - 1.0f &&
+                           ImGui::GetItemRectMin().y <= origin.y + 1.0f);
+                ImGui::Unindent(24.0f * scale);
+            });
+        }
+    }
+    ds::theme::SetUiScale(1.0f);
+    ds::theme::ApplyTheme();
+
     const char* labels[] = {"Assembly", "Pseudocode", "Hex", "Graph", "Call Graph", "Overview", "Live Assembly"};
     const bool enabled[] = {true, true, true, true, true, true, false};
     int selected = 0;

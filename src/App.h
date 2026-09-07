@@ -27,6 +27,7 @@
 #include "Core/JdwpClient.h"
 #include "Core/InvestigationService.h"
 #include "Core/LiveScanService.h"
+#include "Core/MemoryScan.h"
 #include "Core/ModuleRegistry.h"
 #include "Core/PassiveDump.h"
 #include "Core/PeUnpack.h"
@@ -67,6 +68,26 @@ enum class LiveDocumentOpenOrigin : uint8_t {
     AttachMain,
     HostedDll,
 };
+
+// One-shot, identity-bound navigation into the live-memory workbench. Ordinary
+// callers only select bytes in the viewer. An explicit scan-preparation action
+// may additionally supply a typed value; Memory Tools applies it only after the
+// same debugger PID/session has been revalidated and never starts a scan itself.
+struct MemoryToolsRequest {
+    bool                pending = false;
+    uint64_t            address = 0;
+    DebugTargetIdentity target{};
+    uint32_t            selectionBytes = 1;
+    bool                prepareScan = false;
+    MemoryScanValue     scanValue;
+};
+
+// Convert a captured canonical GML numeric payload into the exact value type
+// understood by Memory Tools. The flags/type tag beside the payload remain
+// inspection evidence and are intentionally not part of the typed scan needle.
+bool BuildGmlMemoryScanPreset(const GmlHelperNumericSlot& slot,
+                              MemoryScanValue& value,
+                              uint32_t& selectionBytes);
 
 // Shared, app-wide state passed by reference to every tab.
 struct AppContext {
@@ -146,10 +167,7 @@ struct AppContext {
     bool                           hasGotoRequest        = false; // distinguishes "go to VA 0" from "no request"
     bool                           requestedGotoLive     = false; // goto target is a runtime VA -> open the live view (no file-VA translation)
     DebugTargetIdentity            requestedGotoTarget{};         // owner of a LIVE goto; empty for FILE requests
-    uint64_t                       requestedMemoryVA     = 0;     // identity-bound live address -> Memory Tools hex view
-    uint32_t                       requestedMemoryPid    = 0;
-    uint64_t                       requestedMemoryGeneration = 0;
-    bool                           hasMemoryRequest      = false;
+    MemoryToolsRequest             requestedMemory;              // one-shot live viewer / explicit scan-preparation handoff
     std::string                    pendingSignature;             // Binary View -> Sig Scanner pattern handoff
     bool                           pendingSignatureLive  = false; // pendingSignature was built from live process memory -> scan live, not the file
     DocumentResultIdentity         pendingSignatureOwner;        // exact source for static handoffs; empty for live handoffs
@@ -231,11 +249,30 @@ struct AppContext {
     // Send a runtime address to Memory Tools. Supplying the debugger identity
     // prevents a delayed UI request from being applied after detach/reattach.
     void openMemoryToolsAt(uint64_t va, uint32_t pid = 0,
-                           uint64_t sessionGeneration = 0) {
-        requestedMemoryVA = va;
-        requestedMemoryPid = pid;
-        requestedMemoryGeneration = sessionGeneration;
-        hasMemoryRequest = true;
+                           uint64_t sessionGeneration = 0,
+                           uint32_t selectionBytes = 1) {
+        requestedMemory = {};
+        requestedMemory.pending = true;
+        requestedMemory.address = va;
+        requestedMemory.target = { pid, sessionGeneration };
+        requestedMemory.selectionBytes = selectionBytes ? selectionBytes : 1;
+        requestedTab = "Memory Tools";
+    }
+
+    // Unlike openMemoryToolsAt, this explicitly replaces the scanner inputs.
+    // Requiring a complete debugger identity prevents a delayed GML value from
+    // being prepared against a different attachment.
+    void prepareMemoryToolsScanAt(uint64_t va, DebugTargetIdentity target,
+                                  MemoryScanValue value,
+                                  uint32_t selectionBytes = 1) {
+        if (!target.valid() || !value.valid()) return;
+        requestedMemory = {};
+        requestedMemory.pending = true;
+        requestedMemory.address = va;
+        requestedMemory.target = target;
+        requestedMemory.selectionBytes = selectionBytes ? selectionBytes : 1;
+        requestedMemory.prepareScan = true;
+        requestedMemory.scanValue = std::move(value);
         requestedTab = "Memory Tools";
     }
 
@@ -373,6 +410,9 @@ public:
     // facade over DocumentManager; callers never retain DocumentContext pointers.
     std::vector<StaticDocumentSummary> staticDocuments() const;
     size_t staticDocumentCount() const { return documents_.size(); }
+    void setTypeDraftPending(DocumentId id, bool pending);
+    bool commitTypeDefinition(DocumentId id, uint64_t imageGeneration,
+        const TypeDefinition& definition, bool persist, std::string& error);
     bool queueActivateStaticDocument(DocumentId id);
     bool queueCloseStaticDocument(DocumentId id);
     bool documentCommandPending() const;
@@ -506,8 +546,36 @@ public:
     }
 
     // Launch the loaded binary under the debugger (break at entry) and open the
-    // live view. The one shared path for the toolbar / command palette / Binary
-    // View Run button. Returns false with `err` set on failure.
+    // live view after exact-owner completion. The UI only enqueues startup.
+    uint64_t debugLaunchRequest = 0;
+    DocumentId debugLaunchDocument{};
+    uint64_t debugLaunchImageGeneration = 0;
+
+    uint64_t requestDebugLaunch(DbgLaunchRequest request, std::string& err) {
+        const uint64_t id = debug.requestLaunch(std::move(request), &err);
+        if (id) {
+            debugLaunchRequest = id;
+            debugLaunchDocument = staticDocumentId();
+            debugLaunchImageGeneration = staticImageGeneration();
+        }
+        return id;
+    }
+    uint64_t requestDebugDllLaunch(DllDebugLaunchPlan plan, std::string& err) {
+        const uint64_t id = debug.requestLaunchDll(std::move(plan), &err);
+        if (id) {
+            debugLaunchRequest = id;
+            debugLaunchDocument = staticDocumentId();
+            debugLaunchImageGeneration = staticImageGeneration();
+        }
+        return id;
+    }
+    bool debugLaunchSourceCurrent(uint64_t requestId) const {
+        return requestId && requestId == debugLaunchRequest &&
+            debugLaunchDocument == staticDocumentId() &&
+            debugLaunchImageGeneration == staticImageGeneration();
+    }
+
+    // Shared toolbar / command palette / Binary View Run path. True means queued.
     bool launchAndDebug(std::string& err) {
         if (!binaryLaunchable()) {
             err = staticBinary().loaded() && !binaryDebugArchitectureMatches()
@@ -515,9 +583,9 @@ public:
                 : "the active image is not a launchable on-disk PE executable";
             return false;
         }
-        if (!debug.launchAndAttach(staticBinary().path(), err)) return false;
-        openLiveAssemblyView();
-        return true;
+        DbgLaunchRequest request;
+        request.executable = staticBinary().path();
+        return requestDebugLaunch(std::move(request), err) != 0;
     }
 
     // Opens a Win32 file dialog and loads the chosen binary. Returns true on
@@ -748,6 +816,7 @@ private:
     void closeBinary();         // flush + unload the current binary (menu / file tab / palette)
 
     AppContext                          ctx_;
+    TraceCoverageSnapshot               traceSnapshot_; // retained across unchanged frames
     std::vector<std::unique_ptr<ITab>>  tabs_;
     BinaryViewHostTab*                  binaryView_ = nullptr;  // per-document Binary View owner + investigation source
     InvestigationService                investigation_;         // sole worker for unified index build/query
@@ -758,6 +827,7 @@ private:
     DebugTargetIdentity                 investigationSubmittedLiveTarget_{};
     int                                 activeTab_ = 0;   // index into tabs_ (primary strip selection)
     uint64_t                            lastDebugLifecycleCompletion_ = 0;
+    DebugTargetIdentity                 suppressedLaunchNavigation_{};
     bool                                exit_      = false;
     bool                                showDemo_  = false;
     bool                                showHelp_  = false;
@@ -847,6 +917,10 @@ private:
         bool closeAfterDocumentLoad = false;
         bool observing = false;
         bool waitingForInitialBreak = false;
+        uint64_t launchRequestId = 0;
+        DocumentId sourceDocument{};
+        uint64_t sourceImageGeneration = 0;
+        DebugTargetIdentity target{};
         bool pauseRequested = false;
         bool containedLaunch = true;
         bool autoRun = true;

@@ -52,6 +52,46 @@
 
 namespace ds {
 
+bool BuildGmlMemoryScanPreset(const GmlHelperNumericSlot& slot,
+                              MemoryScanValue& value,
+                              uint32_t& selectionBytes) {
+    MemoryScanValue next;
+    uint32_t width = 0;
+    switch (slot.kind) {
+    case GmlNumericKind::Real:
+        next.type = MemoryValueType::Float64;
+        width = 8;
+        break;
+    case GmlNumericKind::Int32:
+        next.type = MemoryValueType::Int32;
+        width = 4;
+        break;
+    case GmlNumericKind::Int64:
+        next.type = MemoryValueType::Int64;
+        width = 8;
+        break;
+    // The only verified runner adapter represents Boolean payloads as Float64.
+    case GmlNumericKind::Boolean:
+        next.type = MemoryValueType::Float64;
+        width = 8;
+        break;
+    default:
+        value = {};
+        selectionBytes = 1;
+        return false;
+    }
+    next.bytes.resize(width);
+    std::memcpy(next.bytes.data(), &slot.value.payload, width);
+    if (!next.valid()) {
+        value = {};
+        selectionBytes = 1;
+        return false;
+    }
+    value = std::move(next);
+    selectionBytes = width;
+    return true;
+}
+
 // Keep full dialogs usable on small displays and at high DPI. The window's
 // normal scroll path retains every field when its preferred size cannot fit.
 static void prepareWorkbenchDialog(float width, float height,
@@ -221,6 +261,54 @@ bool AppContext::queueActivateStaticDocument(DocumentId id) {
     command.kind = PendingDocumentKind::Activate;
     command.id = id;
     return queueDocumentOpen(std::move(command));
+}
+
+void AppContext::setTypeDraftPending(DocumentId id, bool pending) {
+    if (auto* document = documents_.find(id)) document->setTypeDraftPending(pending);
+}
+
+bool AppContext::commitTypeDefinition(DocumentId id, uint64_t imageGeneration,
+    const TypeDefinition& definition, bool persist, std::string& error) {
+    error.clear();
+    auto* document = documents_.find(id);
+    if (!document || !document->open() || !document->binary().loaded() ||
+        document->imageGeneration() != imageGeneration) {
+        error = "The Types draft belongs to a different document image; its contents have been retained.";
+        return false;
+    }
+    if (persist && (document->persistence() == DocumentInstallPersistence::Ephemeral ||
+                    document->binary().isMappedImage())) {
+        error = "This live-image document has no persistent project sidecar. The Types draft cannot be saved for closing; cancel to keep it open, or explicitly discard it.";
+        return false;
+    }
+    TypeRegistry proposed = document->project().typeRegistry;
+    if (auto* old = FindType(proposed, definition.id)) *old = definition;
+    else proposed.types.push_back(definition);
+    if (!RecomputeTypeArraySizes(proposed, &error) || !ValidateTypeRegistry(proposed, &error)) return false;
+    for (const auto& application : proposed.applications) {
+        const auto* type = FindType(proposed, application.typeId);
+        size_t available = 0;
+        if (!type || !document->binary().ptrFromVA(application.address, available) || type->sizeBytes > available) {
+            error = "Definition would extend an applied global beyond backed FILE memory.";
+            return false;
+        }
+    }
+    // Join any older asynchronous save before committing a closing draft. This
+    // applies equally to inactive documents, whose state cannot use active aliases.
+    if (persist && projectSaveFuture.valid() && !finishProjectSave(true)) {
+        error = projectSaveError;
+        return false;
+    }
+    TypeRegistry previous = document->project().typeRegistry;
+    document->editProject().typeRegistry = std::move(proposed);
+    if (persist && !document->flush(&error)) {
+        document->editProject().typeRegistry = std::move(previous);
+        if (id == staticDocumentId()) resetProjectSaveMirrorFromActive();
+        return false;
+    }
+    document->setTypeDraftPending(false);
+    if (id == staticDocumentId()) resetProjectSaveMirrorFromActive();
+    return true;
 }
 
 bool AppContext::queueCloseStaticDocument(DocumentId id) {
@@ -497,6 +585,7 @@ App::~App() {
 }
 
 void App::requestExit() {
+    if (binaryView_ && !binaryView_->prepareTypeDraftsForExit(ctx_)) return;
     std::string error;
     if (binaryView_ && !binaryView_->prepareDocumentTransition(
             ctx_, ctx_.staticDocumentId(), false, error)) {
@@ -2989,7 +3078,7 @@ void App::applyPendingDocumentCommand() {
     finishOwnedLoad(true);
 
     if (outcome.retired && binaryView_)
-        binaryView_->retireDocument(outcome.retired);
+        binaryView_->retireDocument(ctx_, outcome.retired);
     if (outcome.activeChanged) retireActiveDocumentRequests();
     if (outcome.browseArchive) ctx_.requestedBrowseArchive = true;
     if (!outcome.warning.empty())
@@ -3210,7 +3299,8 @@ void App::renderMenuBar() {
                     ArchName(ctx_.staticArch()));
             ImGui::Separator();
             const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
-            const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
+            const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) ||
+                (ctx_.frameDebugSnapshot && ctx_.frameDebugSnapshot->traceOwnedSites != 0);
             uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
             const bool exactTraceImage = ctx_.frameDebugSnapshot &&
                 ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
@@ -4609,6 +4699,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             ImGui::GetColorU32(theme::col::lineSoft()));
 
         Debugger& d = ctx_.debug;
+        const auto lifecycle = d.lifecycleSnapshot();
         const bool attached = s.attached();
         const bool paused   = s.state == DbgState::Paused;
         const bool running  = s.state == DbgState::Running;
@@ -4737,10 +4828,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             executionModeControl();
             nextGroup();
         }
-        const bool modePaused = ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused;
-        const bool modeRunning = running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
+        const bool modePaused = !lifecycle.busy && (ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused);
+        const bool modeRunning = !lifecycle.busy && running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
 
-        const bool lifecycleIdle = !ctx_.debug.lifecycleSnapshot().busy;
+        const bool lifecycleIdle = !lifecycle.busy;
         const bool canLaunch = lifecycleIdle && ctx_.binaryLaunchable();
         const bool canDebugDll = lifecycleIdle && ctx_.binaryDllDebuggable();
         const bool canRun = canLaunch || canDebugDll;
@@ -4751,7 +4842,14 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             : (canLaunch || !loaded)
             ? "Launch & Debug - launch the loaded binary and break at its entry point"
             : "This image cannot be started directly; attach a process in Communications.";
-        if (attached) {
+        if (lifecycle.busy) {
+            const bool cancellable = lifecycle.command != DbgLifecycleCommand::Detach &&
+                lifecycle.state == DbgLifecycleState::Starting;
+            if (commandButton("##cmd_primary", DS_ICON_STOP, "[]",
+                    cancellable ? "Cancel startup" : "Stopping...",
+                    "Debugger startup and cleanup run in the background",
+                    true, cancellable)) d.cancelLifecycle(lifecycle.requestId);
+        } else if (attached) {
             if (running) {
                 if (commandButton("##cmd_primary", DS_ICON_PAUSE, "||", "Pause",
                                   "Pause - break into the running process (F5)",
@@ -4805,7 +4903,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
 
         const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
-        const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
+        const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) || s.traceOwnedSites != 0;
         uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
         const bool exactTraceImage = ctx_.frameDebugSnapshot &&
             ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
@@ -5332,7 +5430,8 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                                     moduleHealth.jobsFailed || moduleHealth.resultsDropped;
         const bool saveFailure = prefsSaveFailed_ ||
             ctx_.projectSaveState == AppContext::ProjectSaveState::Failed;
-        const bool statusIssues = analysisIssues || saveFailure || !ctx_.projectSaveWarning.empty();
+        const bool traceRecovery = d.traceOwnedSites != 0 && tr && !tr->active;
+        const bool statusIssues = analysisIssues || saveFailure || traceRecovery || !ctx_.projectSaveWarning.empty();
 
         // One small activity label owns the right edge. All services keep their
         // separate cancellation routes in its details popup, including when the
@@ -5367,7 +5466,9 @@ void App::renderStatusBar(const DbgSnapshot& d) {
         if (liveScanning) activities[activityCount++] = {
             StatusActivity::Live, liveTotal ? "Reading modules"
                 : liveProgress.kind == LiveKind::Strings ? "Process strings"
-                : liveProgress.kind == LiveKind::Xref ? "Searching references" : "Reading module",
+                : liveProgress.kind == LiveKind::Xref ? "Searching references"
+                : liveProgress.kind == LiveKind::Pattern ? "Searching process bytes"
+                : "Reading module",
             liveTotal ? liveDone : liveProgress.current, liveTotal ? liveTotal : liveProgress.total};
         if (ctx_.traceSeedPlanning || planting) activities[activityCount++] = {
             StatusActivity::Trace, ctx_.traceSeedPlanning ? "Finding trace blocks" : "Planting trace sites",
@@ -5411,6 +5512,8 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             std::snprintf(activityText, sizeof(activityText), "Analysis issues");
         else if (saveFailure)
             std::snprintf(activityText, sizeof(activityText), "Save failed");
+        else if (traceRecovery)
+            std::snprintf(activityText, sizeof(activityText), "Trace cleanup needed");
         else if (statusIssues)
             std::snprintf(activityText, sizeof(activityText), "Status warning");
         const float activityHeight = ImGui::GetFrameHeight();
@@ -5532,6 +5635,15 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             ImGui::TextColored(theme::col::good(), "Trace %s  %zu blocks / %llu hits",
                                tr->active ? "on" : "stopped", tr->hitSites,
                                (unsigned long long)tr->blockHitTotal);
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("%zu planned, %zu armed, %zu skipped, %zu cleared",
+                    tr->plannedSites, tr->armedSites, tr->skippedSites, tr->retiredSites);
+                ImGui::TextUnformatted("One-shot block entry coverage; hit totals are observations, not loop counts.");
+                if (tr->planTruncated)
+                    ImGui::TextColored(theme::col::warn(), "Additional sites exceeded the trace limit.");
+                ImGui::EndTooltip();
+            }
         }
 
         // Keep the analyst's current location anchored at the far edge when
@@ -5651,6 +5763,16 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             if (tr && (tr->active || tr->blockHitTotal > 0))
                 ImGui::Text("Trace %s: %zu blocks / %llu hits", tr->active ? "on" : "stopped",
                             tr->hitSites, (unsigned long long)tr->blockHitTotal);
+            if (traceRecovery) {
+                ImGui::TextColored(theme::col::warn(), "%zu trace byte(s) still require restoration.",
+                    d.traceOwnedSites);
+                if (!d.lastEvent.empty()) ImGui::TextWrapped("%s", d.lastEvent.c_str());
+                if (controls && ImGui::SmallButton("Retry Stop Trace")) {
+                    ctx_.requestedTraceToggle = true;
+                    ctx_.requestedTraceTarget = {d.pid, d.sessionGeneration};
+                    ctx_.requestedTab = "Binary View";
+                }
+            }
             if (ctx_.projectSaveState == AppContext::ProjectSaveState::Dirty)
                 ImGui::TextColored(theme::col::warn(), "Project: unsaved");
             else if (ctx_.projectSaveState == AppContext::ProjectSaveState::Saving)
@@ -6181,10 +6303,9 @@ void App::renderDllDebugPopup() {
         dllRetargetBase_ = 0;
         dllRetargetPending_.clear();
         dllRetargetFailure_.clear();
-        if (ctx_.debug.launchAndAttachDll(plan, error)) {
-            ctx_.openLiveAssemblyView();
+        if (ctx_.requestDebugDllLaunch(plan, error)) {
             ui::Toast(ui::ToastKind::Success,
-                      "DLL host launched; waiting for the target module to load.");
+                      "DLL host launch queued.");
             ImGui::CloseCurrentPopup();
         } else {
             dllDebugPopup_.error = "Launch failed: " + error;
@@ -6217,18 +6338,24 @@ void App::beginUnpackObservation() {
     unpackPopup_.hasPreviousRip = false;
     unpackPopup_.pauseRequested = false;
     unpackEngine_.reset();
+    unpackPopup_.sourceDocument = ctx_.staticDocumentId();
+    unpackPopup_.sourceImageGeneration = ctx_.staticImageGeneration();
+    unpackPopup_.launchRequestId = 0;
+    unpackPopup_.target = {};
 
     DbgSnapshot snap = ctx_.debug.snapshot();
     if (!snap.attached()) {
         std::string err;
-        if (!ctx_.debug.launchAndAttach(ctx_.staticBinary().path(), err,
-                                       /*breakAtEntry=*/false,
-                                       unpackPopup_.containedLaunch)) {
+        DbgLaunchRequest request;
+        request.executable = ctx_.staticBinary().path();
+        request.breakAtEntry = false;
+        request.containedJob = unpackPopup_.containedLaunch;
+        unpackPopup_.launchRequestId = ctx_.requestDebugLaunch(std::move(request), err);
+        if (!unpackPopup_.launchRequestId) {
             unpackPopup_.error = "Launch failed: " + err;
             return;
         }
-        ctx_.openLiveAssemblyView();
-        unpackPopup_.waitingForInitialBreak = true;
+        unpackPopup_.waitingForInitialBreak = false;
         unpackPopup_.observing = false;
         return;
     }
@@ -6236,11 +6363,51 @@ void App::beginUnpackObservation() {
         unpackPopup_.error = "Pause the debuggee before starting unpack observation.";
         return;
     }
+    unpackPopup_.target = {snap.pid, snap.sessionGeneration};
     unpackPopup_.waitingForInitialBreak = true; // initialized by the common sampler path
 }
 
 void App::sampleUnpackObservation() {
+    const auto lifecycle = ctx_.debug.lifecycleSnapshot();
     DbgSnapshot snap = ctx_.debug.snapshot();
+    if (unpackPopup_.launchRequestId || unpackPopup_.waitingForInitialBreak ||
+        unpackPopup_.observing) {
+        if (unpackPopup_.sourceDocument != ctx_.staticDocumentId() ||
+            unpackPopup_.sourceImageGeneration != ctx_.staticImageGeneration()) {
+            if (unpackPopup_.launchRequestId)
+                ctx_.debug.cancelLifecycle(unpackPopup_.launchRequestId);
+            unpackPopup_.launchRequestId = 0;
+            unpackPopup_.waitingForInitialBreak = unpackPopup_.observing = false;
+            unpackPopup_.error = "Unpack observation expired because its source document changed.";
+            unpackEngine_.cancel();
+            return;
+        }
+    }
+    if (unpackPopup_.launchRequestId) {
+        if (lifecycle.requestId != unpackPopup_.launchRequestId) {
+            unpackPopup_.launchRequestId = 0;
+            unpackPopup_.error = "Unpack startup was replaced by another debugger command.";
+            return;
+        }
+        if (lifecycle.busy) return;
+        unpackPopup_.launchRequestId = 0;
+        if (!lifecycle.completed || !lifecycle.succeeded || lifecycle.cancelled ||
+            !DebugTargetIdentityMatches(lifecycle.target, {snap.pid, snap.sessionGeneration}) ||
+            (snap.state != DbgState::Running && snap.state != DbgState::Paused)) {
+            unpackPopup_.error = lifecycle.error.empty()
+                ? "The unpack target ended before startup completed." : lifecycle.error;
+            return;
+        }
+        unpackPopup_.target = lifecycle.target;
+        unpackPopup_.waitingForInitialBreak = true;
+    }
+    if ((unpackPopup_.waitingForInitialBreak || unpackPopup_.observing) &&
+        !DebugTargetIdentityMatches(unpackPopup_.target, {snap.pid, snap.sessionGeneration})) {
+        unpackPopup_.waitingForInitialBreak = unpackPopup_.observing = false;
+        unpackPopup_.error = "Unpack observation expired because the debugger target changed.";
+        unpackEngine_.cancel();
+        return;
+    }
     if (unpackPopup_.waitingForInitialBreak) {
         if (!snap.attached()) {
             unpackPopup_.error = "The debug session ended before the unpack probe initialized.";
@@ -6675,6 +6842,8 @@ bool App::saveUnpackArtifacts(bool loadAfterSave) {
 
 void App::renderUnpackPopup() {
     if (unpackPopup_.open) {
+        if (unpackPopup_.launchRequestId)
+            ctx_.debug.cancelLifecycle(unpackPopup_.launchRequestId);
         const bool contained = unpackPopup_.containedLaunch;
         unpackPopup_ = {};
         unpackPopup_.containedLaunch = contained;
@@ -6686,10 +6855,14 @@ void App::renderUnpackPopup() {
     sampleUnpackObservation();
     prepareWorkbenchDialog(760.0f, 680.0f, ImGuiCond_FirstUseEver);
     if (!ImGui::BeginPopupModal("Adaptive Unpacker", nullptr, ImGuiWindowFlags_NoSavedSettings)) {
-        if ((unpackPopup_.observing || unpackPopup_.waitingForInitialBreak) &&
+        if ((unpackPopup_.launchRequestId || unpackPopup_.observing || unpackPopup_.waitingForInitialBreak) &&
             !ImGui::IsPopupOpen("Adaptive Unpacker")) {
             const DbgSnapshot snap = ctx_.debug.snapshot();
-            if (snap.state == DbgState::Running) ctx_.debug.pause();
+            if (unpackPopup_.launchRequestId)
+                ctx_.debug.cancelLifecycle(unpackPopup_.launchRequestId);
+            else if (snap.state == DbgState::Running)
+                ctx_.debug.pauseForSession(unpackPopup_.target);
+            unpackPopup_.launchRequestId = 0;
             unpackPopup_.observing = unpackPopup_.waitingForInitialBreak = false;
             unpackEngine_.cancel();
         }
@@ -6702,8 +6875,13 @@ void App::renderUnpackPopup() {
         return;
     }
     const DbgSnapshot snap = ctx_.debug.snapshot();
-    const bool active = unpackPopup_.observing || unpackPopup_.waitingForInitialBreak;
+    const bool active = unpackPopup_.launchRequestId || unpackPopup_.observing || unpackPopup_.waitingForInitialBreak;
     ImGui::TextWrapped("Adaptive live unpacking fuses stack-return, write-to-execute, entropy-settle and run-free evidence. OEP choices remain scored hypotheses until you approve a dump.");
+    if (unpackPopup_.launchRequestId) {
+        ImGui::TextDisabled("Starting unpack target; waiting for debugger initialization...");
+        if (ImGui::SmallButton("Cancel unpack startup"))
+            ctx_.debug.cancelLifecycle(unpackPopup_.launchRequestId);
+    }
     ImGui::Spacing();
     const char* strategies[] = { "Hybrid (adaptive)", "Stack return (ESP/RSP)", "Write -> execute (NX)",
                                  "Entropy settle", "Run free", "Manual OEP" };
@@ -6726,7 +6904,7 @@ void App::renderUnpackPopup() {
     const bool canStartFresh = engineState == UnpackState::Idle ||
         engineState == UnpackState::Completed || engineState == UnpackState::Failed ||
         engineState == UnpackState::Cancelled;
-    ImGui::BeginDisabled(active || !canStartFresh || !targetOk ||
+    ImGui::BeginDisabled(active || ctx_.debug.lifecycleSnapshot().busy || !canStartFresh || !targetOk ||
                          (snap.attached() && snap.state == DbgState::Running));
     if (ImGui::Button("Start observation", ImVec2(150.0f * theme::UiScale(), 0))) beginUnpackObservation();
     ImGui::EndDisabled();
@@ -6824,9 +7002,13 @@ void App::renderUnpackPopup() {
     ImGui::Separator();
     if (ImGui::Button("Close")) {
         if (active) {
-            if (snap.state == DbgState::Running) ctx_.debug.pause();
+            if (unpackPopup_.launchRequestId)
+                ctx_.debug.cancelLifecycle(unpackPopup_.launchRequestId);
+            else if (snap.state == DbgState::Running)
+                ctx_.debug.pauseForSession(unpackPopup_.target);
             unpackEngine_.cancel();
         }
+        unpackPopup_.launchRequestId = 0;
         unpackPopup_.observing = unpackPopup_.waitingForInitialBreak = false;
         ImGui::CloseCurrentPopup();
     }
@@ -7050,7 +7232,7 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
             });
         }
         const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
-        const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
+        const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) || dbg.traceOwnedSites != 0;
         uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
         const bool exactTraceImage = ctx_.frameDebugSnapshot &&
             ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
@@ -7167,9 +7349,10 @@ bool App::wantsContinuousRedraw() {
         if (pending.buildQueued || pending.searchQueued || pending.building || pending.searching)
             return true;
     }
-    TraceCoverageSnapshot trace = ctx_.debug.traceCoverageSnapshot();
-    const size_t traceDone = trace.armedSites + trace.hitSites + trace.skippedSites + trace.retiredSites;
-    if (trace.active && trace.plannedSites > traceDone) return true;
+    ctx_.debug.traceCoverageSnapshotIfChanged(traceSnapshot_);
+    const size_t traceDone = traceSnapshot_.armedSites + traceSnapshot_.hitSites +
+                             traceSnapshot_.skippedSites + traceSnapshot_.retiredSites;
+    if (traceSnapshot_.active && traceSnapshot_.plannedSites > traceDone) return true;
     // An active debug session: the debug thread mutates the snapshot asynchronously
     // (breakpoint hits, steps) and the live view pulses the RIP/selection row.
     if (ctx_.debug.snapshot().attached()) return true;
@@ -7344,15 +7527,34 @@ void App::render() {
         if (lifecycle.cancelled) ui::Toast(ui::ToastKind::Info, "Debugger startup cancelled.");
         else if (!lifecycle.succeeded) ui::Toast(ui::ToastKind::Error, lifecycle.error.empty()
             ? "Debugger command failed." : lifecycle.error);
-        else if (lifecycle.command == DbgLifecycleCommand::Attach &&
+        else if (lifecycle.command != DbgLifecycleCommand::Detach &&
                  (dbg.state == DbgState::Running || dbg.state == DbgState::Paused) &&
                  DebugTargetIdentityMatches(lifecycle.target, {dbg.pid, dbg.sessionGeneration})) {
-            if (!ctx_.staticBinary().loaded())
-                ctx_.setStaticDecoderConfiguration(ctx_.staticEngine(), dbg.is32 ? Arch::X86 : Arch::X64);
-            ctx_.openLiveAssemblyView();
-            ui::Toast(ui::ToastKind::Success, "Debugger attached.");
+            const bool sourceCurrent = lifecycle.command == DbgLifecycleCommand::Attach ||
+                ctx_.debugLaunchSourceCurrent(lifecycle.requestId);
+            if (sourceCurrent) {
+                suppressedLaunchNavigation_ = {};
+                if (!ctx_.staticBinary().loaded())
+                    ctx_.setStaticDecoderConfiguration(ctx_.staticEngine(), dbg.is32 ? Arch::X86 : Arch::X64);
+                ctx_.openLiveAssemblyView();
+                ui::Toast(ui::ToastKind::Success, lifecycle.command == DbgLifecycleCommand::Attach
+                    ? "Debugger attached." : "Debugger launch completed.");
+            } else {
+                suppressedLaunchNavigation_ = lifecycle.target;
+                ui::Toast(ui::ToastKind::Info,
+                    "Debugger launch completed; the source document changed, so navigation was kept in place.");
+            }
         }
     }
+    const bool launchHandoffAllowed =
+        !(lifecycle.busy && (lifecycle.command == DbgLifecycleCommand::Launch ||
+                             lifecycle.command == DbgLifecycleCommand::LaunchDll)) &&
+        !DebugTargetIdentityMatches(suppressedLaunchNavigation_, {dbg.pid, dbg.sessionGeneration}) &&
+        // A DLL host can finish initialization long before its target DLL loads.
+        // Its delayed handoff still belongs to the document that requested it.
+        (lifecycle.command != DbgLifecycleCommand::LaunchDll ||
+         !DebugTargetIdentityMatches(lifecycle.target, {dbg.pid, dbg.sessionGeneration}) ||
+         ctx_.debugLaunchSourceCurrent(lifecycle.requestId));
     // A debuggee that exited leaves the session "attached" to a dead process: the
     // debug thread is gone but the state stays Terminated, so the toolbar would
     // keep its (now dead) pause/step controls, Launch & Debug would never come
@@ -7377,7 +7579,7 @@ void App::render() {
         attachMainDocumentGeneration_ = 0;
         attachMainDocumentPending_.clear();
         attachMainDocumentFailure_.clear();
-    } else if (dbg.dllTargetMatched && dbg.dllTargetBase) {
+    } else if (launchHandoffAllowed && dbg.dllTargetMatched && dbg.dllTargetBase) {
         const bool retargetHandled = dllRetargetPid_ == dbg.pid &&
             dllRetargetGeneration_ == dbg.sessionGeneration &&
             dllRetargetBase_ == dbg.dllTargetBase;
@@ -7427,7 +7629,7 @@ void App::render() {
     const bool mainDocumentFailedWithoutRecovery =
         attachMainDocumentFailure_.matches(dbg.pid, dbg.sessionGeneration) &&
         attachMainDocumentFailure_.retryRevision == ctx_.documentRetryRevision();
-    if (liveDocumentSessionState(dbg) && !mainDocumentSessionHandled &&
+    if (launchHandoffAllowed && liveDocumentSessionState(dbg) && !mainDocumentSessionHandled &&
         !mainDocumentPending && !mainDocumentFailedWithoutRecovery) {
         if (dbg.dllHostedLaunch) {
             // The host is only a loader. The exact LOAD_DLL retarget path above
@@ -7499,9 +7701,9 @@ void App::render() {
     // workbench tab is currently visible. This also retires incomplete spinners
     // after cancellation or bounded result loss.
     ctx_.drainModuleAnalysisResults();
-    TraceCoverageSnapshot trace = ctx_.debug.traceCoverageSnapshot();
+    ctx_.debug.traceCoverageSnapshotIfChanged(traceSnapshot_);
     ctx_.frameDebugSnapshot = &dbg;
-    ctx_.frameTraceCoverageSnapshot = &trace;
+    ctx_.frameTraceCoverageSnapshot = &traceSnapshot_;
     struct ResetFrameDebugSnapshot {
         AppContext& ctx;
         ~ResetFrameDebugSnapshot() {
@@ -7571,6 +7773,7 @@ void App::render() {
     renderAntiDebugPopup();
     renderPassiveDumpPopup();
     renderSymbolSettingsPopup();
+    if (binaryView_ && binaryView_->renderTypeDraftPrompt(ctx_)) requestExit();
 
     // Binary View's Java banner can't open the Save dialog itself (it has no
     // access to App); it raises this flag instead (same pattern as

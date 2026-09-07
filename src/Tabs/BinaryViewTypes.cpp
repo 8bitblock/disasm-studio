@@ -76,15 +76,35 @@ void BinaryViewTab::renderTypedLocation(AppContext& ctx, uint64_t va) {
     }
 }
 
+bool BinaryViewTab::saveTypeDraft(AppContext& ctx, bool persist, std::string& error) {
+    if (!typeDraftDirty_) return true;
+    if (!ctx.commitTypeDefinition(documentId_, typeDraftGeneration_, typeDraft_, persist, error)) return false;
+    typeDraftDirty_ = false;
+    return true;
+}
+
+void BinaryViewTab::discardTypeDraft(AppContext& ctx) {
+    typeDraft_ = {};
+    typeDraftDirty_ = false;
+    typeStatus_.clear();
+    ctx.setTypeDraftPending(documentId_, false);
+}
+
 void BinaryViewTab::renderTypeWorkbench(AppContext& ctx) {
     const bool focus = focusTypesTab_;
     if (!ImGui::BeginTabItem("Types", nullptr, focus ? ImGuiTabItemFlags_SetSelected : 0)) return;
     focusTypesTab_ = false;
     if (typeDraftImage_ != investigationImageSerial_) {
-        typeDraft_ = {}; typeDraftDirty_ = false; typeStatus_.clear();
-        typeApplicationName_[0] = 0;
+        // Decoder/analysis changes may retire presentation state in the same
+        // document. Never discard an unsaved definition on that refresh edge.
+        if (!typeDraftDirty_) {
+            typeDraft_ = {}; typeStatus_.clear();
+            typeApplicationName_[0] = 0;
+            typeDraftGeneration_ = ctx.staticImageGeneration();
+        }
         typeDraftImage_ = investigationImageSerial_;
     }
+    if (!typeDraftDirty_) typeDraftGeneration_ = ctx.staticImageGeneration();
     auto& registry = ctx.staticProject().typeRegistry;
     const float scale = theme::UiScale();
     ImGui::BeginChild("##type_workbench", ImVec2(0, 0));
@@ -241,32 +261,12 @@ void BinaryViewTab::renderTypeWorkbench(AppContext& ctx) {
         }
         ImGui::BeginDisabled(!typeDraftDirty_);
         if (ui::AccentButton("Save definition", theme::col::accent())) {
-            TypeRegistry proposed = registry;
-            if (auto* old = FindType(proposed, typeDraft_.id)) *old = typeDraft_;
-            else proposed.types.push_back(typeDraft_);
-            if (RecomputeTypeArraySizes(proposed, &typeStatus_) && ValidateTypeRegistry(proposed, &typeStatus_)) {
-                std::unordered_map<TypeId, uint64_t> sizes;
-                for (const auto& type : proposed.types) sizes.emplace(type.id, type.sizeBytes);
-                bool fits = true;
-                for (const auto& application : proposed.applications) {
-                    size_t available = 0;
-                    if (!ctx.staticBinary().ptrFromVA(application.address, available) || sizes[application.typeId] > available) {
-                        fits = false;
-                        typeStatus_ = "Definition would extend an applied global beyond backed FILE memory.";
-                        break;
-                    }
-                }
-                if (fits) {
-                    registry = std::move(proposed); ctx.markProjectDirty(); typeDraftDirty_ = false;
-                    typeStatus_ = "Definition saved. Applied locations use this definition immediately.";
-                }
-            }
+            if (saveTypeDraft(ctx, false, typeStatus_))
+                typeStatus_ = "Definition saved. Applied locations use this definition immediately.";
         }
         ImGui::EndDisabled(); ImGui::SameLine();
         if (ImGui::Button("Discard draft")) {
-            if (const auto* stored = FindType(registry, typeDraft_.id)) typeDraft_ = *stored;
-            else typeDraft_ = {};
-            typeDraftDirty_ = false; typeStatus_.clear();
+            discardTypeDraft(ctx);
         }
         if (typeDraftDirty_) { ui::SameLineIfFits(130.0f * scale); ImGui::TextColored(theme::col::warn(), "Unsaved definition"); }
         ImGui::SeparatorText("Apply to FILE memory");
@@ -314,6 +314,7 @@ void BinaryViewTab::renderTypeWorkbench(AppContext& ctx) {
             ctx.markProjectDirty();
         }
     }
+    ctx.setTypeDraftPending(documentId_, typeDraftDirty_);
     ImGui::EndChild();
     ImGui::EndTabItem();
 }

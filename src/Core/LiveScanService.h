@@ -8,6 +8,7 @@
 //   * ReadImage — copy one module's mapped image out of the process (backs the parallel
 //                 "analyze all modules": the UI then loadFromMemory's it + hands the
 //                 BinaryFile to AnalysisService).
+//   * Pattern   — masked AOB/value matching over readable regions in bounded chunks.
 //
 // This is the sibling of AnalysisService. The crucial difference: AnalysisService must
 // NEVER touch the Debugger, so it can't do these. A LiveScanService job instead carries
@@ -26,6 +27,7 @@
 // stub disassembler (see tests/livescan_service_test.cpp).
 //
 #include "AnalysisJobs.h"                // StrResult, ScanStringsBuffer
+#include "SigMatch.h"                    // SigPattern, masked byte search
 #include "../Disasm/IDisassembler.h"     // Engine, Arch, IDisassembler
 
 #include <atomic>
@@ -37,11 +39,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace ds {
 
-enum class LiveKind : uint32_t { Strings, Xref, ReadImage };
+enum class LiveKind : uint32_t { Strings, Xref, ReadImage, Pattern };
 
 // One [base, base+size) span of debuggee memory to scan/read.
 struct LiveRange { uint64_t base = 0; uint64_t size = 0; };
@@ -55,8 +58,12 @@ struct LiveScanResult {
     uint64_t target = 0;         // Xref: the searched address (echoed back)
     uint64_t moduleBase = 0;     // ReadImage: which module (echoed back)
     std::vector<StrResult> strings;   // Strings
-    std::vector<uint64_t>  hits;      // Xref (instruction addresses)
+    std::vector<uint64_t>  hits;      // Xref instruction addresses / Pattern match addresses
     std::vector<uint8_t>   image;     // ReadImage (the module's mapped bytes)
+    uint64_t attemptedBytes = 0;      // Pattern: uniquely-owned candidate bytes visited
+    uint64_t scannedBytes = 0;        // Pattern: uniquely-owned bytes actually read
+    size_t unreadableChunks = 0;      // Pattern: reads which returned no bytes
+    size_t partialChunks = 0;         // Pattern: reads shorter than requested
     bool truncated = false;           // hit a cap (strings/hits/bytes)
     bool complete = false;            // false means error describes a failed job
     std::string error;
@@ -66,8 +73,8 @@ struct LiveScanResult {
 struct LiveProgress {
     LiveKind kind    = LiveKind::Strings;
     bool     active  = false;
-    uint32_t current = 0;   // ranges processed so far
-    uint32_t total   = 0;   // ranges total
+    uint32_t current = 0;   // ranges processed; Pattern reports bounded chunks
+    uint32_t total   = 0;   // ranges total; Pattern reports bounded chunks
 };
 
 class LiveScanService {
@@ -100,10 +107,26 @@ public:
                          size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024);
     uint64_t requestReadImage(uint64_t base, uint64_t size, uint64_t moduleBase,
                               MemReader reader, uint64_t epoch);
+    // Scan readable ranges for a masked byte pattern in bounded chunks. A zero
+    // byteCap means there is no artificial coverage cap; hitCap==0 retains all
+    // matches. Each chunk reads pattern.size()-1 bytes of lookahead and owns only
+    // its non-overlap prefix, so boundary matches are found exactly once.
+    uint64_t requestPattern(std::vector<LiveRange> ranges, SigPattern pattern,
+                            MemReader reader, uint64_t epoch,
+                            size_t hitCap = 4096, uint64_t byteCap = 0,
+                            size_t chunkBytes = 1u << 20);
 
     // Non-blocking: move the next finished result out, if any (drain in a loop; still
     // check out.epoch == epoch() before applying).
     bool tryTake(LiveScanResult& out);
+    // Pattern results are document-owned UI requests. Select them by token so an
+    // active sibling document cannot consume another document's completion.
+    bool tryTakePattern(uint64_t token, LiveScanResult& out);
+    // Drain ordinary shared live work without removing retained Pattern results.
+    bool tryTakeNonPattern(LiveScanResult& out);
+    // Retire one queued/running/completed Pattern request without advancing the
+    // global live epoch or canceling another document's work.
+    void cancelPattern(uint64_t token);
 
     bool         busy() const { return pending_.load(std::memory_order_acquire); }
     LiveProgress progress() const;
@@ -127,12 +150,18 @@ private:
         size_t    strCap = kDefaultStringScanCap;
         size_t    hitCap = 3000;
         size_t    byteCap = 256ull * 1024 * 1024;
+        size_t    chunkBytes = 1u << 20;
         uint64_t  epoch = 0;
         uint64_t  token = 0;
         MemReader reader;
+        SigPattern pattern;
     };
 
     uint64_t enqueue(Job&& j);
+    // Caller holds mtx_. Pattern completions are retained until their exact
+    // token owner consumes/cancels them; only ordinary shared results take
+    // part in the bounded eviction policy.
+    void     publishResultLocked(LiveScanResult&& result);
     void     threadMain();
     void     runJob(const Job& j);
 
@@ -143,6 +172,9 @@ private:
     std::condition_variable    cvIdle_;
     std::deque<Job>            queue_;
     std::deque<LiveScanResult> results_;
+    size_t                     nonPatternResultCount_ = 0;
+    std::unordered_set<uint64_t> inFlightPatternTokens_;
+    std::unordered_set<uint64_t> canceledTokens_;
     int                        inFlight_ = 0;
     uint64_t                   nextToken_ = 1;
     std::atomic<bool>          quit_{false};

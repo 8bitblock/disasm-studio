@@ -12,9 +12,11 @@
 #include "imgui.h"
 
 #include <algorithm>
+#include <cctype>
 #include <exception>
 #include <limits>
 #include <cstdio>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <windows.h>
@@ -87,6 +89,19 @@ static std::string semanticFunctionLabel(const SemanticFunction& function) {
     std::snprintf(address, sizeof(address), "sub_%llX",
                   static_cast<unsigned long long>(function.address));
     return address;
+}
+
+static bool semanticFilterMatches(std::string_view value, std::string_view query) {
+    return query.empty() || std::search(value.begin(), value.end(), query.begin(), query.end(),
+        [](unsigned char left, unsigned char right) {
+            return std::tolower(left) == std::tolower(right);
+        }) != value.end();
+}
+
+static bool semanticAddressMatches(uint64_t value, std::string_view query) {
+    char address[32]{};
+    std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(value));
+    return semanticFilterMatches(address, query);
 }
 
 // Map a structured image's machine type to a decoder. Raw/Unknown has no
@@ -308,6 +323,7 @@ void BinaryDiffTab::invalidateComparison() {
     semanticProposalSelectionCount_ = 0;
     semanticTransferTarget_ = {};
     semanticTransferStatus_.clear();
+    semanticFilterDirty_ = true;
 }
 
 void BinaryDiffTab::gotoRegion(int idx) {
@@ -744,6 +760,7 @@ void BinaryDiffTab::pumpDiffResult() {
     semanticError_ = std::move(ready->semanticError);
     semanticWarning_ = std::move(ready->semanticWarning);
     semanticSelectedMatch_ = semanticDiff_.matched.empty() ? -1 : 0;
+    semanticFilterDirty_ = true;
     semanticSelectedHunk_ = -1;
     semanticProposalSelected_.assign(semanticDiff_.transferProposals.size(), false);
     semanticProposalSelectionCount_ = 0;
@@ -908,10 +925,10 @@ void BinaryDiffTab::render(AppContext& ctx) {
         !ImGui::GetIO().WantTextInput && !ImGui::IsPopupOpen(nullptr,
             ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
     ImGui::BeginDisabled(nReg == 0);
-    bool prev = ImGui::Button("\xE2\x97\x80 Prev") ||
+    bool prev = ImGui::Button("Prev") ||
                 (focused && ImGui::IsKeyPressed(ImGuiKey_F3) && ImGui::GetIO().KeyShift);
     ImGui::SameLine();
-    bool next = ImGui::Button("Next \xE2\x96\xB6") ||
+    bool next = ImGui::Button("Next") ||
                 (focused && ImGui::IsKeyPressed(ImGuiKey_F3) && !ImGui::GetIO().KeyShift);
     ImGui::EndDisabled();
     ui::SameLineIfFits(300.0f * scale);
@@ -927,9 +944,12 @@ void BinaryDiffTab::render(AppContext& ctx) {
     const float asmH = curRegion_ >= 0
         ? std::max(0.0f, std::min(200.0f * scale, avail.y * 0.45f)) : 0.0f;
     const float gap   = 12.0f * scale;
-    const float paneW = std::max(1.0f, (avail.x - gap) * 0.5f);
-    const float paneH = std::max(1.0f, avail.y -
-        (asmH > 0 ? asmH + ImGui::GetStyle().ItemSpacing.y : 0));
+    const bool stacked = avail.x < 920.0f * scale;
+    const float paneW = stacked ? std::max(1.0f, avail.x)
+                               : std::max(1.0f, (avail.x - gap) * 0.5f);
+    const float hexHeight = avail.y - (asmH > 0 ? asmH + ImGui::GetStyle().ItemSpacing.y : 0);
+    const float paneH = std::max(1.0f, stacked
+        ? (hexHeight - ImGui::GetStyle().ItemSpacing.y) * 0.5f : hexHeight);
 
     const bool force = applyScroll_;
     float ls = scrollY_, rs = scrollY_;
@@ -937,17 +957,17 @@ void BinaryDiffTab::render(AppContext& ctx) {
 
     // LEFT container.
     ImGui::BeginChild("Lcont", ImVec2(paneW, paneH), ImGuiChildFlags_Borders);
-    ImGui::TextColored(theme::col::accent(), "%s", baseName(left_.path()).c_str());
+    ImGui::TextColored(theme::col::accent(), "Baseline  |  %s", baseName(left_.path()).c_str());
     ui::ItemTooltip(left_.path().c_str());
     ImGui::Separator();
     renderPane("Lhex", left_, right_, rows, leftMaster_, ls, lhov, force);
     ImGui::EndChild();
 
-    ImGui::SameLine(0, gap);
+    if (!stacked) ImGui::SameLine(0, gap);
 
     // RIGHT container.
     ImGui::BeginChild("Rcont", ImVec2(paneW, paneH), ImGuiChildFlags_Borders);
-    ImGui::TextColored(theme::col::accent(), "%s", baseName(right_.path()).c_str());
+    ImGui::TextColored(theme::col::accent(), "Candidate  |  %s", baseName(right_.path()).c_str());
     ui::ItemTooltip(right_.path().c_str());
     ImGui::Separator();
     renderPane("Rhex", right_, left_, rows, !leftMaster_, rs, rhov, force);
@@ -984,7 +1004,8 @@ void BinaryDiffTab::renderDiffAsm() {
 
     auto renderSide = [&](const char* id, const char* label, const BinaryFile& bf,
                           IDisassembler* dis, const std::string& decoderError) {
-        ImGui::BeginChild(id, ImVec2(colW, 0), ImGuiChildFlags_Borders);
+        ImGui::BeginChild(id, ImVec2(colW, 0), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_HorizontalScrollbar);
         ImGui::TextColored(theme::col::accent(), "%s", label);
         Arch displayArch = Arch::X64;
         ImGui::SameLine();
@@ -1049,9 +1070,9 @@ void BinaryDiffTab::renderDiffAsm() {
         ImGui::EndChild();
     };
 
-    renderSide("AsmL", "OLD (left)",  left_,  leftDis_.get(), leftDisError_);
+    renderSide("AsmL", "Baseline",  left_,  leftDis_.get(), leftDisError_);
     ImGui::SameLine(0, gap);
-    renderSide("AsmR", "NEW (right)", right_, rightDis_.get(), rightDisError_);
+    renderSide("AsmR", "Candidate", right_, rightDis_.get(), rightDisError_);
 
     ImGui::EndChild();
 }
@@ -1215,7 +1236,9 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
         return;
     }
     if (!semanticError_.empty()) {
+        ImGui::PushTextWrapPos();
         ImGui::TextColored(theme::col::bad(), "%s", semanticError_.c_str());
+        ImGui::PopTextWrapPos();
         return;
     }
     if (!semanticWarning_.empty()) {
@@ -1257,32 +1280,81 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
                 semanticDiff_.matched.size(), semanticDiff_.added.size(),
                 semanticDiff_.removed.size());
     if (semanticDiff_.truncated) {
-        ImGui::SameLine();
-        ImGui::TextColored(theme::col::warn(), "bounded result (one or more limits reached)");
+        ui::SameLineIfFits(ImGui::CalcTextSize("Partial result: analysis limits reached").x);
+        ImGui::TextColored(theme::col::warn(), "Partial result: analysis limits reached");
+    }
+
+    ui::SearchBox("##semantic_filter", "Find a function, address, or match evidence...",
+        semanticFilter_, sizeof(semanticFilter_), std::min(380.0f * theme::UiScale(),
+        ImGui::GetContentRegionAvail().x));
+    ui::SameLineIfFits(ImGui::CalcTextSize("Changed matches only").x + ImGui::GetFrameHeight() +
+                      ImGui::GetStyle().ItemInnerSpacing.x);
+    if (ImGui::Checkbox("Changed matches only", &semanticChangesOnly_)) semanticFilterDirty_ = true;
+    ui::ItemTooltip("Hide matched functions without instruction edits. Added and removed functions remain searchable.");
+    if (semanticFilterDirty_ || appliedSemanticFilter_ != semanticFilter_) {
+        appliedSemanticFilter_ = semanticFilter_;
+        const std::string_view query = appliedSemanticFilter_;
+        semanticVisibleMatches_.clear();
+        semanticVisibleAdded_.clear();
+        semanticVisibleRemoved_.clear();
+        for (size_t index = 0; index < semanticDiff_.matched.size(); ++index) {
+            const auto& match = semanticDiff_.matched[index];
+            if (match.leftIndex >= semanticLeft_->functions.size() ||
+                match.rightIndex >= semanticRight_->functions.size() ||
+                (semanticChangesOnly_ && match.hunks.empty())) continue;
+            if (semanticFilterMatches(semanticLeft_->functions[match.leftIndex].name, query) ||
+                semanticFilterMatches(semanticRight_->functions[match.rightIndex].name, query) ||
+                semanticAddressMatches(match.leftAddress, query) ||
+                semanticAddressMatches(match.rightAddress, query) ||
+                semanticFilterMatches(match.evidence, query) ||
+                semanticFilterMatches(semanticBasisName(match.basis), query))
+                semanticVisibleMatches_.push_back(index);
+        }
+        const auto filterUnmatched = [&](const auto& functions, auto& visible) {
+            for (size_t index = 0; index < functions.size(); ++index)
+                if (semanticFilterMatches(functions[index].name, query) ||
+                    semanticAddressMatches(functions[index].address, query)) visible.push_back(index);
+        };
+        filterUnmatched(semanticDiff_.added, semanticVisibleAdded_);
+        filterUnmatched(semanticDiff_.removed, semanticVisibleRemoved_);
+        if (std::find(semanticVisibleMatches_.begin(), semanticVisibleMatches_.end(),
+                      static_cast<size_t>(semanticSelectedMatch_)) == semanticVisibleMatches_.end()) {
+            semanticSelectedMatch_ = semanticVisibleMatches_.empty()
+                ? -1 : static_cast<int>(semanticVisibleMatches_.front());
+            semanticSelectedHunk_ = -1;
+        }
+        semanticFilterDirty_ = false;
     }
 
     const float listHeight = std::max(1.0f, std::min(210.0f * theme::UiScale(),
                                         ImGui::GetContentRegionAvail().y * 0.38f));
+    bool showMatchedDetail = false;
     if (ImGui::BeginTabBar("SemanticLists")) {
         if (ImGui::BeginTabItem("Matched")) {
-            if (ImGui::BeginTable("SemanticMatched", 5,
+            showMatchedDetail = true;
+            ImGui::TextDisabled("%zu of %zu matched functions", semanticVisibleMatches_.size(), semanticDiff_.matched.size());
+            if (semanticVisibleMatches_.empty())
+                ImGui::TextWrapped(semanticDiff_.matched.empty() ? "No functions could be matched between these files."
+                    : "No matches meet these filters. Clear the search or show unchanged matches.");
+            else if (ImGui::BeginTable("SemanticMatched", 5,
                     ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
-                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
-                    ImVec2(0, listHeight))) {
-                ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+                    ImVec2(0, listHeight), std::max(720.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x))) {
+                ImGui::TableSetupColumn("Baseline", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Candidate", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Confidence", ImGuiTableColumnFlags_WidthFixed,
                                         90.0f * theme::UiScale());
                 ImGui::TableSetupColumn("Evidence", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Edits", ImGuiTableColumnFlags_WidthFixed,
                                         52.0f * theme::UiScale());
+                ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 ImGuiListClipper matchClipper;
-                matchClipper.Begin(static_cast<int>(semanticDiff_.matched.size()));
+                matchClipper.Begin(static_cast<int>(semanticVisibleMatches_.size()));
                 while (matchClipper.Step()) for (int clippedIndex = matchClipper.DisplayStart;
                                                   clippedIndex < matchClipper.DisplayEnd;
                                                   ++clippedIndex) {
-                    const size_t index = static_cast<size_t>(clippedIndex);
+                    const size_t index = semanticVisibleMatches_[static_cast<size_t>(clippedIndex)];
                     const SemanticFunctionMatch& match = semanticDiff_.matched[index];
                     if (match.leftIndex >= semanticLeft_->functions.size() ||
                         match.rightIndex >= semanticRight_->functions.size()) continue;
@@ -1299,11 +1371,13 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
                     }
                     ImGui::PopID();
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("0x%llX", static_cast<unsigned long long>(match.leftAddress));
+                        ImGui::SetTooltip("%s\nBaseline: 0x%llX", leftLabel.c_str(),
+                                          static_cast<unsigned long long>(match.leftAddress));
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(semanticFunctionLabel(rightFunction).c_str());
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("0x%llX", static_cast<unsigned long long>(match.rightAddress));
+                        ImGui::SetTooltip("%s\nCandidate: 0x%llX", semanticFunctionLabel(rightFunction).c_str(),
+                                          static_cast<unsigned long long>(match.rightAddress));
                     ImGui::TableSetColumnIndex(2);
                     ImGui::Text("%.0f%%", static_cast<double>(match.confidence) * 100.0);
                     ImGui::TableSetColumnIndex(3);
@@ -1319,25 +1393,31 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
         }
 
         if (ImGui::BeginTabItem("Added")) {
-            if (ImGui::BeginTable("SemanticAdded", 2,
+            ImGui::TextDisabled("%zu of %zu candidate-only functions", semanticVisibleAdded_.size(), semanticDiff_.added.size());
+            if (semanticVisibleAdded_.empty())
+                ImGui::TextWrapped(semanticDiff_.added.empty() ? "No added functions were detected."
+                    : "No added functions match this search. Clear the search to see all added functions.");
+            else if (ImGui::BeginTable("SemanticAdded", 2,
                     ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                    ImVec2(0, listHeight))) {
+                    ImVec2(0, std::max(1.0f, ImGui::GetContentRegionAvail().y)))) {
                 ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
                                         130.0f * theme::UiScale());
                 ImGui::TableSetupColumn("Function");
+                ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 ImGuiListClipper addedClipper;
-                addedClipper.Begin(static_cast<int>(semanticDiff_.added.size()));
+                addedClipper.Begin(static_cast<int>(semanticVisibleAdded_.size()));
                 while (addedClipper.Step()) for (int clippedIndex = addedClipper.DisplayStart;
                                                   clippedIndex < addedClipper.DisplayEnd;
                                                   ++clippedIndex) {
                     const SemanticUnmatchedFunction& function =
-                        semanticDiff_.added[static_cast<size_t>(clippedIndex)];
+                        semanticDiff_.added[semanticVisibleAdded_[static_cast<size_t>(clippedIndex)]];
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     ImGui::Text("0x%llX", static_cast<unsigned long long>(function.address));
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(function.name.empty() ? "(unnamed)" : function.name.c_str());
+                    ui::ItemTooltip(function.name.c_str());
                 }
                 ImGui::EndTable();
             }
@@ -1345,25 +1425,31 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
         }
 
         if (ImGui::BeginTabItem("Removed")) {
-            if (ImGui::BeginTable("SemanticRemoved", 2,
+            ImGui::TextDisabled("%zu of %zu baseline-only functions", semanticVisibleRemoved_.size(), semanticDiff_.removed.size());
+            if (semanticVisibleRemoved_.empty())
+                ImGui::TextWrapped(semanticDiff_.removed.empty() ? "No removed functions were detected."
+                    : "No removed functions match this search. Clear the search to see all removed functions.");
+            else if (ImGui::BeginTable("SemanticRemoved", 2,
                     ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                    ImVec2(0, listHeight))) {
+                    ImVec2(0, std::max(1.0f, ImGui::GetContentRegionAvail().y)))) {
                 ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
                                         130.0f * theme::UiScale());
                 ImGui::TableSetupColumn("Function");
+                ImGui::TableSetupScrollFreeze(0, 1);
                 ImGui::TableHeadersRow();
                 ImGuiListClipper removedClipper;
-                removedClipper.Begin(static_cast<int>(semanticDiff_.removed.size()));
+                removedClipper.Begin(static_cast<int>(semanticVisibleRemoved_.size()));
                 while (removedClipper.Step()) for (int clippedIndex = removedClipper.DisplayStart;
                                                     clippedIndex < removedClipper.DisplayEnd;
                                                     ++clippedIndex) {
                     const SemanticUnmatchedFunction& function =
-                        semanticDiff_.removed[static_cast<size_t>(clippedIndex)];
+                        semanticDiff_.removed[semanticVisibleRemoved_[static_cast<size_t>(clippedIndex)]];
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     ImGui::Text("0x%llX", static_cast<unsigned long long>(function.address));
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(function.name.empty() ? "(unnamed)" : function.name.c_str());
+                    ui::ItemTooltip(function.name.c_str());
                 }
                 ImGui::EndTable();
             }
@@ -1378,10 +1464,12 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
             const bool activeProjectValid = activeHash &&
                                             ctx.staticProject().hash == activeHash &&
                                             !ctx.staticBinary().isMappedImage();
-            ImGui::TextDisabled("Nothing is copied automatically. Check proposals, then apply the selection.");
+            ImGui::TextWrapped("Choose the metadata proposals to transfer into the active project, then apply the selection.");
+            if (semanticDiff_.transferProposals.empty())
+                ImGui::TextDisabled("No metadata transfer proposals are available for these files.");
             ImGui::BeginChild("SemanticTransfers", ImVec2(0, std::max(1.0f,
-                                listHeight - ImGui::GetFrameHeightWithSpacing())),
-                              ImGuiChildFlags_Borders);
+                                ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 3)),
+                              ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
             ImGuiListClipper transferClipper;
             transferClipper.Begin(static_cast<int>(semanticDiff_.transferProposals.size()));
             while (transferClipper.Step()) for (int clippedIndex = transferClipper.DisplayStart;
@@ -1434,22 +1522,23 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
             ImGui::BeginDisabled(!activeProjectValid || !semanticProposalSelectionCount_);
             if (ImGui::Button("Apply selected")) applySelectedSemanticTransfers(ctx);
             ImGui::EndDisabled();
-            ImGui::SameLine();
+            ui::SameLineIfFits(ImGui::CalcTextSize("Clear selection").x + ImGui::GetStyle().FramePadding.x * 2);
             if (ImGui::Button("Clear selection")) {
                 std::fill(semanticProposalSelected_.begin(), semanticProposalSelected_.end(), false);
                 semanticProposalSelectionCount_ = 0;
                 semanticTransferTarget_ = {};
             }
             if (!semanticTransferStatus_.empty()) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", semanticTransferStatus_.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+                ImGui::TextWrapped("%s", semanticTransferStatus_.c_str());
+                ImGui::PopStyleColor();
             }
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
     }
 
-    if (semanticSelectedMatch_ < 0 ||
+    if (!showMatchedDetail || semanticSelectedMatch_ < 0 ||
         semanticSelectedMatch_ >= static_cast<int>(semanticDiff_.matched.size())) return;
     const SemanticFunctionMatch& selected = semanticDiff_.matched[semanticSelectedMatch_];
     if (selected.leftIndex >= semanticLeft_->functions.size() ||
@@ -1458,12 +1547,13 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
     const SemanticFunction& rightFunction = semanticRight_->functions[selected.rightIndex];
 
     ImGui::Separator();
-    ImGui::Text("%s  <->  %s", semanticFunctionLabel(leftFunction).c_str(),
+    ImGui::TextWrapped("%s  <->  %s", semanticFunctionLabel(leftFunction).c_str(),
                 semanticFunctionLabel(rightFunction).c_str());
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s; %.0f%% - %s", semanticBasisName(selected.basis),
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+    ImGui::TextWrapped("%s; %.0f%% - %s", semanticBasisName(selected.basis),
                         static_cast<double>(selected.confidence) * 100.0,
                         selected.evidence.c_str());
+    ImGui::PopStyleColor();
 
     if (!selected.hunks.empty()) {
         ImGui::TextDisabled("Instruction edit hunks:");
@@ -1515,10 +1605,11 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
     const float instructionHeight = std::max(1.0f, ImGui::GetContentRegionAvail().y);
     if (ImGui::BeginTable("SemanticInstructions", 2,
             ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable,
-            ImVec2(0, instructionHeight))) {
-        ImGui::TableSetupColumn("Left instructions", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Right instructions", ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+            ImVec2(0, instructionHeight), std::max(920.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x))) {
+        ImGui::TableSetupColumn("Baseline instructions", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Candidate instructions", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>((std::min)(displayRows,
@@ -1545,6 +1636,8 @@ void BinaryDiffTab::renderSemantic(AppContext& ctx) {
                                        static_cast<unsigned long long>(instruction.address),
                                        instruction.display.empty() ? instruction.mnemonic.c_str()
                                                                    : instruction.display.c_str());
+                    ui::ItemTooltip(instruction.display.empty() ? instruction.mnemonic.c_str()
+                                                               : instruction.display.c_str());
                 };
                 renderInstruction(0, leftFunction, leftIndex, leftLast,
                                   selectedHunk ? selectedHunk->leftBegin : 0,
@@ -1570,9 +1663,11 @@ void BinaryDiffTab::renderPane(const char* id, const BinaryFile& self, const Bin
     uint64_t curS = 0, curE = 0;
     if (curRegion_ >= 0 && curRegion_ < (int)regions_.size()) { curS = regions_[curRegion_].start; curE = regions_[curRegion_].end; }
 
-    // Only the master pane shows a scrollbar; the follower is positioned to match.
+    // Both panes retain horizontal access to complete hex/ASCII rows. Equal
+    // scrollbar space also keeps their columns aligned; the follower's vertical
+    // position is synchronized with the hovered master.
     // A forced scroll (Prev/Next) drives both panes to the selected region.
-    ImGuiWindowFlags wf = master ? 0 : ImGuiWindowFlags_NoScrollbar;
+    ImGuiWindowFlags wf = ImGuiWindowFlags_HorizontalScrollbar;
     ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_None, wf);
     if (!master || forceScroll) ImGui::SetScrollY(scrollY_);
 

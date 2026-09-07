@@ -36,6 +36,9 @@
     <ClCompile Include="src\Tabs\BinaryViewOverview.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryViewWorkflow.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryViewTypes.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\BinaryViewValueOrigin.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Core\ValueOrigin.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\SignatureLibrary.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryViewGml.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Core\JumpTableResolver.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\FunctionNamer.cpp"><Filter>Source\Core</Filter></ClCompile>
@@ -129,6 +132,7 @@
     <ClInclude Include="src\Core\AddressInspector.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\BinaryFile.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\GameMakerArchive.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\GmlInstructionText.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\GameMakerDebug.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\GameMakerDebugProtocol.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\GameMakerHelperImage.h"><Filter>Headers\Core</Filter></ClInclude>
@@ -174,6 +178,7 @@
     <ClInclude Include="src\Core\CodeExport.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\FirmwareSniffer.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\TraceCoverage.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\TracePlan.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\DllDebugPlan.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\UnpackEngine.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\PeUnpack.h"><Filter>Headers\Core</Filter></ClInclude>
@@ -224,6 +229,10 @@
     <ClInclude Include="src\Tabs\CommunicationsTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Tabs\SigScannerTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Tabs\BinaryViewTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Tabs\BinaryViewValueOrigin.h"><Filter>Headers\Tabs</Filter></ClInclude>
+    <ClInclude Include="src\Core\ValueOrigin.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\SignatureLibrary.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Ui\NotesEditor.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Tabs\BinaryViewHostTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Tabs\MemoryToolsTab.h"><Filter>Headers\Tabs</Filter></ClInclude>
     <ClInclude Include="src\Tabs\BinaryDiffTab.h"><Filter>Headers\Tabs</Filter></ClInclude>

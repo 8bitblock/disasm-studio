@@ -117,3 +117,114 @@ static void checkIntentWorkflows(const std::string& path) {
     }
     theme::ApplyTheme(theme::ThemeId::Midnight);
 }
+
+// Exercise the actual command band with long context, scaled controls, and
+// keyboard copy. Source provenance must stay visible when context is elided.
+static void checkWorkflowRefinement(const std::string& path) {
+    ImGui::ClosePopupsOverWindow(nullptr, false);
+    ImGui::ClearActiveID();
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::FocusWindow(nullptr);
+    io.ClearInputKeys();
+    io.ClearInputMouse();
+    Fixture f(path);
+    f.tab->functions_ = {{0, std::string(250, 'W') + "##literal_symbol", 32}};
+    ++f.tab->functionsGen_;
+    f.tab->funcIndexDirty_ = true;
+    frame([&] { f.tab->navigateToStaticView(0, DocumentView::Assembly); });
+    const float previousScale = theme::UiScale();
+    const float previousFontScale = io.FontGlobalScale;
+    ImVec2 breadcrumbMin, breadcrumbMax;
+    ImVec2 size(540, 560);
+    auto paint = [&] {
+        frame([&] {
+            f.tab->renderWorkflowContext(f.ctx);
+            breadcrumbMin = ImGui::GetItemRectMin();
+            breadcrumbMax = ImGui::GetItemRectMax();
+        }, "Workflow refinement", size);
+        CHECK(GImGui->ErrorCountCurrentFrame == 0);
+    };
+    for (auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+        for (float scale : {1.0f, 1.5f, 2.0f}) {
+            theme::SetUiScale(scale);
+            io.FontGlobalScale = scale;
+            theme::ApplyTheme(palette);
+            for (float width : {340.0f, 540.0f, 820.0f}) {
+                size = ImVec2(width * scale, 560.0f * scale);
+                paint(); paint(); paint();
+                ImGuiWindow* window = ImGui::FindWindowByName("Workflow refinement");
+                CHECK(window && window->ScrollMax.x == 0.0f);
+                CHECK(breadcrumbMin.x >= 0 && breadcrumbMax.x <= size.x);
+                CHECK(breadcrumbMax.y <= size.y);
+                // Source begins at the left and the complete address remains
+                // at the right, despite a context much wider than the window.
+                float first = FLT_MAX, last = -FLT_MAX;
+                const ImU32 color = ImGui::GetColorU32(theme::col::accent());
+                if (window) for (const auto& vertex : window->DrawList->VtxBuffer) {
+                    if (vertex.col != color || vertex.pos.y < breadcrumbMin.y ||
+                        vertex.pos.y > breadcrumbMax.y) continue;
+                    first = std::min(first, vertex.pos.x);
+                    last = std::max(last, vertex.pos.x);
+                }
+                CHECK(first < breadcrumbMin.x + 12.0f * scale);
+                CHECK(last > breadcrumbMax.x - 20.0f * scale);
+                CHECK(last <= breadcrumbMax.x);
+            }
+        }
+    }
+    theme::SetUiScale(previousScale);
+    io.FontGlobalScale = previousFontScale;
+    theme::ApplyTheme(theme::ThemeId::Midnight);
+    size = ImVec2(540, 560);
+    paint(); paint();
+    ImGuiWindow* window = ImGui::FindWindowByName("Workflow refinement");
+    CHECK(window != nullptr);
+    if (window) {
+        const ImGuiID id = window->GetID("##location_breadcrumb");
+        ImGui::SetClipboardText("unchanged");
+        ImGui::FocusWindow(window);
+        // Use actual Tab input so ImGui establishes keyboard navigation and its
+        // visible focus cursor, rather than only changing the internal NavId.
+        for (int step = 0; step < 20; ++step) {
+            io.AddKeyEvent(ImGuiKey_Tab, true);
+            paint();
+            io.AddKeyEvent(ImGuiKey_Tab, false);
+            paint(); paint();
+            if (GImGui->NavId == id) break;
+        }
+        CHECK(GImGui->NavId == id);
+        io.AddKeyEvent(ImGuiKey_Space, true);
+        paint();
+        io.AddKeyEvent(ImGuiKey_Space, false);
+        paint();
+        CHECK(std::string(ImGui::GetClipboardText()) == "FILE:0x0");
+
+        // Copy retains exact FILE-offset provenance and 64-bit address digits.
+        f.tab->navigation_->replaceCurrent({UINT64_MAX, true, DocumentView::Hex,
+                                            DocumentAddressSpace::FileOffset});
+        paint();
+        ImGui::ActivateItemByID(id);
+        paint();
+        CHECK(std::string(ImGui::GetClipboardText()) == "FILEOFF:0xFFFFFFFFFFFFFFFF");
+        size = ImVec2(210, 560);
+        ImGui::FocusWindow(nullptr);
+        paint(); paint();
+        CHECK(breadcrumbMax.y - breadcrumbMin.y >= ImGui::GetFontSize() * 2.0f);
+        CHECK(window->ScrollMax.x == 0.0f);
+        f.tab->navigation_->replaceCurrent({0xFEDCBA9876543210ull, true,
+            DocumentView::LiveAssembly, DocumentAddressSpace::Live, {42, 1}});
+        paint();
+        ImGui::FocusWindow(window);
+        ImGui::ActivateItemByID(id);
+        paint();
+        CHECK(std::string(ImGui::GetClipboardText()) == "LIVE:0xFEDCBA9876543210");
+        f.tab->navigation_->replaceCurrent({});
+        f.tab->cursorValid_ = false;
+        ImGui::SetClipboardText("no location");
+        ImGui::ActivateItemByID(id);
+        paint();
+        CHECK(std::string(ImGui::GetClipboardText()) == "no location");
+    }
+    io.ClearInputKeys();
+    ImGui::ClearActiveID();
+}

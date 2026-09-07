@@ -279,6 +279,41 @@ int main() {
 
     const auto fixture = makeRawFixture();
 
+    // Unsaved editor drafts block destructive image/owner transitions, while
+    // navigation, decoder refresh, and ordinary project saves stay available.
+    {
+        DocumentContext draftOwner(DocumentId{98}, "draft owner", factory,
+                                   Engine::Zydis, Arch::X64, acceptingStore);
+        assert(draftOwner.loadRaw(fixture.string(), 0, Engine::Zydis, Arch::X64, 0));
+        const auto generation = draftOwner.imageGeneration();
+        const auto bytes = draftOwner.binary().bytes();
+        draftOwner.setTypeDraftPending(true);
+        std::string error;
+        assert(!draftOwner.clearImage(&error) && !error.empty());
+        assert(!draftOwner.close(&error) && draftOwner.open());
+        assert(!draftOwner.loadRaw(fixture.string(), 0x1000, Engine::Zydis, Arch::X64, 0x1000));
+        assert(draftOwner.imageGeneration() == generation && draftOwner.binary().bytes() == bytes);
+        assert(draftOwner.flush());
+        assert(draftOwner.typeDraftPending());
+        draftOwner.setTypeDraftPending(false);
+        assert(draftOwner.clearImage(&error));
+        assert(draftOwner.close(&error));
+    }
+    {
+        DocumentManager draftWorkspace(factory, acceptingStore);
+        const auto a = draftWorkspace.create("first");
+        const auto b = draftWorkspace.create("second");
+        assert(a && b);
+        draftWorkspace.find(*b)->setTypeDraftPending(true);
+        std::string error;
+        assert(!draftWorkspace.clear({}, &error));
+        assert(draftWorkspace.size() == 2 && draftWorkspace.find(*a)->open() && draftWorkspace.find(*b)->open());
+        assert(draftWorkspace.activate(*a)); // ordinary switching retains the draft
+        assert(!draftWorkspace.close(*b, {}, &error)); // inactive owner also protected
+        draftWorkspace.find(*b)->setTypeDraftPending(false);
+        assert(draftWorkspace.clear({}, &error));
+    }
+
     // Configuration-aware factories receive byte order and feature bits, and
     // the exact Raw choices survive the durable project snapshot.
     {

@@ -348,9 +348,14 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
                 const auto* slot=stop && resolution.resolved() && resolution.slotIndex<stop->numericSlotCount?&stop->numericSlots[resolution.slotIndex]:nullptr;
                 ImGui::PushID(static_cast<int>(index));ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);
                 ImGui::Selectable(watch.label.empty()?watch.target.variableName.c_str():watch.label.c_str());
-                if(ImGui::BeginPopupContextItem()){
-                    if(ImGui::MenuItem("Remove watch"))remove=index;
-                    if(slot && slot->storage==GmlSlotStorage::Canonical && ImGui::MenuItem("Inspect resolved address in Memory Tools (session)"))ctx.openMemoryToolsAt(slot->address,stop->identity.pid,stop->identity.sessionGeneration);
+                    if(ImGui::BeginPopupContextItem()){
+                        if(ImGui::MenuItem("Remove watch"))remove=index;
+                        if(slot && slot->storage==GmlSlotStorage::Canonical){
+                            MemoryScanValue scan;uint32_t width=1;
+                            const bool numeric=BuildGmlMemoryScanPreset(*slot,scan,width);
+                            if(ImGui::MenuItem("Inspect resolved address in Memory Tools (session)"))ctx.openMemoryToolsAt(slot->address,stop->identity.pid,stop->identity.sessionGeneration,width);
+                            if(slot->availability==GmlValueAvailability::Available && numeric && ImGui::MenuItem("Prepare typed scan in Memory Tools (session)"))ctx.prepareMemoryToolsScanAt(slot->address,{stop->identity.pid,stop->identity.sessionGeneration},scan,width);
+                        }
                     if(inspectable && watch.target.scope==GmlVariableScope::UniqueObject && ImGui::BeginMenu("Select instance from registry")){
                         for(uint32_t n=0;n<stop->instanceCount;++n){const auto& instance=stop->instances[n];if(instance.objectIndex!=watch.target.objectIndex)continue;
                             ImGui::PushID(static_cast<int>(n));const std::string label="Instance "+std::to_string(instance.runtimeInstanceNumber)+" / token "+std::to_string(instance.instanceId);
@@ -409,7 +414,12 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
                         if(slot.scope==GmlVariableScope::SessionInstance){if(ImGui::MenuItem("Watch this instance (session)"))addWatch(slot,false);ImGui::BeginDisabled(slot.objectIndex==kGmlNoCodeIndex);if(ImGui::MenuItem("Save unique-object watch"))addWatch(slot,true);ImGui::EndDisabled();}
                         if(slot.scope==GmlVariableScope::FrameLocal && ImGui::MenuItem("Watch this local (frame)"))addWatch(slot,false);
                         ImGui::EndDisabled();
-                        if(slot.storage==GmlSlotStorage::Canonical && ImGui::MenuItem("Inspect address in Memory Tools (session)"))ctx.openMemoryToolsAt(slot.address,stop->identity.pid,stop->identity.sessionGeneration);
+                        if(slot.storage==GmlSlotStorage::Canonical){
+                            MemoryScanValue scan;uint32_t width=1;
+                            const bool numeric=BuildGmlMemoryScanPreset(slot,scan,width);
+                            if(ImGui::MenuItem("Inspect address in Memory Tools (session)"))ctx.openMemoryToolsAt(slot.address,stop->identity.pid,stop->identity.sessionGeneration,width);
+                            if(slot.availability==GmlValueAvailability::Available && numeric && ImGui::MenuItem("Prepare typed scan in Memory Tools (session)"))ctx.prepareMemoryToolsScanAt(slot.address,{stop->identity.pid,stop->identity.sessionGeneration},scan,width);
+                        }
                         ImGui::EndPopup();
                     }
                     ImGui::TableSetColumnIndex(1);ImGui::TextUnformatted(scopeText(slot.scope));ImGui::TableSetColumnIndex(2);ImGui::Text("%s / %s",numericType(slot.kind),slot.storage==GmlSlotStorage::Canonical?"storage":slot.storage==GmlSlotStorage::Copied?"copy":"unavailable");

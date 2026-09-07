@@ -273,6 +273,10 @@ public:
     }
     void markDirty();
     bool flush(std::string* error = nullptr);
+    // Transient editor state is never serialized as a completed type. Image
+    // replacement and close must resolve it before releasing its owner.
+    void setTypeDraftPending(bool pending) { typeDraftPending_ = pending; }
+    bool typeDraftPending() const { return typeDraftPending_; }
 
     // AppContext retains its existing debounced asynchronous sidecar writer.
     // These two edges let that writer acknowledge exactly the document revision
@@ -358,6 +362,7 @@ private:
     uint64_t                         revision_ = 0;
     uint64_t                         savedRevision_ = 0;
     uint64_t                         imageGeneration_ = 1;
+    bool                             typeDraftPending_ = false;
 
     // Declared after BinaryFile so reverse destruction joins both workers before
     // the storage they may be reading is destroyed, even if a caller forgets to

@@ -34,6 +34,8 @@ int main() {
         checkReleaseWorkbench(path);
         checkRegisterEditorPresentation(path);
         checkInspectorObservationValidity(path);
+        checkNavigatorRefinement(path);
+        checkWorkflowRefinement(path);
     } catch (const std::exception& error) {
         std::printf("EXCEPTION: %s\n", error.what());
         ++failures;

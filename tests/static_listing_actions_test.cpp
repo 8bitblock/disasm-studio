@@ -13,9 +13,11 @@
 // class's existing internals in the fixture instead of adding a public seam.
 #define private public
 #include "Tabs/BinaryViewTab.h"
+#include "Tabs/BinaryViewHostTab.h"
 #undef private
 #include "Ui/Widgets.h"
 #include "Ui/Fonts.h"
+#include "Ui/NotesEditor.h"
 #include "Core/GameMakerArchive.h"
 #include "Core/ApiInfo.h"
 #include "gamemaker_fixture.h"
@@ -153,8 +155,14 @@ struct Fixture {
 #include "workbench_workflow_fixture.inc"
 #include "function_navigator_fixture.inc"
 #include "static_xref_workflow_fixture.inc"
+#include "seven_improvements_fixture.inc"
+#include "notes_editor_fixture.inc"
+#include "value_origin_ui_fixture.inc"
 #include "release_workbench_fixture.inc"
+#include "navigator_refinement_fixture.inc"
 #include "context_action_regressions.inc"
+#include "patch_restoration_fixture.inc"
+#include "trace_workflow_fixture.inc"
 
 static void checkRetainedActions(const std::string& path) {
     Fixture f(path);
@@ -351,6 +359,130 @@ static void checkGameMakerActions(const std::string& directory) {
     CHECK(ctx.staticProject().gmlBreakpoints.size()==1);
     size_t available=0;const auto* original=ctx.staticBinary().ptrFromVA(bytes.rootOffset,available);
     CHECK(original && available>=bytes.rootLength && std::memcmp(original,bytes.bytes.data()+bytes.rootOffset,bytes.rootLength)==0);
+
+    // Use actual archive-decoded rows and production ImGui widgets: readable
+    // text must preserve the exact instruction identities used by navigation,
+    // selections, and symbolic GML breakpoints.
+    const auto instructions = ctx.staticDisassembler()->disassemble(original, bytes.rootLength, bytes.rootOffset, 0);
+    const auto variable = std::find_if(instructions.begin(), instructions.end(), [&](const Instruction& in) {
+        return in.address == bytes.variableInstruction;
+    });
+    CHECK(variable != instructions.end());
+    if (variable != instructions.end()) {
+        CHECK(variable->mnemonic == "push.v" && variable->operands == "self.money");
+        CHECK(variable->comment == "VARI #0, id=0");
+        CHECK(tab.gmlReadableInstructions_);
+        DbgSnapshot detached;
+        tab.frameSnap_ = &detached;
+        tab.showHints_ = tab.showStringComments_ = true;
+        tab.showFnNotes_ = false;
+        float branchTargetX = 0.0f;
+        const auto rowsFrame = [&]() {
+            std::string text;
+            tab.asmFullProgram_ = false;
+            tab.asmWindowInsns_ = instructions;
+            tab.asmWindowBoundaryExact_ = true;
+            tab.listRows_.clear(); tab.listingRowsIndex_.reset({}); tab.codeDataMap_.reset();
+            frame([&] {
+                tab.asmFlow_.clear(); tab.rowGlow_.clear();
+                tab.asmGotLaneX_ = tab.asmGotAddrX_ = false;
+                ImGui::LogToBuffer();
+                if (ImGui::BeginTable("GML instruction rows", 6,
+                        ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoSavedSettings)) {
+                    const char* names[] = {"", "", "Address", "Bytes", "Instruction", "Comment"};
+                    const float widths[] = {18, 40, 115, 200, 500, 2200};
+                    for (int i = 0; i < 6; ++i)
+                        ImGui::TableSetupColumn(names[i], ImGuiTableColumnFlags_WidthFixed, widths[i]);
+                    ImGui::TableHeadersRow();
+                    std::string nextHover;
+                    for (const auto& in : instructions)
+                        tab.renderAsmRow(ctx, in, detached, {}, nextHover, false, true);
+                    branchTargetX = ImGui::GetCurrentTable()->Columns[5].WorkMinX + 20.0f;
+                    ImGui::EndTable();
+                }
+                text = ImGui::GetCurrentContext()->LogBuffer.c_str();
+                ImGui::LogFinish();
+            }, "GML readable instruction integration", ImVec2(3300, 900));
+            return text;
+        };
+        const auto clickRow = [&](uint64_t address, bool gutter, bool followTarget = false) {
+            rowsFrame();
+            const auto found = std::find_if(tab.asmFlow_.begin(), tab.asmFlow_.end(), [&](const auto& row) {
+                return row.addr == address;
+            });
+            CHECK(found != tab.asmFlow_.end());
+            if (found == tab.asmFlow_.end()) return;
+            const float x = followTarget ? branchTargetX : gutter ? tab.asmLaneX_ - 12.0f : tab.asmAddrX_ + 30.0f;
+            const float y = found->y;
+            ImGui::GetIO().AddMousePosEvent(x, y); rowsFrame();
+            ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true); rowsFrame();
+            ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false); rowsFrame();
+        };
+        const auto toggleReadableToolbar = [&]() {
+            const auto body = [&] { tab.renderAssembly(ctx); };
+            frame(body, "GML assembly toolbar integration");
+            ImGuiWindow* window = ImGui::FindWindowByName("GML assembly toolbar integration");
+            CHECK(window != nullptr);
+            if (window) {
+                ImGui::FocusWindow(window);
+                ImGui::ActivateItemByID(window->GetID("Readable GML"));
+            }
+            frame(body, "GML assembly toolbar integration");
+        };
+        const char* variableExplanation = "Read this variable and keep its value on the temporary stack for the next operations.";
+        for (bool readable : {true, false}) {
+            CHECK(tab.gmlReadableInstructions_ == readable);
+            ImGui::GetIO().AddMousePosEvent(3250.0f, 850.0f);
+            rowsFrame();
+            const std::string text = rowsFrame();
+            // Operand tokens are separate ImGui items; its text logger inserts
+            // spacing between them even when the listing paints them together.
+            std::string compactText = text;
+            std::erase_if(compactText, [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; });
+            CHECK(text.find(readable ? "Read variable" : "push.v") != std::string::npos);
+            CHECK(compactText.find("self.money") != std::string::npos);
+            CHECK(text.find("VARI #0, id=0") != std::string::npos);
+            CHECK(text.find(variableExplanation) != std::string::npos);
+            CHECK(text.find(".v = dynamic GameMaker value") != std::string::npos);
+            if (readable) CHECK(text.find("push.v") == std::string::npos);
+            CHECK(tab.asmFlow_.size() == instructions.size());
+            CHECK(!tab.asmFlow_.empty() && tab.asmFlow_[0].branch && tab.asmFlow_[0].target == bytes.stringInstruction);
+
+            tab.showHints_ = false;
+            const std::string withoutExplanation = rowsFrame();
+            CHECK(withoutExplanation.find(variableExplanation) == std::string::npos);
+            CHECK(withoutExplanation.find("VARI #0, id=0") != std::string::npos);
+            CHECK(withoutExplanation.find(readable ? "Read variable" : "push.v") != std::string::npos);
+
+            clickRow(bytes.variableInstruction, false);
+            CHECK(tab.cursorVA_ == bytes.variableInstruction && tab.selVAs_.count(bytes.variableInstruction) == 1);
+            CHECK(tab.listingCursorInstruction_.instruction.mnemonic == "push.v");
+            Instruction action; std::string error;
+            CHECK(tab.listingActionInstruction(ctx, bytes.variableInstruction, action, error));
+            CHECK(action.address == bytes.variableInstruction && action.length == 8 && action.mnemonic == "push.v" &&
+                  action.operands == "self.money");
+            CHECK(!tab.hasGmlBreakpoint(ctx, bytes.variableInstruction));
+            clickRow(bytes.variableInstruction, true);
+            CHECK(tab.hasGmlBreakpoint(ctx, bytes.variableInstruction));
+            CHECK(tab.breakpoints_.empty() && ctx.staticProject().breakpoints.empty());
+            clickRow(bytes.variableInstruction, true);
+            CHECK(!tab.hasGmlBreakpoint(ctx, bytes.variableInstruction));
+
+            // The same target link follows the decoded branch destination
+            // with either presentation, including the full saved navigation.
+            clickRow(bytes.rootOffset, false);
+            CHECK(tab.cursorVA_ == bytes.rootOffset);
+            clickRow(bytes.rootOffset, false, true);
+            CHECK(tab.cursorVA_ == bytes.stringInstruction);
+            tab.setStaticCursor(bytes.variableInstruction);
+            tab.showHints_ = true;
+            toggleReadableToolbar();
+            CHECK(tab.gmlReadableInstructions_ != readable);
+            CHECK(tab.cursorVA_ == bytes.variableInstruction);
+        }
+        CHECK(tab.gmlReadableInstructions_);
+        tab.frameSnap_ = nullptr;
+    }
     for(int i=0;i<1000;++i){tab.advanceInvestigationSnapshot(ctx,{},0,256);if(!tab.investigationBuilding_)break;}
     CHECK(tab.investigationPublished_ && tab.investigationPublished_->functions.size()==2);
     if(tab.investigationPublished_){const auto archive=ctx.staticBinary().gameMakerArchive();for(const auto& code:archive->code){const auto& rows=tab.investigationPublished_->functions;CHECK(std::any_of(rows.begin(),rows.end(),[&](const auto& row){return row.name==code.name && row.location.valid && row.location.value==code.entryFileOffset();}));}}
@@ -396,7 +528,7 @@ static void checkReferenceWorkflow(const std::string& path) {
     CHECK(!f.tab->adoptStaticXrefResult(f.ctx, wrongScope));
     f.tab->startXrefSearch(f.ctx, 0, false);
     CHECK(f.tab->xrefPinned_ && f.tab->xrefTargetValid_ && f.tab->xrefTarget_ == 0);
-    CHECK(f.tab->xrefHits_.size() == 2 && !f.tab->xrefFilePending_);
+    CHECK(f.tab->pinnedXrefSources().size() == 2 && !f.tab->xrefFilePending_);
     std::snprintf(f.tab->xrefFilter_, sizeof(f.tab->xrefFilter_), "0x%llX",
                   static_cast<unsigned long long>(kTarget + 2));
     frame([&] {
@@ -408,7 +540,7 @@ static void checkReferenceWorkflow(const std::string& path) {
     CHECK(f.tab->cursorVA_ == kTarget + 2 && f.tab->mainView_ == 0);
     CHECK(f.tab->xrefPinned_ && f.tab->xrefTarget_ == 0);
     CHECK(f.tab->xrefSelectedValid_ && f.tab->xrefSelectedSource_ == kTarget + 2);
-    CHECK(f.tab->xrefFilter_[0] && f.tab->xrefHits_.size() == 2);
+    CHECK(f.tab->xrefFilter_[0] && f.tab->pinnedXrefSources().size() == 2);
     const auto originalScope = f.ctx.staticAnalysisCache().codeData;
     auto replacementScope = std::make_shared<CodeDataMap>(*originalScope);
     ++replacementScope->scopeDigest;
@@ -419,7 +551,7 @@ static void checkReferenceWorkflow(const std::string& path) {
     f.ctx.staticAnalysisCache().codeData = originalScope;
     CHECK(f.tab->adoptStaticXrefResult(f.ctx, result));
     f.tab->startXrefSearch(f.ctx, 0, false);
-    CHECK(f.tab->xrefTargetValid_ && f.tab->xrefHits_.size() == 2);
+    CHECK(f.tab->xrefTargetValid_ && f.tab->pinnedXrefSources().size() == 2);
     f.ctx.staticAnalysis().bumpEpoch();
     frame([&] { f.tab->renderPinnedXrefs(f.ctx); });
     CHECK(!f.tab->xrefTargetValid_ && f.tab->xrefHits_.empty());
@@ -847,6 +979,13 @@ static void checkWorkbenchShell() {
 }
 
 int main() {
+    char patchRestorationChild[8]{};
+    if (GetEnvironmentVariableA("DS_PATCH_RESTORATION_CHILD", patchRestorationChild,
+                               static_cast<DWORD>(sizeof(patchRestorationChild))) &&
+        patchRestorationChild[0] == '1') {
+        Sleep(30000);
+        return 0;
+    }
     char temporary[MAX_PATH]{};
     if (!GetEnvironmentVariableA("DS_STATIC_LISTING_TEST_ROOT", temporary, MAX_PATH)) return 2;
     const std::string path = std::string(temporary) + "\\listing.raw";
@@ -883,12 +1022,21 @@ int main() {
         checkReferenceWorkflow(path);
         checkNavigationWorkflow(path);
         checkIntentWorkflows(path);
+        checkWorkflowRefinement(path);
+        checkNavigatorRefinement(path);
         checkFunctionNavigator(path);
         checkStaticXrefWorkflow(path);
+        checkNotesAndTypesPreservation(path);
+        checkCompletePinnedReferences(path);
+        checkTypesClosePrompt(path);
+        checkNotesEditorBoundaries();
+        checkValueOriginWorkbench(path);
         checkContextActionDispatcher(path);
         checkEffectivePatchPreview(path, false);
         checkEffectivePatchPreview(path, true);
         checkLivePatchMappingAndSkippedOutcome(path);
+        checkLivePatchByteRestoration(path);
+        checkTraceWorkflow(path);
         checkListingColumns(path);
         checkListingVisualSignals(path);
         checkGameMakerActions(temporary);

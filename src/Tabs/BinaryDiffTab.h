@@ -174,6 +174,13 @@ private:
     size_t                         semanticProposalSelectionCount_ = 0;
     DocumentResultIdentity         semanticTransferTarget_;
     std::string                    semanticTransferStatus_;
+    char                           semanticFilter_[128] = "";
+    std::string                    appliedSemanticFilter_;
+    bool                           semanticChangesOnly_ = false;
+    bool                           semanticFilterDirty_ = true;
+    std::vector<size_t>             semanticVisibleMatches_;
+    std::vector<size_t>             semanticVisibleAdded_;
+    std::vector<size_t>             semanticVisibleRemoved_;
 
     // A persistent worker consumes only paths/identities and reloads files into
     // worker-owned BinaryFile instances. It never borrows the render thread's
