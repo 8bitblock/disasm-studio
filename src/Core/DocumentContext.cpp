@@ -618,6 +618,7 @@ std::optional<DocumentId> DocumentManager::create(std::string title,
     if (nextId_ == (std::numeric_limits<uint64_t>::max)()) nextId_ = 0;
     else ++nextId_;
     activeId_ = id;
+    refreshAnalysisPriorities();
     return id;
 }
 
@@ -646,6 +647,7 @@ bool DocumentManager::activate(DocumentId id, PrepareTransition prepare,
         return false;
     id = target->id();
     activeId_ = id;
+    refreshAnalysisPriorities();
     return true;
 }
 
@@ -681,6 +683,7 @@ bool DocumentManager::close(DocumentId id, PrepareTransition prepare,
         // final slot this naturally selects its predecessor.
         activeId_ = documents_[std::min(index, documents_.size() - 1)]->id();
     }
+    refreshAnalysisPriorities();
     return true;
 }
 
@@ -833,9 +836,15 @@ DocumentManager::OpenResult DocumentManager::openStaged(
     if (nextId_ == (std::numeric_limits<uint64_t>::max)()) nextId_ = 0;
     else ++nextId_;
     activeId_ = id;
+    refreshAnalysisPriorities();
     result.status = OpenStatus::Created;
     result.id = id;
     return result;
+}
+
+void DocumentManager::refreshAnalysisPriorities() {
+    for (auto& document : documents_)
+        document->analysis().setActiveDocument(activeId_ && document->id() == *activeId_);
 }
 
 DocumentContext* DocumentManager::find(DocumentId id) {

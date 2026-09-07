@@ -138,6 +138,7 @@ AppContext::AppContext()
               error = "Project save failed; changes remain in memory.";
               return false;
           }) {
+    moduleAnalysis_.setActiveDocument(false);
     if (!documents_.create("Untitled"))
         throw std::runtime_error("Unable to create the initial static document: " +
                                  documents_.lastError());
@@ -460,7 +461,7 @@ bool AppContext::setStaticDecoderConfiguration(const DecoderConfig& decoder) {
 }
 
 App::App(std::string startupPath) {
-    loadPrefs();                 // restore the last-used theme + density, if any
+    loadPrefs();                 // restore the last-used theme, density and zoom
     theme::SetDensity(density_);
     theme::ApplyTheme(theme_);
     tabs_.emplace_back(std::make_unique<ProjectsTab>());
@@ -1148,6 +1149,7 @@ void App::loadPrefs() {
     PreferencesData defaults;
     defaults.theme = static_cast<int>(theme_);
     defaults.density = static_cast<int>(density_);
+    defaults.uiZoomPercent = theme::UiZoomPercent();
     defaults.symbolNetwork = false;
     defaults.symbolCache = defaultSymbolCachePath();
     defaults.symbolServer = "https://msdl.microsoft.com/download/symbols";
@@ -1177,6 +1179,9 @@ void App::loadPrefs() {
 
     theme_ = static_cast<theme::ThemeId>(loaded.theme);
     density_ = static_cast<theme::Density>(loaded.density);
+    theme::SetUiZoomPercent(loaded.uiZoomPercent);
+    ctx_.navigatorOptionalMask = static_cast<uint32_t>(loaded.navigatorOptionalMask);
+    ctx_.analysisQueueCollapsed = loaded.analysisQueueCollapsed;
     ctx_.symbolOptions.networkEnabled = loaded.symbolNetwork;
     ctx_.symbolOptions.cacheDirectory = std::move(loaded.symbolCache);
     ctx_.symbolOptions.serverUrl = std::move(loaded.symbolServer);
@@ -1197,6 +1202,9 @@ bool App::savePrefs() {
     PreferencesData data;
     data.theme = static_cast<int>(theme_);
     data.density = static_cast<int>(density_);
+    data.uiZoomPercent = theme::UiZoomPercent();
+    data.navigatorOptionalMask = static_cast<int>(ctx_.navigatorOptionalMask);
+    data.analysisQueueCollapsed = ctx_.analysisQueueCollapsed;
     data.symbolNetwork = ctx_.symbolOptions.networkEnabled;
     data.symbolCache = ctx_.symbolOptions.cacheDirectory;
     data.symbolServer = ctx_.symbolOptions.serverUrl;
@@ -1233,6 +1241,12 @@ bool App::savePrefs() {
     prefsSaveError_ = "Preferences save failed; the previous prefs.ini/.bak remain available.";
     if (firstFailure) ui::Toast(ui::ToastKind::Error, prefsSaveError_);
     return false;
+}
+
+void App::setUiZoomPercent(int percent) {
+    const int previous = theme::UiZoomPercent();
+    theme::SetUiZoomPercent(percent);
+    if (theme::UiZoomPercent() != previous) savePrefs();
 }
 
 void App::renderSymbolSettingsPopup() {
@@ -3116,6 +3130,24 @@ void App::renderMenuBar() {
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("UI Zoom")) {
+                const int zoom = theme::UiZoomPercent();
+                if (ImGui::MenuItem("Zoom out", "Ctrl+-", false, zoom > kMinUiZoomPercent))
+                    setUiZoomPercent(zoom - 5);
+                if (ImGui::MenuItem("Zoom in", "Ctrl++", false, zoom < kMaxUiZoomPercent))
+                    setUiZoomPercent(zoom + 5);
+                if (ImGui::MenuItem("Actual size (100%)", "Ctrl+0", zoom == 100))
+                    setUiZoomPercent(100);
+                ImGui::Separator();
+                for (int percent : {75, 80, 85, 90, 95, 100, 110, 125, 150}) {
+                    char label[40];
+                    std::snprintf(label, sizeof(label), percent == kDefaultUiZoomPercent
+                        ? "%d%% (default)" : "%d%%", percent);
+                    if (ImGui::MenuItem(label, nullptr, zoom == percent))
+                        setUiZoomPercent(percent);
+                }
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Density")) {
                 const theme::Density opts[] = { theme::Density::Compact,
                                                 theme::Density::Comfortable,
@@ -4227,10 +4259,25 @@ static float DocumentStripHeight() {
     return h > m ? h : m;
 }
 
+// Use the actual font metrics to decide whether the address/mode controls need
+// their own row. Execution controls retain text labels even at compact widths.
+static bool ToolbarUsesTwoRows() {
+    const float k = theme::UiScale();
+    float commandLabels = 0.0f;
+    for (const char* label : {"Launch & Debug", "Step Into", "Step Over",
+                              "Step Out", "Run to cursor", "Trace", "Detach"})
+        commandLabels += ImGui::CalcTextSize(label).x;
+    const float iconWidth = ui::IconsLoaded()
+        ? ImGui::CalcTextSize(DS_ICON_PLAY).x : ImGui::CalcTextSize(">>").x;
+    const float preferredWidth = commandLabels + 7.0f * (18.0f * k + iconWidth + 6.0f * k)
+        + 98.0f * k + 222.0f * k + 109.0f * k;
+    return ImGui::GetMainViewport()->WorkSize.x < preferredWidth;
+}
+
 static float ToolbarHeight() {
     const float k = theme::UiScale();
     const float row = (std::max)(30.0f * k, ImGui::GetFrameHeight());
-    return ImGui::GetMainViewport()->WorkSize.x < 920.0f * k
+    return ToolbarUsesTwoRows()
         ? row * 2.0f + 18.0f * k : row + 14.0f * k;
 }
 
@@ -4541,7 +4588,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
     const float barH = ToolbarHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float toolbarY = vp->WorkPos.y + docH + TabStripHeight();
-    const bool twoRows = vp->WorkSize.x < 920.0f * k;
+    const bool twoRows = ToolbarUsesTwoRows();
     const float rowH = (std::max)(30.0f * k, ImGui::GetFrameHeight());
     const float toolbarPaddingY = (barH - (twoRows ? rowH * 2.0f + 4.0f * k : rowH)) * 0.5f;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, toolbarY));
@@ -4599,31 +4646,25 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         }
         const bool loaded   = ctx_.staticBinary().loaded();
         const float commandH = rowH;
-        const bool compactCommands = vp->WorkSize.x < 1120.0f * k;
-        const bool tinyCommands = vp->WorkSize.x < 760.0f * k;
+        const bool compactCommands = vp->WorkSize.x < 1000.0f * k;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         auto commandWidth = [&](const char* icon, const char* fallback,
-                                const char* label, bool keepLabel) {
+                                const char* label) {
             const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
-            const bool showLabel = (keepLabel && !tinyCommands) || !compactCommands;
             const float glyphW = (glyph && glyph[0])
                 ? ImGui::CalcTextSize(glyph).x : 0.0f;
-            const float labelW = showLabel ? ImGui::CalcTextSize(label).x : 0.0f;
-            const float gap = showLabel && glyphW > 0.0f ? 8.0f * k : 0.0f;
-            return showLabel ? 23.0f * k + glyphW + gap + labelW
-                             : (std::max)(30.0f * k, glyphW + 12.0f * k);
+            const float labelW = ImGui::CalcTextSize(label).x;
+            const float gap = glyphW > 0.0f ? 6.0f * k : 0.0f;
+            return (std::max)(30.0f * k, 18.0f * k + glyphW + gap + labelW);
         };
         auto commandButton = [&](const char* id, const char* icon,
                                  const char* fallback, const char* label,
-                                 const char* tip, bool hot, bool enabled,
-                                 bool keepLabel = false) {
+                                 const char* tip, bool hot, bool enabled) {
             const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
-            const bool showLabel = (keepLabel && !tinyCommands) || !compactCommands;
             const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
-            const ImVec2 labelSize = showLabel
-                ? ImGui::CalcTextSize(label) : ImVec2(0, 0);
-            const float gap = showLabel && glyph && glyph[0] ? 8.0f * k : 0.0f;
-            const float width = commandWidth(icon, fallback, label, keepLabel);
+            const ImVec2 labelSize = ImGui::CalcTextSize(label);
+            const float gap = glyph && glyph[0] ? 6.0f * k : 0.0f;
+            const float width = commandWidth(icon, fallback, label);
             const ImVec2 p = ImGui::GetCursorScreenPos();
             if (!enabled) ImGui::BeginDisabled();
             const bool clicked = ImGui::InvisibleButton(id, ImVec2(width, commandH));
@@ -4653,11 +4694,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : theme::col::muted();
             const float glyphY = p.y + (commandH - glyphSize.y) * 0.5f;
             const float labelY = p.y + (commandH - labelSize.y) * 0.5f;
-            dl->AddText(ImVec2(p.x + 11.0f * k, glyphY),
+            dl->AddText(ImVec2(p.x + 9.0f * k, glyphY),
                         ImGui::GetColorU32(glyphCol), glyph);
-            if (showLabel)
-                dl->AddText(ImVec2(p.x + 11.0f * k + glyphSize.x + gap, labelY),
-                            ImGui::GetColorU32(labelCol), label);
+            dl->AddText(ImVec2(p.x + 9.0f * k + glyphSize.x + gap, labelY),
+                        ImGui::GetColorU32(labelCol), label);
             if (hovered) ui::ItemTooltip(tip);
             return clicked && enabled;
         };
@@ -4675,17 +4715,34 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         };
         auto nextCommand = [&] { ImGui::SameLine(0.0f, 3.0f * k); };
 
-        ImGui::SetNextItemWidth((tinyCommands ? 76.0f : 98.0f) * k);
-        int executionMode = ctx_.gmlExecutionMode ? 1 : 0;
-        if (ImGui::Combo("##execution_mode", &executionMode, "Native\0GML\0"))
-            ctx_.gmlExecutionMode = executionMode == 1;
-        ui::ItemTooltip("Select native CPU instructions or verified GameMaker VM instructions for execution controls.");
-        nextGroup();
+        auto executionModeControl = [&] {
+            ImGui::SetNextItemWidth(98.0f * k);
+            int executionMode = ctx_.gmlExecutionMode ? 1 : 0;
+            if (ImGui::Combo("##execution_mode", &executionMode, "Native\0GML\0"))
+                ctx_.gmlExecutionMode = executionMode == 1;
+            ui::ItemTooltip("Select native CPU instructions or verified GameMaker VM instructions for execution controls.");
+        };
+        ImVec2 addressRowStart;
+        if (twoRows) {
+            // Submit the selector first so a mode change also governs keyboard
+            // commands in this frame, while drawing it on the secondary row.
+            const ImVec2 executionRowStart = ImGui::GetCursorPos();
+            ImGui::SetCursorPos(ImVec2(8.0f * k, toolbarPaddingY + rowH + 4.0f * k));
+            executionModeControl();
+            nextGroup();
+            addressRowStart = ImGui::GetCursorPos();
+            ImGui::Dummy(ImVec2(0, 0)); // finish SameLine before returning to row one
+            ImGui::SetCursorPos(executionRowStart);
+        } else {
+            executionModeControl();
+            nextGroup();
+        }
         const bool modePaused = ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused;
         const bool modeRunning = running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
 
-        const bool canLaunch = ctx_.binaryLaunchable();
-        const bool canDebugDll = ctx_.binaryDllDebuggable();
+        const bool lifecycleIdle = !ctx_.debug.lifecycleSnapshot().busy;
+        const bool canLaunch = lifecycleIdle && ctx_.binaryLaunchable();
+        const bool canDebugDll = lifecycleIdle && ctx_.binaryDllDebuggable();
         const bool canRun = canLaunch || canDebugDll;
         const char* launchTip = canDebugDll
             ? "Debug DLL - choose a compatible host, export, and DLL breakpoint"
@@ -4698,16 +4755,17 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             if (running) {
                 if (commandButton("##cmd_primary", DS_ICON_PAUSE, "||", "Pause",
                                   "Pause - break into the running process (F5)",
-                                  true, modeRunning, true)) executionCommand(GmlControlCommand::Pause);
+                                  true, modeRunning)) executionCommand(GmlControlCommand::Pause);
             } else if (commandButton("##cmd_primary", DS_ICON_PLAY, ">", "Continue",
                                      "Continue - resume until the next breakpoint (F5)",
-                                     true, modePaused, true)) {
+                                     true, modePaused)) {
                 executionCommand(GmlControlCommand::Continue);
             }
         } else {
-            const char* primaryLabel = canDebugDll ? "Debug DLL" : "Launch & Debug";
+            const char* primaryLabel = canDebugDll ? "Debug DLL"
+                                     : compactCommands ? "Launch" : "Launch & Debug";
             if (commandButton("##cmd_primary", DS_ICON_PLAY, ">", primaryLabel,
-                              launchTip, canRun, canRun, true)) {
+                              launchTip, canRun, canRun)) {
                 if (canDebugDll) ctx_.requestedDebugDll = true;
                 else {
                     std::string error;
@@ -4718,17 +4776,33 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         }
 
         nextGroup();
-        if (commandButton("##cmd_step_into", DS_ICON_DOWN, "v", "Step Into",
+        if (commandButton("##cmd_step_into", DS_ICON_DOWN, "v",
+                          compactCommands ? "Into" : "Step Into",
                           "Step Into (F11) - one instruction, following calls",
                            false, modePaused)) executionCommand(GmlControlCommand::StepInto);
         nextCommand();
-        if (commandButton("##cmd_step_over", DS_ICON_REDO, ">>", "Step Over",
+        if (commandButton("##cmd_step_over", DS_ICON_REDO, ">>",
+                          compactCommands ? "Over" : "Step Over",
                           "Step Over (F10) - one instruction, stepping over calls",
                            false, modePaused)) executionCommand(GmlControlCommand::StepOver);
         nextCommand();
-        if (commandButton("##cmd_step_out", DS_ICON_UP, "^", "Step Out",
+        if (commandButton("##cmd_step_out", DS_ICON_UP, "^",
+                          compactCommands ? "Out" : "Step Out",
                           "Step Out (Shift+F11) - run until the current function returns",
                            false, modePaused)) executionCommand(GmlControlCommand::StepOut);
+
+        const bool runtimeCursorCurrent = ctx_.runtimeCursorTarget.valid() &&
+            DebugTargetIdentityMatches(frameTarget, ctx_.runtimeCursorTarget);
+        const bool canRunToCursor = modePaused && !ctx_.gmlExecutionMode &&
+            ctx_.runtimeCursorVA && runtimeCursorCurrent;
+        nextCommand();
+        if (commandButton("##cmd_run_to_cursor", DS_ICON_PIN, "@",
+                          compactCommands ? "To cursor" : "Run to cursor",
+                          canRunToCursor
+                              ? "Run to cursor (Ctrl+F9) - continue to the selected live instruction"
+                              : "Run to cursor requires a paused native session and a selected instruction belonging to that session",
+                          false, canRunToCursor))
+            d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
 
         const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
         const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active);
@@ -4751,8 +4825,9 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             ctx_.requestedTab = "Binary View";
         }
 
-        if (twoRows)
-            ImGui::SetCursorPos(ImVec2(8.0f * k, toolbarPaddingY + rowH + 4.0f * k));
+        if (twoRows) {
+            ImGui::SetCursorPos(addressRowStart);
+        }
         else nextGroup();
         bool mirrorValid = false;
         bool mirrorLive = false;
@@ -4801,7 +4876,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         float trailingReserve = 0.0f;
         if (attached) {
             trailingReserve = 12.0f * k + commandWidth(
-                DS_ICON_STOP, "X", "Detach", true);
+                DS_ICON_STOP, "X", "Detach");
         } else if (loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
             trailingReserve = ImGui::CalcTextSize("Break on JVM init").x +
                               ImGui::GetFrameHeight() + 18.0f * k;
@@ -4900,11 +4975,8 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 ImGui::GetIO().KeyShift) executionCommand(GmlControlCommand::StepOut);
             else if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F11)) executionCommand(GmlControlCommand::StepInto);
             if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F10)) executionCommand(GmlControlCommand::StepOver);
-            const bool runtimeCursorCurrent = ctx_.runtimeCursorTarget.valid() &&
-                DebugTargetIdentityMatches(frameTarget, ctx_.runtimeCursorTarget);
-            if (modePaused && !ctx_.gmlExecutionMode && ImGui::GetIO().KeyCtrl &&
-                ImGui::IsKeyPressed(ImGuiKey_F9) && ctx_.runtimeCursorVA &&
-                runtimeCursorCurrent)
+            if (canRunToCursor && ImGui::GetIO().KeyCtrl &&
+                ImGui::IsKeyPressed(ImGuiKey_F9))
                 d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
         }
 
@@ -4914,7 +4986,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             ImGui::SameLine(0.0f, 12.0f * k);
             if (commandButton("##cmd_detach", DS_ICON_STOP, "X", "Detach",
                               "Stop debugging and detach from the process",
-                              false, true, true)) d.detachForSession(frameTarget);
+                              false, true)) d.requestDetach(frameTarget);
         } else if (loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
             ImGui::SameLine(0.0f, 12.0f * k);
             bool jvmInit = ctx_.debug.breakOnJvmInit();
@@ -5024,19 +5096,9 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
         const float cardH = (std::max)(1.0f, stripH - 2.0f * k);
         const float usableW = (std::max)(1.0f, vp->WorkSize.x - sidePad * 2.0f);
 
-        auto compactName = [](const char* name) -> const char* {
-            if (std::strcmp(name, "Communications") == 0) return "Comms";
-            if (std::strcmp(name, "Sig Scanner") == 0)    return "Sig Scan";
-            if (std::strcmp(name, "Binary View") == 0)    return "Binary";
-            if (std::strcmp(name, "Memory Tools") == 0)   return "Memory";
-            if (std::strcmp(name, "Binary Diff") == 0)    return "Diff";
-            if (std::strcmp(name, "Binary Tech") == 0)    return "Tech";
-            return name;
-        };
-
-        // Keep descriptive labels at normal sizes, then switch to familiar short
-        // names before squeezing cells. This preserves readable targets at the
-        // minimum supported window size instead of reducing labels to ellipses.
+        // Preserve every full feature name at the supported design widths. On
+        // smaller windows use an explicit inventory, retaining the active tab,
+        // instead of progressively squeezing labels into ambiguous fragments.
         std::vector<float> naturalWidths;
         naturalWidths.reserve(tabs_.size());
         float naturalTotal = 0.0f;
@@ -5050,33 +5112,35 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             naturalWidths.push_back(width);
             naturalTotal += width;
         }
-        const bool compactLabels = naturalTotal > usableW;
-        if (compactLabels) {
-            naturalWidths.clear();
-            naturalTotal = 0.0f;
-            for (const auto& tab : tabs_) {
-                const char* nm = tab->name();
-                const bool reservesBadge = std::strcmp(nm, "Communications") == 0 ||
-                                           std::strcmp(nm, "Binary View") == 0;
-                const float width = (std::max)(
-                    54.0f * k, ImGui::CalcTextSize(compactName(nm)).x +
-                               20.0f * k + (reservesBadge ? 14.0f * k : 0.0f));
-                naturalWidths.push_back(width);
-                naturalTotal += width;
-            }
+        const bool overflow = naturalTotal > usableW;
+        const float overflowWidth = ImGui::CalcTextSize("All features").x + 36.0f * k;
+        const float visibleBudget = overflow
+            ? (std::max)(0.0f, usableW - overflowWidth - 8.0f * k) : usableW;
+        std::vector<int> visibleTabs;
+        visibleTabs.reserve(tabs_.size());
+        float visibleWidth = 0.0f;
+        for (int i = 0; i < (int)tabs_.size(); ++i) {
+            if (visibleWidth + naturalWidths[(size_t)i] > visibleBudget) break;
+            visibleTabs.push_back(i);
+            visibleWidth += naturalWidths[(size_t)i];
         }
-        const float fit = naturalTotal > usableW && naturalTotal > 0.0f
-                        ? usableW / naturalTotal : 1.0f;
+        if (overflow && activeTab_ >= 0 && activeTab_ < (int)tabs_.size() &&
+            std::find(visibleTabs.begin(), visibleTabs.end(), activeTab_) == visibleTabs.end()) {
+            while (!visibleTabs.empty() &&
+                   visibleWidth + naturalWidths[(size_t)activeTab_] > visibleBudget) {
+                visibleWidth -= naturalWidths[(size_t)visibleTabs.back()];
+                visibleTabs.pop_back();
+            }
+            if (naturalWidths[(size_t)activeTab_] <= visibleBudget)
+                visibleTabs.push_back(activeTab_);
+        }
         float x = win.x + sidePad;
 
-        for (int i = 0; i < (int)tabs_.size(); ++i) {
+        for (int i : visibleTabs) {
             const char* nm = tabs_[i]->name();
             const bool active = (i == activeTab_);
             std::string sub = subFor(nm);
-            float cardW = naturalWidths[(size_t)i] * fit;
-            if (fit < 1.0f && i + 1 == (int)tabs_.size())
-                cardW = win.x + sidePad + usableW - x; // absorb FP rounding
-            cardW = (std::max)(1.0f, cardW);
+            const float cardW = naturalWidths[(size_t)i];
             const ImVec2 a(x, cardTop);
             const ImVec2 b(x + cardW, cardTop + cardH);
 
@@ -5120,8 +5184,8 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
                         ctx_.moduleAnalysisPending() || ctx_.livescan.busy())) {
                 badge = true;
                 badgeCol = acc;
-                badgeCol.w = 0.45f + 0.55f *
-                    (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.0f));
+                // A steady activity marker keeps the chrome quiet and does not
+                // require motion to distinguish active analysis from idle.
             }
             const bool reservesBadge = std::strcmp(nm, "Communications") == 0 ||
                                        std::strcmp(nm, "Binary View") == 0;
@@ -5131,21 +5195,11 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             const float textAvail = (std::max)(1.0f, textRight - textLeft);
             const ImVec4 labCol = active || hovered || focused
                 ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : theme::col::muted();
-            std::string label = compactLabels ? compactName(nm) : nm;
-            if (ImGui::CalcTextSize(label.c_str()).x > textAvail) {
-                if (ImGui::CalcTextSize("...").x > textAvail) label.clear();
-                else {
-                    while (label.size() > 1 &&
-                           ImGui::CalcTextSize((label + "...").c_str()).x > textAvail)
-                        label.pop_back();
-                    label += "...";
-                }
-            }
-            const ImVec2 labelSize = ImGui::CalcTextSize(label.c_str());
+            const ImVec2 labelSize = ImGui::CalcTextSize(nm);
             const float labelX = textLeft + (textAvail - labelSize.x) * 0.5f;
             const float labelY = a.y + (cardH - labelSize.y) * 0.5f;
             dl->AddText(ImVec2(labelX, labelY), ImGui::GetColorU32(labCol),
-                        label.c_str());
+                        nm);
             if (badge)
                 dl->AddCircleFilled(ImVec2(b.x - 10.0f * k,
                                            a.y + cardH * 0.5f),
@@ -5163,6 +5217,28 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             ImGui::PopID();
 
             x += cardW;
+        }
+
+        if (overflow) {
+            ImGui::SetCursorScreenPos(ImVec2(
+                win.x + sidePad + (std::max)(0.0f, usableW - overflowWidth), cardTop));
+            if (ImGui::Button("All features##feature_overflow", ImVec2(
+                    (std::min)(overflowWidth, usableW), cardH)))
+                ImGui::OpenPopup("##feature_inventory");
+            ui::ItemTooltip("All nine workspaces remain available here. Ctrl+1 through Ctrl+9 switch directly; Ctrl+K searches tools.");
+        }
+        // Keep an already-open inventory alive if a resize restores the full
+        // feature strip; otherwise the popup would disappear during selection.
+        if (ImGui::BeginPopup("##feature_inventory")) {
+            ImGui::TextDisabled("WORKSPACES");
+            ImGui::Separator();
+            for (int i = 0; i < (int)tabs_.size(); ++i) {
+                char shortcut[24]{};
+                if (i < 9) std::snprintf(shortcut, sizeof(shortcut), "Ctrl+%d", i + 1);
+                if (ImGui::MenuItem(tabs_[i]->name(), shortcut, i == activeTab_))
+                    activeTab_ = i;
+            }
+            ImGui::EndPopup();
         }
     }
     ImGui::End();
@@ -5558,7 +5634,10 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             }
             if (!activityCount) ImGui::TextDisabled("No background work");
             auto healthDetails = [&](const char* owner, const ProgressSnapshot& health, const char* explanation) {
-                if (!health.jobsFailed && !health.resultsDropped) return;
+                ImGui::Text("%s: %u running / %u queued", owner, health.runningJobs, health.queuedJobs);
+                ImGui::TextDisabled("View requests first  |  %llu yielded  |  %llu cache hits",
+                    (unsigned long long)health.jobsYielded, (unsigned long long)health.cacheHits);
+                if (!health.jobsFailed && !health.resultsDropped && !health.requestsRejected) return;
                 ImGui::Separator();
                 ImGui::TextColored(health.jobsFailed ? theme::col::bad() : theme::col::warn(),
                     "%s: %llu failed, %llu dropped", owner,
@@ -6094,7 +6173,7 @@ void App::renderDllDebugPopup() {
     ImGui::EndChild();
 
     const bool alreadyAttached = ctx_.frameDebugSnapshot && ctx_.frameDebugSnapshot->attached();
-    ImGui::BeginDisabled(!plan.valid || alreadyAttached);
+    ImGui::BeginDisabled(!plan.valid || alreadyAttached || ctx_.debug.lifecycleSnapshot().busy);
     if (ImGui::Button("Debug DLL", ImVec2(130.0f * scale, 0))) {
         std::string error;
         dllRetargetPid_ = 0;
@@ -6911,7 +6990,7 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
         add(DS_ICON_LIGHTNING, "Adaptive Unpack...", "OEP / dump / IAT repair",
             [this] { unpackPopup_.open = true; });
     }
-    if (!attached && ctx_.binaryLaunchable()) {
+    if (!attached && !ctx_.debug.lifecycleSnapshot().busy && ctx_.binaryLaunchable()) {
         add(DS_ICON_PLAY, "Launch & Debug", "break at entry", [this] {
             std::string err;
             if (!ctx_.launchAndDebug(err)) ui::Toast(ui::ToastKind::Error, "Launch failed: " + err);
@@ -6930,7 +7009,7 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
                 ctx_.openMemoryToolsAt(rip, pid, generation);
             }, "memory viewer hex process address cheat engine");
         add(DS_ICON_STOP, "Detach", "Debug", [this, paletteTarget] {
-            ctx_.debug.detachForSession(paletteTarget);
+            ctx_.debug.requestDetach(paletteTarget);
         });
         const auto gml = ctx_.debug.gameMakerSnapshot();
         const bool gmlOwner = DebugTargetIdentityMatches(gml.target, paletteTarget);
@@ -7011,6 +7090,18 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
     }
 
     // Sections (same switch the rail / Ctrl+N does)
+    const char* workflows[] = {"Analyze", "Debug", "Memory", "Compare"};
+    for (int preset = 0; preset < 4; ++preset) {
+        const std::string label = std::string("Workflow: ") + workflows[preset];
+        add(nullptr, label.c_str(), "Workspace preset", [this, preset] {
+            ctx_.requestedWorkflow = preset;
+            ctx_.requestedTab = "Binary View";
+        });
+    }
+    add(nullptr, "Types: open workbench", "Structures, unions and enums", [this] {
+        ctx_.requestedTypeWorkbench = true;
+        ctx_.requestedTab = "Binary View";
+    });
     for (int i = 0; i < (int)tabs_.size(); ++i) {
         char lbl[64], det[16];
         std::snprintf(lbl, sizeof(lbl), "Go to: %s", tabs_[i]->name());
@@ -7020,7 +7111,15 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
         add(nullptr, lbl, det, [this, nm] { ctx_.requestedTab = nm; });
     }
 
-    // View: themes + density (mirrors the View menu, incl. prefs persistence)
+    // View controls mirror the menu and persist across sessions.
+    add(nullptr, "Zoom out", "Ctrl+-", [this] {
+        setUiZoomPercent(theme::UiZoomPercent() - 5);
+    });
+    add(nullptr, "Zoom in", "Ctrl++", [this] {
+        setUiZoomPercent(theme::UiZoomPercent() + 5);
+    });
+    add(nullptr, "Zoom: actual size (100%)", "Ctrl+0", [this] { setUiZoomPercent(100); });
+    add(nullptr, "Zoom: 90% (default)", "View", [this] { setUiZoomPercent(kDefaultUiZoomPercent); });
     for (int i = 0; i < (int)theme::ThemeId::Count; ++i) {
         theme::ThemeId id = (theme::ThemeId)i;
         char lbl[64];
@@ -7198,6 +7297,22 @@ void App::renderHelpWindow() {
 }
 
 void App::render() {
+    if (!ImGui::GetIO().WantTextInput &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Minus) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadSubtract))
+            setUiZoomPercent(theme::UiZoomPercent() - 5);
+        else if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) ||
+                 ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Equal) ||
+                 ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadAdd))
+            setUiZoomPercent(theme::UiZoomPercent() + 5);
+        else if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_0))
+            setUiZoomPercent(100);
+    }
+    if (ctx_.workbenchPrefsDirty) {
+        ctx_.workbenchPrefsDirty = false;
+        savePrefs();
+    }
     // Cleared each frame; a tab rendered this frame may set it to request that the
     // idle throttle keep redrawing (e.g. the live connection monitor's auto-refresh).
     ctx_.wantContinuousRedraw = false;
@@ -7221,18 +7336,34 @@ void App::render() {
     }
     // One lock-guarded debug snapshot per frame, shared by the toolbar and status bar
     // (each used to take its own deep copy of registers/threads/breakpoints).
+    const auto lifecycle = ctx_.debug.lifecycleSnapshot();
     DbgSnapshot dbg = ctx_.debug.snapshot();
+    if (lifecycle.busy) ctx_.wantContinuousRedraw = true;
+    if (lifecycle.completed && lifecycle.requestId != lastDebugLifecycleCompletion_) {
+        lastDebugLifecycleCompletion_ = lifecycle.requestId;
+        if (lifecycle.cancelled) ui::Toast(ui::ToastKind::Info, "Debugger startup cancelled.");
+        else if (!lifecycle.succeeded) ui::Toast(ui::ToastKind::Error, lifecycle.error.empty()
+            ? "Debugger command failed." : lifecycle.error);
+        else if (lifecycle.command == DbgLifecycleCommand::Attach &&
+                 (dbg.state == DbgState::Running || dbg.state == DbgState::Paused) &&
+                 DebugTargetIdentityMatches(lifecycle.target, {dbg.pid, dbg.sessionGeneration})) {
+            if (!ctx_.staticBinary().loaded())
+                ctx_.setStaticDecoderConfiguration(ctx_.staticEngine(), dbg.is32 ? Arch::X86 : Arch::X64);
+            ctx_.openLiveAssemblyView();
+            ui::Toast(ui::ToastKind::Success, "Debugger attached.");
+        }
+    }
     // A debuggee that exited leaves the session "attached" to a dead process: the
     // debug thread is gone but the state stays Terminated, so the toolbar would
     // keep its (now dead) pause/step controls, Launch & Debug would never come
     // back, and the continuous-redraw throttle would spin forever. Finalize the
-    // session here (the join is instant - the thread already returned) so the UI
+    // session asynchronously so slow observation cleanup cannot block the UI.
+    // This also ensures the UI
     // drops back to the static state and the Binary View's detach edge releases
     // the per-session live caches + module registry.
-    if (dbg.state == DbgState::Terminated) {
-        ctx_.debug.detach();
-        ui::Toast(ui::ToastKind::Info, "Debuggee exited - debug session ended");
-        dbg = ctx_.debug.snapshot();
+    if (dbg.state == DbgState::Terminated && !lifecycle.busy) {
+        if (ctx_.debug.requestDetach({dbg.pid, dbg.sessionGeneration}))
+            ui::Toast(ui::ToastKind::Info, "Debuggee exited - ending debug session");
     }
     ctx_.synchronizeModuleSession(dbg);
     if (!dbg.attached()) {

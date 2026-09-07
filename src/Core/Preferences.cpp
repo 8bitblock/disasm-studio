@@ -108,6 +108,9 @@ bool validateData(const PreferencesData& data, const PreferencesBounds& bounds) 
     if (bounds.themeCount <= 0 || bounds.densityMin > bounds.densityMax ||
         data.theme < 0 || data.theme >= bounds.themeCount ||
         data.density < bounds.densityMin || data.density > bounds.densityMax ||
+        data.uiZoomPercent < kMinUiZoomPercent ||
+        data.uiZoomPercent > kMaxUiZoomPercent ||
+        data.navigatorOptionalMask < 0 || data.navigatorOptionalMask > 127 ||
         invalidLineValue(data.symbolCache, kMaxSymbolCacheBytes, true) ||
         remoteCachePath(data.symbolCache) ||
         invalidLineValue(data.symbolServer, kMaxSymbolServerBytes, true) ||
@@ -163,6 +166,20 @@ bool ParsePreferences(std::string_view text, const PreferencesData& defaults,
             if (!recognized || parsed.density < bounds.densityMin ||
                 parsed.density > bounds.densityMax)
                 return false;
+        } else if (key == "ui_zoom") {
+            if (!parseInt(value, parsed.uiZoomPercent) ||
+                parsed.uiZoomPercent < kMinUiZoomPercent ||
+                parsed.uiZoomPercent > kMaxUiZoomPercent)
+                return false;
+            recognized = true;
+        } else if (key == "navigator_optional") {
+            if (!parseInt(value, parsed.navigatorOptionalMask) ||
+                parsed.navigatorOptionalMask < 0 || parsed.navigatorOptionalMask > 127)
+                return false;
+            recognized = true;
+        } else if (key == "analysis_queue_collapsed") {
+            if (!parseBool(value, parsed.analysisQueueCollapsed)) return false;
+            recognized = true;
         } else if (key == "symbol_network") {
             if (!parseBool(value, parsed.symbolNetwork)) return false;
             recognized = true;
@@ -220,6 +237,9 @@ bool SerializePreferences(const PreferencesData& data,
                     data.investigationRecent.size() * 64);
     encoded += "theme=" + std::to_string(data.theme) + "\n";
     encoded += "density=" + std::to_string(data.density) + "\n";
+    encoded += "ui_zoom=" + std::to_string(data.uiZoomPercent) + "\n";
+    encoded += "navigator_optional=" + std::to_string(data.navigatorOptionalMask) + "\n";
+    encoded += std::string("analysis_queue_collapsed=") + (data.analysisQueueCollapsed ? "1\n" : "0\n");
     encoded += std::string("symbol_network=") + (data.symbolNetwork ? "1\n" : "0\n");
     encoded += "symbol_cache=" + data.symbolCache + "\n";
     encoded += "symbol_server=" + data.symbolServer + "\n";

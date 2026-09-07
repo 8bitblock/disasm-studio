@@ -49,14 +49,21 @@ int main() {
     // Pure codec: round-trip every persisted class, including FILE/LIVE identity.
     {
         PreferencesData expected = sample(3, "CreateFileW");
+        expected.uiZoomPercent = 110;
         expected.symbolNetwork = true;
+        expected.navigatorOptionalMask = 85;
+        expected.analysisQueueCollapsed = true;
         std::string text;
         CHECK(SerializePreferences(expected, bounds, text));
+        CHECK(text.find("ui_zoom=110\n") != std::string::npos);
         PreferencesData parsed;
         CHECK(ParsePreferences(text, defaults, bounds, parsed));
         CHECK(parsed.theme == 3);
         CHECK(parsed.density == 1);
+        CHECK(parsed.uiZoomPercent == 110);
         CHECK(parsed.symbolNetwork);
+        CHECK(parsed.navigatorOptionalMask == 85);
+        CHECK(parsed.analysisQueueCollapsed);
         CHECK(parsed.symbolCache == "C:\\symbols");
         CHECK(parsed.investigationRecent.size() == 2);
         CHECK(parsed.investigationRecent[0].identity == PreferenceIdentity::File);
@@ -70,7 +77,13 @@ int main() {
     {
         PreferencesData parsed;
         CHECK(ParsePreferences("theme=2\ndensity=0\n", defaults, bounds, parsed));
+        CHECK(parsed.uiZoomPercent == kDefaultUiZoomPercent);
         CHECK(!parsed.symbolNetwork);
+        CHECK(parsed.navigatorOptionalMask == 0);
+        CHECK(!parsed.analysisQueueCollapsed);
+        CHECK(!ParsePreferences("theme=2\nnavigator_optional=128\n", defaults, bounds, parsed));
+        CHECK(!ParsePreferences("theme=2\nnavigator_optional=-1\n", defaults, bounds, parsed));
+        CHECK(!ParsePreferences("theme=2\nanalysis_queue_collapsed=yes\n", defaults, bounds, parsed));
         CHECK(parsed.symbolServer == defaults.symbolServer);
         CHECK(!ParsePreferences("theme=99\n", defaults, bounds, parsed));
         CHECK(!ParsePreferences("theme=2\nsymbol_network=yes\n", defaults, bounds, parsed));
@@ -89,6 +102,48 @@ int main() {
         CHECK(!SerializePreferences(invalidSave, bounds, text));
     }
 
+    // Zoom accepts its inclusive limits and retains caller defaults for legacy
+    // files. Invalid numbers reject the complete copy without changing output.
+    {
+        CHECK(PreferencesData{}.uiZoomPercent == 90);
+        for (const int zoom : {75, 90, 100, 150}) {
+            PreferencesData parsed;
+            CHECK(ParsePreferences("ui_zoom=" + std::to_string(zoom) + "\n",
+                                   defaults, bounds, parsed));
+            CHECK(parsed.uiZoomPercent == zoom);
+            std::string text;
+            CHECK(SerializePreferences(parsed, bounds, text));
+            PreferencesData roundTrip;
+            CHECK(ParsePreferences(text, defaults, bounds, roundTrip));
+            CHECK(roundTrip.uiZoomPercent == zoom);
+        }
+
+        PreferencesData customDefaults = defaults;
+        customDefaults.uiZoomPercent = 115;
+        PreferencesData parsed;
+        CHECK(ParsePreferences("theme=2\n", customDefaults, bounds, parsed));
+        CHECK(parsed.uiZoomPercent == 115);
+        std::string original;
+        CHECK(SerializePreferences(parsed, bounds, original));
+        for (const char* value : {"", "small", "90%", "90.0", "+90", " 90",
+                                  "90 ", "74", "151", "0", "-90",
+                                  "2147483648", "-2147483649",
+                                  "999999999999999999999999"}) {
+            CHECK(!ParsePreferences(std::string("theme=1\nui_zoom=") + value + "\n",
+                                    defaults, bounds, parsed));
+            std::string unchanged;
+            CHECK(SerializePreferences(parsed, bounds, unchanged));
+            CHECK(unchanged == original);
+        }
+        for (const int zoom : {74, 151}) {
+            PreferencesData invalidSave = defaults;
+            invalidSave.uiZoomPercent = zoom;
+            std::string text = "unchanged";
+            CHECK(!SerializePreferences(invalidSave, bounds, text));
+            CHECK(text == "unchanged");
+        }
+    }
+
     const fs::path root = uniqueRoot();
     const fs::path path = root / "prefs.ini";
     std::error_code ec;
@@ -98,6 +153,8 @@ int main() {
     // The second durable write preserves the first complete primary as .bak.
     PreferencesData first = sample(1, "first");
     PreferencesData second = sample(2, "second");
+    first.uiZoomPercent = 80;
+    second.uiZoomPercent = 125;
     CHECK(SavePreferencesFile(path, first, bounds));
     CHECK(SavePreferencesFile(path, second, bounds));
     CHECK(fs::is_regular_file(atomic_file::BackupPath(path)));
@@ -106,6 +163,7 @@ int main() {
     CHECK(LoadPreferencesFile(path, defaults, bounds, loaded) ==
           atomic_file::ReadSource::Primary);
     CHECK(loaded.theme == 2);
+    CHECK(loaded.uiZoomPercent == 125);
     CHECK(loaded.investigationRecent[0].query == "second");
 
     // A syntactically malformed primary recovers the last known-good backup.
@@ -117,6 +175,7 @@ int main() {
     CHECK(LoadPreferencesFile(path, defaults, bounds, loaded) ==
           atomic_file::ReadSource::Backup);
     CHECK(loaded.theme == 1);
+    CHECK(loaded.uiZoomPercent == 80);
     CHECK(loaded.investigationRecent[0].query == "first");
     CHECK(!loaded.symbolNetwork);
 

@@ -154,6 +154,13 @@ static size_t pyMatchParen(const std::string& s, size_t open);
 // `fl` when the instruction sets flags a branch may test.
 static std::string liftStmt(const Instruction& in, FlagState& fl,
                             const std::function<std::string(uint64_t)>& nameFor) {
+    // Prefixes carry ordering, repetition, or control-flow semantics that the
+    // scalar statement lift does not implement. Preserve the decoded operation
+    // in the lightweight path just as the deep data-flow path does.
+    if (!in.prefixes.empty() || in.isRepString) {
+        fl.clear();
+        return "__asm { " + InstructionText(in) + " };";
+    }
     const std::string& m = in.mnemonic;
     std::string a, b;
     bool two = split2(in.operands, a, b);

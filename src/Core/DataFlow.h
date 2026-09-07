@@ -12,6 +12,7 @@
 // original string-lift so no instruction is ever lost.
 //
 #include "CFG.h"
+#include "InstructionSemantics.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -146,6 +147,9 @@ struct DfForLoop {
 
 struct DataFlowResult {
     bool                                  ok = false;     // false => caller uses the legacy lift
+    // One typed machine operation per original instruction, including block
+    // transfers and instructions removed by presentation-only DCE.
+    std::vector<std::vector<IntermediateOperation>> blockOperations;
     std::vector<std::vector<DataFlowStatement>> blockStmts; // body statements per block (no terminator)
     std::vector<FlagState>                termFlag;       // flags feeding each block's terminator
     std::vector<std::string>              decls;          // inferred local declarations

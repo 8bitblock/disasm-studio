@@ -450,6 +450,7 @@ private:
                          const PrepareTransition& prepare,
                          std::string* error);
     void forceClear() noexcept;
+    void refreshAnalysisPriorities();
 
     DecoderFactory                                factory_;
     DocumentSaveCallback                         saveCallback_;

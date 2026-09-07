@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -266,9 +267,130 @@ static bool parseDataKind(const std::string& text, PjDataKind& out) {
 
 // ------------------------------------------------------------ serialize -----
 
+static Value serializeTypeRegistry(const TypeRegistry& registry) {
+    Value result = Value::Obj();
+    result.set("version", Value::Int(1));
+    auto fields = [](const std::vector<TypeField>& source) {
+        Value array = Value::Arr();
+        for (const auto& field : source) {
+            Value item = Value::Obj();
+            item.set("id", Value::Str(hexU64(field.id)));
+            item.set("name", Value::Str(field.name));
+            item.set("typeId", Value::Str(hexU64(field.typeId)));
+            item.set("offsetBytes", Value::Str(hexU64(field.offsetBytes)));
+            array.push(std::move(item));
+        }
+        return array;
+    };
+    Value definitions = Value::Arr();
+    for (const auto& type : registry.types) {
+        Value item = Value::Obj();
+        item.set("id", Value::Str(hexU64(type.id)));
+        item.set("name", Value::Str(type.name));
+        item.set("kind", Value::Str(TypeKindName(type.kind)));
+        item.set("sizeBytes", Value::Str(hexU64(type.sizeBytes)));
+        item.set("signedValue", Value::Bool(type.signedValue));
+        item.set("targetType", Value::Str(hexU64(type.targetType)));
+        item.set("count", Value::Str(hexU64(type.count)));
+        item.set("fields", fields(type.fields));
+        item.set("parameters", fields(type.parameters));
+        item.set("returnType", Value::Str(hexU64(type.returnType)));
+        item.set("callingConvention", Value::Str(type.callingConvention));
+        Value enumerators = Value::Arr();
+        for (const auto& value : type.enumValues) {
+            Value enumerator = Value::Obj();
+            enumerator.set("name", Value::Str(value.name));
+            enumerator.set("value", Value::Str(std::to_string(value.value)));
+            enumerators.push(std::move(enumerator));
+        }
+        item.set("enumValues", std::move(enumerators));
+        definitions.push(std::move(item));
+    }
+    result.set("types", std::move(definitions));
+    Value applications = Value::Arr();
+    for (const auto& application : registry.applications) {
+        Value item = Value::Obj();
+        item.set("address", Value::Str(hexU64(application.address)));
+        item.set("typeId", Value::Str(hexU64(application.typeId)));
+        item.set("name", Value::Str(application.name));
+        applications.push(std::move(item));
+    }
+    result.set("applications", std::move(applications));
+    return result;
+}
+
+static bool deserializeTypeRegistry(const Value& root, TypeRegistry& output) {
+    const Value* version = root.find("version");
+    const Value* definitions = root.find("types");
+    const Value* applications = root.find("applications");
+    if (!root.isObj() || !version || !version->isNum() || version->num != 1 ||
+        !definitions || !definitions->isArr() || definitions->arr.size() > kMaxTypeDefinitions ||
+        !applications || !applications->isArr() || applications->arr.size() > kMaxTypeApplications) return false;
+    auto hex = [](const Value& value, const char* key, uint64_t& output) {
+        return value.find(key) && optionalHexField(value, key, output);
+    };
+    auto name = [](const Value& value, const char* key, std::string& output) {
+        return value.find(key) && optionalBoundedString(value, key, output, 96);
+    };
+    TypeRegistry registry;
+    size_t totalMembers = 0;
+    auto fields = [&](const Value& item, const char* key, std::vector<TypeField>& output) {
+        const Value* array = item.find(key);
+        if (!array || !array->isArr() || array->arr.size() > kMaxTypeMembers) return false;
+        totalMembers += array->arr.size();
+        if (totalMembers > kMaxTotalTypeMembers) return false;
+        for (const auto& value : array->arr) {
+            TypeField field;
+            if (!value.isObj() || !hex(value, "id", field.id) || !name(value, "name", field.name) ||
+                !hex(value, "typeId", field.typeId) || !hex(value, "offsetBytes", field.offsetBytes)) return false;
+            output.push_back(std::move(field));
+        }
+        return true;
+    };
+    for (const auto& item : definitions->arr) {
+        TypeDefinition type;
+        std::string kind;
+        if (!item.isObj() || !hex(item, "id", type.id) || !name(item, "name", type.name) || !name(item, "kind", kind) ||
+            !hex(item, "sizeBytes", type.sizeBytes) || !item.find("signedValue") || !optionalBool(item, "signedValue", type.signedValue, false) ||
+            !hex(item, "targetType", type.targetType) || !hex(item, "count", type.count) ||
+            !fields(item, "fields", type.fields) || !fields(item, "parameters", type.parameters) ||
+            !hex(item, "returnType", type.returnType) || !name(item, "callingConvention", type.callingConvention)) return false;
+        bool kindFound = false;
+        for (unsigned i = 0; i <= static_cast<unsigned>(TypeKind::Function); ++i)
+            if (kind == TypeKindName(static_cast<TypeKind>(i))) { type.kind = static_cast<TypeKind>(i); kindFound = true; break; }
+        if (!kindFound) return false;
+        const Value* enumerators = item.find("enumValues");
+        if (!enumerators || !enumerators->isArr() || enumerators->arr.size() > kMaxTypeMembers) return false;
+        totalMembers += enumerators->arr.size();
+        if (totalMembers > kMaxTotalTypeMembers) return false;
+        for (const auto& value : enumerators->arr) {
+            TypeEnumValue enumerator;
+            const Value* number = value.find("value");
+            if (!value.isObj() || !name(value, "name", enumerator.name) || !number || !number->isStr() ||
+                number->str.empty() || number->str.size() > 20) return false;
+            const auto parsed = std::from_chars(number->str.data(), number->str.data() + number->str.size(), enumerator.value);
+            if (parsed.ec != std::errc{} || parsed.ptr != number->str.data() + number->str.size()) return false;
+            type.enumValues.push_back(std::move(enumerator));
+        }
+        registry.types.push_back(std::move(type));
+    }
+    for (const auto& item : applications->arr) {
+        TypeApplication application;
+        if (!item.isObj() || !hex(item, "address", application.address) || !hex(item, "typeId", application.typeId) ||
+            !name(item, "name", application.name)) return false;
+        registry.applications.push_back(std::move(application));
+    }
+    if (!ValidateTypeRegistry(registry)) return false;
+    output = std::move(registry);
+    return true;
+}
+
 std::string SerializeProject(const ProjectState& st) {
     if (st.gmlBreakpoints.size() > kGmlMaxBreakpoints || st.gmlWatches.size() > kGmlMaxWatches)
         throw std::invalid_argument("GML project records exceed persistence limits");
+    std::string typeError;
+    if (!ValidateTypeRegistry(st.typeRegistry, &typeError))
+        throw std::invalid_argument("Invalid type workbench: " + typeError);
     Value root = Value::Obj();
     root.set("version",        Value::Int(5));
     root.set("hash",           Value::Str(hexU64(st.hash)));
@@ -281,6 +403,7 @@ std::string SerializeProject(const ProjectState& st) {
     root.set("lastCursor",     Value::Str(hexU64(st.lastCursor)));
     root.set("lastCursorValid",Value::Bool(st.lastCursorValid));
     root.set("notes",          Value::Str(st.notes));
+    if (!st.typeRegistry.empty()) root.set("typeRegistry", serializeTypeRegistry(st.typeRegistry));
 
     if (st.rawMappingSaved) {
         Value raw = Value::Obj();
@@ -560,6 +683,7 @@ static bool DeserializeProjectImpl(const std::string& text, ProjectState& out) {
         version = static_cast<int>(value->num);
     }
     ProjectState st;
+    if (const Value* types = root.find("typeRegistry"); types && !deserializeTypeRegistry(*types, st.typeRegistry)) return false;
     if (!optionalHexField(root, "hash", st.hash) ||
         !optionalHexField(root, "lastCursor", st.lastCursor) ||
         !optionalBoundedString(root, "binaryPath", st.binaryPath, 32u * 1024u) ||

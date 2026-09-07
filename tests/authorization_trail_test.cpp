@@ -976,6 +976,54 @@ void deterministicOrdering() {
     }
 }
 
+void conflictingDecisionEvidence() {
+    AuthorizationTrailInput input;
+    input.predicateCandidates.push_back(predicate(0x3000, "Gate", true));
+    auto first = branchUse(0, 0x4000, 0x4010);
+    auto opposite = first;
+    std::swap(opposite.trueDestination, opposite.falseDestination);
+    input.predicateUses = { first, opposite };
+    auto report = RunAuthorizationTrail(input);
+    CHECK(report.predicateUses.size() == 2,
+          "opposite branch arms must remain distinct evidence records");
+    CHECK(!report.completeness.predicateUsesComplete,
+          "conflicting branch evidence must make the analysis incomplete");
+    for (const auto& use : report.predicateUses)
+        CHECK(!use.branchUseProven && !use.complete,
+              "contradictory branch destinations cannot prove either permitted arm");
+    const auto* gate = predicateAt(report, 0x3000);
+    CHECK(gate && gate->branchConsumerCount == 0,
+          "contradictory branch evidence must not increase predicate ranking");
+
+    std::reverse(input.predicateUses.begin(), input.predicateUses.end());
+    const auto reordered = RunAuthorizationTrail(input);
+    CHECK(reordered.predicateUses.size() == report.predicateUses.size() &&
+          reordered.predicateUses[0].trueDestination.address == report.predicateUses[0].trueDestination.address,
+          "conflicting evidence order must not determine the reported arm");
+    input.limits.maxPredicateUses = 1;
+    report = RunAuthorizationTrail(input);
+    CHECK(report.predicateUses.size() == 1 && !report.predicateUses[0].branchUseProven,
+          "truncation cannot hide a contradictory observation and restore proof");
+
+    input.limits.maxPredicateUses = 100;
+    auto incomplete = first;
+    incomplete.complete = false;
+    input.predicateUses = { first, incomplete };
+    report = RunAuthorizationTrail(input);
+    CHECK(report.predicateUses.size() == 2 && !report.completeness.predicateUsesComplete,
+          "deduplication cannot erase incomplete evidence");
+    auto alternativeComparison = first;
+    alternativeComparison.comparison.address += 1;
+    input.predicateUses = { first, alternativeComparison };
+    report = RunAuthorizationTrail(input);
+    CHECK(report.predicateUses.size() == 2 && !report.predicateUses[0].branchUseProven,
+          "different flag producers must not silently deduplicate");
+    input.predicateUses = { first, first };
+    report = RunAuthorizationTrail(input);
+    CHECK(report.predicateUses.size() == 1 && report.predicateUses[0].branchUseProven,
+          "identical complete evidence still deduplicates and retains proof");
+}
+
 } // namespace
 
 int main() {
@@ -989,6 +1037,7 @@ int main() {
     stringToDecisionRetainsOccurrencesAndLimits();
     incompleteScopesCapsAndCancellation();
     deterministicOrdering();
+    conflictingDecisionEvidence();
     if (failures) {
         std::printf("%d authorization trail test(s) failed\n", failures);
         return 1;

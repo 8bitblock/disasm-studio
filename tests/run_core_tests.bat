@@ -203,6 +203,7 @@ if "!RESULT!"=="0" (
 exit /b !RESULT!
 
 rem TEST|fuzzy_test|
+rem TEST|function_filter_test|
 rem TEST|investigation_index_test|src\Core\InvestigationIndex.cpp
 rem TEST|investigation_service_test|src\Core\InvestigationService.cpp src\Core\InvestigationIndex.cpp
 rem TEST|address_span_test|src\Core\CFG.cpp
@@ -301,6 +302,7 @@ rem TEST|jvmannotate_test|src\Core\JvmAnnotate.cpp src\Core\JvmClass.cpp src\Dis
 rem TEST|jdwp_test|src\Core\Jdwp.cpp
 rem TEST|jdwp_client_mock_test|/DDS_JDWP_TEST_HOOKS src\Core\Jdwp.cpp src\Core\JdwpClient.cpp ws2_32.lib
 rem TEST|project_roundtrip_test|src\Core\Project.cpp src\Core\AtomicFile.cpp src\Core\Json.cpp src\Core\ConnectionSchema.cpp
+rem TEST|type_system_test|
 rem TEST|project_synth_test|src\Core\Project.cpp src\Core\AtomicFile.cpp src\Core\Json.cpp src\Core\ConnectionSchema.cpp
 rem TEST|raw_project_reopen_test|src\Core\Project.cpp src\Core\AtomicFile.cpp src\Core\Json.cpp src\Core\ConnectionSchema.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
 rem TEST|xref_report_test|src\Core\XrefIndex.cpp src\Core\Report.cpp
@@ -322,11 +324,13 @@ rem TEST|cortex_test|src\Core\Cortex.cpp src\Core\NetworkApiCatalog.cpp src\Core
 rem TEST|prism_test|src\Core\Prism.cpp
 
 rem LIVE_TEST|x64_debug_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
+rem TEST|debugger_lifecycle_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
 rem LIVE_TEST|wow64_debug_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
 rem LIVE_TEST|authorization_watch_live_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
 
 rem TEST|ui_widgets_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Ui\Widgets.cpp src\Ui\Theme.cpp src\Ui\Fonts.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\imgui.lib
 rem INTEGRATION_TEST|static_listing_actions_test|tests\run_static_listing_actions_test.ps1
+rem INTEGRATION_TEST|release_workbench_test|tests\run_release_workbench_test.ps1
 
 rem TEST|gamemaker_archive_test|src\Core\GameMakerArchive.cpp
 rem TEST|gml_disasm_test|src\Core\GameMakerArchive.cpp src\Disasm\GmlDisassembler.cpp src\Core\CFG.cpp

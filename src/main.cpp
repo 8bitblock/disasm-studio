@@ -55,6 +55,7 @@ static void ApplyNativeWindowChrome(HWND hwnd) {
 // between frames, after the message queue has drained.
 static constexpr UINT          kDefaultDpi = 96;
 static UINT                    g_AppliedDpi = kDefaultDpi;
+static int                     g_AppliedZoomPercent = 100;
 static UINT                    g_PendingDpi = 0;
 static bool                    g_CloseRequested = false;
 // Separate from g_AppliedDpi: a failed B-scale rebuild has already destroyed
@@ -400,15 +401,17 @@ void CleanupRenderTarget() {
 }
 
 bool ApplyPendingDpiChange() {
-    const UINT nextDpi = g_PendingDpi;
-    if (nextDpi == 0) return false;
-    if (nextDpi == g_AppliedDpi && g_DpiResourcesValid) {
+    const UINT nextDpi = g_PendingDpi ? g_PendingDpi : g_AppliedDpi;
+    const int nextZoom = ds::theme::UiZoomPercent();
+    if (nextDpi == g_AppliedDpi && nextZoom == g_AppliedZoomPercent &&
+        g_DpiResourcesValid) {
         g_PendingDpi = 0;
         return false;
     }
 
     const float requestedScale = static_cast<float>(nextDpi) /
-                                 static_cast<float>(kDefaultDpi);
+                                 static_cast<float>(kDefaultDpi) *
+                                 (static_cast<float>(nextZoom) / 100.0f);
 
     // The font atlas owns the ImFont pointers used throughout the UI. Invalidate
     // the old GPU texture before clearing/loading the atlas.
@@ -431,6 +434,7 @@ bool ApplyPendingDpiChange() {
     }
 
     g_AppliedDpi = nextDpi;
+    g_AppliedZoomPercent = nextZoom;
     g_PendingDpi = 0;
     g_DpiResourcesValid = true;
     return true;

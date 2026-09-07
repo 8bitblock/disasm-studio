@@ -45,6 +45,33 @@ class IDisassembler;
 
 enum class DbgState { Detached, Running, Paused, Terminated };
 
+// Lifecycle work has its own state: Starting/Stopping never grant authority to
+// read or modify a target. DbgState continues to describe the actual session.
+enum class DbgLifecycleState { Detached, Starting, Attached, Paused, Stopping, Failed };
+enum class DbgLifecycleCommand { None, Attach, Detach };
+struct DbgLifecycleSnapshot {
+    DbgLifecycleState state = DbgLifecycleState::Detached;
+    DbgLifecycleCommand command = DbgLifecycleCommand::None;
+    uint64_t requestId = 0;
+    uint32_t requestedPid = 0;
+    DebugTargetIdentity target{}; // exact successful completion owner
+    bool busy = false;
+    bool completed = false;
+    bool succeeded = false;
+    bool cancelled = false;
+    std::string error;
+};
+
+struct NetCaptureLogStatus {
+    bool enabled = false;
+    bool opening = false;
+    bool draining = false;
+    size_t queuedRecords = 0;
+    size_t queuedBytes = 0;
+    uint64_t droppedRecords = 0;
+    std::string error;
+};
+
 struct Registers {
     uint64_t rip = 0, rsp = 0, rbp = 0, rflags = 0;
     uint64_t rax = 0, rbx = 0, rcx = 0, rdx = 0, rsi = 0, rdi = 0;
@@ -154,6 +181,7 @@ struct CheckedRunToSnapshot {
 };
 
 namespace debugger_detail {
+struct LifecycleTestAccess; // target-free deterministic worker/lifetime regression fixture
 
 // Pure reconciliation model for abandoning a temporary software breakpoint.
 // A failed byte transition may release metadata only when another persistent
@@ -217,11 +245,20 @@ struct DbgSnapshot {
 };
 
 class Debugger {
+    friend struct debugger_detail::LifecycleTestAccess;
 public:
     Debugger();
     ~Debugger();
 
     bool attach(uint32_t pid, std::string& err);
+
+    // UI lifecycle commands are bounded to one outstanding operation. Zero
+    // means rejected (busy, stale identity, or invalid input). No join, Win32
+    // attach, or cleanup executes on the caller. Poll completion by requestId.
+    uint64_t requestAttach(uint32_t pid);
+    uint64_t requestDetach(DebugTargetIdentity expected = {});
+    bool cancelLifecycle(uint64_t requestId);
+    DbgLifecycleSnapshot lifecycleSnapshot();
 
     // Launch a new process under the debugger (CreateProcess with DEBUG flags) and
     // begin a debug session. With breakAtEntry, the session pauses at the program's
@@ -308,9 +345,13 @@ public:
     // Identity-atomic register edit for UI state captured from one debugger
     // frame. PID/generation validation, paused-state validation, thread-handle
     // selection, context write, and snapshot publication share one mtx_ lock.
+    // The editor supplies both optional guards; they reject a draft after an
+    // active-thread or paused-RIP change, including a valid RIP of zero.
     bool setRegisterForSession(uint32_t expectedPid,
                                uint64_t expectedSessionGeneration,
-                               const std::string& name, uint64_t value);
+                               const std::string& name, uint64_t value,
+                               uint32_t expectedTid = 0,
+                               const uint64_t* expectedRip = nullptr);
 
     // Capture RIP/RAX and its EAX/AL aliases only while the exact target and
     // active thread remain paused.  This is intentionally narrower than the
@@ -343,13 +384,15 @@ public:
     // become target-owned: a live detach deliberately leaves them mapped because
     // the debuggee may have retained the pointer; process termination reclaims
     // them, and explicit freeRemote/freeAllRemote remains available while paused.
+    // A supplied expectedRip is checked before target allocation or mutation.
     bool setRegisterToBufferForSession(uint32_t expectedPid,
                                        uint64_t expectedSessionGeneration,
                                        uint32_t expectedTid,
                                        const std::string& name,
                                        const std::vector<uint8_t>& bytes,
                                        uint64_t& remoteAddress,
-                                       std::string* error = nullptr);
+                                       std::string* error = nullptr,
+                                       const uint64_t* expectedRip = nullptr);
 
     // Freeze / thaw a single thread (Suspend/ResumeThread). Frozen threads stay
     // stopped across continues until thawed; all are auto-thawed on detach.
@@ -413,8 +456,11 @@ public:
     // Compatibility toggle name retained for the existing Connections tab.
     void enableNetTap(bool on);
     bool netTapEnabled() const { return networkObservationWant_.load(); }
+    // Accept an asynchronous open request. Check netCaptureLogStatus() for
+    // completion/errors; all file operations are owned by the bounded writer.
     bool setNetCaptureLogFile(const std::string& utf8Path, bool append, std::string* err = nullptr);
     void closeNetCaptureLogFile();
+    NetCaptureLogStatus netCaptureLogStatus();
     bool netCaptureLogEnabled();
     std::string netCaptureLogPath();
 
@@ -595,6 +641,7 @@ private:
     void   emergencyThreadCleanup(const std::string& reason) noexcept;
     uint64_t beginSessionControl();
     bool   waitForStartup(std::string& err);
+    void   lifecycleWorkerLoop();
     void   captureContext(uint32_t tid);
     void   applyContext(uint32_t tid);
     CommandEnvelope waitForCommand(uint64_t controlEpoch); // blocks until an epoch-valid UI command
@@ -690,12 +737,26 @@ private:
     std::atomic<bool>  isWow64_{false};         // target is a 32-bit (WOW64) process
 
     std::thread        thread_;
+    // Serializes every synchronous lifecycle API and ownership of thread_. The
+    // async worker uses those same APIs; nested detach during attach is valid.
+    std::recursive_mutex lifecycleOwnerMtx_;
+    std::mutex lifecycleMtx_;
+    std::condition_variable lifecycleCv_;
+    std::thread lifecycleThread_;
+    DbgLifecycleSnapshot lifecycle_{};
+    DebugTargetIdentity lifecycleExpected_{};
+    uint64_t nextLifecycleRequest_ = 0;
+    bool lifecycleQueued_ = false;
+    bool lifecycleShutdown_ = false;
+    std::atomic<bool> lifecycleCancel_{false};
+    std::atomic<bool> lifecycleAttaching_{false};
     std::atomic<bool>  quit_{false};
     std::atomic<bool>  startupOk_{false};
     std::atomic<bool>  startupDone_{false};
     std::atomic<bool>  breakRequested_{false};   // UI pressed Pause -> break into user code
     std::atomic<bool>  traceSyncBreakRequested_{false}; // coalesced target-mutation DebugBreakProcess wake-up
     std::string        startupErr_;
+    bool               initialProcessEventReady_ = false; // mtx_: bitness/main module published
 
     // Shared state (guarded by mtx_).
     std::mutex                       mtx_;
@@ -867,8 +928,27 @@ private:
     void   decorateNetworkEvent(NetworkObservationEvent& event);
     void   pushNetworkEvent(NetworkObservationEvent&& event);
     void   writeNetworkObservationLog(const NetworkObservationEvent& event);
+    void   networkLogWorkerLoop();
+    struct NetLogWork {
+        enum class Kind { Open, Record, Close } kind = Kind::Record;
+        std::string path;
+        bool append = false;
+        uint64_t generation = 0;
+        uint64_t timestamp = 0; // UTC FILETIME captured at observation time
+        size_t bytes = 0;
+        NetworkObservationEvent event;
+    };
+    static constexpr size_t kNetLogQueueRecords = 256;
+    static constexpr size_t kNetLogQueueBytes = 4 * 1024 * 1024;
+    static constexpr size_t kNetLogQueueControls = 16;
     std::mutex                       netLogMtx_;
-    std::FILE*                       netLogFile_ = nullptr;
+    std::condition_variable          netLogCv_;
+    std::thread                      netLogThread_;
+    std::deque<NetLogWork>            netLogQueue_;
+    NetCaptureLogStatus              netLogStatus_;
+    size_t                           netLogQueuedControls_ = 0;
+    uint64_t                         netLogGeneration_ = 0;
+    bool                             netLogShutdown_ = false;
     std::string                      netLogPath_;
 
     // ---- live module list (LOAD_DLL/UNLOAD_DLL), guarded by mtx_ ----

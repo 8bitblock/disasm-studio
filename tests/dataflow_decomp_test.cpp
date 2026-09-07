@@ -12,6 +12,7 @@
 //
 #include "Core/CFG.h"
 #include "Core/Decompiler.h"
+#include "Core/DataFlow.h"
 #include "Disasm/IDisassembler.h"
 
 #include <cstdint>
@@ -717,7 +718,9 @@ int main() {
         DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Win64 };
         Instruction mystery = mk(0x3903, 2, "mystery", "r10");
         mystery.typedOperands = { regOp("r10", 64, OperandAccess::Read) };
-        mystery.flagsWritten = true;
+        mystery.flagsWritten = SemanticFlagBit(SemanticFlag::Carry) |
+            SemanticFlagBit(SemanticFlag::Zero) | SemanticFlagBit(SemanticFlag::Sign) |
+            SemanticFlagBit(SemanticFlag::Overflow) | SemanticFlagBit(SemanticFlag::Parity);
         std::string out = decompile({
             mk(0x3900, 3, "cmp", "rcx, rdx"), mystery,
             mk(0x3905, 2, "jl", "0x3909", true, false, 0x3909),
@@ -915,6 +918,116 @@ int main() {
         CHECK(!has(flagsAcrossShift("rcx, 64"), "jb_cc"));
         CHECK(has(flagsAcrossShift("r8d, 1"), "jb_cc"));
         if (g_fail) std::printf("--- native shifts ---\n%s\n%s\n%s\n", logical.c_str(), arithmetic.c_str(), highByte.c_str());
+    }
+
+    // Unknown operations still read real registers and stack memory. A raw
+    // consumer must retain its setup even if no later C expression uses it.
+    {
+        DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Win64 };
+        Instruction unknown = mk(3, 2, "opaque_consume", "rcx");
+        unknown.typedOperands = { regOp("rcx", 64, OperandAccess::Read) };
+        const std::string direct = decompile({ mk(0, 3, "mov", "rcx, 7"), unknown,
+            mk(5, 2, "xor", "eax, eax"), mk(7, 1, "ret", "", true, true) }, opt);
+        CHECK(has(direct, " = 7;"));
+        CHECK(has(direct, "opaque_consume rcx"));
+
+        unknown.operands = "";
+        unknown.typedOperands.clear();
+        unknown.registersRead = { "rcx" }; // implicit decoder input
+        CHECK(has(decompile({ mk(0, 3, "mov", "rcx, 7"), unknown,
+            mk(5, 2, "xor", "eax, eax"), mk(7, 1, "ret", "", true, true) }, opt), " = 7;"));
+
+        TypedOperand memory;
+        memory.kind = OperandKind::Memory; memory.access = OperandAccess::Read;
+        memory.widthBits = 32; memory.baseRegister = "rbp";
+        memory.displacement = -8; memory.displacementValid = true;
+        unknown.operands = "dword ptr [rbp - 8]";
+        unknown.typedOperands = { memory }; unknown.registersRead.clear();
+        CHECK(has(decompile({ mk(0, 3, "mov", "dword ptr [rbp - 8], 7"), unknown,
+            mk(5, 2, "xor", "eax, eax"), mk(7, 1, "ret", "", true, true) }, opt), " = 7;"));
+
+        // Incomplete access metadata is a conservative barrier, not proof
+        // that this unknown operation preserves cached register constants.
+        unknown.typedOperands = { regOp("rcx", 64, OperandAccess::None) };
+        unknown.operands = "rcx";
+        const std::string incomplete = decompile({ mk(0, 3, "mov", "rcx, 7"), unknown,
+            mk(5, 3, "mov", "rax, rcx"), mk(8, 1, "ret", "", true, true) }, opt);
+        CHECK(!has(incomplete, "return 7;"));
+    }
+
+    // Decoder flag masks describe independent flag lifetimes. A CF-only
+    // unsupported writer preserves a preceding signed comparison's SF/OF.
+    {
+        Instruction writer = mk(3, 2, "opaque_carry", "r10");
+        writer.typedOperands = { regOp("r10", 64, OperandAccess::Read) };
+        writer.flagsWritten = SemanticFlagBit(SemanticFlag::Carry);
+        DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Win64 };
+        const std::string output = decompile({ mk(0, 3, "cmp", "rcx, rdx"), writer,
+            mk(5, 2, "jl", "9", true, false, 9), mk(7, 2, "jmp", "10", true, false, 10),
+            mk(9, 1, "nop", ""), mk(10, 1, "ret", "", true, true) }, opt);
+        CHECK(!has(output, "jl_cc"));
+        CHECK(has(output, "int64_t"));
+    }
+
+    // Typed operation records retain origin, width, alias slices, sign,
+    // memory/address distinctions and ABI boundaries independently of text.
+    {
+        Instruction load = mk(0, 4, "movsx", "presentation deliberately ignored");
+        load.typedOperands = { regOp("eax", 32, OperandAccess::Write),
+                               regOp("ah", 8, OperandAccess::Read) };
+        const auto operation = LiftInstructionSemantics(load, Arch::X64, DecompileABI::Win64);
+        CHECK(operation.sourceVA == 0 && operation.sourceLength == 4);
+        CHECK(operation.opcode == IntermediateOpcode::SignExtend && operation.widthBits == 32);
+        CHECK(operation.signedness == IntermediateSignedness::Signed);
+        CHECK(operation.operands[0].reg.zeroExtendsStorage);
+        CHECK(operation.operands[1].reg.offsetBits == 8 && operation.operands[1].reg.storage == "rax");
+        CHECK(!DescribeRegisterSlice("eax", 32, Arch::X86).zeroExtendsStorage);
+        Instruction repeated = mk(0, 2, "movsb", "");
+        repeated.prefixes = { InstructionPrefix::Rep };
+        repeated.registersRead = { "rsi", "rdi", "rcx" };
+        repeated.registersWritten = repeated.registersRead;
+        const auto repeatedEffects = LiftInstructionSemantics(repeated, Arch::X64);
+        CHECK(repeatedEffects.repeated && repeatedEffects.readsMemory && repeatedEffects.writesMemory && repeatedEffects.unknownMemoryEffects);
+
+        Instruction address = mk(4, 3, "lea", "rax, [rcx + 8]");
+        TypedOperand memory; memory.kind = OperandKind::Memory;
+        memory.access = OperandAccess::Read; memory.baseRegister = "rcx";
+        memory.displacement = 8; memory.displacementValid = true;
+        address.typedOperands = { regOp("rax", 64, OperandAccess::Write), memory };
+        const auto lea = LiftInstructionSemantics(address, Arch::X64);
+        CHECK(lea.operands[1].addressOnly && !lea.readsMemory && !lea.writesMemory);
+        CHECK(std::find(lea.registersRead.begin(), lea.registersRead.end(), "rcx") != lea.registersRead.end());
+        address.mnemonic = "mov";
+        CHECK(LiftInstructionSemantics(address, Arch::X64).readsMemory);
+
+        const auto call = LiftInstructionSemantics(mk(7, 5, "call", "callee"), Arch::X64, DecompileABI::SysV64);
+        CHECK(call.callingConvention == DecompileABI::SysV64 && call.unknownMemoryEffects && call.unknownFlagEffects);
+        CHECK(LiftInstructionSemantics(load, Arch::ARM64).opcode == IntermediateOpcode::Unknown);
+
+        ControlFlowGraph graph;
+        graph.blocks.emplace_back();
+        graph.blocks[0].insns = { load, mk(4, 1, "ret", "", true, true) };
+        graph.blocks[0].isReturn = true;
+        graph.blocks[0].transferIndex = 1;
+        const auto result = AnalyzeDataFlow(graph, {}, {}, true, Arch::X64, DecompileABI::Win64);
+        CHECK(result.ok && result.blockOperations.size() == 1);
+        CHECK(result.blockOperations[0].size() == 2);
+        CHECK(result.blockOperations[0][0].sourceVA == 0);
+        CHECK(result.blockOperations[0][1].opcode == IntermediateOpcode::Return);
+    }
+
+    // Prefix effects survive rendering, and modern direct-target metadata is
+    // authoritative even when a legacy decoder target field is absent.
+    {
+        Instruction atomic = mk(0, 4, "add", "dword ptr [rcx], 1");
+        atomic.prefixes = { InstructionPrefix::Lock };
+        DecompileOptions opt; opt.target = { Arch::X64, DecompileABI::Win64 };
+        const std::string output = decompile({ atomic, mk(4, 1, "ret", "", true, true) }, opt);
+        CHECK(has(output, "__asm { lock add dword ptr [rcx], 1 };"));
+        Instruction call = mk(0, 5, "call", "display_only");
+        call.flow = { FlowKind::DirectCall, true, 0x1234 };
+        opt.nameFor = [](uint64_t address) { return address == 0x1234 ? "semantic_callee" : "wrong_target"; };
+        CHECK(has(decompile({ call, mk(5, 1, "ret", "", true, true) }, opt), "semantic_callee("));
     }
 
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }

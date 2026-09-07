@@ -223,6 +223,8 @@
     </ClCompile>
     <ClCompile Include="src\Tabs\BinaryViewHostTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewOverview.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewWorkflow.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewTypes.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewGml.cpp" />
     <ClCompile Include="src\Tabs\MemoryToolsTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryDiffTab.cpp" />
@@ -286,6 +288,8 @@
     <ClInclude Include="src\Core\AtomicFile.h" />
     <ClInclude Include="src\Core\Preferences.h" />
     <ClInclude Include="src\Core\Project.h" />
+    <ClInclude Include="src\Core\TypeSystem.h" />
+    <ClInclude Include="src\Core\InstructionSemantics.h" />
     <ClInclude Include="src\Core\PatchedImage.h" />
     <ClInclude Include="src\Core\PatchRefresh.h" />
     <ClInclude Include="src\Core\LivePatchOriginal.h" />
@@ -362,6 +366,7 @@
     <ClInclude Include="src\Core\ProcessMemorySession.h" />
     <ClInclude Include="src\Core\FunctionAnalyzer.h" />
     <ClInclude Include="src\Core\FunctionNamer.h" />
+    <ClInclude Include="src\Core\FunctionFilter.h" />
     <ClInclude Include="src\Disasm\IDisassembler.h" />
     <ClInclude Include="src\Disasm\JvmDisassembler.h" />
     <ClInclude Include="src\Disasm\GmlDisassembler.h" />
@@ -415,7 +420,8 @@
     <ItemGroup><FileWrites Include="$(IntDir)GameMakerHelperResource.rc" /></ItemGroup>
   </Target>
   <Target Name="DsVerifyGameMakerHelperResource" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)tests\verify_gamemaker_helper_resource.ps1&quot; -Executable &quot;$(TargetPath)&quot; -HelperDll &quot;$(_DsGameMakerHelperPath)&quot;" />
+    <PropertyGroup><DsPowerShell Condition="'$(DsPowerShell)' == ''">powershell</DsPowerShell></PropertyGroup>
+    <Exec Command="&quot;$(DsPowerShell)&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)tests\verify_gamemaker_helper_resource.ps1&quot; -Executable &quot;$(TargetPath)&quot; -HelperDll &quot;$(_DsGameMakerHelperPath)&quot;" />
   </Target>
 
   <!-- The stock vcpkg MSBuild target inherits its compiler selection from the

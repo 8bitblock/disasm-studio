@@ -292,10 +292,24 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
     ImGui::TextDisabled("%d process(es)", (int)procs_.size());
 
     DbgSnapshot snap = ctx.debug.snapshot();
+    const auto lifecycle = ctx.debug.lifecycleSnapshot();
     if (snap.attached()) {
         ui::SameLineIfFits(160.0f * scale);
         char b[40]; std::snprintf(b, sizeof(b), "debugging PID %u", snap.pid);
         ui::Badge(b, theme::col::good());
+    }
+    if (lifecycle.busy) {
+        ImGui::TextColored(theme::col::warn(), "%s",
+            lifecycle.state == DbgLifecycleState::Starting
+                ? "Starting debugger attachment..." : "Stopping debugger; restoring owned state...");
+        if (lifecycle.command == DbgLifecycleCommand::Attach &&
+            lifecycle.state == DbgLifecycleState::Starting) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel attachment"))
+                ctx.debug.cancelLifecycle(lifecycle.requestId);
+        }
+    } else if (lifecycle.completed && !lifecycle.error.empty()) {
+        ImGui::TextWrapped("%s", lifecycle.error.c_str());
     }
     ui::SearchBox("##pfilter", "process name or PID...", filter_, sizeof(filter_), -1.0f);
     if (!status_.empty()) ImGui::TextWrapped("%s", status_.c_str());
@@ -344,33 +358,24 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
                                "%s", p.canOpen ? "ok" : "denied");
             ImGui::TableSetColumnIndex(4);
             bool isAttached = snap.attached() && snap.pid == p.pid;
+            ImGui::BeginDisabled(lifecycle.busy);
             if (isAttached) {
-                if (ImGui::SmallButton("Detach")) { ctx.debug.detach(); status_ = "detached"; }
-            } else if (ImGui::SmallButton("Attach")) {
-                std::string err;
-                if (ctx.debug.attach(p.pid, err)) {
-                    status_ = "debugging " + p.name + " (PID " + std::to_string(p.pid) + ")";
-                    // No file backs this session: point the engine/arch at the debuggee's
-                    // bitness so the active static-document decoder/arch fallbacks decode correctly.
-                    // (When a file IS loaded its arch is authoritative for the static view,
-                    // and live paths use liveDecoder(snap.is32) — so don't touch it then.)
-                    if (!ctx.staticBinary().loaded()) {
-                        ctx.setStaticDecoderConfiguration(
-                            ctx.staticEngine(),
-                            ctx.debug.snapshot().is32 ? Arch::X86 : Arch::X64);
-                    }
-                    ctx.openLiveAssemblyView();
-                } else {
-                    status_ = err;
-                    ui::Toast(ui::ToastKind::Error, "Attach failed: " + err);
+                if (ImGui::SmallButton("Detach")) {
+                    ctx.debug.requestDetach({snap.pid, snap.sessionGeneration});
+                    status_.clear();
                 }
+            } else if (ImGui::SmallButton("Attach")) {
+                // App consumes the identity-bound completion even if the user
+                // changes workspace while Windows is establishing the session.
+                if (ctx.debug.requestAttach(p.pid)) status_.clear();
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             // A live DisasmStudio session owns software/temp/trace/concealment
             // int3 bytes in this process. Passive RPM cannot distinguish those
             // from target code, so refuse a supposedly clean passive dump until
             // the session is detached and every pristine byte is restored.
-            ImGui::BeginDisabled(!p.canOpen || isAttached);
+            ImGui::BeginDisabled(!p.canOpen || isAttached || lifecycle.busy);
             if (ImGui::SmallButton("Dump")) {
                 ctx.requestedPassiveDumpPid = p.pid;
                 ctx.requestedPassiveDump = true;

@@ -34,6 +34,8 @@
     <ClCompile Include="src\Core\CodeDataClassifier.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\BinaryOverview.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryViewOverview.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\BinaryViewWorkflow.cpp"><Filter>Source\Tabs</Filter></ClCompile>
+    <ClCompile Include="src\Tabs\BinaryViewTypes.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Tabs\BinaryViewGml.cpp"><Filter>Source\Tabs</Filter></ClCompile>
     <ClCompile Include="src\Core\JumpTableResolver.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\FunctionNamer.cpp"><Filter>Source\Core</Filter></ClCompile>
@@ -163,6 +165,8 @@
       <ClInclude Include="src\Core\AtomicFile.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\Preferences.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\Project.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\TypeSystem.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\InstructionSemantics.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\PatchedImage.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\PatchRefresh.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\LivePatchOriginal.h"><Filter>Headers\Core</Filter></ClInclude>
@@ -210,6 +214,7 @@
     <ClInclude Include="src\Core\BinaryOverview.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\JumpTableResolver.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\FunctionNamer.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\FunctionFilter.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Disasm\IDisassembler.h"><Filter>Headers\Disasm</Filter></ClInclude>
     <ClInclude Include="src\Disasm\ZydisDisassembler.h"><Filter>Headers\Disasm</Filter></ClInclude>
     <ClInclude Include="src\Disasm\CapstoneDisassembler.h"><Filter>Headers\Disasm</Filter></ClInclude>

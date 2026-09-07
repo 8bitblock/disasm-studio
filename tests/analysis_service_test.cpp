@@ -4552,6 +4552,226 @@ int main() {
         targeted.cancelAndWaitIdle();
     }
 
+    // A requested view overtakes pending whole-image work, including a combined
+    // request. Repeated selected-function requests keep only the newest region.
+    {
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService priority([release, entered](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<GateDisasm>(release, entered);
+        }, 1);
+        const uint64_t e = priority.epoch();
+        priority.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, e, 1, base, base + 2, true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK(entered->load() == 1, "priority fixture holds its sole worker");
+        priority.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings,
+                             false, e, 2);
+        priority.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile | K_Strings,
+                             false, e, 2, base, base + 3, true);
+        priority.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, e, 2, base + 4, base + 8, true);
+        CHECK((priority.pendingKinds() & (K_Strings | K_Decompile)) ==
+                  (K_Strings | K_Decompile),
+              "pending kind snapshot includes queued and running work");
+        release->store(true, std::memory_order_release);
+        std::vector<AnalysisResult> ordered;
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (priority.bulkPending() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        AnalysisResult result;
+        while (priority.tryTakeBulk(result))
+            if (result.moduleBase == 2) ordered.push_back(std::move(result));
+        CHECK(ordered.size() == 2 && ordered[0].decompValid &&
+                  ordered[0].decompVA == base + 4 && ordered[1].stringsValid,
+              "latest selected function completes before separately queued bulk strings");
+        CHECK(priority.progress().requestsCoalesced >= 2,
+              "duplicate bulk and selected-view requests coalesce within their own lane");
+        priority.cancelAndWaitIdle();
+    }
+
+    // Cooperative preemption must preserve epoch/lifetime ownership and restore
+    // cached dependencies without publishing an already-delivered pass twice.
+    {
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService yielding([release, entered](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<GateDisasm>(release, entered);
+        }, 1);
+        const uint64_t e = yielding.epoch();
+        yielding.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings | K_Funcs,
+                             false, e);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK(entered->load() == 1, "yield fixture stops inside function analysis after strings");
+        yielding.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, e, 0, base + 4, base + 8, true);
+        release->store(true, std::memory_order_release);
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (yielding.bulkPending() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        unsigned strings = 0, functions = 0, decomp = 0;
+        bool requestedViewFirst = false;
+        AnalysisResult result;
+        while (yielding.tryTakeBulk(result)) {
+            CHECK(result.epoch == e, "priority yield does not invalidate the image epoch");
+            strings += result.stringsValid ? 1u : 0u;
+            if (result.decompValid) { ++decomp; requestedViewFirst = functions == 0; }
+            functions += result.funcsValid ? 1u : 0u;
+        }
+        CHECK(strings == 1 && functions == 1 && decomp == 1 && requestedViewFirst,
+              "selected view interrupts a running bulk pass and each pass is delivered once");
+        CHECK(yielding.progress().jobsYielded >= 1 && yielding.progress().cacheHits >= 1,
+              "resumed bulk work reuses its completed immutable dependency cache");
+        yielding.cancelAndWaitIdle();
+    }
+
+    // Bound both pending and running admission. A requested view can replace a
+    // fresh background request, and overload has an observable failure result.
+    {
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService bounded([release, entered](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<GateDisasm>(release, entered);
+        }, 1);
+        const uint64_t e = bounded.epoch();
+        bounded.beginModuleBatch(static_cast<uint32_t>(AnalysisService::kMaxOutstandingJobs + 2));
+        bounded.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                            false, e, 1, base, base + 2, true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        for (size_t i = 1; i < AnalysisService::kMaxOutstandingJobs; ++i)
+            bounded.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings,
+                                false, e, 100 + i);
+        bounded.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings,
+                            false, e, 0xFFFF);
+        bounded.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                            false, e, 0xFFFE, base + 4, base + 8, true);
+        const ProgressSnapshot progress = bounded.progress();
+        CHECK(progress.queuedJobs + progress.runningJobs == AnalysisService::kMaxOutstandingJobs &&
+                  progress.requestsRejected == 2,
+              "scheduler rejects overload and admits interaction within its exact outstanding cap");
+        unsigned failures = 0;
+        AnalysisResult result;
+        while (bounded.tryTakeBulk(result)) failures += result.failureValid ? 1u : 0u;
+        CHECK(failures == 2, "rejected and displaced requests both publish a retryable failure");
+        release->store(true, std::memory_order_release);
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (bounded.bulkPending() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bool admittedView = false;
+        while (bounded.tryTakeBulk(result))
+            admittedView |= result.moduleBase == 0xFFFE && result.decompValid;
+        CHECK(admittedView, "interactive work admitted during overload completes");
+        CHECK(bounded.progress().modulesTotal == 0,
+              "rejected module requests still complete bounded batch accounting");
+        bounded.cancelAndWaitIdle();
+    }
+
+    // A module base alone is insufficient identity for coalescing: distinct
+    // borrowed images and decoder settings must retain independent results.
+    {
+        BinaryFile otherImage;
+        std::vector<uint8_t> otherBytes(64, 0);
+        std::memcpy(otherBytes.data(), "OTHER", 5);
+        CHECK(otherImage.loadFromMemory(std::move(otherBytes), base, "scheduler-other-image"),
+              "load independent image for scheduler coalescing fixture");
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        AnalysisService identity([release, entered](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            return std::make_unique<GateDisasm>(release, entered);
+        }, 1);
+        const uint64_t e = identity.epoch();
+        identity.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                             false, e, 1, base, base + 2, true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!entered->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        identity.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings, false, e);
+        identity.requestBulk(&otherImage, Engine::Zydis, Arch::X64, K_Strings, false, e);
+        identity.requestBulk(&otherImage, Engine::Zydis, Arch::X86, K_Strings, false, e);
+        CHECK(identity.progress().queuedJobs == 3,
+              "different image or exact decoder retains independent pending ownership");
+        release->store(true, std::memory_order_release);
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (identity.bulkPending() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        unsigned delivered = 0, others = 0;
+        AnalysisResult result;
+        while (identity.tryTakeBulk(result)) if (result.stringsValid) {
+            ++delivered;
+            others += std::any_of(result.strings.begin(), result.strings.end(),
+                                 [](const StrResult& text) { return text.text == "OTHER"; }) ? 1u : 0u;
+        }
+        CHECK(delivered == 3 && others == 2,
+              "coalescing cannot transplant analysis onto a different borrowed image");
+        identity.cancelAndWaitIdle();
+    }
+
+    // Separate document pools share one bounded CPU arbiter. Keep all but one
+    // global slot occupied so observed factory order is deterministic, then verify
+    // requested-view > active-document > background-document admission.
+    {
+        const unsigned limit = AnalysisService::globalWorkerLimit();
+        std::vector<std::shared_ptr<std::atomic<bool>>> releases;
+        for (unsigned i = 0; i < limit; ++i)
+            releases.push_back(std::make_shared<std::atomic<bool>>(false));
+        auto entered = std::make_shared<std::atomic<int>>(0);
+        std::atomic<unsigned> factoryIndex{0};
+        AnalysisService blockers([&](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+            const unsigned slot = factoryIndex.fetch_add(1);
+            if (slot >= releases.size()) return std::make_unique<StubDisasm>();
+            return std::make_unique<GateDisasm>(releases[slot], entered);
+        }, limit);
+        for (unsigned i = 0; i < limit; ++i)
+            blockers.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                                 false, blockers.epoch(), 1 + i, base, base + 2, true);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (entered->load() < static_cast<int>(limit) &&
+               std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        CHECK(entered->load() == static_cast<int>(limit), "global admission fixture occupies its full CPU bound");
+        std::mutex orderMutex;
+        std::vector<char> order;
+        auto factory = [&](char tag) -> AnalysisService::LegacyDecoderFactory {
+            return [&, tag](Engine, Arch) -> std::unique_ptr<IDisassembler> {
+                std::lock_guard<std::mutex> lock(orderMutex);
+                order.push_back(tag);
+                return std::make_unique<StubDisasm>();
+            };
+        };
+        AnalysisService background(factory('B'), 1), active(factory('A'), 1), view(factory('V'), 1);
+        active.setActiveDocument(false);
+        background.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings, false, background.epoch());
+        active.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Strings, false, active.epoch());
+        view.requestBulk(&bin, Engine::Zydis, Arch::X64, K_Decompile,
+                         false, view.epoch(), 0, base + 4, base + 8, true);
+        background.setActiveDocument(false);
+        active.setActiveDocument(true); // reprioritize already-queued work after a tab switch
+        {
+            std::lock_guard<std::mutex> lock(orderMutex);
+            CHECK(order.empty(), "independent document pools cannot exceed the process-wide running cap");
+        }
+        releases[0]->store(true, std::memory_order_release);
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((background.bulkPending() || active.bulkPending() || view.bulkPending()) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        {
+            std::lock_guard<std::mutex> lock(orderMutex);
+            CHECK(order == std::vector<char>({'V', 'A', 'B'}),
+                  "global scheduler admits requested view, active document, then background document");
+        }
+        for (const auto& release : releases) release->store(true, std::memory_order_release);
+        blockers.cancelAndWaitIdle();
+        background.cancelAndWaitIdle();
+        active.cancelAndWaitIdle();
+        view.cancelAndWaitIdle();
+    }
+
     // VA 0 is a legitimate function address for raw/ELF/Mach-O images. Keep this
     // backend regression beside the BinaryView validity-flag fix: zero must not be
     // treated as the decompiler's "not initialized" sentinel.

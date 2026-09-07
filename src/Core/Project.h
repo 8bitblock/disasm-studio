@@ -16,6 +16,7 @@
 
 #include "ConnectionSchema.h"
 #include "GameMakerDebug.h"
+#include "TypeSystem.h"
 #include "../Disasm/IDisassembler.h"
 
 namespace ds {
@@ -177,6 +178,7 @@ struct ProjectState {
     std::unordered_map<uint64_t, std::string> algorithmLabels; // data VA -> confirmed algorithm label
     std::vector<PjFunctionOverride>           functionOverrides; // authoritative; heuristic results yield
     std::vector<PjDataOverride>               dataOverrides;     // authoritative code/data span decisions
+    TypeRegistry                              typeRegistry;      // shared analyst type and global identities
     std::vector<PjBookmark>                    bookmarks;
     std::vector<uint64_t>                      breakpoints;
     std::unordered_map<uint64_t, std::string>  bpConditions; // addr -> condition
@@ -211,7 +213,7 @@ struct ProjectState {
             connection.enabled || connection.authEnabled || !connection.localhostOnly ||
             !connection.accessToken.empty() || !connectionEvents.empty();
         return !comments.empty() || !names.empty() || !algorithmLabels.empty() ||
-               !functionOverrides.empty() || !dataOverrides.empty() ||
+               !functionOverrides.empty() || !dataOverrides.empty() || !typeRegistry.empty() ||
                !bookmarks.empty() || !breakpoints.empty() || !patches.empty() ||
                !gmlBreakpoints.empty() || !gmlWatches.empty() ||
                !patchSets.empty() ||

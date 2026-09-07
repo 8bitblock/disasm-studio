@@ -11,6 +11,7 @@
 #include "Disasm/IDisassembler.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -32,9 +33,16 @@ struct ScriptDisasm final : IDisassembler {
 
     bool decodeOne(const uint8_t*, size_t, uint64_t va, Instruction& out) override {
         auto it = bodies.find(va);
-        if (it == bodies.end() || it->second.empty()) return false;
-        out = it->second.front();
-        return true;
+        if (it != bodies.end() && !it->second.empty()) {
+            out = it->second.front();
+            return true;
+        }
+        // Prefix probes advance through padding without disassembling the
+        // whole body. Model decodeOne at interior instruction boundaries too.
+        for (const auto& [address, body] : bodies)
+            for (const Instruction& instruction : body)
+                if (instruction.address == va) { out = instruction; return true; }
+        return false;
     }
 
     std::vector<Instruction> disassemble(const uint8_t*, size_t, uint64_t va,
@@ -90,6 +98,93 @@ static Instruction ret(uint64_t va) {
     return in;
 }
 
+// Observe the actual decode/evidence schedule, without timing or allocator
+// assumptions. Full-body decoding must never run ahead of evidence processing;
+// previously all function bodies were materialized before the first callback.
+struct StreamingDisasm final : IDisassembler {
+    uint64_t base = 0, stringVA = 0;
+    size_t prefixCalls = 0, fullWindows = 0, evidenceWindows = 0, maxWindowsAhead = 0;
+    bool inFullWindow = false;
+    Engine engine() const override { return Engine::Zydis; }
+    const char* engineName() const override { return "streaming"; }
+    bool decodeOne(const uint8_t* data, size_t size, uint64_t va, Instruction& out) override {
+        if (!data || !size) return false;
+        if (!inFullWindow) ++prefixCalls;
+        out = (va - base) % 512 == 0 ? dataRef(va, stringVA) : op(va, "mov", "eax, ecx");
+        return true;
+    }
+    std::vector<Instruction> disassemble(const uint8_t* data, size_t size,
+                                         uint64_t va, size_t cap) override {
+        ++fullWindows;
+        maxWindowsAhead = std::max(maxWindowsAhead, fullWindows - evidenceWindows);
+        inFullWindow = true;
+        std::vector<Instruction> out;
+        for (size_t i = 0; i < size && (!cap || i < cap); ++i) {
+            Instruction instruction;
+            if (!decodeOne(data + i, size - i, va + i, instruction)) break;
+            out.push_back(std::move(instruction));
+        }
+        inFullWindow = false;
+        return out;
+    }
+};
+
+static void checkStreamingAndCancellation(const BinaryFile& bin, uint64_t base) {
+    std::vector<NamerInput> funcs;
+    for (size_t i = 0; i < 6; ++i) {
+        char name[40];
+        std::snprintf(name, sizeof(name), "sub_%llX", static_cast<unsigned long long>(base + i * 512));
+        funcs.push_back({base + i * 512, 512, false, name});
+    }
+    funcs.push_back({base + 6 * 512, 512, true, "authoritative_export"});
+    StreamingDisasm dis;
+    dis.base = base;
+    dis.stringVA = base + 0xF00;
+    const auto stringAt = [&](uint64_t va) -> std::string {
+        if (va != dis.stringVA) return {};
+        ++dis.evidenceWindows;
+        return "streaming_worker";
+    };
+    FunctionNamer namer;
+    auto results = namer.name(bin, dis, funcs, 0, false, false, {}, stringAt);
+    CHECK(results.size() == funcs.size());
+    CHECK(dis.prefixCalls == funcs.size());
+    CHECK(dis.fullWindows == 6); // named exports only need a thunk prefix
+    CHECK(dis.evidenceWindows == 6);
+    CHECK(dis.maxWindowsAhead == 1);
+    CHECK_EQ(results.back().name, "authoritative_export");
+
+    dis.prefixCalls = dis.fullWindows = dis.evidenceWindows = dis.maxWindowsAhead = 0;
+    results = namer.name(bin, dis, funcs, 0, false, false, {}, stringAt,
+                        [&] { return dis.prefixCalls >= 3; });
+    CHECK(results.empty());
+    CHECK(namer.guessedCount() == 0);
+    CHECK(dis.prefixCalls == 3);
+    CHECK(dis.fullWindows == 0);
+
+    dis.prefixCalls = dis.fullWindows = dis.evidenceWindows = dis.maxWindowsAhead = 0;
+    results = namer.name(bin, dis, funcs, 0, false, false, {}, stringAt,
+                        [&] { return dis.fullWindows >= 2; });
+    CHECK(results.empty());
+    CHECK(namer.guessedCount() == 0);
+    CHECK(dis.fullWindows == 2);
+    CHECK(dis.evidenceWindows == 1);
+
+    // CET/padding can precede the actual import thunk. Streaming the prefix
+    // must preserve that inference even after a longer run of padding.
+    ScriptDisasm padded;
+    for (size_t i = 0; i < 64; ++i)
+        padded.bodies[base].push_back(op(base + i, i ? "nop" : "endbr64"));
+    padded.bodies[base].push_back(jumpMem(base + 64, base + 0xF00));
+    const auto imported = [&](uint64_t va) -> std::string {
+        return va == base + 0xF00 ? "KERNEL32.CreateFileW" : "";
+    };
+    results = namer.name(bin, padded, {{base, 96, false, "sub_100000"}},
+                        0, false, false, imported, {});
+    CHECK(results.size() == 1);
+    CHECK_EQ(results.front().name, "j_CreateFileW");
+}
+
 // Large batches exercise allocation after reserved-name holes and long thunk
 // chains without depending on a particular unordered-map traversal order. The
 // optional benchmark reports wall time; correctness never uses timing limits.
@@ -103,6 +198,7 @@ static void checkLargeNamingBatches(size_t count, bool reportTime) {
     }
     BinaryFile bin;
     CHECK(bin.loadRaw(path, base));
+
     ScriptDisasm dis;
     std::vector<NamerInput> funcs;
     for (size_t i = 0; i < count; ++i) {
@@ -187,6 +283,7 @@ int main(int argc, char** argv) {
     BinaryFile bin;
     CHECK(bin.loadRaw(path, base));
 
+    checkStreamingAndCancellation(bin, base);
     ScriptDisasm dis;
     auto importNameFor = [&](uint64_t va) -> std::string {
         if (va == iatCreate)  return "KERNEL32.CreateFileW";

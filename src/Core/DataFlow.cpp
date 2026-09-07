@@ -794,6 +794,7 @@ struct Analyzer {
     int argCount_ = 0;                                     // number of detected parameters (a1..aN)
 
     std::vector<std::vector<Stmt>> blockStmts_;
+    std::vector<std::vector<IntermediateOperation>> blockOperations_;
     std::vector<FlagState>         termFlag_;
 
     // Return-value recovery: the inlined rax expression captured at the end of each
@@ -1317,6 +1318,7 @@ struct Analyzer {
             // structurer emit the no-fallthrough terminator.
             if (k == b.transferIndex && !b.isNoReturnCall) continue; // delay slots still execute
             const Instruction& in = b.insns[k];
+            const IntermediateOperation& effects = blockOperations_[bi][k];
             currentInstruction_ = &in;
             const std::string m = lower(in.mnemonic);
             std::vector<Operand> operands;
@@ -1398,7 +1400,33 @@ struct Analyzer {
                 killMemory(e); killStackSlots(e);          // may alias a tracked stack slot
             };
             auto emitRaw = [&](const std::string& text) {
-                Stmt s; s.side = true; s.text = text; appendStatement(out, std::move(s));
+                Stmt s; s.side = true; s.text = text;
+                // Inline assembly still consumes its physical input locations.
+                // Keep their actual definitions live even when propagation has
+                // substituted constants into the surrounding C expressions.
+                std::set<std::string> rawReads;
+                for (const std::string& read : effects.registersRead) {
+                    RegInfo reg;
+                    if (lookupReg(read, reg) && reg.canon >= 0)
+                        rawReads.insert(nameOf(regLoc(reg.canon)));
+                }
+                for (const IntermediateOperand& operand : effects.operands) {
+                    if (operand.decoded.kind != OperandKind::Memory ||
+                        operand.addressOnly || !OperandReads(operand.decoded.access)) continue;
+                    Operand decoded;
+                    std::string loc;
+                    if (operandFromTyped(operand.decoded, decoded) && stackLoc(decoded.mem, loc))
+                        rawReads.insert(nameOf(loc));
+                }
+                if (effects.unknownRegisterEffects || effects.readsMemory || effects.unknownMemoryEffects) {
+                    // Unknown code and computed loads may consume a tracked
+                    // stack value through an alias; no proven input may vanish.
+                    for (const auto& named : name_)
+                        if (effects.unknownRegisterEffects || named.first.rfind("k:", 0) == 0)
+                            rawReads.insert(named.second);
+                }
+                s.reads.assign(rawReads.begin(), rawReads.end());
+                appendStatement(out, std::move(s));
             };
             auto emitRawReads = [&](const std::string& text,
                                     const std::set<std::string>& trackedReads) {
@@ -1411,10 +1439,8 @@ struct Analyzer {
             // the decoder. When a legacy decoder reports no semantics at all we
             // retain the old fail-closed behavior and discard the whole cache.
             auto invalidateUnmodelled = [&]() {
-                bool reportedOutput = false;
                 for (const TypedOperand& typed : in.typedOperands) {
                     if (!OperandWrites(typed.access)) continue;
-                    reportedOutput = true;
                     Operand output;
                     if (!operandFromTyped(typed, output)) continue;
                     if (output.kind == OK::Reg && output.reg.canon >= 0) {
@@ -1427,19 +1453,38 @@ struct Analyzer {
                         else { fl.clear(); killMemory(e); killStackSlots(e); }
                     }
                 }
-                for (const std::string& written : in.registersWritten) {
+                for (const std::string& written : effects.registersWritten) {
                     RegInfo reg;
                     if (!lookupReg(written, reg) || reg.canon < 0) continue;
-                    reportedOutput = true;
                     const std::string loc = regLoc(reg.canon);
                     fl.invalidateDependency(loc);
                     killDep(e, loc); e.v.erase(loc);
                 }
-                if (!reportedOutput && in.typedOperands.empty() && in.registersWritten.empty())
-                    e.v.clear();
-                if (in.flagsWritten || (in.typedOperands.empty() && in.registersWritten.empty()))
+                if (effects.unknownRegisterEffects) { e.v.clear(); fl.clear(); }
+                if (effects.writesMemory || effects.unknownMemoryEffects) {
+                    fl.clear(); killMemory(e); killStackSlots(e);
+                }
+                if (effects.unknownFlagEffects)
                     fl = {};
+                else {
+                    uint8_t written = 0;
+                    if (effects.flagsWritten & SemanticFlagBit(SemanticFlag::Carry)) written |= kX86FlagCF;
+                    if (effects.flagsWritten & SemanticFlagBit(SemanticFlag::Zero)) written |= kX86FlagZF;
+                    if (effects.flagsWritten & SemanticFlagBit(SemanticFlag::Sign)) written |= kX86FlagSF;
+                    if (effects.flagsWritten & SemanticFlagBit(SemanticFlag::Overflow)) written |= kX86FlagOF;
+                    if (effects.flagsWritten & SemanticFlagBit(SemanticFlag::Parity)) written |= kX86FlagPF;
+                    fl.clear(written);
+                }
             };
+
+            // The scalar C lifter does not model atomic ordering or REP loops.
+            // Preserve the complete decoded instruction and its effects rather
+            // than silently rendering a prefixed operation as one scalar step.
+            if (!in.prefixes.empty() || effects.repeated) {
+                emitRaw("__asm { " + effects.instructionText + " };");
+                invalidateUnmodelled();
+                continue;
+            }
 
             // Unparseable operands -> fall back to a faithful asm comment (never lose it).
             const bool hasEncodedOperands = !in.typedOperands.empty() || !in.operands.empty();
@@ -1826,8 +1871,9 @@ struct Analyzer {
                 // registers below (rcx/rdx/r8/r9 hold the Win64 integer args here).
                 std::string args = renderCallArgs(e, reads);
                 std::string callee;
-                if (HasBranchTarget(in)) { std::string nm = nameFor ? nameFor(in.branchTarget) : std::string();
-                    if (nm.empty()) { char c[24]; std::snprintf(c, sizeof(c), "sub_%llX", (unsigned long long)in.branchTarget); nm = c; }
+                uint64_t callTarget = 0;
+                if (TryGetDirectTarget(in, callTarget)) { std::string nm = nameFor ? nameFor(callTarget) : std::string();
+                    if (nm.empty()) { char c[24]; std::snprintf(c, sizeof(c), "sub_%llX", (unsigned long long)callTarget); nm = c; }
                     callee = nm; }
                 else {
                     // Indirect call: resolve `call [iat]` to the import name when known.
@@ -1988,6 +2034,13 @@ struct Analyzer {
         retExpr_.assign(N, {}); retReads_.assign(N, {});
         r.retComment.assign(N, {});
         is32_ = exactArch_ ? targetArch_ == Arch::X86 : looksLike32();
+        blockOperations_.assign(N, {});
+        for (int i = 0; i < N; ++i) {
+            blockOperations_[i].reserve(g.blocks[i].insns.size());
+            for (const Instruction& instruction : g.blocks[i].insns)
+                blockOperations_[i].push_back(LiftInstructionSemantics(
+                    instruction, is32_ ? Arch::X86 : Arch::X64, targetABI_));
+        }
         detectArgs();
 
         // ---- inter-block reaching-definitions (sparse constant/copy propagation) ----
@@ -2075,6 +2128,7 @@ struct Analyzer {
             r.termFlag.push_back(termFlag_[i]);
         }
         r.retExpr = std::move(retExpr_);
+        r.blockOperations = std::move(blockOperations_);
         for (int k = 1; k <= argCount_; ++k) r.args.push_back("a" + std::to_string(k));  // header parameter list
         r.ok = true;
         return r;

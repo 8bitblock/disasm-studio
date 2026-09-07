@@ -1,4 +1,5 @@
 #include "Theme.h"
+#include "Core/Preferences.h"
 #include "imgui.h"
 
 #include <algorithm>
@@ -35,7 +36,10 @@ static Palette PaletteFor(ThemeId id) {
             p.bg0=V(0.067f,0.075f,0.086f); p.bg1=V(0.094f,0.106f,0.122f);
             p.bg2=V(0.137f,0.153f,0.176f); p.bg3=V(0.192f,0.212f,0.239f);
             p.child=V(0.078f,0.086f,0.102f); p.popup=V(0.094f,0.106f,0.122f,0.995f); p.menubar=V(0.094f,0.106f,0.122f);
-            p.text=V(0.855f,0.878f,0.906f); p.muted=V(0.553f,0.596f,0.655f); p.border=V(0.180f,0.200f,0.231f);
+            // The release design uses readable secondary labels on the same
+            // graphite surfaces; dim addresses and disabled controls must not
+            // make the feature inventory disappear into the surrounding chrome.
+            p.text=V(0.855f,0.878f,0.906f); p.muted=V(0.631f,0.667f,0.722f); p.border=V(0.180f,0.200f,0.231f);
             p.accent=V(0.055f,0.553f,0.890f); p.good=V(0.302f,0.773f,0.420f); p.warn=V(0.945f,0.690f,0.251f);
             p.bad=V(0.965f,0.294f,0.263f); p.call=V(0.235f,0.671f,0.973f); p.branch=V(0.945f,0.735f,0.345f);
             p.jump=V(0.690f,0.455f,0.941f);
@@ -53,8 +57,8 @@ static Palette PaletteFor(ThemeId id) {
             p.bg0=V(0.935f,0.945f,0.960f); p.bg1=V(0.985f,0.990f,1.000f);
             p.bg2=V(0.900f,0.920f,0.950f); p.bg3=V(0.820f,0.860f,0.920f);
             p.child=V(0.965f,0.975f,0.988f); p.popup=V(1.000f,1.000f,1.000f,0.98f); p.menubar=V(0.900f,0.918f,0.945f);
-            p.text=V(0.12f,0.14f,0.18f); p.muted=V(0.40f,0.43f,0.48f); p.border=V(0.68f,0.72f,0.78f,0.85f);
-            p.accent=V(0.16f,0.50f,0.92f); p.good=V(0.16f,0.60f,0.30f); p.warn=V(0.78f,0.54f,0.10f);
+            p.text=V(0.12f,0.14f,0.18f); p.muted=V(0.38f,0.41f,0.46f); p.border=V(0.68f,0.72f,0.78f,0.85f);
+            p.accent=V(0.10f,0.39f,0.75f); p.good=V(0.12f,0.43f,0.23f); p.warn=V(0.57f,0.36f,0.04f);
             p.bad=V(0.82f,0.25f,0.25f); p.call=V(0.13f,0.44f,0.84f); p.branch=V(0.66f,0.44f,0.06f);
             p.jump=V(0.52f,0.22f,0.78f);
             p.light=true;
@@ -126,6 +130,7 @@ static Palette PaletteFor(ThemeId id) {
 static ThemeId g_theme   = ThemeId::Midnight;
 static Palette g_pal     = PaletteFor(ThemeId::Midnight);
 static float   g_scale   = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
+static int     g_zoomPercent = kDefaultUiZoomPercent;
 static Density g_density = Density::Compact;       // dense RE-workbench default
 
 // Spacing/padding multiplier for the current density (applied on top of HiDPI k).
@@ -173,8 +178,8 @@ static void applyMetrics() {
     s.IndentSpacing     = 16.0f * d;
     // Hit targets scale with DPI, even in Compact density. Density changes the
     // information spacing without making scrolling or sliders harder to grab.
-    s.ScrollbarSize     = 11.0f * k;
-    s.GrabMinSize       = 10.0f * k;
+    s.ScrollbarSize     = 12.0f * k;
+    s.GrabMinSize       = 12.0f * k;
 
     s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
     s.WindowMenuButtonPosition = ImGuiDir_None;
@@ -262,6 +267,11 @@ void ApplyTheme() { ApplyTheme(g_theme); }
 
 void SetUiScale(float scale) { g_scale = (scale > 0.5f && scale < 8.0f) ? scale : 1.0f; }
 float UiScale() { return g_scale; }
+
+void SetUiZoomPercent(int percent) {
+    g_zoomPercent = std::clamp(percent, kMinUiZoomPercent, kMaxUiZoomPercent);
+}
+int UiZoomPercent() { return g_zoomPercent; }
 
 void    SetDensity(Density d) { g_density = d; }
 Density CurrentDensity()      { return g_density; }

@@ -3,6 +3,7 @@
 #include "../Core/ProcessManager.h"    // ModuleInfo (Functions sub-tab)
 #include "../Core/SymbolService.h"     // asynchronous DbgHelp / PDB ownership
 #include "../Core/DocumentContext.h"   // one bounded navigation history per document
+#include "../Core/TypeSystem.h"
 #include "../Core/XrefIndex.h"         // whole-program cross-reference index (Xrefs tab)
 #include "../Core/AlgoScan.h"          // AlgoMatch (Algorithms sub-tab / K_Intent results)
 #include "../Core/CFG.h"               // ControlFlowGraph (cached CFG graph view)
@@ -124,6 +125,12 @@ private:
 
     struct ListRow;
     void renderWelcome(AppContext& ctx);
+    void applyWorkflow(AppContext& ctx, int preset);
+    void renderWorkflowContext(AppContext& ctx);
+    void renderEvidenceInspector(AppContext& ctx, bool collapsed);
+    void selectRepresentation(AppContext& ctx, int view);
+    void renderTypeWorkbench(AppContext& ctx);
+    void renderTypedLocation(AppContext& ctx, uint64_t va);
     void renderOverview(AppContext& ctx);
     std::vector<RecentEntry> welcomeRecents_; // at most seven displayed targets
     double welcomeRecentsRefresh_ = -1.0;
@@ -374,6 +381,21 @@ private:
     uint64_t staticCursorVA_ = 0; // last mapped FILE focus, retained while browsing Live
     bool     staticCursorValid_ = false;
     int      mainView_  = 0;     // 0=asm 1=pseudo 2=hex 3=graph 4=live 5=callgraph 7=overview (6 is legacy)
+    int      workflowPreset_ = 0;
+    DocumentLocation viewPins_[8]{};
+    uint64_t viewPinsImage_ = 0;
+    bool     focusTypesTab_ = false;
+    bool     focusResourcesTab_ = false;
+    uint32_t navigatorOptionalMask_ = 0;
+    bool     analysisQueueCollapsed_ = false;
+    bool     evidenceInspectorCollapsed_ = false;
+    float    evidenceInspectorW_ = 300.0f;
+    TypeDefinition typeDraft_;
+    uint64_t typeDraftImage_ = 0;
+    bool typeDraftDirty_ = false;
+    std::string typeStatus_;
+    char typeFilter_[96]{};
+    char typeApplicationName_[97]{};
     BinaryOverview overview_;
     uint64_t overviewImageSerial_ = 0;
     uint64_t overviewImageRevision_ = 0;
@@ -651,7 +673,7 @@ private:
 
     // ---- Live disassembly view state ----
     int       liveMode_       = 0;     // 0 = disassembly, 1 = pseudocode
-    bool      showRegBox_     = true;  // compact register box, top-right of the view
+    bool      showRegBox_     = false; // optional extra live register pane; lower Registers is always reachable
     bool      showJumpArrows_ = true;  // branch arrows drawn in the flow gutter
     bool      showRegHints_   = true;  // inline "rax=0x..." hints on the RIP row
     Registers regsAtLastStop_{};       // registers captured at the current stop
@@ -663,6 +685,12 @@ private:
         std::vector<char>(kRegisterEditMaxInputBytes + 1, '\0');
     bool      regEditFocus_ = false;
     bool      focusRegistersTab_ = false; // compact register-box edit handoff
+    DebugTargetIdentity regEditOwner_{};
+    uint32_t regEditTid_ = 0;
+    uint64_t regEditRip_ = 0;
+    bool regEditIs32_ = false;
+    std::string regEditStatus_;
+    bool regEditStatusError_ = false;
     uint64_t  stackEditAddr_ = 0;      // stack qword address being edited (0 = none)
     char      stackEditBuf_[20] = "";
     bool      stackEditFocus_ = false;
@@ -773,10 +801,11 @@ private:
     uint32_t                liveModulesPid_ = 0;
     uint64_t                liveMainBase_    = 0;   // cached runtime base of the main module
     uint32_t                liveMainBasePid_ = 0;   // pid the cache was computed for
-    char                    funcTabFilter_[64] = "";
+    char                    funcTabFilter_[128] = "";
     std::vector<int>        funcTabVisible_;          // cached lower Functions-tab filter result
-    char                    funcTabFilterLast_[64] = "\x01";
+    char                    funcTabFilterLast_[128] = "\x01";
     uint64_t                funcTabVisSig_ = ~0ull;
+    uint32_t                funcTabVisNamesGen_ = 0;
 
     // Pseudocode cache (regenerated when the function or RIP context changes).
     uint64_t              pseudoVA_ = 0;
@@ -956,6 +985,19 @@ private:
     XrefIndex             xrefIndex_;
     uint64_t              xrefIndexSig_ = ~0ull;
     uint64_t              xrefRequestedSig_ = ~0ull;   // last sig we asked the worker to index (dedup re-requests)
+    // Retain the cursor/enclosing-function groups across frames. Clipping rows
+    // alone does not bound repeated grouping or counting of a high-fan-out index.
+    struct XrefPanelGroups {
+        bool valid = false;
+        uint64_t target = 0;
+        std::vector<uint64_t> writers, readers, takers, branches;
+    };
+    XrefPanelGroups       xrefPanelGroups_[2];
+    bool                  xrefPanelCacheValid_ = false;
+    uint64_t              xrefPanelImageSerial_ = 0;
+    uint64_t              xrefPanelResultSerial_ = 0;
+    uint64_t              xrefPanelIndexSig_ = 0;
+    size_t                xrefPanelEdgeCount_ = 0;
     // Analysis export (File > Export Analysis) result, shown in a small popup.
     std::string           exportStatus_;
     bool                  openExportPopup_ = false;
@@ -1169,7 +1211,7 @@ private:
     std::unordered_map<uint64_t, std::string> guessReason_;
     bool                  guessNames_ = true;    // run the name guesser after analysis
     std::string           fnSummary_;
-    char                  fnFilter_[64] = "";
+    char                  fnFilter_[128] = "";
     char                  strFilter_[64] = "";
     // Filtered row indices for the side lists, clipper-rendered (these lists can hold
     // thousands of entries; rendering all of them was wasteful). Rebuilt ONLY when the
@@ -1178,9 +1220,12 @@ private:
     std::vector<int>      fnVisible_;
     std::vector<int>      strVisible_;
     std::vector<int>      impVisible_;
-    char                  fnFilterLast_[64] = "\x01";   // sentinel != "" forces a first build
+    char                  fnFilterLast_[128] = "\x01";   // sentinel != "" forces a first build
     char                  strFilterLast_[64] = "\x01";
     uint64_t              fnVisSig_  = ~0ull;   // data signature of fnVisible_'s last build
+    uint32_t              fnVisNamesGen_ = 0;
+    void refreshFunctionFilter(bool lower);
+    void renderFunctionDestinations(AppContext& ctx, uint64_t address);
     uint64_t              strVisSig_ = ~0ull;   // stringsGen_ of strVisible_'s last build
     uint32_t              namesGen_  = 0;       // bumped when user/guessed/discovered names change
     uint64_t              functionsGen_ = 0;    // bumped whenever functions_ membership/bounds change

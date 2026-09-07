@@ -814,6 +814,54 @@ int main() {
     fs::remove_all(persistenceRoot, fsError);
     CHECK(!fsError);
 
+    // Type definitions are authored metadata with stable 64-bit identities.
+    // Persist exact values, VA zero and signed enum values without JSON doubles.
+    {
+        ProjectState typed;
+        TypeDefinition integer; integer.id = 0xFEDCBA9876543210ull; integer.name = "i64";
+        integer.sizeBytes = 8; integer.signedValue = true;
+        TypeDefinition record; record.id = 2; record.name = "Player";
+        record.kind = TypeKind::Structure; record.sizeBytes = 8;
+        record.fields = { {0xABCDEF0123456789ull, "health", integer.id, 0} };
+        TypeDefinition enumeration; enumeration.id = 3; enumeration.name = "Result";
+        enumeration.kind = TypeKind::Enum; enumeration.sizeBytes = 8; enumeration.signedValue = true;
+        enumeration.enumValues = { {"Minimum", INT64_MIN}, {"Maximum", INT64_MAX} };
+        TypeDefinition signature; signature.id = 4; signature.name = "Check";
+        signature.kind = TypeKind::Function; signature.sizeBytes = 0; signature.returnType = 3;
+        signature.callingConvention = "Win64"; signature.parameters = { {1, "player", 2, 0} };
+        typed.typeRegistry.types = { integer, record, enumeration, signature };
+        typed.typeRegistry.applications = { {0, 2, "player"} };
+        CHECK(typed.hasContent());
+        const std::string serialized = SerializeProject(typed);
+        ProjectState restored;
+        CHECK(DeserializeProject(serialized, restored));
+        CHECK(restored.typeRegistry.types.size() == 4);
+        CHECK(restored.typeRegistry.types[0].id == integer.id);
+        CHECK(restored.typeRegistry.types[1].fields[0].id == record.fields[0].id);
+        CHECK(restored.typeRegistry.types[2].enumValues[0].value == INT64_MIN);
+        CHECK(restored.typeRegistry.types[2].enumValues[1].value == INT64_MAX);
+        CHECK(restored.typeRegistry.types[3].callingConvention == "Win64");
+        CHECK(restored.typeRegistry.applications.size() == 1 && restored.typeRegistry.applications[0].address == 0);
+        CHECK(restored.dataOverrides.empty() && restored.patches.empty());
+        CHECK(SerializeProject(restored) == serialized);
+
+        json::Value tree;
+        CHECK(json::Parse(serialized, tree));
+        auto& fields = tree.find("typeRegistry")->find("types")->arr[1].find("fields")->arr;
+        fields[0].set("typeId", json::Value::Str("0x999"));
+        restored.name = "unchanged";
+        CHECK(!DeserializeProject(json::Dump(tree), restored) && restored.name == "unchanged");
+        CHECK(json::Parse(serialized, tree));
+        tree.find("typeRegistry")->find("types")->arr[2].find("enumValues")->arr[0].set("value", json::Value::Num(1));
+        CHECK(!DeserializeProject(json::Dump(tree), restored));
+        CHECK(json::Parse(serialized, tree));
+        tree.find("typeRegistry")->set("version", json::Value::Int(2));
+        CHECK(!DeserializeProject(json::Dump(tree), restored));
+        CHECK(DeserializeProject("{\"version\":1}", restored) && restored.typeRegistry.empty());
+        typed.reset();
+        CHECK(typed.typeRegistry.empty() && !typed.hasContent());
+    }
+
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     std::printf("project_roundtrip_test: all checks passed\n");
     return 0;

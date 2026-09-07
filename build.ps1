@@ -142,6 +142,9 @@ $arguments = @(
 if ($resolvedVcpkgRoot) {
     $arguments += "/p:VcpkgRoot=$resolvedVcpkgRoot\"
 }
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    $arguments += "/p:DsPowerShell=$(Join-Path $PSHOME 'pwsh.exe')"
+}
 
 $oldVcpkgVsPath = [Environment]::GetEnvironmentVariable('VCPKG_VISUAL_STUDIO_PATH', 'Process')
 $oldVcpkgToolset = [Environment]::GetEnvironmentVariable('DS_VCPKG_PLATFORM_TOOLSET_VERSION', 'Process')

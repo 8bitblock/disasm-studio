@@ -321,6 +321,49 @@ int main() {
               missingResult.diagnostics[0].kind == DecompileDiagnosticKind::MissingChunk);
     }
 
+    // Unsupported execution prefixes retain complete operations and exact
+    // instruction origins in both lifters. Raw consumers keep their input
+    // setup live, including a definition at VA zero, through DCE.
+    {
+        Instruction setup = mk(0, 3, "mov", "rcx, 7");
+        Instruction locked = mk(3, 4, "add", "dword ptr [rcx], 1");
+        locked.prefixes = { InstructionPrefix::Lock };
+        TypedOperand memory; memory.kind = OperandKind::Memory;
+        memory.access = OperandAccess::ReadWrite; memory.baseRegister = "rcx"; memory.widthBits = 32;
+        TypedOperand immediate; immediate.kind = OperandKind::Immediate;
+        immediate.access = OperandAccess::Read; immediate.widthBits = 8; immediate.immediate = 1;
+        locked.typedOperands = { memory, immediate };
+        Instruction repeated = mk(7, 2, "movsb", "");
+        repeated.prefixes = { InstructionPrefix::Rep };
+        repeated.registersRead = { "rcx", "rsi", "rdi" };
+        repeated.registersWritten = repeated.registersRead;
+        const auto graph = buildG({setup, locked, repeated, mk(9, 2, "xor", "eax, eax"), mk(11, 1, "ret", "", true, true)});
+        for (bool deep : {false, true}) {
+            DecompileOptions options; options.deepDataFlow = deep;
+            options.target = {Arch::X64, DecompileABI::Win64};
+            const auto result = DecompileWithMap(graph, options);
+            const auto lines = splitLines(result.text);
+            CHECK(result.text == Decompile(graph, options));
+            CHECK(result.lineOrigins.size() == lines.size());
+            for (const auto& expected : std::vector<std::pair<std::string, uint64_t>>{
+                     {" = 7;", 0}, {"__asm { lock add dword ptr [rcx], 1 };", 3}, {"__asm { rep movsb };", 7}}) {
+                const int line = lineWith(lines, expected.first.c_str());
+                CHECK(line >= 0);
+                if (line >= 0) {
+                    CHECK(result.lineOrigins[line].valid && result.lineOrigins[line].va == expected.second);
+                    CHECK(result.lineOrigins[line].granularity == SourceOriginGranularity::Instruction);
+                }
+            }
+            const auto python = DecompileToPython(result);
+            CHECK(python.lineOrigins.size() == splitLines(python.text).size());
+            for (uint64_t source : {uint64_t{3}, uint64_t{7}}) {
+                bool found = false;
+                for (const auto& origin : python.lineOrigins) found |= origin.valid && origin.va == source;
+                CHECK(found);
+            }
+        }
+    }
+
     if (g_fail) { std::printf("\n%d CHECK(s) FAILED\n", g_fail); return 1; }
     std::printf("decompiler_linemap_test: all checks passed\n");
     return 0;

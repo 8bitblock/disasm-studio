@@ -97,6 +97,11 @@ struct AppContext {
         return MakeDisassembler(config);
     } };
     std::string                    requestedTab;
+    int                            requestedWorkflow = -1; // Analyze / Debug / Memory / Compare
+    uint32_t                       navigatorOptionalMask = 0;
+    bool                           analysisQueueCollapsed = false;
+    bool                           workbenchPrefsDirty = false;
+    bool                           requestedTypeWorkbench = false;
     bool                           requestedLiveAssembly = false;
     bool                           requestedCrackmeTriage = false;
     TriageWorkspaceView            requestedTriageView = TriageWorkspaceView::StartHere;
@@ -739,6 +744,7 @@ private:
     void extractArchiveEntryToFile(const JavaZipEntry& e);  // Save dialog writing the DECOMPRESSED entry bytes
     void loadPrefs();           // validated primary / .bak recovery from %APPDATA%
     bool savePrefs();           // flushed atomic replace; false stays visible in status
+    void setUiZoomPercent(int percent);
     void closeBinary();         // flush + unload the current binary (menu / file tab / palette)
 
     AppContext                          ctx_;
@@ -751,6 +757,7 @@ private:
     uint64_t                            investigationSubmittedGeneration_ = 0;
     DebugTargetIdentity                 investigationSubmittedLiveTarget_{};
     int                                 activeTab_ = 0;   // index into tabs_ (primary strip selection)
+    uint64_t                            lastDebugLifecycleCompletion_ = 0;
     bool                                exit_      = false;
     bool                                showDemo_  = false;
     bool                                showHelp_  = false;

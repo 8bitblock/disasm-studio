@@ -8,7 +8,10 @@
 // mutex-guarded queue the render thread drains each frame; an epoch counter drops
 // results that a newer binary load or patch has superseded.
 //
-// Two responsiveness properties matter:
+// Three responsiveness properties matter:
+//   * INTERACTION FIRST — selected-function and visible-listing requests use a
+//     separate priority lane; bulk passes yield at their cancellation checkpoints
+//     and resume using immutable cached pass results. Admission is bounded.
 //   * PARALLELISM — N worker threads (≈ cores-2) so a "analyze every module"
 //     batch fans out across cores while the single render thread stays free.
 //   * INCREMENTAL DELIVERY — each pass (strings, then functions, then listing,
@@ -43,6 +46,7 @@
 #include "../Disasm/IDisassembler.h"   // Engine, Arch, IDisassembler
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <condition_variable>
 #include <cstdint>
@@ -85,6 +89,10 @@ struct ProgressSnapshot {
     uint64_t      jobsFailed   = 0;   // worker exceptions converted into failure results
     uint64_t      resultsDropped = 0; // completed results evicted by the bounded queue
     uint64_t      requestsCoalesced = 0; // pending requests merged before execution
+    uint64_t      requestsRejected = 0; // bounded admission failures (also delivered as results)
+    uint64_t      jobsYielded = 0;   // bulk attempts paused for queued interaction
+    uint32_t      queuedJobs = 0;
+    uint32_t      runningJobs = 0;
     uint64_t      cacheHits = 0;      // worker-side immutable derived-result reuse
     uint64_t      cacheMisses = 0;    // cacheable passes which required recomputation
 };
@@ -143,6 +151,7 @@ public:
     using LegacyDecoderFactory = std::function<std::unique_ptr<IDisassembler>(Engine, Arch)>;
     static constexpr unsigned kAutomaticWorkerCount = 0;
     static constexpr unsigned kMaxWorkerCount = 8;
+    static constexpr size_t kMaxOutstandingJobs = 128;
 
     // `workerCount == 0` preserves the historical automatic policy
     // (approximately hardware_concurrency()-2, clamped to [1, 8]).  Owners
@@ -161,16 +170,25 @@ public:
         return static_cast<unsigned>(threads_.size());
     }
 
+    // A process-wide admission arbiter bounds executing analysis across all
+    // services. Interaction runs first, then active-document bulk, then other
+    // documents. Owners should update this after committing a document switch.
+    // Existing per-owner threads and image lifetime barriers remain unchanged.
+    void setActiveDocument(bool active);
+    static unsigned globalWorkerLimit();
+
     // Monotone cancellation token. A result is accepted by the consumer only when
     // result.epoch == epoch(); bumpEpoch() invalidates everything older.
     uint64_t epoch() const { return epoch_.load(std::memory_order_acquire); }
     uint64_t bumpEpoch()   { return epoch_.fetch_add(1, std::memory_order_acq_rel) + 1; }
 
     // Queue (and coalesce) a bulk job for `moduleBase` (0 = the single loaded
-    // binary). A compatible pending request for the same module is merged: kinds
-    // are OR'd and newest settings win. Different targeted kinds (Synthesis, Path
-    // Explore, Decompile) stay separate because each owns a distinct address range.
-    // Different modules queue independently and fan out across the worker pool.
+    // binary). Compatible pending requests for the same image/decoder/epoch are
+    // merged. Targeted work stays separate from whole-image work and runs first;
+    // bulk passes yield at cancellation checkpoints without changing the epoch.
+    // Repeated requests for the same targeted kind use the newest region. Distinct
+    // prefix pages retain separate completion identities. Admission, including
+    // running work, is capped at kMaxOutstandingJobs; overload emits a failure.
     // Targeted callers must set regionValid=true; regionLo==0 is a real address.
     void requestBulk(const BinaryFile* bin, const DecoderConfig& decoder,
                      uint32_t kinds, bool guessNames, uint64_t epoch,
@@ -263,6 +281,8 @@ public:
     void cancelPending();
 
 private:
+    struct SharedScheduler;
+    static SharedScheduler& scheduler();
     struct BulkJob {
         const BinaryFile* bin    = nullptr;
         DecoderConfig     decoder;
@@ -286,6 +306,8 @@ private:
         uint64_t          listingRevision = 0;
         uint64_t          listingPrefixPageBase = 0;
         uint64_t          listingTopologyGeneration = 0;
+        uint32_t          publishedKinds = 0; // suppress already-delivered passes on resume
+        bool              yielded = false;  // latched by cooperative cancellation checks
     };
 
     void requestBulkImpl(const BinaryFile* bin, const DecoderConfig& decoder,
@@ -305,8 +327,12 @@ private:
                          std::shared_ptr<const std::vector<FunctionChunk>> decompChunks = {},
                          bool decompOwnershipTruncated = false,
                          std::shared_ptr<const std::vector<uint64_t>> noreturnTargets = {});
-    void threadMain();
-    void runJob(const BulkJob& job);
+    void threadMain(unsigned workerIndex);
+    void runJob(BulkJob& job);
+    void refreshPendingLocked();
+    void finishModuleLocked(const BulkJob& job);
+    static bool interactive(const BulkJob& job);
+    void enqueueLocked(BulkJob job, std::vector<BulkJob>& rejected);
     void publishResult(AnalysisResult&& result);
     void publishFailure(const BulkJob& job, const char* message) noexcept;
     void setPhase(AnalysisPhase p, uint32_t total, uint64_t modBase);
@@ -320,6 +346,11 @@ private:
     std::deque<BulkJob>          queue_;     // pending (unstarted) jobs
     std::deque<AnalysisResult>   results_;   // finished results awaiting pickup
     int                          inFlight_ = 0;  // jobs currently executing
+    std::array<uint32_t, kMaxWorkerCount> inFlightKinds_{};
+    std::atomic<uint32_t>        queuedInteractive_{0};
+    std::atomic<uint32_t>        queuedJobs_{0};
+    std::atomic<uint32_t>        runningJobs_{0};
+    std::atomic<bool>            activeDocument_{true};
     std::atomic<bool>            quit_{false};
     std::atomic<bool>            pending_{false};
     std::atomic<uint32_t>        pendingKinds_{0};
@@ -327,6 +358,8 @@ private:
     std::atomic<uint64_t>        failedJobs_{0};
     std::atomic<uint64_t>        droppedResults_{0};
     std::atomic<uint64_t>        coalescedRequests_{0};
+    std::atomic<uint64_t>        rejectedRequests_{0};
+    std::atomic<uint64_t>        yieldedJobs_{0};
     std::atomic<uint64_t>        cacheHits_{0};
     std::atomic<uint64_t>        cacheMisses_{0};
 

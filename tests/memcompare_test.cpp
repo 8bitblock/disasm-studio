@@ -23,7 +23,8 @@ static_assert(std::is_same_v<
     void* (Debugger::*)(DebugTargetIdentity)>);
 static_assert(std::is_same_v<
     decltype(&Debugger::setRegisterForSession),
-    bool (Debugger::*)(uint32_t, uint64_t, const std::string&, uint64_t)>);
+    bool (Debugger::*)(uint32_t, uint64_t, const std::string&, uint64_t,
+                      uint32_t, const uint64_t*)>);
 
 static int g_fail = 0;
 #define CHECK(cond) do { if (!(cond)) { \

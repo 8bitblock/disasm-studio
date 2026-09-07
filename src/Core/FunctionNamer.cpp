@@ -1131,9 +1131,10 @@ std::vector<GuessedName>
 FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                     const std::vector<NamerInput>& funcs, uint64_t entryVA,
                     const std::function<std::string(uint64_t)>& importNameFor,
-                    const std::function<std::string(uint64_t)>& stringRefFor) {
+                    const std::function<std::string(uint64_t)>& stringRefFor,
+                    const std::function<bool()>& cancelled) {
     return name(bin, dis, funcs, entryVA, entryVA != 0, false,
-                importNameFor, stringRefFor);
+                importNameFor, stringRefFor, cancelled);
 }
 
 std::vector<GuessedName>
@@ -1141,8 +1142,15 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                     const std::vector<NamerInput>& funcs, uint64_t startVA,
                     bool startValid, bool rawAnalysisStart,
                     const std::function<std::string(uint64_t)>& importNameFor,
-                    const std::function<std::string(uint64_t)>& stringRefFor) {
+                    const std::function<std::string(uint64_t)>& stringRefFor,
+                    const std::function<bool()>& cancelled) {
     guessed_ = 0;
+    const auto stopped = [&] {
+        if (!cancelled || !cancelled()) return false;
+        guessed_ = 0;
+        return true;
+    };
+    if (stopped()) return {};
     std::vector<GuessedName> out(funcs.size());
 
     auto isGuessable = [](const NamerInput& f) {
@@ -1162,14 +1170,15 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         return nm;
     };
 
-    // Decode a function body into a window of instructions (bounded for speed).
-    auto decodeBody = [&](const NamerInput& f, std::vector<Instruction>& insns) {
+    // The thunk pass needs only the first non-padding instruction. Retaining
+    // 512 rich Instructions for every function can exhaust memory on a large
+    // image, so probe the prefix, then stream full bodies during synthesis.
+    auto bodyBytes = [&](const NamerInput& f, size_t& win) {
         size_t avail = 0;
         const uint8_t* p = bin.ptrFromVA(f.address, avail);
-        if (!p) return;
-        size_t win = f.size ? std::min<size_t>(avail, f.size) : std::min<size_t>(avail, 2048);
+        win = f.size ? std::min<size_t>(avail, f.size) : std::min<size_t>(avail, 2048);
         win = std::min<size_t>(win, 8192);
-        insns = dis.disassemble(p, win, f.address, 512);
+        return p;
     };
 
     // ---- Pass 1: detect thunks so calls *to* a thunk resolve to its API. ----
@@ -1181,12 +1190,19 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         uint64_t target = 0;
     };
     std::unordered_map<uint64_t, ThunkInfo> thunks;
-    std::vector<std::vector<Instruction>> bodies(funcs.size());
     for (size_t i = 0; i < funcs.size(); ++i) {
-        decodeBody(funcs[i], bodies[i]);
-        const auto& insns = bodies[i];
+        if (stopped()) return {};
+        size_t win = 0;
+        const uint8_t* p = bodyBytes(funcs[i], win);
+        if (!p) continue;
         ThunkInfo t;
-        for (const auto& in : insns) {
+        size_t offset = 0;
+        for (size_t count = 0; offset < win && count < 512; ++count) {
+            if ((count & 0x3Fu) == 0 && stopped()) return {};
+            Instruction in;
+            if (!dis.decodeOne(p + offset, win - offset, funcs[i].address + offset, in) ||
+                !in.length || in.length > win - offset) break;
+            offset += in.length;
             if (in.mnemonic == "endbr64" || in.mnemonic == "endbr32" || in.mnemonic == "nop")
                 continue;                                        // skip CET/padding prologue
             if (in.mnemonic == "jmp") {                          // unconditional -> tail call
@@ -1206,11 +1222,13 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     // API. This iterative walk keeps hostile chains off the call stack.
     std::vector<ThunkInfo*> chain;
     for (auto& [address, root] : thunks) {
+        if (stopped()) return {};
         (void)address;
         if (root.resolved) continue;
         chain.clear();
         ThunkInfo* current = &root;
         while (current && !current->resolved) {
+            if ((chain.size() & 0xFFu) == 0 && stopped()) return {};
             current->resolved = true;
             chain.push_back(current);
             if (!current->api.empty()) break;
@@ -1218,7 +1236,10 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
             current = next == thunks.end() ? nullptr : &next->second;
         }
         if (current && !current->api.empty()) {
-            for (ThunkInfo* member : chain) member->api = current->api;
+            for (size_t i = 0; i < chain.size(); ++i) {
+                if ((i & 0xFFu) == 0 && stopped()) return {};
+                chain[i]->api = current->api;
+            }
         }
     }
 
@@ -1228,6 +1249,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     std::vector<GuessedName> synthesized(funcs.size());
 
     for (size_t i = 0; i < funcs.size(); ++i) {
+        if (stopped()) return {};
         const NamerInput& f = funcs[i];
         out[i].name = f.name;                 // default: keep existing name
         if (!isGuessable(f)) continue;
@@ -1241,7 +1263,11 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
             e.thunkApi = it->second.api;
         }
 
-        const auto& insns = bodies[i];
+        size_t win = 0;
+        const uint8_t* p = bodyBytes(f, win);
+        const auto insns = p ? dis.disassemble(p, win, f.address, 512)
+                             : std::vector<Instruction>{};
+        if (stopped()) return {};
         int meaningful = 0;     // instrs that aren't padding/frame noise
         int retCount = 0;
         bool accKnownZero = false, allReturnsZero = true, hasControlBranch = false;
@@ -1283,6 +1309,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         };
         std::unordered_set<std::string> apiSeen, strSeen;
         for (const auto& in : insns) {
+            if ((e.instrCount & 0x3Fu) == 0 && stopped()) return {};
             ++e.instrCount;
             bool noise = isFrameNoise(in, retCount != 0);
             if (!noise) ++meaningful;
@@ -1400,8 +1427,12 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     // stable function order.  This avoids both duplicate unresolved sub_ names
     // and needless suffixes for placeholders that another guess will vacate.
     std::unordered_map<std::string, size_t> used;
-    for (const auto& f : funcs) if (!f.name.empty()) ++used[nameKey(f.name)];
+    for (const auto& f : funcs) {
+        if (stopped()) return {};
+        if (!f.name.empty()) ++used[nameKey(f.name)];
+    }
     for (size_t i = 0; i < funcs.size(); ++i) {
+        if (stopped()) return {};
         if (!synthesized[i].guessed) continue;
         const std::string oldKey = nameKey(funcs[i].name);
         if (auto it = used.find(oldKey); it != used.end()) {
@@ -1415,6 +1446,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     // where its search stopped instead of restarting at _1 for every function.
     std::unordered_map<std::string, size_t> nextSuffix;
     for (size_t i = 0; i < funcs.size(); ++i) {
+        if (stopped()) return {};
         GuessedName& g = synthesized[i];
         if (!g.guessed) continue;
         std::string base = g.name, cand = base;
@@ -1423,6 +1455,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
             size_t& suffix = nextSuffix[baseKey];
             if (!suffix) suffix = 1;
             do {
+                if ((suffix & 0xFFu) == 0 && stopped()) return {};
                 cand = base + "_" + std::to_string(suffix++);
             } while (used.count(nameKey(cand)));
         }
@@ -1435,6 +1468,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         ++guessed_;
     }
 
+    if (stopped()) return {};
     return out;
 }
 

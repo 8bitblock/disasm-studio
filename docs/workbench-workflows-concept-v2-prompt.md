@@ -1,0 +1,26 @@
+# Release design visual refinement
+
+Generated with the built-in imagegen tool, editing `workbench-workflows-concept.png`. The image is a visual proposal; the interactive prototype defines exact labels and behavior.
+
+Use case: ui-mockup, precise edit of a desktop software design.
+Edit target: the supplied DisasmStudio workbench concept image. Refine this into a polished final visual proposal for a professional Windows reverse-engineering workbench. Preserve the graphite dark visual language and single-window information density. This is a synthetic crackme fixture, not real analysis. Produce a crisp wide 1920x1200-style desktop UI with careful typography, convincing readable monospace assembly, clean alignment, subtle borders, and ample code width. No perspective, no device frame, no marketing hero, no big decoration.
+
+Apply all ten annotated requirements together:
+1. Keep visible multi-lane right-angle jump arrows in a dedicated flow gutter LEFT of addresses. Draw real arrowheads at destinations and an offscreen continuation. Paths remain visible above row glow.
+2. Selected row has a restrained BLUE luminous halo with a crisp blue outline and bright left stripe, readable text. Current instruction has a separate GREEN execution arrow/state, and the selected destination is violet. Do not confuse selection with execution.
+3. Full top feature tab row, all exact labels: "Projects", "Communications", "Sig Scanner", "Binary View", "Memory Tools", "Binary Diff", "Binary Tech", "Cortex", "Prism". Keep the separate compact "Analyze", "Debug", "Memory", "Compare" preset row.
+4. Right "Evidence Inspector" pane has an obvious header collapse chevron, modest visible resize separator, and a pin icon. Collapsing is a supported design action; leave its expanded content visible in this main image.
+5. Left Navigator stacks Functions and Strings as visible searchable sections. "Strings" must visibly show actual fixture strings at all times, e.g. "Enter activation code", "Invalid format", "Feature enabled". Below/above these add a restrained "+ Add section" menu for Bookmarks, Sections, Symbols, Imports, Resources and Types; optional sections are closed until manually opened. Do not make Strings a hidden alternate tab.
+6. Bottom "Analysis Queue" is independently collapsible with a header chevron and compact running/queued counts. The lower central Types/References/Registers/Trace drawer also has its own collapse chevron and a "More tools" control. Keep useful code space. Queue may be shallow: two believable sample entries with words such as Running, Queued and Cached, no fake confidence meters.
+7. Assembly must have rich, disciplined syntax colors: ordinary mnemonics light blue, calls cyan, conditional branches amber, unconditional jumps violet, returns coral, registers cyan, numbers amber, strings soft green, punctuation muted, comments dimmer but readable. Preserve LOCK/REP if shown. Do not leave the asm uniformly white.
+8. Show paused LIVE debugging of a JNE at current RIP, with a readable GREEN inline badge "Jump will be taken · ZF=0" and its evaluated destination. Future branches have no prediction badge. Clearly show "Paused" plus process/thread context.
+9. Breakpoints occupy a dedicated narrow gutter immediately before flow lanes/address. Include an unmistakable red FILLED dot on an armed breakpoint row and a subtle hollow marker on an inactive saved breakpoint. Do not render breakpoints as selected blue dots.
+10. Prominent live toolbar with exact labels and shortcut hints: "Continue F5", "Step Into F11", "Step Over F10", "Step Out Shift+F11", "Run to Cursor", "Trace". Include a paused state chip. These controls stay available above the listing.
+
+Below feature tools/presets retain document tab "crackme.exe", breadcrumb "crackme.exe / LIVE / crackme.exe / validate_input / 0x1400012A3", and view rail with exact labels "Overview", "Assembly", "Pseudocode", "Hex", "Graph", "Call Graph", "Live Assembly". LIVE clearly selected. Add explicit small "Pin view" control.
+
+Evidence Inspector is sober and compact: "Activation trail", followed by Input observed / Observed, Format check / Candidate, Server acceptance / Unknown, Signature verification / Unknown, Feature gate / Candidate. NO percentages, NO fabricated confidence scores, NO claim server acceptance or signature validation occurred. Evidence details name a return-value branch, selected address and width. Include a small registers summary with EAX and ZF=0 so the JNE prediction has visible basis.
+
+Assembly fixture must look structurally credible with aligned Address / Bytes / Instruction / Comment columns. Use the familiar validate_input region of the reference with selected JNE row, but prioritize correct hierarchy, syntax colors, jump paths, visible breakpoint gutter, and the green current-flags badge over showing excessive rows. A compact useful Types panel can show LicenseState and uint32_t fields. Analysis Queue sits below main panes and above a quiet status bar.
+
+Overall: customer-ready visual refinement, disciplined native desktop chrome, strong text contrast, precise 1px separators, restrained blue/green glow, no teal dashboard cards, no unsupported confidence percentages. All feature tabs and debugging actions must remain clearly visible.

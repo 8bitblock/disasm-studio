@@ -10,6 +10,10 @@
 
 namespace ds {
 
+constexpr int kMinUiZoomPercent = 75;
+constexpr int kMaxUiZoomPercent = 150;
+constexpr int kDefaultUiZoomPercent = 90;
+
 enum class PreferenceIdentity {
     File,
     Live,
@@ -23,6 +27,9 @@ struct PreferenceRecentQuery {
 struct PreferencesData {
     int theme = 0;
     int density = 0;
+    int uiZoomPercent = kDefaultUiZoomPercent;
+    int navigatorOptionalMask = 0;
+    bool analysisQueueCollapsed = false;
     bool symbolNetwork = false;
     std::string symbolCache;
     std::string symbolServer = "https://msdl.microsoft.com/download/symbols";

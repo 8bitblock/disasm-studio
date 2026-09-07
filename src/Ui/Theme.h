@@ -40,6 +40,12 @@ const char* ThemeName(ThemeId id);   // human label for menus
 void  SetUiScale(float scale);
 float UiScale();
 
+// User zoom is independent of Windows DPI. Changing it queues a crisp font
+// and layout rebuild in the host between frames; UiScale remains the applied
+// DPI * zoom until that rebuild, so a frame never mixes two scales.
+void SetUiZoomPercent(int percent);
+int UiZoomPercent();
+
 // UI density. Only the spacing/padding metrics are scaled by this (on top of the
 // HiDPI UiScale); rounding/borders are unaffected. Compact is the workbench
 // default so code, tables, and result lists expose more rows. SetDensity takes

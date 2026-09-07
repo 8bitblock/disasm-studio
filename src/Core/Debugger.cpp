@@ -229,8 +229,167 @@ static constexpr uint32_t kStatusWx86SingleStep = 0x4000001EUL;
 // native targets, x86 for WOW64 - independent of whichever engine the UI is showing.
 Debugger::Debugger()
     : ownDis_(std::make_unique<ZydisDisassembler>(Arch::X64)),
-      ownDis32_(std::make_unique<ZydisDisassembler>(Arch::X86)) {}
-Debugger::~Debugger() { detach(); }
+      ownDis32_(std::make_unique<ZydisDisassembler>(Arch::X86)) {
+    lifecycleThread_ = std::thread([this] { lifecycleWorkerLoop(); });
+    try {
+        netLogThread_ = std::thread([this] { networkLogWorkerLoop(); });
+    } catch (...) {
+        { std::lock_guard lock(lifecycleMtx_); lifecycleShutdown_ = true; }
+        lifecycleCv_.notify_one();
+        lifecycleThread_.join();
+        throw;
+    }
+}
+Debugger::~Debugger() {
+    {
+        std::lock_guard lock(lifecycleMtx_);
+        lifecycleShutdown_ = true;
+        lifecycleQueued_ = false;
+        lifecycleCancel_.store(true);
+    }
+    lifecycleCv_.notify_all();
+    cmdCv_.notify_all();
+    if (lifecycleThread_.joinable()) lifecycleThread_.join();
+    detach();
+    { std::lock_guard lock(netLogMtx_); netLogShutdown_ = true; }
+    netLogCv_.notify_one();
+    if (netLogThread_.joinable()) netLogThread_.join();
+}
+
+uint64_t Debugger::requestAttach(uint32_t pid) {
+    if (!pid) return 0;
+    std::lock_guard lock(lifecycleMtx_);
+    if (lifecycleShutdown_ || lifecycle_.busy) return 0;
+    lifecycle_ = {};
+    lifecycle_.requestId = ++nextLifecycleRequest_;
+    if (!lifecycle_.requestId) lifecycle_.requestId = ++nextLifecycleRequest_;
+    lifecycle_.requestedPid = pid;
+    lifecycle_.command = DbgLifecycleCommand::Attach;
+    lifecycle_.state = DbgLifecycleState::Starting;
+    lifecycle_.busy = true;
+    lifecycleExpected_ = {};
+    lifecycleCancel_.store(false);
+    lifecycleQueued_ = true;
+    lifecycleCv_.notify_one();
+    return lifecycle_.requestId;
+}
+
+uint64_t Debugger::requestDetach(DebugTargetIdentity expected) {
+    std::lock_guard lock(lifecycleMtx_);
+    if (lifecycleShutdown_ || lifecycle_.busy) return 0;
+    if (expected.valid()) {
+        std::lock_guard sessionLock(mtx_);
+        if (state_ == DbgState::Detached ||
+            !DebugTargetIdentityMatches({pid_, sessionGeneration_}, expected))
+            return 0;
+    }
+    lifecycle_ = {};
+    lifecycle_.requestId = ++nextLifecycleRequest_;
+    if (!lifecycle_.requestId) lifecycle_.requestId = ++nextLifecycleRequest_;
+    lifecycle_.command = DbgLifecycleCommand::Detach;
+    lifecycle_.state = DbgLifecycleState::Stopping;
+    lifecycle_.busy = true;
+    lifecycleExpected_ = expected;
+    lifecycleCancel_.store(false);
+    lifecycleQueued_ = true;
+    lifecycleCv_.notify_one();
+    return lifecycle_.requestId;
+}
+
+bool Debugger::cancelLifecycle(uint64_t requestId) {
+    std::lock_guard lock(lifecycleMtx_);
+    // Detach cleanup must finish restoring target-owned state; cancellation is
+    // only meaningful while starting an attachment.
+    if (!requestId || requestId != lifecycle_.requestId || !lifecycle_.busy ||
+        lifecycle_.command != DbgLifecycleCommand::Attach) return false;
+    lifecycleCancel_.store(true);
+    lifecycle_.state = DbgLifecycleState::Stopping;
+    cmdCv_.notify_all();
+    return true;
+}
+
+DbgLifecycleSnapshot Debugger::lifecycleSnapshot() {
+    std::lock_guard lock(lifecycleMtx_);
+    auto result = lifecycle_;
+    if (!result.busy) {
+        std::lock_guard sessionLock(mtx_);
+        if (state_ == DbgState::Paused) result.state = DbgLifecycleState::Paused;
+        else if (state_ == DbgState::Running) result.state = DbgLifecycleState::Attached;
+        else if (result.state != DbgLifecycleState::Failed) result.state = DbgLifecycleState::Detached;
+    }
+    return result;
+}
+
+void Debugger::lifecycleWorkerLoop() {
+    for (;;) {
+        DbgLifecycleSnapshot request;
+        DebugTargetIdentity expected;
+        {
+            std::unique_lock lock(lifecycleMtx_);
+            lifecycleCv_.wait(lock, [this] { return lifecycleShutdown_ || lifecycleQueued_; });
+            if (lifecycleShutdown_) return;
+            request = lifecycle_;
+            expected = lifecycleExpected_;
+            lifecycleQueued_ = false;
+        }
+        bool succeeded = false;
+        std::string error;
+        DebugTargetIdentity target;
+        std::lock_guard ownerLock(lifecycleOwnerMtx_);
+        try {
+            if (request.command == DbgLifecycleCommand::Attach) {
+                lifecycleAttaching_.store(true);
+                const bool attemptedAttach = !lifecycleCancel_.load();
+                if (attemptedAttach) succeeded = attach(request.requestedPid, error);
+                // Cancellation also covers the race after Win32 succeeded but
+                // before completion publication. Only the owner performs cleanup.
+                if (lifecycleCancel_.load()) {
+                    // A queued request cancelled before it acquires ownership
+                    // never tears down an existing unrelated attachment.
+                    if (attemptedAttach) detach();
+                    succeeded = false;
+                    error = "attachment cancelled";
+                }
+                if (succeeded) {
+                    std::lock_guard sessionLock(mtx_);
+                    target = {pid_, sessionGeneration_};
+                }
+                lifecycleAttaching_.store(false);
+            } else {
+                succeeded = expected.valid() ? detachForSession(expected) : (detach(), true);
+                if (!succeeded) error = "the debugger session changed before detach";
+            }
+        } catch (const std::exception& e) {
+            error = std::string("debugger lifecycle failed: ") + e.what();
+            lifecycleAttaching_.store(false);
+        } catch (...) {
+            error = "debugger lifecycle failed";
+            lifecycleAttaching_.store(false);
+        }
+        std::unique_lock lock(lifecycleMtx_);
+        if (succeeded && request.command == DbgLifecycleCommand::Attach &&
+            lifecycleCancel_.load()) {
+            // Commit and cancellation share this lock. Keep the operation busy
+            // while cleanup runs, but release it so UI polling never waits on IO.
+            lock.unlock();
+            detach();
+            succeeded = false;
+            target = {};
+            error = "attachment cancelled";
+            lock.lock();
+        }
+        lifecycle_.busy = false;
+        lifecycle_.completed = true;
+        lifecycle_.succeeded = succeeded;
+        lifecycle_.cancelled = lifecycleCancel_.load() &&
+            request.command == DbgLifecycleCommand::Attach;
+        lifecycle_.error = std::move(error);
+        lifecycle_.target = target;
+        lifecycle_.state = succeeded ? (request.command == DbgLifecycleCommand::Attach
+            ? DbgLifecycleState::Attached : DbgLifecycleState::Detached)
+            : lifecycle_.cancelled ? DbgLifecycleState::Detached : DbgLifecycleState::Failed;
+    }
+}
 
 // ---- UI-thread API ----------------------------------------------------------
 
@@ -298,6 +457,7 @@ uint64_t Debugger::beginSessionControl() {
     quit_ = false;
     startupOk_ = false;
     startupDone_ = false;
+    initialProcessEventReady_ = false;
     breakRequested_ = false;
     traceSyncBreakRequested_ = false;
     return controlEpoch_;
@@ -305,23 +465,36 @@ uint64_t Debugger::beginSessionControl() {
 
 bool Debugger::waitForStartup(std::string& err) {
     bool timedOut = false;
+    bool cancelled = false;
     {
         std::unique_lock<std::mutex> lk(mtx_);
         if (!cmdCv_.wait_for(lk, kDebuggerStartupTimeout,
-                             [this] { return startupDone_.load(); })) {
+                             [this] { return (startupDone_.load() &&
+                                 (!startupOk_.load() || !lifecycleAttaching_.load() ||
+                                  initialProcessEventReady_ || state_ == DbgState::Terminated)) ||
+                                 (lifecycleAttaching_.load() && lifecycleCancel_.load()); })) {
             timedOut = true;
             startupErr_ = "debugger startup timed out after 30 seconds";
+        }
+        cancelled = lifecycleAttaching_.load() && lifecycleCancel_.load();
+        if (!timedOut && !cancelled && lifecycleAttaching_.load() &&
+            startupOk_.load() && !initialProcessEventReady_) {
+            startupOk_ = false;
+            startupErr_ = "the target ended before debugger initialization completed";
+        }
+        if (timedOut || cancelled) {
+            if (cancelled) startupErr_ = "attachment cancelled";
             startupOk_ = false;
             startupDone_ = true;
             quit_ = true;
             pendingCommand_ = { Cmd::Detach, 0, controlEpoch_ };
         }
         err = startupErr_;
-        if (!timedOut && startupOk_) return true;
+        if (!timedOut && !cancelled && startupOk_) return true;
     }
 
     cmdCv_.notify_all();
-    if (timedOut && thread_.joinable()) {
+    if ((timedOut || cancelled) && thread_.joinable()) {
         // All startup operations are synchronous Win32 calls. Ask Windows to
         // cancel any cancellable call and wake a target that was attached just
         // before the timeout so the worker can reach its cleanup boundary.
@@ -333,6 +506,15 @@ bool Debugger::waitForStartup(std::string& err) {
 }
 
 bool Debugger::attach(uint32_t pid, std::string& err) {
+    std::unique_lock ownerLock(lifecycleOwnerMtx_, std::try_to_lock);
+    if (!ownerLock.owns_lock()) { err = "debugger lifecycle is busy"; return false; }
+    {
+        std::lock_guard lock(lifecycleMtx_);
+        if (lifecycle_.busy && std::this_thread::get_id() != lifecycleThread_.get_id()) {
+            err = "debugger lifecycle is busy";
+            return false;
+        }
+    }
     detach();
     const uint64_t controlEpoch = beginSessionControl();
     try {
@@ -353,6 +535,12 @@ bool Debugger::launchAndAttach(const std::string& exePath, std::string& err,
                                const AuthorizationWatchPlan* authorizationPlan,
                                AuthorizationWatchOptions authorizationOptions,
                                bool prelaunchNetworkObservation) {
+    std::unique_lock ownerLock(lifecycleOwnerMtx_, std::try_to_lock);
+    if (!ownerLock.owns_lock()) { err = "debugger lifecycle is busy"; return false; }
+    {
+        std::lock_guard lock(lifecycleMtx_);
+        if (lifecycle_.busy) { err = "debugger lifecycle is busy"; return false; }
+    }
     // UTF-8 path -> UTF-16 for CreateProcessW.
     std::wstring wpath;
     if (!exePath.empty()) {
@@ -420,6 +608,12 @@ bool Debugger::launchAndAttach(const std::string& exePath, std::string& err,
 }
 
 bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& err) {
+    std::unique_lock ownerLock(lifecycleOwnerMtx_, std::try_to_lock);
+    if (!ownerLock.owns_lock()) { err = "debugger lifecycle is busy"; return false; }
+    {
+        std::lock_guard lock(lifecycleMtx_);
+        if (lifecycle_.busy) { err = "debugger lifecycle is busy"; return false; }
+    }
     detach();
     if (!plan.valid) {
         err = plan.errors.empty() ? "invalid DLL debug launch plan" : plan.errors.front();
@@ -447,6 +641,7 @@ bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& e
 }
 
 void Debugger::detach() {
+    std::lock_guard ownerLock(lifecycleOwnerMtx_);
     // Observation is session-scoped. Never carry an old opt-in into a later
     // attach, even when detach is called while no worker is running.
     networkObservationWant_.store(false);
@@ -539,6 +734,8 @@ void Debugger::detach() {
 }
 
 bool Debugger::detachForSession(DebugTargetIdentity expected) {
+    std::unique_lock ownerLock(lifecycleOwnerMtx_, std::try_to_lock);
+    if (!ownerLock.owns_lock()) return false;
     if (!expected.valid()) return false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -763,6 +960,12 @@ void Debugger::requestTraceSyncBreak(DebugTargetIdentity expected) {
                 { pid_, sessionGeneration_ }, expected))
             return;
         state = state_;
+    }
+    if (state == DbgState::Paused) {
+        // Queued breakpoint edits can be applied under the held debug event;
+        // they must not require an execution command to wake its owner.
+        cmdCv_.notify_all();
+        return;
     }
     if (state != DbgState::Running) return;
     std::lock_guard<std::mutex> lk(hProcMtx_);
@@ -1028,7 +1231,9 @@ bool Debugger::setRegister(const std::string& name, uint64_t value) {
 
 bool Debugger::setRegisterForSession(uint32_t expectedPid,
                                      uint64_t expectedSessionGeneration,
-                                     const std::string& name, uint64_t value) {
+                                     const std::string& name, uint64_t value,
+                                     uint32_t expectedTid,
+                                     const uint64_t* expectedRip) {
     uint64_t Registers::* f = registerFieldByName(name);
     if (!f) return false;
     const DebugTargetIdentity expected{ expectedPid, expectedSessionGeneration };
@@ -1036,6 +1241,7 @@ bool Debugger::setRegisterForSession(uint32_t expectedPid,
     const DebugTargetIdentity current{ pid_, sessionGeneration_ };
     if (!DebugTargetIdentityMatches(current, expected) || state_ != DbgState::Paused || gmlSnapshot_.stop)
         return false;
+    if (expectedTid && activeTid_ != expectedTid) return false;
     const bool wow64 = isWow64_.load();
     if (!RegisterValueFitsTarget(value, wow64) ||
         (wow64 && (name == "r8" || name == "r9" || name == "r10" ||
@@ -1047,7 +1253,10 @@ bool Debugger::setRegisterForSession(uint32_t expectedPid,
     for (auto& thread : threadHandles_)
         if (thread.first == activeTid_) { h = thread.second; break; }
     if (!h) return false;
-    Registers r = regs_;
+    Registers r;
+    if (!ctxReadFull(h, r)) return false;
+    regs_ = r;
+    if (expectedRip && r.rip != *expectedRip) return false;
     r.*f = value;
     if (!ctxWriteFull(h, r)) return false;
     // Publish what the target actually received.  In particular, a WOW64
@@ -1215,7 +1424,7 @@ bool Debugger::setRegisterToBufferForSession(
     uint32_t expectedPid, uint64_t expectedSessionGeneration,
     uint32_t expectedTid, const std::string& name,
     const std::vector<uint8_t>& bytes, uint64_t& remoteAddress,
-    std::string* error) {
+    std::string* error, const uint64_t* expectedRip) {
     remoteAddress = 0;
     if (error) error->clear();
     auto fail = [&](std::string message) {
@@ -1265,6 +1474,13 @@ bool Debugger::setRegisterToBufferForSession(
             break;
         }
     if (!thread) return fail("active thread handle is no longer available");
+
+    Registers before;
+    if (!ctxReadFull(thread, before))
+        return fail("could not read the paused thread context");
+    regs_ = before;
+    if (expectedRip && before.rip != *expectedRip)
+        return fail("the paused instruction pointer changed before the write");
 
     // Lock order matches allocRemote/freeRemote: mtx_ -> hProcMtx_. A fresh
     // PAGE_READWRITE region cannot overlap debugger breakpoints, so it is safe
@@ -1658,59 +1874,58 @@ void Debugger::clearNetworkObservation() {
 
 bool Debugger::setNetCaptureLogFile(const std::string& utf8Path, bool append, std::string* err) {
     if (err) err->clear();
-    if (utf8Path.empty()) {
-        if (err) *err = "empty log path";
+    if (utf8Path.empty() || utf8Path.size() > 32768 || utf8Path.find('\0') != std::string::npos) {
+        if (err) *err = "invalid log path";
         return false;
     }
-
-    std::wstring wpath = widenUtf8(utf8Path);
-    if (wpath.empty()) {
-        if (err) *err = "could not convert log path";
+    std::lock_guard lock(netLogMtx_);
+    // Reserve an extra control slot for Close, which must always be accepted.
+    if (netLogShutdown_ || netLogQueuedControls_ >= kNetLogQueueControls) {
+        if (err) *err = "log writer is busy; wait for queued file changes to finish";
         return false;
     }
-
-    std::FILE* f = nullptr;
-    if (_wfopen_s(&f, wpath.c_str(), append ? L"ab" : L"wb") != 0 || !f) {
-        if (err) *err = "could not open log file";
-        return false;
-    }
-
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    std::fprintf(f,
-                 "# DisasmStudio typed network observation log\n"
-                 "# started %04u-%02u-%02u %02u:%02u:%02u.%03u local\n"
-                 "# records retain typed lifecycle, endpoint, request, evidence, and bounded payload fields\n\n",
-                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    std::fflush(f);
-
-    std::lock_guard<std::mutex> lk(netLogMtx_);
-    if (netLogFile_) std::fclose(netLogFile_);
-    netLogFile_ = f;
+    NetLogWork work;
+    work.kind = NetLogWork::Kind::Open;
+    work.path = utf8Path;
+    work.append = append;
+    work.generation = ++netLogGeneration_;
+    netLogQueue_.push_back(std::move(work));
+    ++netLogQueuedControls_;
     netLogPath_ = utf8Path;
+    netLogStatus_.enabled = true;
+    netLogStatus_.opening = true;
+    netLogStatus_.draining = false;
+    netLogStatus_.error.clear();
+    netLogCv_.notify_one();
     return true;
 }
 
 void Debugger::closeNetCaptureLogFile() {
-    std::lock_guard<std::mutex> lk(netLogMtx_);
-    if (netLogFile_) {
-        SYSTEMTIME st{};
-        GetLocalTime(&st);
-        std::fprintf(netLogFile_, "\n# stopped %04u-%02u-%02u %02u:%02u:%02u.%03u local\n",
-                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        std::fclose(netLogFile_);
-        netLogFile_ = nullptr;
-    }
-    netLogPath_.clear();
+    std::lock_guard lock(netLogMtx_);
+    if (!netLogStatus_.enabled && !netLogStatus_.opening) return;
+    NetLogWork work;
+    work.kind = NetLogWork::Kind::Close;
+    work.generation = ++netLogGeneration_;
+    netLogQueue_.push_back(std::move(work));
+    ++netLogQueuedControls_;
+    netLogStatus_.enabled = false;
+    netLogStatus_.opening = false;
+    netLogStatus_.draining = true;
+    netLogCv_.notify_one();
+}
+
+NetCaptureLogStatus Debugger::netCaptureLogStatus() {
+    std::lock_guard lock(netLogMtx_);
+    return netLogStatus_;
 }
 
 bool Debugger::netCaptureLogEnabled() {
-    std::lock_guard<std::mutex> lk(netLogMtx_);
-    return netLogFile_ != nullptr;
+    std::lock_guard lock(netLogMtx_);
+    return netLogStatus_.enabled;
 }
 
 std::string Debugger::netCaptureLogPath() {
-    std::lock_guard<std::mutex> lk(netLogMtx_);
+    std::lock_guard lock(netLogMtx_);
     return netLogPath_;
 }
 
@@ -1793,15 +2008,15 @@ void Debugger::pushNetworkEvent(NetworkObservationEvent&& event) {
     networkCoverage_.retainedPayloadBytes += event.payload.size();
     networkEvents_.push_back(std::move(event));
 }
-void Debugger::writeNetworkObservationLog(const NetworkObservationEvent& event) {
-    std::lock_guard<std::mutex> lk(netLogMtx_);
-    if (!netLogFile_) return;
-
+static void writeNetworkLogRecord(std::FILE* file, const NetworkObservationEvent& event,
+                                  uint64_t timestamp) {
+    FILETIME utc{static_cast<DWORD>(timestamp), static_cast<DWORD>(timestamp >> 32)}, local{};
     SYSTEMTIME st{};
-    GetLocalTime(&st);
+    FileTimeToLocalFileTime(&utc, &local);
+    FileTimeToSystemTime(&local, &st);
     const std::string port = event.portValid ? std::to_string(event.port) : "-";
-    const uint32_t eventPid = event.pid ? event.pid : pid_;
-    std::fprintf(netLogFile_,
+    const uint32_t eventPid = event.pid;
+    std::fprintf(file,
                  "=== %04u-%02u-%02u %02u:%02u:%02u.%03u stage=%s direction=%s api=%s pid=%u tid=%u handle=0x%llX host=%s ip=%s port=%s method=%s path=%s object=%s endpoint=%s detail=%s result=%lld raw_result=0x%llX result_valid=%u pointer_bits=%u requested=%llu requested_valid=%u transferred=%u transferred_valid=%u captured=%zu%s%s%s ===\n",
                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
                  networkStageName(event.stage), networkDirectionName(event.direction),
@@ -1818,13 +2033,123 @@ void Debugger::writeNetworkObservationLog(const NetworkObservationEvent& event) 
                  event.asyncPartial ? " async-partial" : "",
                  event.payloadOpaque ? " opaque" : "");
     if (!event.payload.empty()) {
-        std::fputs("TEXT:\n", netLogFile_);
-        writePrintablePayload(netLogFile_, event.payload);
-        std::fputs("HEX:\n", netLogFile_);
-        writeHexPayload(netLogFile_, event.payload);
+        std::fputs("TEXT:\n", file);
+        writePrintablePayload(file, event.payload);
+        std::fputs("HEX:\n", file);
+        writeHexPayload(file, event.payload);
     }
-    std::fputc('\n', netLogFile_);
-    std::fflush(netLogFile_);
+    std::fputc('\n', file);
+}
+
+void Debugger::writeNetworkObservationLog(const NetworkObservationEvent& event) {
+    std::lock_guard lock(netLogMtx_);
+    if (!netLogStatus_.enabled || netLogShutdown_) return;
+    if (event.payload.size() > kNetLogQueueBytes - sizeof(NetworkObservationEvent)) {
+        ++netLogStatus_.droppedRecords;
+        return;
+    }
+    size_t bytes = sizeof(NetworkObservationEvent) + event.payload.size();
+    for (const auto* text : {&event.hostname, &event.ip, &event.endpoint, &event.method,
+            &event.path, &event.object, &event.detail, &event.runtimeModule, &event.mappingEvidence}) {
+        if (text->size() > kNetLogQueueBytes || bytes > kNetLogQueueBytes - text->size()) {
+            ++netLogStatus_.droppedRecords;
+            return;
+        }
+        bytes += text->size();
+    }
+    if (netLogStatus_.queuedRecords >= kNetLogQueueRecords ||
+        bytes > kNetLogQueueBytes - netLogStatus_.queuedBytes) {
+        ++netLogStatus_.droppedRecords;
+        return;
+    }
+    NetLogWork work;
+    work.event = event;
+    work.event.pid = event.pid ? event.pid : pid_; // called only by the debug-event owner
+    work.bytes = bytes;
+    work.generation = netLogGeneration_;
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    work.timestamp = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    netLogQueue_.push_back(std::move(work));
+    ++netLogStatus_.queuedRecords;
+    netLogStatus_.queuedBytes += bytes;
+    netLogCv_.notify_one();
+}
+
+void Debugger::networkLogWorkerLoop() {
+    std::FILE* file = nullptr; // accessed/closed exclusively by this worker
+    uint64_t openGeneration = 0;
+    auto closeFile = [&] {
+        if (!file) return;
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        std::fprintf(file, "\n# stopped %04u-%02u-%02u %02u:%02u:%02u.%03u local\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        const bool failed = std::ferror(file) != 0;
+        const int closed = std::fclose(file);
+        file = nullptr;
+        if (failed || closed != 0) {
+            std::lock_guard lock(netLogMtx_);
+            netLogStatus_.error = "network log could not be completely written to storage";
+        }
+    };
+    for (;;) {
+        NetLogWork work;
+        {
+            std::unique_lock lock(netLogMtx_);
+            netLogCv_.wait(lock, [this] { return netLogShutdown_ || !netLogQueue_.empty(); });
+            if (netLogQueue_.empty() && netLogShutdown_) break;
+            work = std::move(netLogQueue_.front());
+            netLogQueue_.pop_front();
+            if (work.kind == NetLogWork::Kind::Record) {
+                --netLogStatus_.queuedRecords;
+                netLogStatus_.queuedBytes -= work.bytes;
+            } else --netLogQueuedControls_;
+        }
+        if (work.kind == NetLogWork::Kind::Close) {
+            closeFile();
+            std::lock_guard lock(netLogMtx_);
+            if (work.generation == netLogGeneration_) netLogStatus_.draining = false;
+        } else if (work.kind == NetLogWork::Kind::Open) {
+            closeFile();
+            const auto path = widenUtf8(work.path);
+            const bool opened = !path.empty() &&
+                _wfopen_s(&file, path.c_str(), work.append ? L"ab" : L"wb") == 0 && file;
+            if (opened) {
+                openGeneration = work.generation;
+                SYSTEMTIME st{};
+                GetLocalTime(&st);
+                std::fprintf(file,
+                    "# DisasmStudio typed network observation log\n"
+                    "# started %04u-%02u-%02u %02u:%02u:%02u.%03u local\n"
+                    "# bounded asynchronous writer; queue drops are reported in Server Watch\n\n",
+                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            }
+            std::lock_guard lock(netLogMtx_);
+            if (work.generation == netLogGeneration_) {
+                netLogStatus_.opening = false;
+                netLogStatus_.enabled = opened;
+                if (!opened) netLogStatus_.error = "could not open network log file: " + work.path;
+            }
+        } else if (file && work.generation == openGeneration) {
+            writeNetworkLogRecord(file, work.event, work.timestamp);
+            // Flushing is exclusively writer-owned. Even a stalled filesystem
+            // cannot hold a debug-event/UI mutex or grow the bounded queue.
+            if (std::fflush(file) != 0 || std::ferror(file)) {
+                closeFile();
+                std::lock_guard lock(netLogMtx_);
+                if (work.generation == netLogGeneration_) {
+                    netLogStatus_.enabled = false;
+                    netLogStatus_.error = "network log write failed; logging stopped";
+                }
+                ++netLogStatus_.droppedRecords;
+            }
+        } else {
+            std::lock_guard lock(netLogMtx_);
+            ++netLogStatus_.droppedRecords;
+        }
+    }
+    closeFile();
 }
 
 // Resolve exports from the debuggee's exact mapped modules. Probe metadata lives
@@ -3497,6 +3822,18 @@ bool Debugger::hasHardwareBreakpoint(uint64_t va) {
 }
 
 bool Debugger::setAntiDebugPolicy(const AntiDebugPolicy& policy, std::string* error) {
+    std::unique_lock ownerLock(lifecycleOwnerMtx_, std::try_to_lock);
+    if (!ownerLock.owns_lock()) {
+        if (error) *error = "Hide Debugger policy cannot change during debugger lifecycle work";
+        return false;
+    }
+    {
+        std::lock_guard lock(lifecycleMtx_);
+        if (lifecycle_.busy) {
+            if (error) *error = "Hide Debugger policy cannot change during debugger lifecycle work";
+            return false;
+        }
+    }
     std::lock_guard<std::mutex> lk(mtx_);
     if (state_ != DbgState::Detached || thread_.joinable()) {
         if (error) *error = "Hide Debugger policy can only be changed while detached";
@@ -4393,9 +4730,15 @@ DbgSnapshot Debugger::snapshot() {
 
 Debugger::CommandEnvelope Debugger::waitForCommand(uint64_t controlEpoch) {
     std::unique_lock<std::mutex> lk(mtx_);
-    const auto ready = [this, controlEpoch] {
+    const auto hasBreakpointEdits = [this, controlEpoch] {
+        return controlEpoch_ == controlEpoch &&
+            (!pendingBpAdds_.empty() || !pendingBpRems_.empty() ||
+             !pendingBpConds_.empty() || !pendingBpEveryN_.empty());
+    };
+    const auto ready = [this, controlEpoch, &hasBreakpointEdits] {
         return quit_ || (pendingCommand_.command != Cmd::None &&
                          pendingCommand_.epoch == controlEpoch) ||
+               hasBreakpointEdits() ||
                std::any_of(pendingWrites_.begin(), pendingWrites_.end(),
                            [controlEpoch](const auto& request) {
                                return request->epoch == controlEpoch;
@@ -4414,9 +4757,9 @@ Debugger::CommandEnvelope Debugger::waitForCommand(uint64_t controlEpoch) {
         const bool hasWrite = std::any_of(
             pendingWrites_.begin(), pendingWrites_.end(),
             [controlEpoch](const auto& request) { return request->epoch == controlEpoch; });
-        // Writes take priority so a Continue queued in the same frame cannot
-        // resume the held event before the transaction is serviced.
-        if (hasWrite) result = { Cmd::ServiceWrites, 0, controlEpoch };
+        // Mutations take priority so a Continue queued in the same frame cannot
+        // resume the held event before breakpoint changes/writes are serviced.
+        if (hasWrite || hasBreakpointEdits()) result = { Cmd::ServiceWrites, 0, controlEpoch };
         else {
             result = pendingCommand_;
             pendingCommand_ = {};
@@ -6234,8 +6577,9 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                           bool containedJob, uint64_t controlEpoch) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (controlEpoch != controlEpoch_) {
-            startupErr_ = "debugger session was superseded before startup";
+        if (controlEpoch != controlEpoch_ || quit_.load() ||
+            (lifecycleAttaching_.load() && lifecycleCancel_.load())) {
+            startupErr_ = "debugger session was cancelled or superseded before startup";
             startupOk_ = false;
             startupDone_ = true;
             cmdCv_.notify_all();
@@ -8113,6 +8457,11 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     mainImageLoadGeneration = main.loadGeneration;
                     std::lock_guard<std::mutex> lk(mtx_);
                     if (dbgModules_.size() < kMaxDbgModules) dbgModules_.push_back(std::move(main));
+                    // Async Attach completes only when the bitness and main
+                    // mapping are ready; otherwise a WOW64 target could open a
+                    // transient x64 live view before this first event arrived.
+                    initialProcessEventReady_ = true;
+                    cmdCv_.notify_all();
                 }
                 if (ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
                 break;
@@ -9488,7 +9837,9 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             // Close the paused->running enqueue race atomically. A request that
             // wins mtx_ first is drained under this event; one that loses sees
             // Running and asks DebugBreakProcess for a fresh event.
+            bool serviceBreakpointEdits = false;
             for (;;) {
+                if (serviceBreakpointEdits) applyPendingBps();
                 servicePendingWrites(controlEpoch);
                 std::lock_guard<std::mutex> lk(mtx_);
                 const bool pendingForThisEpoch = std::any_of(
@@ -9496,7 +9847,10 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     [controlEpoch](const auto& request) {
                         return request->epoch == controlEpoch;
                     });
-                if (!pendingForThisEpoch) {
+                serviceBreakpointEdits = !pendingBpAdds_.empty() ||
+                    !pendingBpRems_.empty() || !pendingBpConds_.empty() ||
+                    !pendingBpEveryN_.empty();
+                if (!pendingForThisEpoch && !serviceBreakpointEdits) {
                     state_ = DbgState::Running;
                     break;
                 }

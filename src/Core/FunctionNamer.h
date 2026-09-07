@@ -100,6 +100,9 @@ std::string ToSnakeIdentifier(const std::string& api);
 class FunctionNamer {
 public:
     // Guess names for every input function (result is parallel to `funcs`).
+    // Decoded bodies are streamed one function at a time. Optional cancellation
+    // is polled between bounded decode/evidence windows; cancellation returns
+    // no partial names and resets guessedCount() to zero.
     //   entryVA       - image entry point VA (function there is named "start").
     //   importNameFor - va -> imported API ("dll.func" or bare name) for an IAT
     //                   slot / import target; "" if the address isn't an import.
@@ -108,7 +111,8 @@ public:
     name(const BinaryFile& bin, IDisassembler& dis,
          const std::vector<NamerInput>& funcs, uint64_t entryVA,
          const std::function<std::string(uint64_t)>& importNameFor,
-         const std::function<std::string(uint64_t)>& stringRefFor);
+         const std::function<std::string(uint64_t)>& stringRefFor,
+         const std::function<bool()>& cancelled = {});
 
     // Explicit-validity form for analysis roots whose address may legitimately
     // be zero. `rawAnalysisStart` changes only the evidence wording: the result
@@ -118,7 +122,8 @@ public:
          const std::vector<NamerInput>& funcs, uint64_t startVA,
          bool startValid, bool rawAnalysisStart,
          const std::function<std::string(uint64_t)>& importNameFor,
-         const std::function<std::string(uint64_t)>& stringRefFor);
+         const std::function<std::string(uint64_t)>& stringRefFor,
+         const std::function<bool()>& cancelled = {});
 
     int guessedCount() const { return guessed_; }
 

@@ -406,7 +406,8 @@ void ScanStringsBuffer(const uint8_t* d, size_t n, uint64_t base,
 
 static void ApplyGuessedNames(AnalyzeOut& out, const BinaryFile& bin,
                               IDisassembler& dis,
-                              const std::vector<StrResult>& strings) {
+                              const std::vector<StrResult>& strings,
+                              const std::function<bool()>& cancelled = {}) {
     // Imports: an IAT-slot / import-target VA -> "dll.func". Restricted to the import
     // map so the guesser never recurses into the sub_ names we're replacing.
     std::unordered_map<uint64_t, std::string> importMap;
@@ -435,7 +436,7 @@ static void ApplyGuessedNames(AnalyzeOut& out, const BinaryFile& bin,
     FunctionNamer namer;
     std::vector<GuessedName> guesses = namer.name(
         bin, dis, in, startVA, rawStart || headerEntry, rawStart,
-        importNameFor, stringRefFor);
+        importNameFor, stringRefFor, cancelled);
 
     int guessed = 0;
     for (size_t i = 0; i < out.functions.size() && i < guesses.size(); ++i) {
@@ -651,7 +652,7 @@ AnalyzeOut AnalyzeFunctionsNamed(const BinaryFile& bin, IDisassembler& dis,
         out.summary += CodeDataSummary(out.codeData);
     }
     if (guessNames && !out.functions.empty() && !(cancelled && cancelled()))
-        ApplyGuessedNames(out, bin, dis, strings);
+        ApplyGuessedNames(out, bin, dis, strings, cancelled);
     return out;
 }
 

@@ -1831,7 +1831,7 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
     if (ImGui::SmallButton(logging ? "Stop file log##caps" : "Start file log...##caps")) {
         if (logging) {
             ctx.debug.closeNetCaptureLogFile();
-            capLogStatus_ = "Network payload log stopped.";
+            capLogStatus_ = "Finishing queued network log records...";
             ui::Toast(ui::ToastKind::Info, capLogStatus_);
         } else {
             std::string path;
@@ -1872,8 +1872,8 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
                             ui::Toast(ui::ToastKind::Warn, capLogStatus_);
                         } else {
                             on = true;
-                            capLogStatus_ = "Logging network payloads to " + path;
-                            ui::Toast(ui::ToastKind::Success, "Network payload logging started");
+                            capLogStatus_ = "Opening network payload log: " + path;
+                            ui::Toast(ui::ToastKind::Info, "Network payload log requested");
                         }
                     } else {
                         capLogStatus_ = "Log start failed: " + err;
@@ -1885,19 +1885,36 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Write every captured send/recv buffer to a text log with printable text and exact hex bytes.");
+        ImGui::SetTooltip("Queue captured buffers for a background text/hex writer. Queue drops and storage errors are shown below.");
+    const auto logStatus = ctx.debug.netCaptureLogStatus();
+    if (!logStatus.enabled && !logStatus.draining &&
+        capLogStatus_ == "Finishing queued network log records...")
+        capLogStatus_ = "Network payload log stopped.";
     if (ctx.debug.netCaptureLogEnabled()) {
         std::string path = ctx.debug.netCaptureLogPath();
-        ImGui::TextColored(theme::col::good(), "Logging to file");
+        ImGui::TextColored(logStatus.opening ? theme::col::warn() : theme::col::good(), "%s",
+            logStatus.opening ? "Opening log file..." : "Logging to file");
         if (!path.empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("%s", path.c_str());
             ImGui::SameLine();
             if (ImGui::SmallButton("Copy path##caplog")) ImGui::SetClipboardText(path.c_str());
         }
-    } else if (!capLogStatus_.empty()) {
+    } else if (logStatus.draining) {
+        ImGui::TextDisabled("Finishing queued records and closing log file...");
+    } else if (!capLogStatus_.empty() && logStatus.error.empty()) {
         ImGui::TextDisabled("%s", capLogStatus_.c_str());
     }
+    if (!logStatus.error.empty()) {
+        ImGui::TextColored(theme::col::bad(), "%s", logStatus.error.c_str());
+    }
+    if (logStatus.queuedRecords || logStatus.droppedRecords) {
+        ImGui::TextDisabled("Writer queue: %zu records (%zu KiB); %llu dropped",
+            logStatus.queuedRecords, logStatus.queuedBytes / 1024,
+            static_cast<unsigned long long>(logStatus.droppedRecords));
+    }
+    if (logStatus.opening || logStatus.draining || logStatus.queuedRecords)
+        ctx.wantContinuousRedraw = true;
     if (!on) {
         ImGui::TextDisabled(
             "Server Watch follows exact Winsock, WinHTTP, and WinINet calls, including handle lineage and WOW64 targets where probes are available.");

@@ -152,6 +152,56 @@ static bool buildX86NetworkFixture(std::string& executable, std::string& object,
     return true;
 }
 
+// Breakpoint UI edits must complete while the same debug event remains held.
+// No Continue, step, or unrelated memory write may be needed to wake the owner.
+static void checkPausedBreakpointMutation(Debugger& debugger, const DbgSnapshot& before) {
+    const DebugTargetIdentity target{before.pid, before.sessionGeneration};
+    const uint64_t address = before.regs.rip;
+    uint8_t original = 0;
+    CHECK(debugger.readMemory(address, &original, 1) == 1);
+    CHECK(original != 0xCC);
+    bool pauseStayedOwned = true;
+    auto waitForMutation = [&](bool wantArmed) {
+        const ULONGLONG deadline = GetTickCount64() + 4000;
+        do {
+            const DbgSnapshot current = debugger.snapshot();
+            pauseStayedOwned &= current.state == DbgState::Paused &&
+                current.pid == before.pid &&
+                current.sessionGeneration == before.sessionGeneration &&
+                current.activeTid == before.activeTid && current.tid == before.tid &&
+                current.regs.rip == before.regs.rip && current.is32 == before.is32;
+            bool present = false, armed = false;
+            for (const auto& bp : current.breakpoints) {
+                if (bp.address != address) continue;
+                present = true;
+                armed = bp.armed && bp.error.empty();
+                break;
+            }
+            uint8_t raw = 0, masked = 0;
+            const bool bytesRead = debugger.readMemory(address, &raw, 1) == 1 &&
+                debugger.readMemoryMaskedForSession(
+                    target.pid, target.sessionGeneration, address, &masked, 1) == 1;
+            if (bytesRead && masked == original &&
+                (wantArmed ? present && armed && raw == 0xCC
+                           : !present && raw == original))
+                return true;
+            Sleep(5);
+        } while (GetTickCount64() < deadline);
+        return false;
+    };
+    CHECK(debugger.addBreakpointForSession(target, address));
+    CHECK(waitForMutation(true));
+    CHECK(pauseStayedOwned);
+    CHECK(debugger.removeBreakpointForSession(target, address));
+    CHECK(waitForMutation(false));
+    CHECK(pauseStayedOwned);
+    const DbgSnapshot after = debugger.snapshot();
+    CHECK(after.state == DbgState::Paused && after.pid == before.pid &&
+          after.sessionGeneration == before.sessionGeneration &&
+          after.activeTid == before.activeTid && after.tid == before.tid &&
+          after.regs.rip == before.regs.rip && after.is32 == before.is32);
+}
+
 int main(int argc, char** argv) {
     std::string target = (argc > 1) ? argv[1] : "C:\\Windows\\SysWOW64\\cmd.exe";
     if (GetFileAttributesA(target.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -242,14 +292,38 @@ int main(int argc, char** argv) {
             s.pid, s.sessionGeneration, "r8", 1));    // no x64-only GPRs in WOW64
         CHECK(d.snapshot().regs.rax == originalEax);
 
+        const uint64_t wrongEditorRip = s.regs.rip ^ UINT64_C(1);
+        CHECK(!d.setRegisterForSession(
+            s.pid, s.sessionGeneration, "rax", forcedEax,
+            s.activeTid ^ 0x80000000u, &s.regs.rip));
+        CHECK(!d.setRegisterForSession(
+            s.pid, s.sessionGeneration, "rax", forcedEax,
+            s.activeTid, &wrongEditorRip));
+        CHECK(d.snapshot().regs.rax == originalEax);
+        CHECK(d.setRegisterForSession(
+            s.pid, s.sessionGeneration, "rax", forcedEax,
+            s.activeTid, &s.regs.rip));
+        CHECK(d.snapshot().regs.rax == forcedEax);
+        CHECK(d.setRegisterForSession(
+            s.pid, s.sessionGeneration, "rax", originalEax,
+            s.activeTid, &s.regs.rip));
+
         const std::vector<uint8_t> registerText{
             't','h','i','s',' ','i','s',' ','s','o','m','e',' ','t','e','x','t',0
         };
         uint64_t textAddress = 0;
         std::string textError;
+        const size_t regionsBeforeRejectedEdit = d.regions().size();
+        CHECK(!d.setRegisterToBufferForSession(
+            s.pid, s.sessionGeneration, s.activeTid,
+            "rax", registerText, textAddress, &textError, &wrongEditorRip));
+        CHECK(textAddress == 0);
+        CHECK(!textError.empty());
+        CHECK(d.snapshot().regs.rax == originalEax);
+        CHECK(d.regions().size() == regionsBeforeRejectedEdit);
         const bool textSet = d.setRegisterToBufferForSession(
             s.pid, s.sessionGeneration, s.activeTid,
-            "rax", registerText, textAddress, &textError);
+            "rax", registerText, textAddress, &textError, &s.regs.rip);
         CHECK(textSet);
         if (textSet) {
             CHECK(textAddress != 0 && textAddress <= UINT32_MAX);
@@ -275,6 +349,7 @@ int main(int argc, char** argv) {
                 s.pid, s.sessionGeneration, "rax", s.regs.rax));
         }
 
+        checkPausedBreakpointMutation(d, s);
         uint64_t rip0 = s.regs.rip;
         d.stepInto();
         bool advanced = false;

@@ -2045,6 +2045,81 @@ size_t EstimateAnalysisResultBytes(const AnalysisResult& result) {
     return estimateAnalysisResultBytesImpl(result);
 }
 
+// Central admission keeps existing document-owned queues/lifetimes intact while
+// preventing eight documents from each consuming a full eight-worker CPU pool.
+// No scheduler lock is held while decoding or while acquiring an owner mutex.
+struct AnalysisService::SharedScheduler {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<AnalysisService*> owners;
+    unsigned running = 0;
+    std::atomic<unsigned> bestPending{3}; // interaction / active / background / idle
+
+    static unsigned priority(const AnalysisService& service) {
+        if (!service.queuedJobs_.load(std::memory_order_acquire)) return 3;
+        if (service.queuedInteractive_.load(std::memory_order_acquire)) return 0;
+        return service.activeDocument_.load(std::memory_order_acquire) ? 1u : 2u;
+    }
+    void refreshLocked() {
+        unsigned best = 3;
+        for (const AnalysisService* owner : owners)
+            best = (std::min)(best, priority(*owner));
+        bestPending.store(best, std::memory_order_release);
+    }
+    void add(AnalysisService* service) {
+        std::lock_guard<std::mutex> lock(mutex);
+        owners.push_back(service);
+        refreshLocked();
+    }
+    void remove(AnalysisService* service) {
+        std::lock_guard<std::mutex> lock(mutex);
+        owners.erase(std::remove(owners.begin(), owners.end(), service), owners.end());
+        refreshLocked();
+        changed.notify_all();
+    }
+    void notify() {
+        std::lock_guard<std::mutex> lock(mutex);
+        refreshLocked();
+        changed.notify_all();
+    }
+    bool acquire(AnalysisService& service) {
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait(lock, [&] {
+            return service.quit_.load(std::memory_order_acquire) ||
+                priority(service) == 3 ||
+                (running < AnalysisService::globalWorkerLimit() &&
+                 priority(service) <= bestPending.load(std::memory_order_acquire));
+        });
+        if (service.quit_.load(std::memory_order_acquire) || priority(service) == 3)
+            return false;
+        ++running;
+        return true;
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        --running;
+        changed.notify_all();
+    }
+};
+
+AnalysisService::SharedScheduler& AnalysisService::scheduler() {
+    static SharedScheduler shared;
+    return shared;
+}
+
+unsigned AnalysisService::globalWorkerLimit() {
+    static const unsigned limit = [] {
+        const unsigned cores = std::thread::hardware_concurrency();
+        return (std::min)(cores > 3 ? cores - 2 : 1u, kMaxWorkerCount);
+    }();
+    return limit;
+}
+
+void AnalysisService::setActiveDocument(bool active) {
+    activeDocument_.store(active, std::memory_order_release);
+    scheduler().notify();
+}
+
 AnalysisService::AnalysisService(DecoderFactory factory, unsigned workerCount)
     : factory_(std::move(factory)) {
     unsigned n = workerCount;
@@ -2056,17 +2131,20 @@ AnalysisService::AnalysisService(DecoderFactory factory, unsigned workerCount)
     }
     n = (std::max)(1u, (std::min)(n, kMaxWorkerCount));
     threads_.reserve(n);
+    scheduler().add(this);
     try {
         for (unsigned i = 0; i < n; ++i)
-            threads_.emplace_back([this] { threadMain(); });
+            threads_.emplace_back([this, i] { threadMain(i); });
     } catch (...) {
         // A partially constructed vector of joinable std::threads would invoke
         // std::terminate during unwinding. Stop and join every thread which did
         // start before propagating the resource/construction failure.
         quit_.store(true, std::memory_order_release);
         cv_.notify_all();
+        scheduler().notify();
         for (auto& thread : threads_)
             if (thread.joinable()) thread.join();
+        scheduler().remove(this);
         throw;
     }
 }
@@ -2084,7 +2162,9 @@ AnalysisService::~AnalysisService() {
         quit_.store(true);
     }
     cv_.notify_all();
+    scheduler().notify();
     for (auto& t : threads_) if (t.joinable()) t.join();
+    scheduler().remove(this);
 }
 
 void AnalysisService::requestBulk(const BinaryFile* bin, const DecoderConfig& decoder,
@@ -2210,101 +2290,128 @@ void AnalysisService::requestBulkImpl(const BinaryFile* bin, const DecoderConfig
     // still delivered incrementally and can satisfy other consumers/caches.
     if (kinds & K_CrackmeTriage)
         kinds |= K_Strings | K_Funcs | K_Xref | K_CallGraph | K_Intent;
-    const DecoderConfig effectiveDecoder = bin
-        ? DecoderConfigForImage(*bin, decoder) : decoder;
+    BulkJob job;
+    job.bin = bin;
+    job.decoder = bin ? DecoderConfigForImage(*bin, decoder) : decoder;
+    job.kinds = kinds;
+    job.guess = guessNames;
+    job.epoch = epoch;
+    job.modBase = moduleBase;
+    job.regionLo = regionLo;
+    job.regionHi = regionHi;
+    job.regionValid = regionValid;
+    job.decompNames = std::move(decompNames);
+    job.decompSignature = std::move(decompSignature);
+    job.decompContext = decompContext;
+    job.decompChunks = std::move(decompChunks);
+    job.decompOwnershipTruncated = decompOwnershipTruncated;
+    job.noreturnTargets = std::move(noreturnTargets);
+    job.analysisOverrides = std::move(analysisOverrides);
+    job.orderedPatchDigest = orderedPatchDigest;
+    job.listingLayout = std::move(listingLayout);
+    job.listingRevision = listingRevision;
+    job.listingStrings = std::move(listingStrings);
+    job.listingCodeData = std::move(listingCodeData);
+    job.listingPrefixPageBase = listingPrefixPageBase;
+    job.listingTopologyGeneration = listingTopologyGeneration;
+    std::vector<BulkJob> rejected;
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (epoch != epoch_.load(std::memory_order_acquire) || quit_.load()) return;
         constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix;
-        const uint32_t incomingTargeted = kinds & kTargeted;
-        BulkJob* mergeInto = nullptr;
-        for (auto& j : queue_) {                 // coalesce with an unstarted request
-            if (j.modBase != moduleBase) continue;
-            const uint32_t queuedTargeted = j.kinds & kTargeted;
-            // Targeted passes share regionLo/regionHi storage. Different target
-            // kinds must remain separate jobs or the newer request silently moves
-            // the older pass to its own region. Untargeted bulk work may still
-            // merge into either job; the same target kind takes the newest region.
-            if (queuedTargeted && incomingTargeted
-                && queuedTargeted != incomingTargeted) continue;
-            if ((incomingTargeted & K_ListingPrefix) &&
-                (queuedTargeted & K_ListingPrefix) && j.regionHi != regionHi)
-                continue; // distinct far pages retain independent completion/results
-            if (!mergeInto) mergeInto = &j; // untargeted fallback
-            // Prefer an already-pending request for this exact targeted pass over
-            // an earlier untargeted job, avoiding duplicate decompiles.
-            if (!incomingTargeted || queuedTargeted == incomingTargeted) {
-                mergeInto = &j;
-                break;
-            }
+        // Do not let whole-image dependencies delay a requested function even
+        // when a caller supplied both kinds in one request.
+        if ((kinds & kTargeted) && (kinds & ~kTargeted)) {
+            BulkJob bulk = job;
+            bulk.kinds &= ~kTargeted;
+            bulk.regionLo = bulk.regionHi = 0;
+            bulk.regionValid = false;
+            job.kinds &= kTargeted;
+            enqueueLocked(std::move(job), rejected);
+            enqueueLocked(std::move(bulk), rejected);
+        } else if (kinds) {
+            enqueueLocked(std::move(job), rejected);
         }
-        if (mergeInto) {
-            coalescedRequests_.fetch_add(1, std::memory_order_relaxed);
-            BulkJob& j = *mergeInto;
-            j.kinds |= kinds;
-            j.bin    = bin;
-            j.decoder = effectiveDecoder;
-            j.guess  = guessNames;
-            j.epoch  = epoch;
-            if (incomingTargeted) {
-                j.regionLo = regionLo; j.regionHi = regionHi; j.regionValid = regionValid;
-            }
-            if (kinds & K_Decompile) {
-                j.decompNames = std::move(decompNames);
-                j.decompSignature = std::move(decompSignature);
-                j.decompContext = decompContext;
-                j.decompChunks = std::move(decompChunks);
-                j.decompOwnershipTruncated = decompOwnershipTruncated;
-                j.noreturnTargets = std::move(noreturnTargets);
-            }
-            if (kinds & K_Listing) {
-                j.listingLayout = std::move(listingLayout);
-                j.listingRevision = listingRevision;
-                j.listingStrings = std::move(listingStrings);
-                j.listingCodeData = std::move(listingCodeData);
-            }
-            if (kinds & K_ListingPrefix) {
-                j.listingPrefixPageBase = listingPrefixPageBase;
-                j.listingRevision = listingRevision;
-                j.listingTopologyGeneration = listingTopologyGeneration;
-            }
-            // A non-null snapshot is authoritative even when both vectors are
-            // empty (the analyst just cleared the last override). Requests that
-            // do not carry project state, such as module-batch xrefs, must not
-            // erase a compatible pending active-image snapshot while coalescing.
-            if (analysisOverrides)
-                j.analysisOverrides = std::move(analysisOverrides);
-            j.orderedPatchDigest = orderedPatchDigest;
-        } else {
-            BulkJob job;
-            job.bin = bin; job.decoder = effectiveDecoder; job.kinds = kinds;
-            job.guess = guessNames; job.epoch = epoch; job.modBase = moduleBase;
-            job.regionLo = regionLo; job.regionHi = regionHi;
-            job.regionValid = regionValid;
-            job.decompNames = std::move(decompNames);
-            job.decompSignature = std::move(decompSignature);
-            job.decompContext = decompContext;
-            job.decompChunks = std::move(decompChunks);
-            job.decompOwnershipTruncated = decompOwnershipTruncated;
-            job.noreturnTargets = std::move(noreturnTargets);
-            job.analysisOverrides = std::move(analysisOverrides);
-            job.orderedPatchDigest = orderedPatchDigest;
-            if (kinds & K_Listing) {
-                job.listingLayout = std::move(listingLayout);
-                job.listingRevision = listingRevision;
-                job.listingStrings = std::move(listingStrings);
-                job.listingCodeData = std::move(listingCodeData);
-            }
-            if (kinds & K_ListingPrefix) {
-                job.listingPrefixPageBase = listingPrefixPageBase;
-                job.listingRevision = listingRevision;
-                job.listingTopologyGeneration = listingTopologyGeneration;
-            }
-            queue_.push_back(std::move(job));
-        }
-        pending_.store(true);
-        pendingKinds_.store(pendingKinds_.load(std::memory_order_relaxed) | kinds);
+        for (const BulkJob& refused : rejected) finishModuleLocked(refused);
+        refreshPendingLocked();
     }
-    cv_.notify_one();
+    // Reporting takes mtx_ itself. Preserve exact prefix/failure identities so
+    // the consumer can retire pending ownership and retry after overload.
+    for (const BulkJob& refused : rejected)
+        publishFailure(refused, "analysis scheduler capacity reached; retry the request");
+    cv_.notify_all();
+}
+
+bool AnalysisService::interactive(const BulkJob& job) {
+    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix;
+    return (job.kinds & kTargeted) != 0 || job.kinds == K_Listing;
+}
+
+void AnalysisService::enqueueLocked(BulkJob job, std::vector<BulkJob>& rejected) {
+    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix;
+    for (BulkJob& queued : queue_) {
+        if (queued.bin != job.bin || queued.modBase != job.modBase ||
+            queued.epoch != job.epoch || queued.decoder != job.decoder ||
+            queued.guess != job.guess || queued.orderedPatchDigest != job.orderedPatchDigest ||
+            interactive(queued) != interactive(job) ||
+            (queued.kinds & kTargeted) != (job.kinds & kTargeted)) continue;
+        if ((job.kinds & K_ListingPrefix) && queued.regionHi != job.regionHi) continue;
+        // New snapshots win, including explicitly empty override definitions.
+        // A request without project state must preserve the pending snapshot.
+        if (!job.analysisOverrides) job.analysisOverrides = queued.analysisOverrides;
+        if (!(job.kinds & K_Listing) && (queued.kinds & K_Listing)) {
+            job.listingLayout = std::move(queued.listingLayout);
+            job.listingRevision = queued.listingRevision;
+            job.listingStrings = std::move(queued.listingStrings);
+            job.listingCodeData = std::move(queued.listingCodeData);
+        }
+        job.kinds |= queued.kinds;
+        queued = std::move(job);
+        coalescedRequests_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (queue_.size() + static_cast<size_t>(inFlight_) >= kMaxOutstandingJobs) {
+        auto displaced = queue_.end();
+        if (interactive(job)) {
+            // The newest bulk request has made the least progress. Do not evict
+            // a resumed pass whose already-published dependency state is useful.
+            for (auto it = queue_.begin(); it != queue_.end(); ++it)
+                if (!interactive(*it) && !it->publishedKinds) displaced = it;
+        }
+        rejectedRequests_.fetch_add(1, std::memory_order_relaxed);
+        if (displaced == queue_.end()) {
+            rejected.push_back(std::move(job));
+            return;
+        }
+        rejected.push_back(std::move(*displaced));
+        queue_.erase(displaced);
+    }
+    queue_.push_back(std::move(job));
+}
+
+void AnalysisService::refreshPendingLocked() {
+    uint32_t kinds = 0, interactions = 0;
+    for (const BulkJob& job : queue_) {
+        kinds |= job.kinds;
+        interactions += interactive(job) ? 1u : 0u;
+    }
+    for (uint32_t running : inFlightKinds_) kinds |= running;
+    queuedInteractive_.store(interactions, std::memory_order_release);
+    queuedJobs_.store(static_cast<uint32_t>(queue_.size()), std::memory_order_relaxed);
+    runningJobs_.store(static_cast<uint32_t>(inFlight_), std::memory_order_relaxed);
+    pendingKinds_.store(kinds, std::memory_order_release);
+    pending_.store(!queue_.empty() || inFlight_ != 0, std::memory_order_release);
+    scheduler().notify();
+}
+
+void AnalysisService::finishModuleLocked(const BulkJob& job) {
+    const uint32_t total = progModTotal_.load(std::memory_order_relaxed);
+    if (job.modBase == 0 || total == 0) return;
+    const uint32_t done = progModDone_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (done >= total) {
+        progModTotal_.store(0, std::memory_order_relaxed);
+        progModDone_.store(0, std::memory_order_relaxed);
+    }
 }
 
 bool AnalysisService::tryTakeBulk(AnalysisResult& out) {
@@ -2326,6 +2433,10 @@ ProgressSnapshot AnalysisService::progress() const {
     s.jobsFailed   = failedJobs_.load(std::memory_order_relaxed);
     s.resultsDropped = droppedResults_.load(std::memory_order_relaxed);
     s.requestsCoalesced = coalescedRequests_.load(std::memory_order_relaxed);
+    s.requestsRejected = rejectedRequests_.load(std::memory_order_relaxed);
+    s.jobsYielded = yieldedJobs_.load(std::memory_order_relaxed);
+    s.queuedJobs = queuedJobs_.load(std::memory_order_relaxed);
+    s.runningJobs = runningJobs_.load(std::memory_order_relaxed);
     s.cacheHits = cacheHits_.load(std::memory_order_relaxed);
     s.cacheMisses = cacheMisses_.load(std::memory_order_relaxed);
     return s;
@@ -2336,8 +2447,7 @@ void AnalysisService::cancelAndWaitIdle() {
     queue_.clear();                                  // drop all queued requests
     results_.clear();                                // and any finished-but-unpicked results
     epoch_.fetch_add(1, std::memory_order_acq_rel);  // supersede everything running
-    pending_.store(false);
-    pendingKinds_.store(0);
+    refreshPendingLocked();
     progModTotal_.store(0, std::memory_order_relaxed);
     progModDone_.store(0, std::memory_order_relaxed);
     progPhase_.store((uint32_t)AnalysisPhase::Idle, std::memory_order_relaxed);
@@ -2349,8 +2459,7 @@ void AnalysisService::cancelPending() {
     queue_.clear();                                  // drop all queued requests
     results_.clear();                                // and any finished-but-unpicked results
     epoch_.fetch_add(1, std::memory_order_acq_rel);  // supersede everything running (bails at a checkpoint)
-    pending_.store(inFlight_ > 0);                   // still "pending" while running jobs wind down
-    pendingKinds_.store(0);
+    refreshPendingLocked();
     progModTotal_.store(0, std::memory_order_relaxed);
     progModDone_.store(0, std::memory_order_relaxed);
 }
@@ -2398,54 +2507,79 @@ void AnalysisService::publishFailure(const BulkJob& job, const char* message) no
     }
 }
 
-void AnalysisService::threadMain() {
+void AnalysisService::threadMain(unsigned workerIndex) {
     for (;;) {
         BulkJob job;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_.wait(lk, [this] { return quit_.load() || !queue_.empty(); });
             if (quit_.load()) return;
-            job = queue_.front();
-            queue_.pop_front();
+        }
+        // Wait for shared CPU admission before claiming a job. A selected-view
+        // request can therefore overtake bulk work even while this worker waits.
+        if (!scheduler().acquire(*this)) continue;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (quit_.load() || queue_.empty()) {
+                scheduler().release();
+                if (quit_.load()) return;
+                continue;
+            }
+            auto next = std::find_if(queue_.begin(), queue_.end(), interactive);
+            if (next == queue_.end()) next = queue_.begin();
+            job = std::move(*next);
+            queue_.erase(next);
+            job.yielded = false;
             ++inFlight_;
-            pending_.store(true);
-            pendingKinds_.store(job.kinds);
+            inFlightKinds_[workerIndex] = job.kinds;
+            refreshPendingLocked();
         }
 
         try {
             runJob(job);
         } catch (const std::exception& e) {
+            job.yielded = false;
             publishFailure(job, e.what());
         } catch (...) {
+            job.yielded = false;
             publishFailure(job, "unknown analysis worker exception");
         }
 
         {
             std::lock_guard<std::mutex> lk(mtx_);
             --inFlight_;
+            inFlightKinds_[workerIndex] = 0;
+            const bool resume = job.yielded && !quit_.load() && job.epoch == epoch();
+            if (resume) {
+                // Keep original dependency kinds so their immutable cached facts
+                // are restored on restart, but do not deliver completed passes twice.
+                yieldedJobs_.fetch_add(1, std::memory_order_relaxed);
+                queue_.push_front(std::move(job));
+            }
             // Count a completed module-batch job (even when superseded, so a cancelled
             // batch still converges and resets its counters).
-            if (job.modBase != 0 && progModTotal_.load(std::memory_order_relaxed) > 0) {
-                uint32_t done = progModDone_.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (done >= progModTotal_.load(std::memory_order_relaxed)) {
-                    progModTotal_.store(0, std::memory_order_relaxed);
-                    progModDone_.store(0, std::memory_order_relaxed);
-                }
-            }
+            if (!resume) finishModuleLocked(job);
+            refreshPendingLocked();
             bool idle = queue_.empty() && inFlight_ == 0;
-            pending_.store(!idle);
             if (idle) {
-                pendingKinds_.store(0);
                 progPhase_.store((uint32_t)AnalysisPhase::Idle, std::memory_order_relaxed);
             }
         }
+        scheduler().release();
+        cv_.notify_all();
         cvIdle_.notify_all();
     }
 }
 
-void AnalysisService::runJob(const BulkJob& job) {
-    auto superseded = [this, e = job.epoch] {
-        return epoch_.load(std::memory_order_acquire) != e;
+void AnalysisService::runJob(BulkJob& job) {
+    auto superseded = [this, &job] {
+        if (quit_.load(std::memory_order_acquire) ||
+            epoch_.load(std::memory_order_acquire) != job.epoch) return true;
+        const unsigned priority = interactive(job) ? 0u :
+            (activeDocument_.load(std::memory_order_acquire) ? 1u : 2u);
+        if (scheduler().bestPending.load(std::memory_order_acquire) < priority)
+            job.yielded = true;
+        return job.yielded;
     };
     // Drop a job already superseded by a newer epoch before touching the (possibly
     // freed) binary.
@@ -2476,6 +2610,20 @@ void AnalysisService::runJob(const BulkJob& job) {
     // Emit one result per pass, the moment it finishes, so the consumer can apply the
     // cheap functions/strings immediately and the heavier listing/xref later.
     auto emit = [&](AnalysisResult&& r) {
+        if (superseded()) return;
+        uint32_t pass = 0;
+        if (r.stringsValid) pass |= K_Strings;
+        if (r.funcsValid) pass |= K_Funcs;
+        if (r.listingValid) pass |= K_Listing;
+        if (r.listingPrefixDone) pass |= K_ListingPrefix;
+        if (r.xref) pass |= K_Xref;
+        if (r.algosValid) pass |= K_Intent;
+        if (r.callGraphValid) pass |= K_CallGraph;
+        if (r.crackmeTriageValid) pass |= K_CrackmeTriage;
+        if (r.synthValid) pass |= K_Synthesis;
+        if (r.pathValid) pass |= K_PathExplore;
+        if (r.decompValid) pass |= K_Decompile;
+        if (pass && (job.publishedKinds & pass) == pass) return;
         r.epoch   = job.epoch;
         r.kinds   = job.kinds;
         r.moduleBase = job.modBase;
@@ -2485,6 +2633,7 @@ void AnalysisService::runJob(const BulkJob& job) {
         r.listingRevision = job.listingRevision;
         r.listingTopologyGeneration = job.listingTopologyGeneration;
         publishResult(std::move(r));
+        job.publishedKinds |= pass;
     };
 
     const uint64_t pristineHash = job.bin->contentHash();

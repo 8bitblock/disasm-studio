@@ -150,6 +150,10 @@ struct Fixture {
 };
 
 #include "navigation_workflow_fixture.inc"
+#include "workbench_workflow_fixture.inc"
+#include "function_navigator_fixture.inc"
+#include "static_xref_workflow_fixture.inc"
+#include "release_workbench_fixture.inc"
 #include "context_action_regressions.inc"
 
 static void checkRetainedActions(const std::string& path) {
@@ -878,6 +882,9 @@ int main() {
         checkPopupAfterEviction(path);
         checkReferenceWorkflow(path);
         checkNavigationWorkflow(path);
+        checkIntentWorkflows(path);
+        checkFunctionNavigator(path);
+        checkStaticXrefWorkflow(path);
         checkContextActionDispatcher(path);
         checkEffectivePatchPreview(path, false);
         checkEffectivePatchPreview(path, true);
@@ -885,6 +892,9 @@ int main() {
         checkListingColumns(path);
         checkListingVisualSignals(path);
         checkGameMakerActions(temporary);
+        checkReleaseWorkbench(path);
+        checkRegisterEditorPresentation(path);
+        checkInspectorObservationValidity(path);
         checkWorkbenchShell();
     } catch (const std::exception& error) { std::printf("EXCEPTION: %s\n", error.what()); ++failures; }
     ImGui::DestroyContext();

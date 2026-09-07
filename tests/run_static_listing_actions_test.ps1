@@ -1,4 +1,5 @@
-param([ValidateSet('Release')][string]$Configuration = 'Release', [switch]$CompileOnly)
+param([ValidateSet('Release')][string]$Configuration = 'Release', [switch]$CompileOnly,
+      [switch]$ReleaseWorkbenchOnly)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 $objectRoot = Join-Path $taskRoot "build\int\x64\$Configuration"
@@ -13,21 +14,51 @@ if (!$vsPath) {
 }
 if (!$vsPath) { throw 'Visual Studio 2022 C++ tools were not found.' }
 $vcVars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
-$environmentLines = & $env:ComSpec /d /c ('call "' + $vcVars + '" >nul && set')
+# Production objects use v143 even when a newer VS installation hosts the
+# build. Match its compiler/linker for LTCG instead of taking vcvars' newest ABI.
+$toolsetVersion = $env:DS_VCPKG_PLATFORM_TOOLSET_VERSION
+if (!$toolsetVersion) {
+    $toolsetVersion = (Get-Content -LiteralPath (Join-Path $vsPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.v143.default.txt') -TotalCount 1).Trim()
+}
+if ($toolsetVersion -notmatch '^14\.[0-9]+(\.[0-9]+)?$') { throw 'Invalid v143 toolset version.' }
+$environmentLines = & $env:ComSpec /d /c ('call "' + $vcVars + '" -vcvars_ver=' + $toolsetVersion + ' >nul && set')
 if ($LASTEXITCODE) { throw 'Visual Studio environment setup failed.' }
 foreach ($line in $environmentLines) {
     if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
 }
 $outputRoot = Join-Path ([IO.Path]::GetTempPath()) ('ds_static_listing_' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($outputRoot) | Out-Null
-$source = Join-Path $PSScriptRoot 'static_listing_actions_test.cpp'
+$source = Join-Path $PSScriptRoot $(if ($ReleaseWorkbenchOnly) { 'release_workbench_test.cpp' } else { 'static_listing_actions_test.cpp' })
 $testObject = Join-Path $outputRoot 'static_listing_actions_test.obj'
 $executable = Join-Path $outputRoot 'static_listing_actions_test.exe'
 $compileLog = Join-Path $outputRoot 'compile.log'
 $linkLog = Join-Path $outputRoot 'link.log'
 $runLog = Join-Path $outputRoot 'run.log'
 Write-Host "Headless listing integration artifacts: $outputRoot"
-& cl.exe /nologo /std:c++20 /EHsc /MT /W4 /DNOMINMAX /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /I (Join-Path $taskRoot 'src') /I (Join-Path $dependencyRoot 'include') /c $source "/Fo$testObject" *> $compileLog
+if ($ReleaseWorkbenchOnly) {
+    Write-Host 'Focused release-workbench composition, register editor, and inspector validity checks.'
+}
+if (!$CompileOnly) {
+    # Link only an isolated snapshot. The long LTCG link must not keep the live
+    # build objects locked while the developer rebuilds the application.
+    $linkObjectRoot = Join-Path $outputRoot 'production-objects'
+    [IO.Directory]::CreateDirectory($linkObjectRoot) | Out-Null
+    $productionObjects = @(Get-ChildItem -LiteralPath $objectRoot -Filter '*.obj' | Where-Object Name -ne 'main.obj')
+    foreach ($object in $productionObjects) {
+        Copy-Item -LiteralPath $object.FullName -Destination (Join-Path $linkObjectRoot $object.Name)
+    }
+    foreach ($object in $productionObjects) {
+        $current = Get-Item -LiteralPath $object.FullName
+        if ($current.Length -ne $object.Length -or $current.LastWriteTimeUtc -ne $object.LastWriteTimeUtc) {
+            throw 'Production objects changed during snapshot. Finish the application build before running integration tests.'
+        }
+    }
+    if (@(Get-ChildItem -LiteralPath $objectRoot -Filter '*.obj' | Where-Object Name -ne 'main.obj').Count -ne $productionObjects.Count) {
+        throw 'Production object inventory changed during snapshot. Finish the application build before running integration tests.'
+    }
+    Write-Host "Snapshotted $($productionObjects.Count) production objects."
+}
+& cl.exe /nologo /std:c++20 /EHsc /MT /Gy /W4 /DNOMINMAX /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /I (Join-Path $taskRoot 'src') /I (Join-Path $dependencyRoot 'include') /c $source "/Fo$testObject" *> $compileLog
 if ($LASTEXITCODE) { Get-Content -LiteralPath $compileLog; throw 'Integration harness compilation failed.' }
 if ($CompileOnly) { Write-Host 'Integration harness compilation passed.'; return }
 $linkArguments = @('/NOLOGO', '/LTCG', '/INCREMENTAL:NO', '/OPT:REF', '/OPT:ICF', '/MACHINE:X64', '/SUBSYSTEM:CONSOLE', ('/OUT:"' + $executable + '"'), ('"' + $testObject + '"'))
@@ -44,7 +75,7 @@ foreach ($line in $symbols) {
         }
     }
 }
-$linkArguments += Get-ChildItem -LiteralPath $objectRoot -Filter '*.obj' | Where-Object Name -ne 'main.obj' | ForEach-Object { '"' + $_.FullName + '"' }
+$linkArguments += Get-ChildItem -LiteralPath $linkObjectRoot -Filter '*.obj' | ForEach-Object { '"' + $_.FullName + '"' }
 $linkArguments += Get-ChildItem -LiteralPath (Join-Path $dependencyRoot 'lib') -Filter '*.lib' | ForEach-Object { '"' + $_.FullName + '"' }
 $linkArguments += @('d3d11.lib','dxgi.lib','d3dcompiler.lib','dwmapi.lib','psapi.lib','iphlpapi.lib','ws2_32.lib','advapi32.lib','shell32.lib','kernel32.lib','user32.lib','gdi32.lib','winspool.lib','comdlg32.lib','ole32.lib','oleaut32.lib','uuid.lib','odbc32.lib','odbccp32.lib')
 $responsePath = Join-Path $outputRoot 'link.rsp'

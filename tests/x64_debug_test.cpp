@@ -367,6 +367,56 @@ static bool waitBreakpointResult(Debugger& debugger, uint64_t address, bool arme
     return false;
 }
 
+// Breakpoint UI edits must complete while the same debug event remains held.
+// No Continue, step, or unrelated memory write may be needed to wake the owner.
+static void checkPausedBreakpointMutation(Debugger& debugger, const DbgSnapshot& before) {
+    const DebugTargetIdentity target{before.pid, before.sessionGeneration};
+    const uint64_t address = before.regs.rip;
+    uint8_t original = 0;
+    CHECK(debugger.readMemory(address, &original, 1) == 1);
+    CHECK(original != 0xCC);
+    bool pauseStayedOwned = true;
+    auto waitForMutation = [&](bool wantArmed) {
+        const ULONGLONG deadline = GetTickCount64() + 4000;
+        do {
+            const DbgSnapshot current = debugger.snapshot();
+            pauseStayedOwned &= current.state == DbgState::Paused &&
+                current.pid == before.pid &&
+                current.sessionGeneration == before.sessionGeneration &&
+                current.activeTid == before.activeTid && current.tid == before.tid &&
+                current.regs.rip == before.regs.rip && current.is32 == before.is32;
+            bool present = false, armed = false;
+            for (const auto& bp : current.breakpoints) {
+                if (bp.address != address) continue;
+                present = true;
+                armed = bp.armed && bp.error.empty();
+                break;
+            }
+            uint8_t raw = 0, masked = 0;
+            const bool bytesRead = debugger.readMemory(address, &raw, 1) == 1 &&
+                debugger.readMemoryMaskedForSession(
+                    target.pid, target.sessionGeneration, address, &masked, 1) == 1;
+            if (bytesRead && masked == original &&
+                (wantArmed ? present && armed && raw == 0xCC
+                           : !present && raw == original))
+                return true;
+            Sleep(5);
+        } while (GetTickCount64() < deadline);
+        return false;
+    };
+    CHECK(debugger.addBreakpointForSession(target, address));
+    CHECK(waitForMutation(true));
+    CHECK(pauseStayedOwned);
+    CHECK(debugger.removeBreakpointForSession(target, address));
+    CHECK(waitForMutation(false));
+    CHECK(pauseStayedOwned);
+    const DbgSnapshot after = debugger.snapshot();
+    CHECK(after.state == DbgState::Paused && after.pid == before.pid &&
+          after.sessionGeneration == before.sessionGeneration &&
+          after.activeTid == before.activeTid && after.tid == before.tid &&
+          after.regs.rip == before.regs.rip && after.is32 == before.is32);
+}
+
 int main() {
     char marker[8]{};
     if (GetEnvironmentVariableA("DS_X64_DEBUGGEE", marker,
@@ -476,6 +526,24 @@ int main() {
         CHECK(registerError.empty());
         CHECK(afterAccumulatorWrite.regs.rax == before.regs.rax);
 
+        // Register drawer drafts capture both the displayed thread and RIP.
+        // Refuse stale drafts before modifying any register in the new context.
+        const uint64_t wrongEditorRip = before.regs.rip ^ UINT64_C(1);
+        CHECK(!debugger.setRegisterForSession(
+            before.pid, before.sessionGeneration, "rax", forcedAccumulator,
+            before.activeTid ^ 0x80000000u, &before.regs.rip));
+        CHECK(!debugger.setRegisterForSession(
+            before.pid, before.sessionGeneration, "rax", forcedAccumulator,
+            before.activeTid, &wrongEditorRip));
+        CHECK(debugger.snapshot().regs.rax == before.regs.rax);
+        CHECK(debugger.setRegisterForSession(
+            before.pid, before.sessionGeneration, "rax", forcedAccumulator,
+            before.activeTid, &before.regs.rip));
+        CHECK(debugger.snapshot().regs.rax == forcedAccumulator);
+        CHECK(debugger.setRegisterForSession(
+            before.pid, before.sessionGeneration, "rax", before.regs.rax,
+            before.activeTid, &before.regs.rip));
+
         // A text register edit allocates non-executable target memory, writes a
         // NUL-terminated C string, then installs its pointer in the exact paused
         // thread. Stale session/thread identities must fail before mutation.
@@ -497,10 +565,16 @@ int main() {
         CHECK(textAddress == 0);
         CHECK(!textError.empty());
         CHECK(debugger.snapshot().regs.rax == raxBeforeRejectedEdits);
+        CHECK(!debugger.setRegisterToBufferForSession(
+            before.pid, before.sessionGeneration, before.activeTid,
+            "rax", registerText, textAddress, &textError, &wrongEditorRip));
+        CHECK(textAddress == 0);
+        CHECK(!textError.empty());
+        CHECK(debugger.snapshot().regs.rax == raxBeforeRejectedEdits);
         CHECK(debugger.regions().size() == regionsBeforeRejectedEdits);
         const bool textSet = debugger.setRegisterToBufferForSession(
             before.pid, before.sessionGeneration, before.activeTid,
-            "rax", registerText, textAddress, &textError);
+            "rax", registerText, textAddress, &textError, &before.regs.rip);
         CHECK(textSet);
         if (textSet) {
             CHECK(textAddress != 0);
@@ -527,6 +601,7 @@ int main() {
         uint8_t instructionByte = 0;
         CHECK(debugger.readMemoryMasked(before.regs.rip, &instructionByte, 1) == 1);
 
+        checkPausedBreakpointMutation(debugger, before);
         debugger.stepInto();
         bool advanced = false;
         for (int elapsed = 0; elapsed < 4000; elapsed += 10) {
@@ -887,7 +962,17 @@ int main() {
                           queuedRunTo.checkedRunTo.state ==
                               CheckedRunToState::Hit);
                 }
-                CHECK(waitPausedAt(debugger, callReturn, 5000, stepOverOwner));
+                const bool checkedRunToArrived = waitPausedAt(debugger, callReturn, 5000, stepOverOwner);
+                if (!checkedRunToArrived) {
+                    const DbgSnapshot failed = debugger.snapshot();
+                    std::printf("[diag] checked RunTo state=%u tid=%u expectedTid=%u rip=0x%llX expectedRip=0x%llX outcome=%u error=%s event=%s\n",
+                        static_cast<unsigned>(failed.state), failed.activeTid, stepOverOwner,
+                        static_cast<unsigned long long>(failed.regs.rip),
+                        static_cast<unsigned long long>(callReturn),
+                        static_cast<unsigned>(failed.checkedRunTo.state),
+                        failed.checkedRunTo.error.c_str(), failed.lastEvent.c_str());
+                }
+                CHECK(checkedRunToArrived);
                 {
                     const DbgSnapshot hitRunTo = debugger.snapshot();
                     CHECK(hitRunTo.checkedRunTo.requestToken ==

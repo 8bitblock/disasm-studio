@@ -898,6 +898,12 @@ AuthorizationTrailReport RunAuthorizationTrail(
         if (locationLess(b.caller, a.caller)) return false;
         if (locationLess(a.branch, b.branch)) return true;
         if (locationLess(b.branch, a.branch)) return false;
+        if (locationLess(a.comparison, b.comparison)) return true;
+        if (locationLess(b.comparison, a.comparison)) return false;
+        if (locationLess(a.trueDestination, b.trueDestination)) return true;
+        if (locationLess(b.trueDestination, a.trueDestination)) return false;
+        if (locationLess(a.falseDestination, b.falseDestination)) return true;
+        if (locationLess(b.falseDestination, a.falseDestination)) return false;
         if (a.useKind != b.useKind)
             return static_cast<uint8_t>(a.useKind) <
                    static_cast<uint8_t>(b.useKind);
@@ -907,6 +913,7 @@ AuthorizationTrailReport RunAuthorizationTrail(
             return lessBool(a.flagsPreserved, b.flagsPreserved);
         if (a.branchUseProven != b.branchUseProven)
             return lessBool(a.branchUseProven, b.branchUseProven);
+        if (a.complete != b.complete) return lessBool(a.complete, b.complete);
         return a.evidence < b.evidence;
     };
     auto sameUse = [&](const RetainedUse& left, const RetainedUse& right) {
@@ -917,13 +924,43 @@ AuthorizationTrailReport RunAuthorizationTrail(
                locationEquivalent(a.continuation, b.continuation) &&
                locationEquivalent(a.caller, b.caller) &&
                locationEquivalent(a.branch, b.branch) &&
+               locationEquivalent(a.comparison, b.comparison) &&
+               locationEquivalent(a.trueDestination, b.trueDestination) &&
+               locationEquivalent(a.falseDestination, b.falseDestination) &&
                a.useKind == b.useKind &&
                a.resultWidthBits == b.resultWidthBits &&
                a.flagsPreserved == b.flagsPreserved &&
-               a.branchUseProven == b.branchUseProven;
+               a.branchUseProven == b.branchUseProven && a.complete == b.complete;
     };
     std::sort(uses.begin(), uses.end(), useLess);
     uses.erase(std::unique(uses.begin(), uses.end(), sameUse), uses.end());
+    // Conflicting records for one exact call/branch cannot independently prove
+    // a permitted arm. Check the full bounded scan before display truncation,
+    // so a cap cannot hide the counter-evidence and restore a false proof.
+    using DecisionKey = std::tuple<size_t, uint64_t, uint64_t>;
+    struct DecisionFacts {
+        std::set<uint64_t> comparisons, trueArms, falseArms, continuations;
+        std::set<uint8_t> widths;
+        bool conflicts() const {
+            return comparisons.size() > 1 || trueArms.size() > 1 || falseArms.size() > 1 ||
+                   continuations.size() > 1 || widths.size() > 1;
+        }
+    };
+    std::map<DecisionKey, DecisionFacts> decisions;
+    auto decisionKey = [](const RetainedUse& retained, const AuthorizationTrailPredicateUseInput& source) {
+        return DecisionKey{ retained.predicateWorkIndex, source.callsite.address, source.branch.address };
+    };
+    for (const RetainedUse& retained : uses) {
+        const auto& source = input.predicateUses[retained.inputIndex];
+        if (!source.callsite.addressValid || !source.branch.addressValid || !source.branchUseProven) continue;
+        auto& facts = decisions[decisionKey(retained, source)];
+        if (source.comparison.addressValid) facts.comparisons.insert(source.comparison.address);
+        if (source.trueDestination.addressValid) facts.trueArms.insert(source.trueDestination.address);
+        if (source.falseDestination.addressValid) facts.falseArms.insert(source.falseDestination.address);
+        if (source.continuation.addressValid) facts.continuations.insert(source.continuation.address);
+        if (source.resultWidthBits) facts.widths.insert(source.resultWidthBits);
+    }
+    bool conflictingDecisions = false;
     if (uses.size() > useLimit) {
         uses.resize(useLimit);
         complete.usesTruncated = true;
@@ -949,6 +986,15 @@ AuthorizationTrailReport RunAuthorizationTrail(
         use.complete = source.complete;
         use.confidence = confidence(source.confidence);
         use.evidence = source.evidence;
+        if (source.callsite.addressValid && source.branch.addressValid) {
+            const auto found = decisions.find(decisionKey(retained, source));
+            if (found != decisions.end() && found->second.conflicts()) {
+                use.branchUseProven = false;
+                use.complete = false;
+                appendReason(use.evidence, "Conflicting return-use evidence for this call and branch; permitted arm is unresolved");
+                conflictingDecisions = true;
+            }
+        }
         if (!use.complete) complete.predicateUsesComplete = false;
         const size_t reportIndex = report.predicateUses.size();
         report.predicateUses.push_back(std::move(use));
@@ -963,6 +1009,8 @@ AuthorizationTrailReport RunAuthorizationTrail(
     }
     if (complete.consumersTruncated)
         appendReason(complete.reason, "per-predicate consumer navigation limit reached");
+    if (conflictingDecisions)
+        appendReason(complete.reason, "conflicting predicate-use comparison, continuation, width, or branch destinations");
 
     // Count callsites and caller functions independently. Caller VA zero is a
     // normal identity when its validity bit is true.
@@ -972,7 +1020,7 @@ AuthorizationTrailReport RunAuthorizationTrail(
         std::set<uint64_t> callsites;
         std::set<uint64_t> callers;
         std::set<uint64_t> branchCallers;
-        size_t branchConsumers = 0;
+        std::set<std::pair<uint64_t, uint64_t>> branchConsumers;
         for (size_t useIndex : predicate.useIndices) {
             if (useIndex >= report.predicateUses.size()) continue;
             const AuthorizationTrailPredicateUse& use =
@@ -984,15 +1032,15 @@ AuthorizationTrailReport RunAuthorizationTrail(
             const bool branch = use.complete && use.branchUseProven &&
                 use.flagsPreserved &&
                 use.useKind == AuthorizationTrailUseKind::Branched &&
-                use.branch.addressValid;
+                use.callsite.addressValid && use.branch.addressValid;
             if (branch) {
-                ++branchConsumers;
+                branchConsumers.emplace(use.callsite.address, use.branch.address);
                 if (callerValid) branchCallers.insert(caller);
             }
         }
         predicate.callsiteCount = callsites.size();
         predicate.uniqueCallerCount = callers.size();
-        predicate.branchConsumerCount = branchConsumers;
+        predicate.branchConsumerCount = branchConsumers.size();
         predicate.uniqueBranchCallerCount = branchCallers.size();
     }
 
