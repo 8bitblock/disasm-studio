@@ -160,7 +160,7 @@ static void checkCortexProductionUi(const std::string& path) {
     CHECK(tab.input_[0] == 0);
     CHECK(!tab.chat_.back().second.empty());
 
-    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light, theme::ThemeId::Axiom}) {
         for (const float scale : {1.0f, 1.5f, 2.0f}) {
             theme::SetUiScale(scale);
             theme::ApplyTheme(palette);

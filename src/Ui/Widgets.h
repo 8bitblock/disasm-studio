@@ -39,10 +39,30 @@ void SameLineIfFits(float nextWidth);
 // why an action is unavailable.
 void ItemTooltip(const char* text, bool allowWhenDisabled = true);
 
-// Small rectangular status tag: subtle tinted fill + colored text.
+// Compact status tag with caller-supplied color. Every theme uses a quiet outlined
+// capsule and a small state dot inside the existing padding.
 void Badge(const char* text, const ImVec4& color);
 
 // ---- Workbench chrome ------------------------------------------------------
+// Compact full-width section heading with a hairline divider. Detail is optional, wraps when needed,
+// and never changes the current ID scope or creates a separately scrolling pane.
+void PanelHeader(const char* title, const char* detail = nullptr);
+
+// Shared data-list presentation: subdued headers, horizontal hairlines and
+// palette-aware rows. IDs, columns, sizing and saved settings stay caller-owned.
+// Call EndDataTable only when BeginDataTable/BeginDataTableEx returned true.
+bool BeginDataTable(const char* id, int columns, ImGuiTableFlags flags = 0,
+                    const ImVec2& size = ImVec2(0, 0), float innerWidth = 0.0f);
+bool BeginDataTableEx(const char* name, ImGuiID id, int columns, ImGuiTableFlags flags = 0,
+                      const ImVec2& size = ImVec2(0, 0), float innerWidth = 0.0f);
+void EndDataTable();
+
+// Native tab identity and navigation with a compact count capsule. Pass the
+// original label, including any ### suffix, to retain nested table/settings IDs.
+// End an open tab with ImGui::EndTabItem as usual. Counts must be real inventory.
+bool BeginCountTabItem(const char* label, size_t count, ImGuiTabItemFlags flags = 0,
+                       const ImVec4* color = nullptr, bool marker = false);
+
 // Contiguous panes, compact controls and subdued dividers. All colors route
 // through theme::col::* so every palette (including Light/Paper) stays correct.
 
@@ -60,7 +80,7 @@ void ToolbarDivider();
 bool Pill(const char* id, const char* text, const ImVec4* valueCol = nullptr,
           const char* tip = nullptr);
 
-// State label: compact field with a colored state word + optional muted
+// State label: outlined capsule with a colored state dot/word + optional muted
 // mono detail ("PAUSED  pid 4312  rip 7FF6..."), right of the state word.
 void StatePill(const char* state, const ImVec4& stateCol, const char* detail = nullptr);
 

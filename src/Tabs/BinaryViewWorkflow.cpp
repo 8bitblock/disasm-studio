@@ -150,11 +150,26 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
         const ImVec4 accent = theme::col::accent();
         if (ui::Pill(labels[i], labels[i], i == workflowPreset_ ? &accent : nullptr, hints[i])) applyWorkflow(ctx, i);
     }
-    nextSmallButton("Activation trail");
-    if (ImGui::SmallButton("Activation trail")) {
-        lowerAdvancedMode_ = true;
-        lowerDockCollapsed_ = false;
-        ctx.openCrackmeTriage(TriageWorkspaceView::Authorization);
+    const bool canPin = navigation_ && navigation_->current().valid && mainView_ >= 0 && mainView_ <= 5;
+    const bool pinned = mainView_ >= 0 && mainView_ < 8 && viewPins_[mainView_].valid;
+    nextSmallButton("Workspace");
+    if (ImGui::SmallButton("Workspace")) ImGui::OpenPopup("workflow_tools");
+    ui::ItemTooltip("Analysis destinations and per-view location pinning.");
+    if (ImGui::BeginPopup("workflow_tools")) {
+        if (ImGui::MenuItem("Activation trail")) {
+            lowerAdvancedMode_ = true;
+            lowerDockCollapsed_ = false;
+            ctx.openCrackmeTriage(TriageWorkspaceView::Authorization);
+        }
+        if (ImGui::MenuItem("Types")) {
+            focusTypesTab_ = lowerAdvancedMode_ = true;
+            lowerDockCollapsed_ = false;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(pinned ? "Unpin view" : "Pin view", nullptr, pinned, canPin))
+            viewPins_[mainView_] = pinned ? DocumentLocation{} : navigation_->current();
+        ui::ItemTooltip("A pinned representation retains its location when switching views. Unpinned FILE views share selection; LIVE keeps its own target location.");
+        ImGui::EndPopup();
     }
     nextSmallButton("Registers");
     if (ImGui::SmallButton("Registers")) {
@@ -163,19 +178,6 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
         lowerDockCollapsed_ = false;
     }
     ui::ItemTooltip("Show live registers. Double-click a value to edit while paused.");
-    nextSmallButton("Types");
-    if (ImGui::SmallButton("Types")) {
-        focusTypesTab_ = lowerAdvancedMode_ = true;
-        lowerDockCollapsed_ = false;
-    }
-    const bool canPin = navigation_ && navigation_->current().valid && mainView_ >= 0 && mainView_ <= 5;
-    const bool pinned = mainView_ >= 0 && mainView_ < 8 && viewPins_[mainView_].valid;
-    nextSmallButton(pinned ? "Unpin view" : "Pin view");
-    ImGui::BeginDisabled(!canPin);
-    if (ImGui::SmallButton(pinned ? "Unpin view" : "Pin view"))
-        viewPins_[mainView_] = pinned ? DocumentLocation{} : navigation_->current();
-    ImGui::EndDisabled();
-    ui::ItemTooltip("A pinned representation retains its location when switching views. Unpinned FILE views share selection; LIVE keeps its own target location.");
     nextSmallButton(evidenceInspectorCollapsed_ && lowerDockCollapsed_ ? "Expand panes" : "Focus code");
     if (ImGui::SmallButton(evidenceInspectorCollapsed_ && lowerDockCollapsed_ ? "Expand panes" : "Focus code")) {
         const bool collapse = !(evidenceInspectorCollapsed_ && lowerDockCollapsed_);

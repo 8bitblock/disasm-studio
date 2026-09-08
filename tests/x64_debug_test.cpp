@@ -148,9 +148,11 @@ static int fixtureDebuggeeMain() {
     InterlockedExchange(&g_fixtureScratch, 0);
     InterlockedExchange(&g_fixtureHits, 0);
 
+    char workerCount[2]{};
+    const bool singleWorker = GetEnvironmentVariableA("DS_X64_FIXTURE_WORKERS", workerCount, sizeof(workerCount)) && workerCount[0] == '1';
     HANDLE workers[2] = {
         CreateThread(nullptr, 0, fixtureWorker, reinterpret_cast<void*>(1), 0, nullptr),
-        CreateThread(nullptr, 0, fixtureWorker, reinterpret_cast<void*>(2), 0, nullptr),
+        singleWorker ? nullptr : CreateThread(nullptr, 0, fixtureWorker, reinterpret_cast<void*>(2), 0, nullptr),
     };
     char readyName[128]{};
     if (GetEnvironmentVariableA("DS_X64_FIXTURE_READY", readyName,
@@ -159,7 +161,10 @@ static int fixtureDebuggeeMain() {
         if (ready) { SetEvent(ready); CloseHandle(ready); }
     }
 
-    const ULONGLONG deadline = GetTickCount64() + 30000;
+    // Include the additional held-stop pause/resume checks. Their debugger-side
+    // work consumes wall-clock time while these workers cannot make progress;
+    // the controller still stops the fixture explicitly on the success path.
+    const ULONGLONG deadline = GetTickCount64() + 90000;
     while (InterlockedCompareExchange(&g_fixtureStop, 0, 0) == 0 &&
            GetTickCount64() < deadline)
         Sleep(5);
@@ -396,6 +401,17 @@ static bool waitBreakpointResult(Debugger& debugger, uint64_t address, bool arme
     return false;
 }
 
+static bool waitBreakpointEnabled(Debugger& debugger, uint64_t address, bool enabled,
+                                  int timeoutMs = 4000) {
+    for (int elapsed = 0; elapsed < timeoutMs; elapsed += 5) {
+        for (const auto& bp : debugger.snapshot().breakpoints)
+            if (bp.address == address && bp.enabled == enabled && bp.error.empty() &&
+                (enabled || !bp.armed)) return true;
+        Sleep(5);
+    }
+    return false;
+}
+
 // Breakpoint UI edits must complete while the same debug event remains held.
 // No Continue, step, or unrelated memory write may be needed to wake the owner.
 static void checkPausedBreakpointMutation(Debugger& debugger, const DbgSnapshot& before) {
@@ -435,6 +451,26 @@ static void checkPausedBreakpointMutation(Debugger& debugger, const DbgSnapshot&
     };
     CHECK(debugger.addBreakpointForSession(target, address));
     CHECK(waitForMutation(true));
+    CHECK(pauseStayedOwned);
+    CHECK(!debugger.setBreakpointEnabledForSession(
+        {target.pid, target.sessionGeneration + 1}, address, false));
+    CHECK(!debugger.setBreakpointEnabledForSession(target, 1, false));
+    CHECK(debugger.setBreakpointConditionForSession(target, address, "rax == rax"));
+    CHECK(debugger.setBreakpointEveryNForSession(target, address, 3));
+    CHECK(debugger.setBreakpointEnabledForSession(target, address, false));
+    CHECK(waitBreakpointEnabled(debugger, address, false));
+    CHECK(debugger.hasBreakpoint(address));
+    uint8_t disabledRaw = 0, disabledMasked = 0;
+    CHECK(debugger.readMemory(address, &disabledRaw, 1) == 1 && disabledRaw == original);
+    CHECK(debugger.readMemoryMasked(address, &disabledMasked, 1) == 1 && disabledMasked == original);
+    CHECK(debugger.setBreakpointConditionForSession(target, address, "rax != 7"));
+    CHECK(debugger.setBreakpointEveryNForSession(target, address, 5));
+    CHECK(debugger.setBreakpointEnabledForSession(target, address, true));
+    CHECK(waitForMutation(true));
+    for (const auto& bp : debugger.snapshot().breakpoints) if (bp.address == address) {
+        CHECK(bp.enabled && bp.condition == "rax != 7" && bp.everyN == 5);
+        CHECK(bp.hits == 0 && bp.stops == 0);
+    }
     CHECK(pauseStayedOwned);
     CHECK(debugger.removeBreakpointForSession(target, address));
     CHECK(waitForMutation(false));
@@ -656,6 +692,353 @@ static void checkFailedDetachRecovery(const char* self) {
         failuresBefore == g_fail ? "pass" : "fail");
 }
 
+// Keep pause/resume's intentionally queued peer hits separate from the older
+// checked-RunTo fixture, whose expected starting event belongs to its first stop.
+static void checkLiveBreakpointPauseFixture(Debugger& debugger, const char* self, bool runningPeers) {
+    PROCESS_INFORMATION process{};
+    HANDLE ready = nullptr;
+    std::string error;
+    bool attached = false;
+    if (runningPeers) {
+        CHECK(spawnAttachFixture(self, process, ready));
+        if (process.hProcess) attached = debugger.attach(process.dwProcessId, error);
+    } else {
+        // Launch's loader stop belongs to the main thread; an injected attach
+        // helper can still be retiring when a hot worker first traps, which is
+        // an independent source of safe exclusive-step refusal.
+        SetEnvironmentVariableA("DS_X64_FIXTURE_WORKERS", "1");
+        attached = launchSelf(debugger, self, error, "3");
+        SetEnvironmentVariableA("DS_X64_FIXTURE_WORKERS", nullptr);
+        if (attached) process.hProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            FALSE, debugger.snapshot().pid);
+    }
+    CHECK(process.hProcess != nullptr);
+    if (!process.hProcess) { debugger.detach(); return; }
+    CHECK(attached && waitPaused(debugger, 8000));
+    if (attached && debugger.snapshot().state == DbgState::Paused) {
+        const auto initial = debugger.snapshot();
+        const DebugTargetIdentity fixtureSession{initial.pid, initial.sessionGeneration};
+        const auto* localCall = directFixtureCall();
+        const uint64_t callAddress = localCall ? remoteAddress(initial, localCall) : 0;
+        const uint64_t callReturn = callAddress + 5;
+        const uint64_t stopAddress = remoteAddress(initial, const_cast<const LONG*>(&g_fixtureStop));
+        CHECK(callAddress && stopAddress);
+        if (callAddress && stopAddress) {
+            CHECK(debugger.addBreakpointForSession(fixtureSession, callAddress));
+            debugger.cont();
+            CHECK(waitSoftwareStop(debugger, callAddress, 1, 5000));
+            if (!runningPeers) {
+                // Pause and immediately resume the breakpoint at its own held
+                // stop: do not plant INT3 back under RIP or count a duplicate
+                // stop before the original CALL has executed once.
+                const auto held = debugger.snapshot();
+                uint32_t heldHits = 0;
+                for (const auto& bp : held.breakpoints) if (bp.address == callAddress) heldHits = bp.hits;
+                CHECK(debugger.setBreakpointEnabledForSession(fixtureSession, callAddress, false));
+                CHECK(waitBreakpointEnabled(debugger, callAddress, false));
+                CHECK(debugger.setBreakpointEnabledForSession(fixtureSession, callAddress, true));
+                CHECK(waitBreakpointEnabled(debugger, callAddress, true));
+                uint8_t restoredCall = 0;
+                CHECK(debugger.readMemory(callAddress, &restoredCall, 1) == 1 && restoredCall == 0xE8);
+                CHECK(debugger.snapshot().regs.rip == callAddress);
+                debugger.stepOver();
+                const bool stepped = waitPausedAt(debugger, callReturn, 5000, held.activeTid);
+                if (!stepped) {
+                    const auto state = debugger.snapshot();
+                    DWORD exitCode = STILL_ACTIVE;
+                    GetExitCodeProcess(process.hProcess, &exitCode);
+                    std::printf("[diag] pause fixture immediate resume state=%u tid=%u expectedTid=%u rip=0x%llX event=%s exit=0x%lX\n",
+                        static_cast<unsigned>(state.state), state.activeTid, held.activeTid,
+                        static_cast<unsigned long long>(state.regs.rip), state.lastEvent.c_str(), exitCode);
+                }
+                CHECK(stepped);
+                for (const auto& bp : debugger.snapshot().breakpoints) if (bp.address == callAddress)
+                    CHECK(bp.enabled && bp.armed && bp.hits == heldHits);
+            }
+            if (runningPeers) {
+                const DbgSnapshot firstBreakpointStop = debugger.snapshot();
+                uint32_t retainedHits = 0, retainedStops = 0;
+                for (const auto& bp : firstBreakpointStop.breakpoints) if (bp.address == callAddress) {
+                    retainedHits = bp.hits; retainedStops = bp.stops;
+                }
+                CHECK(debugger.setBreakpointEnabledForSession(fixtureSession, callAddress, false));
+                CHECK(waitBreakpointEnabled(debugger, callAddress, false));
+                CHECK(debugger.snapshot().regs.rip == callAddress);
+                CHECK(debugger.snapshot().activeTid == firstBreakpointStop.activeTid);
+                debugger.cont();
+                CHECK(waitRunning(debugger, 2000));
+                Sleep(80); // both child workers traverse the disabled site repeatedly
+                CHECK(debugger.snapshot().state == DbgState::Running);
+                for (const auto& bp : debugger.snapshot().breakpoints) if (bp.address == callAddress)
+                    CHECK(!bp.enabled && bp.hits == retainedHits && bp.stops == retainedStops);
+                CHECK(debugger.setBreakpointEnabledForSession(fixtureSession, callAddress, true));
+                CHECK(waitSoftwareStop(debugger, callAddress, retainedHits + 1, 5000));
+                for (const auto& bp : debugger.snapshot().breakpoints) if (bp.address == callAddress)
+                    CHECK(bp.enabled && bp.hits > retainedHits && bp.stops == retainedStops + 1);
+            }
+            CHECK(debugger.setBreakpointEnabledForSession(fixtureSession, callAddress, false));
+            CHECK(waitBreakpointEnabled(debugger, callAddress, false));
+            const LONG stop = 1;
+            CHECK(debugger.writeMemory(stopAddress, &stop, sizeof(stop)) == sizeof(stop));
+            debugger.cont();
+            const bool ended = waitTerminated(debugger, 8000);
+            if (!ended) {
+                const auto state = debugger.snapshot();
+                std::printf("[diag] pause fixture cleanup state=%u tid=%u rip=0x%llX event=%s\n",
+                    static_cast<unsigned>(state.state), state.activeTid,
+                    static_cast<unsigned long long>(state.regs.rip), state.lastEvent.c_str());
+            }
+            CHECK(ended);
+        }
+    }
+    debugger.detach();
+    if (WaitForSingleObject(process.hProcess, 1000) == WAIT_TIMEOUT)
+        TerminateProcess(process.hProcess, 1);
+    WaitForSingleObject(process.hProcess, 2000);
+    CloseHandle(process.hProcess);
+    if (ready) CloseHandle(ready);
+}
+
+// A real executable scratch page gives this test an exact path independently of
+// compiler code generation, loaded-module RVAs, and the debuggee's other work.
+// These are observed instruction contexts: reading history must never restore
+// an old RIP/register set or execute an instruction in the paused target.
+static void checkExecutionHistoryFixture(const char* self) {
+    const int failuresBefore = g_fail;
+    Debugger debugger;
+    std::string error;
+    if (!launchSelf(debugger, self, error) || !waitPaused(debugger, 8000)) {
+        std::printf("[diag] execution history fixture launch: %s\n", error.c_str());
+        CHECK(false);
+        return;
+    }
+    const auto initial = debugger.snapshot();
+    const DebugTargetIdentity target{initial.pid, initial.sessionGeneration};
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_TERMINATE | SYNCHRONIZE,
+        FALSE, target.pid);
+    CHECK(process != nullptr);
+    if (!process) { debugger.detach(); return; }
+
+    void* page = VirtualAllocEx(process, nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);
+    CHECK(page != nullptr);
+    if (page) {
+        // mov ecx,3; xor eax,eax; loop: inc eax; dec ecx; jnz loop;
+        // terminal: nop; jmp $ (never run past the terminal breakpoint).
+        static constexpr uint8_t code[] = {
+            0xB9, 0x03, 0x00, 0x00, 0x00, 0x31, 0xC0, 0xFF, 0xC0,
+            0xFF, 0xC9, 0x75, 0xFA, 0x90, 0xEB, 0xFE
+        };
+        static constexpr uint64_t expectedOffsets[] = {
+            0, 5, 7, 9, 11, 7, 9, 11, 7, 9, 11, 13
+        };
+        const uint64_t start = reinterpret_cast<uint64_t>(page);
+        const uint64_t terminal = start + 13;
+        SIZE_T written = 0;
+        const bool initialized = WriteProcessMemory(process, page, code,
+            sizeof(code), &written) && written == sizeof(code) &&
+            FlushInstructionCache(process, page, sizeof(code));
+        CHECK(initialized);
+        auto setRip = [&](uint64_t address) {
+            const auto paused = debugger.snapshot();
+            return debugger.setRegisterForSession(target.pid, target.sessionGeneration,
+                "rip", address, paused.activeTid, &paused.regs.rip);
+        };
+        auto waitHistoryStopped = [&](uint64_t previousGeneration,
+                                       ExecutionHistorySnapshot& history, int timeoutMs) {
+            for (int elapsed = 0; elapsed < timeoutMs; elapsed += 5) {
+                debugger.executionHistorySnapshotIfChanged(history);
+                if (history.generation != previousGeneration && !history.recording &&
+                    debugger.snapshot().state == DbgState::Paused)
+                    return true;
+                Sleep(5);
+            }
+            const auto state = debugger.snapshot();
+            std::printf("[diag] history stop state=%u rip=0x%llX count=%zu recording=%u status=%s event=%s\n",
+                static_cast<unsigned>(state.state),
+                static_cast<unsigned long long>(state.regs.rip), history.entries.size(),
+                static_cast<unsigned>(history.recording), history.status.c_str(), state.lastEvent.c_str());
+            return false;
+        };
+        if (initialized) {
+            CHECK(debugger.addBreakpointForSession(target, start));
+            CHECK(debugger.addBreakpointForSession(target, terminal));
+            CHECK(waitBreakpointResult(debugger, start, true, nullptr, 4000));
+            CHECK(waitBreakpointResult(debugger, terminal, true, nullptr, 4000));
+            CHECK(setRip(start));
+            CHECK(debugger.continueForSession(target));
+            const bool atStart = waitSoftwareStop(debugger, start, 1, 5000);
+            CHECK(atStart);
+            if (atStart) {
+                const auto owner = debugger.snapshot();
+                ExecutionHistorySnapshot history;
+                debugger.executionHistorySnapshotIfChanged(history);
+                CHECK(history.entries.empty() && !history.recording);
+                CHECK(!debugger.recordExecutionPathForSession(
+                    {target.pid, target.sessionGeneration + 1}, owner.activeTid));
+                CHECK(!debugger.recordExecutionPathForSession(
+                    target, owner.activeTid ^ 0x80000000u));
+                CHECK(debugger.snapshot().regs.rip == start);
+                const auto previousGeneration = history.generation;
+                CHECK(debugger.recordExecutionPathForSession(target, owner.activeTid));
+                const bool recorded = waitHistoryStopped(previousGeneration, history, 10000);
+                CHECK(recorded);
+                if (recorded) {
+                    if (history.entries.size() != sizeof(expectedOffsets) / sizeof(expectedOffsets[0])) {
+                        std::printf("[diag] loop history count=%zu status=%s event=%s offsets=",
+                            history.entries.size(), history.status.c_str(), debugger.snapshot().lastEvent.c_str());
+                        for (size_t i = 0; i < history.entries.size() && i < 24; ++i)
+                            std::printf(" %lld", static_cast<long long>(history.entries[i].regs.rip - start));
+                        std::printf("\n");
+                    }
+                    CHECK(DebugTargetIdentityMatches(history.target, target));
+                    CHECK(history.tid == owner.activeTid && !history.is32);
+                    CHECK(history.entries.size() == sizeof(expectedOffsets) / sizeof(expectedOffsets[0]));
+                    for (size_t i = 0; i < history.entries.size(); ++i) {
+                        const auto& entry = history.entries[i];
+                        if (i < sizeof(expectedOffsets) / sizeof(expectedOffsets[0]))
+                            CHECK(entry.regs.rip == start + expectedOffsets[i]);
+                        if (i) CHECK(entry.sequence == history.entries[i - 1].sequence + 1);
+                        CHECK(entry.byteCount > 0 && entry.byteCount <= entry.bytes.size());
+                        if (entry.regs.rip >= start && entry.regs.rip < start + sizeof(code))
+                            CHECK(entry.bytes[0] == code[entry.regs.rip - start]);
+                    }
+                    if (history.entries.size() == sizeof(expectedOffsets) / sizeof(expectedOffsets[0])) {
+                        CHECK(history.entries[2].regs.rax == 0 && history.entries[2].regs.rcx == 3);
+                        CHECK(history.entries[5].regs.rax == 1 && history.entries[5].regs.rcx == 2);
+                        CHECK(history.entries[8].regs.rax == 2 && history.entries[8].regs.rcx == 1);
+                        CHECK(history.entries.back().regs.rip == terminal);
+                        CHECK(history.entries.back().regs.rax == 3 && history.entries.back().regs.rcx == 0);
+                        CHECK(history.entries.front().bytes[0] == 0xB9); // entry BP is masked
+                        CHECK(history.entries.front().byteCount >= 14);
+                        CHECK(history.entries.front().bytes[13] == 0x90); // still-armed BP in lookahead is masked
+                        CHECK(history.entries.back().bytes[0] == 0x90); // terminal BP is masked
+                    }
+                    bool terminalHit = false;
+                    for (const auto& bp : debugger.snapshot().breakpoints)
+                        if (bp.address == terminal) terminalHit = bp.hits == 1 && bp.stops == 1;
+                    CHECK(terminalHit);
+                    const auto held = debugger.snapshot();
+                    CHECK(held.activeTid == owner.activeTid && held.regs.rip == terminal);
+                    CHECK(held.regs.rax == 3 && held.regs.rcx == 0);
+                    CHECK(!debugger.recordExecutionPathForSession(
+                        {target.pid, target.sessionGeneration + 1}, owner.activeTid));
+                    CHECK(!debugger.executionHistorySnapshotIfChanged(history));
+                    CHECK(debugger.snapshot().regs.rip == held.regs.rip);
+                    CHECK(debugger.snapshot().regs.rax == held.regs.rax);
+
+                    // Re-recording replaces the earlier path and pauses at the
+                    // hard instruction bound even when RIP repeats forever.
+                    CHECK(debugger.removeBreakpointForSession(target, start));
+                    CHECK(debugger.removeBreakpointForSession(target, terminal));
+                    CHECK(waitBreakpointCount(debugger, 0, 4000));
+                    static constexpr uint8_t endlessLoop[] = {0xFF, 0xC0, 0xEB, 0xFC}; // inc eax; jmp loop
+                    CHECK(debugger.writeMemory(start + 48, endlessLoop, sizeof(endlessLoop)) == sizeof(endlessLoop));
+                    CHECK(setRip(start + 48));
+                    const uint64_t boundedRip = start + 48;
+                    CHECK(debugger.setRegisterForSession(target.pid, target.sessionGeneration,
+                        "rax", 0, owner.activeTid, &boundedRip));
+                    const auto boundedGeneration = history.generation;
+                    CHECK(debugger.recordExecutionPathForSession(target, owner.activeTid));
+                    const bool bounded = waitHistoryStopped(boundedGeneration, history, 30000);
+                    CHECK(bounded);
+                    if (bounded) {
+                        if (history.entries.size() != Debugger::kExecutionHistoryMaxEntries)
+                            std::printf("[diag] bounded history count=%zu status=%s event=%s\n",
+                                history.entries.size(), history.status.c_str(), debugger.snapshot().lastEvent.c_str());
+                        CHECK(history.entries.size() == Debugger::kExecutionHistoryMaxEntries);
+                        CHECK(!history.status.empty());
+                        bool repeatedRip = true, capturedLoop = true, orderedSequence = true, countedExecutions = true;
+                        for (size_t i = 0; i < history.entries.size(); ++i) {
+                            repeatedRip &= history.entries[i].regs.rip == start + 48 + (i % 2 ? 2 : 0);
+                            capturedLoop &= history.entries[i].bytes[0] == (i % 2 ? 0xEB : 0xFF);
+                            countedExecutions &= history.entries[i].regs.rax == (i + 1) / 2;
+                            if (i) orderedSequence &= history.entries[i].sequence == history.entries[i - 1].sequence + 1;
+                        }
+                        CHECK(repeatedRip && capturedLoop && orderedSequence && countedExecutions);
+                        CHECK(debugger.snapshot().regs.rip == start + 50);
+                        CHECK(debugger.snapshot().regs.rax == Debugger::kExecutionHistoryMaxEntries / 2);
+                        CHECK((debugger.snapshot().regs.rflags & 0x100u) == 0);
+
+                        // A recorded user-mode path must stop before control
+                        // transfers whose execution mode cannot be observed.
+                        // Invalid pointer/stack targets also prove the far
+                        // forms are rejected before an attempted execution.
+                        struct PreflightCase {
+                            uint8_t bytes[3];
+                            uint8_t size;
+                            const char* reason;
+                        };
+                        static constexpr PreflightCase preflights[] = {
+                            {{0x0F, 0x05}, 2, "system or control-state transition"}, // SYSCALL
+                            {{0x9C}, 1, "system or control-state transition"}, // PUSHFQ would store debugger TF
+                            {{0x66, 0x9C}, 2, "system or control-state transition"}, // PUSHF
+                            {{0xCB}, 1, "far control transfer"}, // RETF
+                            {{0xFF, 0x18}, 2, "far control transfer"}, // CALL FAR [RAX]
+                            {{0xFF, 0x28}, 2, "far control transfer"}, // JMP FAR [RAX]
+                            {{0x48, 0xFF, 0x28}, 3, "far control transfer"}, // REX.W JMP FAR [RAX]
+                        };
+                        for (size_t i = 0; i < sizeof(preflights) / sizeof(preflights[0]); ++i) {
+                            const auto& preflight = preflights[i];
+                            const uint64_t address = start + 64 + i * 16;
+                            CHECK(debugger.writeMemory(address, preflight.bytes, preflight.size) == preflight.size);
+                            CHECK(setRip(address));
+                            const auto beforeTransition = debugger.snapshot();
+                            const auto transitionGeneration = history.generation;
+                            CHECK(debugger.recordExecutionPathForSession(target, owner.activeTid));
+                            const bool refusedTransition = waitHistoryStopped(transitionGeneration, history, 5000);
+                            CHECK(refusedTransition);
+                            if (!refusedTransition || history.entries.size() != 1 ||
+                                history.status.find(preflight.reason) == std::string::npos)
+                                std::printf("[diag] preflight case=%zu count=%zu status=%s event=%s\n",
+                                    i, history.entries.size(), history.status.c_str(), debugger.snapshot().lastEvent.c_str());
+                            CHECK(history.entries.size() == 1);
+                            CHECK(history.status.find(preflight.reason) != std::string::npos);
+                            if (!history.entries.empty()) CHECK(history.entries.front().regs.rip == address);
+                            const auto afterTransition = debugger.snapshot();
+                            CHECK(afterTransition.regs.rip == address);
+                            CHECK(afterTransition.regs.rax == beforeTransition.regs.rax);
+                            CHECK(afterTransition.regs.rsp == beforeTransition.regs.rsp);
+                            CHECK(afterTransition.exceptionSequence == beforeTransition.exceptionSequence);
+                        }
+
+                        // A target exception is a real stop, with its faulting
+                        // context retained instead of an invented successor.
+                        static constexpr uint8_t illegal[] = {0x0F, 0x0B}; // UD2
+                        CHECK(debugger.writeMemory(start + 32, illegal, sizeof(illegal)) == sizeof(illegal));
+                        CHECK(setRip(start + 32));
+                        const auto exceptionGeneration = history.generation;
+                        CHECK(debugger.recordExecutionPathForSession(target, owner.activeTid));
+                        const bool faulted = waitHistoryStopped(exceptionGeneration, history, 5000);
+                        CHECK(faulted);
+                        if (faulted) {
+                            CHECK(!history.entries.empty() && history.entries.size() <= 2);
+                            CHECK(history.entries.back().regs.rip == start + 32);
+                            CHECK(history.entries.back().bytes[0] == 0x0F);
+                            CHECK(debugger.snapshot().exceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION);
+                            CHECK(debugger.snapshot().regs.rip == start + 32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // This deliberately redirected loader thread cannot resume its ordinary
+    // workload. Reap only our self-launched process, then inspect cleared state.
+    CHECK(TerminateProcess(process, 0) != FALSE);
+    CHECK(debugger.detach());
+    ExecutionHistorySnapshot cleared;
+    debugger.executionHistorySnapshotIfChanged(cleared);
+    CHECK(cleared.entries.empty() && !cleared.recording);
+    CHECK(cleared.target.pid == 0 && cleared.target.sessionGeneration == 0 && cleared.tid == 0);
+    CHECK(!debugger.recordExecutionPathForSession(target, initial.activeTid));
+    WaitForSingleObject(process, 5000);
+    CloseHandle(process);
+    std::printf("[%s] execution history ordered path, context/byte capture, bounds and ownership\n",
+        failuresBefore == g_fail ? "pass" : "fail");
+}
+
 int main() {
     char marker[8]{};
     if (GetEnvironmentVariableA("DS_X64_DEBUGGEE", marker,
@@ -701,6 +1084,21 @@ int main() {
     }
 
     Debugger debugger;
+    char historyOnly[2]{};
+    if (GetEnvironmentVariableA("DS_X64_EXECUTION_HISTORY_ONLY", historyOnly, sizeof(historyOnly)) &&
+        historyOnly[0] == '1') {
+        checkExecutionHistoryFixture(self);
+        std::printf("x64_debug_test execution history: %d failure(s)\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    char pauseOnly[2]{};
+    if (GetEnvironmentVariableA("DS_X64_BREAKPOINT_PAUSE_ONLY", pauseOnly, sizeof(pauseOnly)) &&
+        pauseOnly[0] == '1') {
+        checkLiveBreakpointPauseFixture(debugger, self, false);
+        checkLiveBreakpointPauseFixture(debugger, self, true);
+        std::printf("x64_debug_test breakpoint pause/resume: %d failure(s)\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     std::string error;
     const bool launched = launchSelf(debugger, self, error);
     if (!launched) {
@@ -1013,6 +1411,37 @@ int main() {
             finalLegacy |= bp.address == scratch + 4 && bp.armed && bp.condition == "rax == 6";
         }
         CHECK(finalExisting && finalNew && finalLegacy);
+        // Pausing while running restores the byte without deleting the record;
+        // writes while paused are not hidden by an inactive breakpoint baseline.
+        CHECK(debugger.setBreakpointEnabledForSession(pausedMutationSession, scratch, false));
+        CHECK(waitBreakpointEnabled(debugger, scratch, false));
+        CHECK(debugger.hasBreakpoint(scratch));
+        CHECK(debugger.readMemory(scratch, &raw, 1) == 1 && raw == patched);
+        debugger.pause();
+        CHECK(waitPaused(debugger, 2000));
+        const uint8_t nativeTrap = 0xCC;
+        CHECK(debugger.writeMemory(scratch, &nativeTrap, 1) == 1);
+        CHECK(debugger.readMemoryMasked(scratch, &masked, 1) == 1 && masked == nativeTrap);
+        CHECK(debugger.setBreakpointEnabledForSession(pausedMutationSession, scratch, true));
+        CHECK(waitBreakpointResult(debugger, scratch, false, "native INT3", 2000));
+        bool failedResumeRetained = false;
+        for (const auto& bp : debugger.snapshot().breakpoints)
+            if (bp.address == scratch) failedResumeRetained = !bp.enabled && bp.condition == "rax == 2";
+        CHECK(failedResumeRetained);
+        CHECK(debugger.writeMemory(scratch, &patched, 1) == 1);
+        CHECK(debugger.setBreakpointEnabledForSession(pausedMutationSession, scratch, true));
+        CHECK(waitBreakpointEnabled(debugger, scratch, true));
+        CHECK(debugger.readMemory(scratch, &raw, 1) == 1 && raw == 0xCC);
+        CHECK(debugger.readMemoryMasked(scratch, &masked, 1) == 1 && masked == patched);
+        // Add+pause retains the new row, whereas remove still deletes it.
+        CHECK(debugger.addBreakpointForSession(pausedMutationSession, scratch + 5, "rax == 8"));
+        CHECK(debugger.setBreakpointEnabledForSession(pausedMutationSession, scratch + 5, false));
+        CHECK(waitBreakpointEnabled(debugger, scratch + 5, false));
+        CHECK(debugger.hasBreakpoint(scratch + 5));
+        CHECK(debugger.removeBreakpointForSession(pausedMutationSession, scratch + 5));
+        CHECK(waitBreakpointCount(debugger, 3, 2000));
+        debugger.cont();
+        CHECK(waitRunning(debugger, 2000));
         CHECK(debugger.removeBreakpointForSession(pausedMutationSession, scratch + 3));
         CHECK(debugger.removeBreakpoint(scratch + 4));
         CHECK(waitBreakpointCount(debugger, 1, 2000));
@@ -1110,6 +1539,9 @@ int main() {
         CHECK(afterDetach == detachOwnedText);
     }
     if (detachOwnedProcess) CloseHandle(detachOwnedProcess);
+
+    checkLiveBreakpointPauseFixture(debugger, self, false);
+    checkLiveBreakpointPauseFixture(debugger, self, true);
 
     // Attach to an already-running, genuinely multithreaded target. Both workers
     // execute the same CALL site: Step Over and Step Out must remain owned by the
@@ -1426,6 +1858,17 @@ int main() {
                 debugger, sharedWinHttpSend, 1, 8000);
             CHECK(parked);
             if (parked) {
+                const auto owner = debugger.snapshot();
+                const DebugTargetIdentity target{owner.pid, owner.sessionGeneration};
+                CHECK(debugger.setBreakpointEnabledForSession(target, sharedWinHttpSend, false));
+                CHECK(waitBreakpointEnabled(debugger, sharedWinHttpSend, false));
+                CHECK(debugger.hasBreakpoint(sharedWinHttpSend));
+                CHECK(debugger.snapshot().regs.rip == sharedWinHttpSend);
+                CHECK(debugger.setBreakpointEnabledForSession(target, sharedWinHttpSend, true));
+                CHECK(waitBreakpointEnabled(debugger, sharedWinHttpSend, true));
+                CHECK(debugger.snapshot().regs.rip == sharedWinHttpSend);
+                CHECK(debugger.setBreakpointEnabledForSession(target, sharedWinHttpSend, false));
+                CHECK(waitBreakpointEnabled(debugger, sharedWinHttpSend, false));
                 CHECK(debugger.removeBreakpoint(sharedWinHttpSend));
                 debugger.stopNetworkObservation();
                 debugger.cont();
@@ -1797,6 +2240,7 @@ int main() {
     CHECK(crash.regs.rip != 0 && !crash.frames.empty());
     debugger.detach();
 
+    checkExecutionHistoryFixture(self);
     checkFailedDetachRecovery(self);
 
     if (g_fail) {

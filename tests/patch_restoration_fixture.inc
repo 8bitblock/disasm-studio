@@ -1,3 +1,68 @@
+// FILE restoration uses the real production transaction, including failures
+// that leave the selected record available for the user to inspect/retry.
+static void checkStaticPatchRestoration(const std::string& path) {
+    const int failuresBefore = failures;
+    Fixture f(path);
+    size_t available = 0;
+    const uint8_t* original = f.ctx.staticBinary().ptrFromVA(kTarget, available);
+    CHECK(original && available >= 8);
+    if (!original || available < 8) return;
+    const std::vector<uint8_t> pristine(original, original + 8);
+    auto bytesAtTarget = [&] {
+        size_t currentAvailable = 0;
+        const uint8_t* current = f.ctx.staticBinary().ptrFromVA(kTarget, currentAvailable);
+        CHECK(current && currentAvailable >= pristine.size());
+        return current && currentAvailable >= pristine.size()
+            ? std::vector<uint8_t>(current, current + pristine.size())
+            : std::vector<uint8_t>{};
+    };
+
+    CHECK(f.tab->applyPatchBytes(f.ctx, kTarget, {0x90, 0x90, 0x90, 0x90}, 4, false));
+    const std::vector<uint8_t> patched = bytesAtTarget();
+    const uint64_t patchedRevision = f.ctx.staticBinary().imageRevision();
+    // An invalid later record refuses the complete transaction. The actual
+    // failing row and reason must survive, without a fictional LIVE rollback.
+    f.ctx.staticProject().patches.push_back({UINT64_MAX, {0x11}, {0x22}});
+    f.tab->revertPatchAt(f.ctx, kTarget, 0);
+    CHECK(f.ctx.staticProject().patches.size() == 2);
+    CHECK(bytesAtTarget() == patched);
+    CHECK(f.ctx.staticBinary().imageRevision() == patchedRevision);
+    CHECK(f.tab->patchStatus_.find("patch #2") != std::string::npos);
+    CHECK(f.tab->patchStatus_.find("overflows") != std::string::npos);
+    CHECK(f.tab->patchStatus_.find("No bytes changed") != std::string::npos);
+    CHECK(f.tab->patchStatus_.find("rolled back") == std::string::npos);
+    f.ctx.staticProject().patches.pop_back();
+
+    f.tab->revertPatchAt(f.ctx, kTarget, 0);
+    CHECK(f.ctx.staticProject().patches.empty());
+    CHECK(bytesAtTarget() == pristine);
+    f.tab->revertPatchAt(f.ctx, kTarget);
+    CHECK(f.tab->patchStatus_.find("no recorded patch") != std::string::npos);
+
+    // Exact rows distinguish same-address alternatives. Removing an inactive
+    // row must keep the active bytes and must not bump the image revision.
+    f.ctx.staticProject().patchSets = {{9, "inactive alternative", false}};
+    CHECK(f.tab->applyPatchBytes(f.ctx, kTarget, {0x90, 0x90}, 2, false));
+    f.tab->patchDestinationSetId_ = 9;
+    CHECK(f.tab->applyPatchBytes(f.ctx, kTarget, {0xCC, 0xCC}, 2, false));
+    CHECK(f.ctx.staticProject().patches.size() == 2);
+    const std::vector<uint8_t> activeBytes = bytesAtTarget();
+    const uint64_t activeRevision = f.ctx.staticBinary().imageRevision();
+    f.tab->revertPatchAt(f.ctx, kTarget);
+    CHECK(f.ctx.staticProject().patches.size() == 2);
+    CHECK(f.tab->patchStatus_.find("exact row") != std::string::npos);
+    f.tab->revertPatchAt(f.ctx, kTarget, 1);
+    CHECK(f.ctx.staticProject().patches.size() == 1);
+    CHECK(f.ctx.staticProject().patches.front().patchSetId == 0);
+    CHECK(bytesAtTarget() == activeBytes);
+    CHECK(f.ctx.staticBinary().imageRevision() == activeRevision);
+    f.tab->revertPatchAt(f.ctx, kTarget, 0);
+    CHECK(f.ctx.staticProject().patches.empty());
+    CHECK(bytesAtTarget() == pristine);
+    std::printf("Static patch restoration: %s (%d new failure(s))\n",
+        failures == failuresBefore ? "passed" : "FAILED", failures - failuresBefore);
+}
+
 // Opt-in integration through the production Binary View patch/revert methods
 // and the real debugger. Only a contained copy of this harness is launched;
 // no existing process, executable code in the child, or user file is modified.
@@ -114,6 +179,9 @@ static void checkLivePatchByteRestoration(const std::string& path) {
     f.ctx.setStaticDebugImageIdentity(identity);
     f.tab->mainView_ = 0;
     f.tab->frameSnap_ = &f.detached;
+
+    checkLiveMultiRowPatch(f, scratch);
+    f.ctx.setStaticDebugImageIdentity(identity);
 
     // Numeric observations use the same real, test-owned debugger process.
     // Decode absolute memory operands through the production x64 decoder.
@@ -261,6 +329,8 @@ static void checkLivePatchByteRestoration(const std::string& path) {
     f.tab->revertPatchAt(f.ctx, kTarget);
     CHECK(f.ctx.staticProject().patches.size() == 2);
     CHECK(f.tab->patchStatus_.find("rolled back") != std::string::npos);
+    CHECK(f.tab->patchStatus_.find("patch #2") != std::string::npos);
+    CHECK(f.tab->patchStatus_.find("overflows") != std::string::npos);
     CHECK(f.tab->livePatchOriginals_.size() == 1);
     CHECK(logicalBytes() == patched);
     CHECK(rawByte() == 0xCC);

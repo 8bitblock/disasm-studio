@@ -62,7 +62,10 @@ Write-Host "Test results: $resultsRoot"
 
 function Invoke-CheckedNative {
     param([string]$Program, [string[]]$Arguments, [string]$LogPath, [switch]$EchoOutput)
-    $resolvedProgram = (Get-Command -Name $Program -CommandType Application -ErrorAction Stop).Source
+    # Multiple VS installations can expose several cl/link executables. Use the
+    # first PATH match from the exact vcvars environment selected above.
+    $resolvedProgram = (Get-Command -Name $Program -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1).Source
     # Native stderr is diagnostic output, not a PowerShell terminating exception.
     # The process exit status remains the sole success criterion on PS5 and PS7.
     $previousPreference = $ErrorActionPreference

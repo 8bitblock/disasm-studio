@@ -660,13 +660,16 @@ void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target)
     const float scale = theme::UiScale();
     ImGui::BeginChild("##memory_target_bar", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY);
-    ImGui::TextUnformatted("Memory Tools");
-    ui::SameLineIfFits(240.0f * scale);
-    ImGui::TextDisabled("Value scans, memory and address records");
+    ui::PanelHeader("Memory Tools", target.valid() ? target.name.c_str() : "No live-memory target");
     if (target.valid()) {
+        char identity[100];
+        std::snprintf(identity, sizeof(identity), "PID %u  |  %s  |  %s",
+            target.pid, target.is32 ? "x86" : "x64", target.canWrite ? "read/write" : "read-only");
         ui::StatePill(target.source == TargetSource::Debugger ? "DEBUGGER" : "PASSIVE",
                       target.source == TargetSource::Debugger
                           ? theme::col::warn() : theme::col::good(), nullptr);
+        ui::SameLineIfFits(ImGui::CalcTextSize(identity).x);
+        ImGui::TextUnformatted(identity);
         ui::SameLineIfFits(145.0f * scale);
         if (ImGui::Button("Open Process...")) processPickerOpen_ = true;
         if (target.source == TargetSource::Passive) {
@@ -680,12 +683,9 @@ void MemoryToolsTab::renderTargetBar(AppContext& ctx, const TargetToken& target)
             ui::SameLineIfFits(140.0f * scale);
             if (ImGui::Button("Communications")) ctx.requestedTab = "Communications";
         }
-        ImGui::TextWrapped("%s  |  PID %u  |  %s  |  %s",
-                           target.name.c_str(), target.pid, target.is32 ? "x86" : "x64",
-                           target.canWrite ? "read/write" : "read-only");
     } else {
-        ImGui::TextDisabled("No live-memory target");
-        ui::SameLineIfFits(150.0f * scale);
+        ui::Badge("Detached", theme::col::muted());
+        ui::SameLineIfFits(145.0f * scale);
         if (ui::AccentButton("Open Process...", theme::col::accent(),
                              "Open a non-invasive query/read/write handle; this does not attach a debugger.",
                              true))
@@ -722,21 +722,24 @@ void MemoryToolsTab::renderProcessPicker(AppContext& ctx) {
 
     if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh", "Refresh process list"))
         refreshProcessList();
-    ImGui::SameLine();
+    ui::SameLineIfFits(260.0f * theme::UiScale());
     if (ui::SearchBox("##memory_process_filter", "process name or PID...",
                       processFilter_, sizeof(processFilter_),
-                      260.0f * theme::UiScale()))
+                      (std::min)(260.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x)))
         selectedProcess_ = -1;
-    ImGui::TextDisabled("Opening here is non-invasive: it does not call DebugActiveProcess or suspend the target.");
+    ImGui::PushTextWrapPos();
+    ImGui::TextDisabled("Open a memory session without pausing the process. An existing debugger session is reused when available.");
+    ImGui::PopTextWrapPos();
 
-    if (ImGui::BeginTable("##memory_processes", 4,
+    if (ui::BeginDataTable("##memory_processes", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
             ImVec2(0, -42.0f * theme::UiScale()))) {
-        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 75.0f * theme::UiScale());
         ImGui::TableSetupColumn("Process");
-        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 55.0f * theme::UiScale());
+        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 94.0f * theme::UiScale());
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         for (int i = 0; i < static_cast<int>(processes_.size()); ++i) {
             const ProcessInfo& process = processes_[i];
@@ -752,11 +755,11 @@ void MemoryToolsTab::renderProcessPicker(AppContext& ctx) {
                 selectedProcess_ = i;
             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(process.is64 ? "x64" : "x86");
             ImGui::TableSetColumnIndex(3);
-            ImGui::TextColored(process.canOpen ? theme::col::good() : theme::col::bad(),
-                               "%s", process.canOpen ? "query ok" : "denied");
+            ui::Badge(process.canOpen ? "Query OK" : "Denied",
+                      process.canOpen ? theme::col::good() : theme::col::bad());
             ImGui::PopID();
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 
     ImGui::BeginDisabled(selectedProcess_ < 0 ||
@@ -1228,10 +1231,8 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
     pumpScanCompletion();
     rebuildScanPage();
 
-    ImGui::TextUnformatted("Value scanner");
-    ImGui::Separator();
-
     const bool running = scanRunning_.load(std::memory_order_acquire);
+    ui::PanelHeader("Value scanner", running ? "Scanning" : firstScanDone_ ? "Refine captured results" : "First scan");
     ImGui::BeginDisabled(running || firstScanDone_);
     ImGui::SetNextItemWidth(150.0f * theme::UiScale());
     ImGui::Combo("Type", &valueKind_, kValueKinds,
@@ -1250,6 +1251,7 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
     }
     ImGui::EndDisabled();
 
+    ui::SameLineIfFits(180.0f * scale + ImGui::CalcTextSize("Scan").x + ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::SetNextItemWidth(180.0f * theme::UiScale());
     ImGui::Combo("Scan", &scanMode_, kScanModes,
                  static_cast<int>(std::size(kScanModes)));
@@ -1345,9 +1347,10 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
     const uint64_t total = scanSnapshot_->candidateCount();
     const uint64_t firstShown = total ? scanPage_.first + 1 : 0;
     const uint64_t lastShown = scanPage_.first + scanPage_.matches.size();
-    ImGui::SeparatorText("Results");
-    ImGui::Text("%s matches  |  %s-%s", compactCount(total).c_str(),
-                compactCount(firstShown).c_str(), compactCount(lastShown).c_str());
+    const std::string resultCount = compactCount(total) + " matches";
+    ui::PanelHeader("Results", resultCount.c_str());
+    ImGui::TextDisabled("Showing %s-%s", compactCount(firstShown).c_str(),
+                        compactCount(lastShown).c_str());
     ui::SameLineIfFits(130.0f * scale);
     ImGui::BeginDisabled(scanPage_.first == 0);
     if (ImGui::SmallButton("|<")) { scanPageStart_ = 0; rebuildScanPage(); }
@@ -1378,16 +1381,16 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
         scanLivePageStart_ = scanPage_.first;
     }
     const uint64_t liveTick = static_cast<uint64_t>(ImGui::GetTime() * 4.0);
-    if (ImGui::BeginTable("##memory_scan_results", 5,
+    if (ui::BeginDataTable("##memory_scan_results", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
-            ImVec2(0, 0))) {
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+            ImVec2(0, 0), (std::max)(620.0f * scale, ImGui::GetContentRegionAvail().x))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 145.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 145.0f * scale);
         ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Current", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Previous", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 86.0f * scale);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(scanPage_.matches.size()));
@@ -1451,7 +1454,9 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
                     ImGui::EndPopup();
                 }
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(moduleAddressLabel(modules, match.address).c_str());
+                const std::string moduleLabel = moduleAddressLabel(modules, match.address);
+                ImGui::TextUnformatted(moduleLabel.c_str());
+                ui::ItemTooltip(moduleLabel.c_str());
                 ImGui::TableSetColumnIndex(2);
                 if (complete)
                     ImGui::TextUnformatted(formatMemoryValue(scanShape_.type, current,
@@ -1462,13 +1467,13 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
                 ImGui::TextUnformatted(formatMemoryValue(scanShape_.type, match.bytes,
                     scanHex_, nullTerminateText_).c_str());
                 ImGui::TableSetColumnIndex(4);
-                ImGui::TextColored(!complete ? theme::col::bad() :
-                                   (changed ? theme::col::warn() : theme::col::good()),
-                                   "%s", !complete ? "gone" : changed ? "changed" : "same");
+                ui::Badge(!complete ? "Gone" : changed ? "Changed" : "Same",
+                          !complete ? theme::col::bad() :
+                          changed ? theme::col::warn() : theme::col::muted());
                 ImGui::PopID();
             }
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
@@ -1622,6 +1627,7 @@ void MemoryToolsTab::refreshViewer(AppContext& ctx, const TargetToken& target,
 
 void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target) {
     const float scale = theme::UiScale();
+    ui::PanelHeader("Memory viewer");
     const uint64_t targetLimit = target.is32 ? UINT32_MAX : UINT64_MAX;
     const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
                          !ImGui::GetIO().WantTextInput;
@@ -1673,7 +1679,7 @@ void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target)
             ui::Toast(ui::ToastKind::Error, "Address exceeds this 32-bit target's range.");
         else ui::Toast(ui::ToastKind::Error, "Memory address must be hexadecimal.");
     }
-    ui::SameLineIfFits(275.0f * scale);
+    ui::SameLineIfFits(220.0f * scale);
     ImGui::BeginDisabled(!viewBaseValid_ || viewBase_ == 0);
     if (ImGui::Button("-0x100"))
         navigateViewer(viewBase_ >= 0x100 ? viewBase_ - 0x100 : 0);
@@ -1686,7 +1692,8 @@ void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target)
     ImGui::SameLine();
     if (ImGui::Button("Refresh"))
         refreshViewer(ctx, target, true);
-    ui::SameLineIfFits(100.0f * scale);
+    ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::CalcTextSize("Live refresh").x +
+                       ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::Checkbox("Live refresh", &viewAutoRefresh_);
 
     refreshViewer(ctx, target, false);
@@ -1696,8 +1703,15 @@ void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target)
     if (!viewStatus_.empty()) ImGui::TextColored(theme::col::warn(), "%s", viewStatus_.c_str());
     ImGui::PopTextWrapPos();
 
+    // Keep a header and two complete byte rows usable at the chosen font size,
+    // without forcing the selection actions below a short inspector viewport.
+    ui::PushMono();
+    const float minGridHeight = ImGui::GetTextLineHeightWithSpacing() * 3.0f +
+        ImGui::GetStyle().ScrollbarSize + ImGui::GetStyle().WindowPadding.y * 2.0f;
+    ui::PopMono();
     const float gridHeight = (std::clamp)(ImGui::GetContentRegionAvail().y * 0.56f,
-                                         100.0f * scale, 350.0f * scale);
+                                         minGridHeight, 350.0f * scale);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
     if (ImGui::BeginChild("##memory_hex_grid", ImVec2(0, gridHeight),
                           ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_HorizontalScrollbar)) {
@@ -1803,6 +1817,7 @@ void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target)
     }
     ImGui::EndChild();
 
+    ImGui::PopStyleColor(); // recessed hex canvas
     const int selectionLo = (std::min)(viewSelectionBegin_, viewSelectionEnd_);
     const int selectionHi = (std::max)(viewSelectionBegin_, viewSelectionEnd_);
     const bool hasSelection = selectionLo >= 0 && selectionHi >= selectionLo &&
@@ -1936,15 +1951,30 @@ void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target)
 
 void MemoryToolsTab::renderRegionBrowser(AppContext& ctx,
                                          const TargetToken& target) {
+    const float scale = theme::UiScale();
+    ui::PanelHeader("Memory regions");
     if (!regionOwner_.sameSession(target)) refreshRegionCache(ctx, target);
-    if (ImGui::Button(DS_ICON_REFRESH " Refresh map")) refreshRegionCache(ctx, target);
-    ImGui::SameLine();
+    if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh map")) refreshRegionCache(ctx, target);
+    ui::SameLineIfFits(230.0f * scale);
     ui::SearchBox("##memory_region_filter", "module, type, protection...",
-                  regionFilter_, sizeof(regionFilter_), 230.0f * theme::UiScale());
-    ImGui::SameLine(); ImGui::Checkbox("R", &regionReadableOnly_);
+                  regionFilter_, sizeof(regionFilter_), std::min(230.0f * scale, ImGui::GetContentRegionAvail().x));
+    const float accessFilterWidth = 3.0f * (ImGui::GetFrameHeight() +
+        ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize("W").x) +
+        2.0f * ImGui::GetStyle().ItemSpacing.x;
+    ui::SameLineIfFits(accessFilterWidth);
+    ImGui::BeginGroup();
+    ImGui::Checkbox("R", &regionReadableOnly_);
+    ui::ItemTooltip("Show readable regions only.");
     ImGui::SameLine(); ImGui::Checkbox("W", &regionWritableOnly_);
+    ui::ItemTooltip("Show writable regions only.");
     ImGui::SameLine(); ImGui::Checkbox("X", &regionExecutableOnly_);
-    if (!regionStatus_.empty()) ImGui::TextDisabled("%s", regionStatus_.c_str());
+    ui::ItemTooltip("Show executable regions only.");
+    ImGui::EndGroup();
+    if (!regionStatus_.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", regionStatus_.c_str());
+        ImGui::PopTextWrapPos();
+    }
 
     const auto modules = modulesFor(ctx, target);
     std::vector<size_t> visibleRegions;
@@ -1964,17 +1994,18 @@ void MemoryToolsTab::renderRegionBrowser(AppContext& ctx,
         }
         visibleRegions.push_back(index);
     }
-    if (ImGui::BeginTable("##memory_regions", 7,
+    if (ui::BeginDataTable("##memory_regions", 7,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+            ImVec2(0, 0), (std::max)(ImGui::GetContentRegionAvail().x, 960.0f * scale))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-        ImGui::TableSetupColumn("End", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 62.0f);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+        ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, 140.0f * scale);
+        ImGui::TableSetupColumn("End", ImGuiTableColumnFlags_WidthFixed, 140.0f * scale);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 80.0f * scale);
+        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 62.0f * scale);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 68.0f * scale);
         ImGui::TableSetupColumn("Module");
-        ImGui::TableSetupColumn("Allocation", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+        ImGui::TableSetupColumn("Allocation", ImGuiTableColumnFlags_WidthFixed, 140.0f * scale);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(visibleRegions.size()));
@@ -2016,12 +2047,13 @@ void MemoryToolsTab::renderRegionBrowser(AppContext& ctx,
                 ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(access.c_str());
                 ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(type.c_str());
                 ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(module.c_str());
+                ui::ItemTooltip(module.c_str());
                 ImGui::TableSetColumnIndex(6);
                 ImGui::TextUnformatted(hexAddress(region.allocationBase).c_str());
                 ImGui::PopID();
             }
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
@@ -2224,7 +2256,8 @@ void MemoryToolsTab::renderPointerScanner(AppContext& ctx,
     pumpPointerCompletion();
     const float scale = theme::UiScale();
     const bool running = pointerRunning_.load(std::memory_order_acquire);
-    ImGui::TextWrapped("Finds bounded pointer paths ending at a live address. Module roots are ASLR-stable and rank first.");
+    ui::PanelHeader("Pointer scanner", running ? "Scanning" : "Module roots rank first");
+    ui::ItemTooltip("Find bounded pointer paths ending at a live address. Module-relative roots remain valid across address-space relocation.");
     ImGui::BeginDisabled(running);
     ImGui::SetNextItemWidth(160.0f * scale);
     ImGui::InputText("Target (hex)", pointerTarget_, sizeof(pointerTarget_),
@@ -2269,17 +2302,20 @@ void MemoryToolsTab::renderPointerScanner(AppContext& ctx,
                 : "No pointer paths to show. Review the scan status above, adjust the target or scan limits, then run Pointer scan again.");
         return;
     }
-    ImGui::TextDisabled("%zu pointer path%s", pointerRows_.size(), pointerRows_.size() == 1 ? "" : "s");
+    const std::string pointerCount = std::to_string(pointerRows_.size()) +
+        (pointerRows_.size() == 1 ? " path" : " paths");
+    ui::PanelHeader("Results", pointerCount.c_str());
     ui::ItemTooltip("Double-click a path to add it to the address table. Right-click for viewer actions.");
 
-    if (ImGui::BeginTable("##pointer_results", 4,
+    if (ui::BeginDataTable("##pointer_results", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+            ImVec2(0, 0), (std::max)(520.0f * scale, ImGui::GetContentRegionAvail().x))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Root", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Offsets", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Depth", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
-        ImGui::TableSetupColumn("Root kind", ImGuiTableColumnFlags_WidthFixed, 72.0f * scale);
+        ImGui::TableSetupColumn("Root kind", ImGuiTableColumnFlags_WidthFixed, 90.0f * scale);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(pointerRows_.size()));
@@ -2314,15 +2350,17 @@ void MemoryToolsTab::renderPointerScanner(AppContext& ctx,
                     }
                     ImGui::EndPopup();
                 }
+                ui::ItemTooltip(row.rootLabel.c_str());
                 ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(offsets.c_str());
+                ui::ItemTooltip(offsets.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::Text("%zu", row.chain.offsets.size());
                 ImGui::TableSetColumnIndex(3);
-                ImGui::TextColored(row.moduleRoot ? theme::col::good() : theme::col::warn(),
-                                   "%s", row.moduleRoot ? "module" : "absolute");
+                ui::Badge(row.moduleRoot ? "Module" : "Absolute",
+                          row.moduleRoot ? theme::col::muted() : theme::col::warn());
                 ImGui::PopID();
             }
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
@@ -2336,13 +2374,13 @@ void MemoryToolsTab::renderInspector(AppContext& ctx, const TargetToken& target)
             renderHexViewer(ctx, target);
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Regions", nullptr,
+        if (ui::BeginCountTabItem("Regions", regionCache_.size(),
                 selectRequest == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
             inspectorTab_ = 1;
             renderRegionBrowser(ctx, target);
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Pointer scan", nullptr,
+        if (ui::BeginCountTabItem("Pointer scan", pointerRows_.size(),
                 selectRequest == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
             inspectorTab_ = 2;
             renderPointerScanner(ctx, target);
@@ -2839,8 +2877,9 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
                                         const TargetToken& target) {
     const float scale = theme::UiScale();
     pumpFreezeCompletion();
-    ImGui::TextUnformatted("Address table");
-    ui::SameLineIfFits(65.0f * scale);
+    const std::string tableCount = std::to_string(table_.size()) +
+        (table_.size() == 1 ? " record" : " records");
+    ui::PanelHeader("Address table", tableCount.c_str());
     if (ImGui::SmallButton("Save...")) {
         if (saveTableDialog(target)) ui::Toast(ui::ToastKind::Success, targetStatus_);
         else if (!targetStatus_.empty()) ui::Toast(ui::ToastKind::Error, targetStatus_);
@@ -2850,6 +2889,7 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
         if (loadTableDialog()) ui::Toast(ui::ToastKind::Success, targetStatus_);
         else if (!targetStatus_.empty()) ui::Toast(ui::ToastKind::Error, targetStatus_);
     }
+    ui::ItemTooltip("Loaded records are always disabled and unfrozen; review them before enabling.");
     ui::SameLineIfFits(220.0f * scale);
     int interval = static_cast<int>(freezeIntervalMs_);
     ImGui::SetNextItemWidth(120.0f * scale);
@@ -2873,15 +2913,15 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
         }
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled("%zu records; loaded records never auto-enable", table_.size());
     ImGui::Separator();
     if (table_.empty()) {
-        ImGui::TextWrapped("Add an address above, add a scan result or viewer selection, or load a saved memory table.");
+        ui::EmptyState(DS_ICON_MEMORY, "No saved addresses",
+            "Add an address above, use a scan result or viewer selection, or load a saved table.");
         return;
     }
 
     uint64_t deleteId = 0;
-    if (ImGui::BeginTable("##memory_address_table", 11,
+    if (ui::BeginDataTable("##memory_address_table", 11,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
             ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable |
             ImGuiTableFlags_Reorderable, ImVec2(0, 0),
@@ -3076,6 +3116,7 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
                     (row.status.starts_with("resolve:") ? theme::col::bad() :
                                                          ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled)),
                     "%s", row.status.c_str());
+                ui::ItemTooltip(row.status.c_str());
                 ImGui::TableSetColumnIndex(10);
                 ImGui::BeginDisabled(!row.record.enabled ||
                                      !target.valid() || !target.canWrite);
@@ -3140,7 +3181,7 @@ void MemoryToolsTab::renderAddressTable(AppContext& ctx,
                 ImGui::PopID();
             }
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
     if (deleteId) {
         table_.erase(std::remove_if(table_.begin(), table_.end(),
@@ -3234,8 +3275,14 @@ void MemoryToolsTab::render(AppContext& ctx) {
     const float contentHeight = (std::max)(1.0f, available.y - 6.0f * scale -
                                           ImGui::GetStyle().ItemSpacing.y * 2.0f);
     const float minUpper = (std::min)(220.0f * scale, contentHeight * 0.55f);
+    // Reserve the address-table header, wrapped controls and at least one full
+    // editable row at the applied font size. The table remains independent and
+    // the user can drag the splitter to expose more records.
+    const float minTable = ImGui::GetFrameHeightWithSpacing() * 4.0f +
+        ImGui::GetTextLineHeightWithSpacing() * 2.0f +
+        ImGui::GetStyle().WindowPadding.y * 2.0f;
     const float maxUpper = (std::max)(minUpper, contentHeight -
-        (std::min)(150.0f * scale, contentHeight * 0.4f));
+        (std::min)(minTable, contentHeight * 0.45f));
     if (upperHeight_ <= 0.0f) upperHeight_ = available.y * 0.62f;
     upperHeight_ = (std::clamp)(upperHeight_, minUpper, maxUpper);
     if (ImGui::BeginChild("##memory_upper", ImVec2(0, upperHeight_), false)) {

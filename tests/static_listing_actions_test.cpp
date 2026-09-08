@@ -164,8 +164,13 @@ struct Fixture {
 #include "navigator_refinement_fixture.inc"
 #include "hex_refinement_fixture.inc"
 #include "context_action_regressions.inc"
+#include "multi_row_patch_fixture.inc"
 #include "patch_restoration_fixture.inc"
+#include "patch_tab_visibility_fixture.inc"
+#include "patch_panel_fixture.inc"
+#include "live_scroll_fixture.inc"
 #include "trace_workflow_fixture.inc"
+#include "execution_history_fixture.inc"
 
 static void checkRetainedActions(const std::string& path) {
     Fixture f(path);
@@ -360,7 +365,7 @@ static void checkPopupAfterEviction(const std::string& path) {
     Instruction in; std::string error;
     CHECK(!f.tab->listingActionInstruction(f.ctx, patchAddress, in, error));
     f.tab->patchMode_ = 0;
-    std::snprintf(f.tab->patchHex_, sizeof(f.tab->patchHex_), "90 90");
+    f.tab->patchHex_ = "90 90";
     frame(popupBody);
     ImGuiWindow* popup = ImGui::FindWindowByName("Patch");
     CHECK(popup != nullptr);
@@ -477,9 +482,20 @@ static void checkGameMakerActions(const std::string& directory) {
             CHECK(window != nullptr);
             if (window) {
                 ImGui::FocusWindow(window);
-                ImGui::ActivateItemByID(window->GetID("Readable GML"));
+                ImGui::ActivateItemByID(window->GetID("Display##listing_display"));
             }
             frame(body, "GML assembly toolbar integration");
+            frame(body, "GML assembly toolbar integration");
+            ImGuiWindow* menu = GImGui->OpenPopupStack.empty()
+                ? nullptr : GImGui->OpenPopupStack.back().Window;
+            CHECK(menu != nullptr);
+            if (menu) {
+                ImGui::FocusWindow(menu);
+                ImGui::ActivateItemByID(menu->GetID("Readable GML"));
+            }
+            frame(body, "GML assembly toolbar integration");
+            frame(body, "GML assembly toolbar integration");
+            CHECK(GImGui->OpenPopupStack.empty());
         };
         const char* variableExplanation = "Read this variable and keep its value on the temporary stack for the next operations.";
         for (bool readable : {true, false}) {
@@ -743,7 +759,9 @@ static void checkListingVisualSignals(const std::string& path) {
                 CHECK(f.tab->rowGlow_.size() == 5);
                 if (f.tab->rowGlow_.size() != 5) return;
                 const auto glows = f.tab->rowGlow_;
-                CHECK(sameRgb(glows[0].colorPacked, ImGui::GetColorU32(theme::col::good())));
+                // Every palette uses the shared Axiom execution marker; trace
+                // coverage retains its independent green success signal.
+                CHECK(sameRgb(glows[0].colorPacked, ImGui::GetColorU32(theme::col::accent())));
                 CHECK(sameRgb(glows[1].colorPacked, ImGui::GetColorU32(theme::col::accent())));
                 CHECK(sameRgb(glows[2].colorPacked, ImGui::GetColorU32(theme::col::jump())));
                 CHECK(sameRgb(glows[3].colorPacked, ImGui::GetColorU32(theme::col::good())));
@@ -1203,6 +1221,12 @@ int main() {
     };
     theme::ApplyTheme();
     try {
+        char liveScrollOnly[8]{};
+        const bool onlyLiveScroll = GetEnvironmentVariableA("DS_LIVE_SCROLL_ONLY",
+            liveScrollOnly, sizeof(liveScrollOnly)) && liveScrollOnly[0] == '1';
+        if (onlyLiveScroll) {
+            checkLiveAssemblyScrolling(path);
+        } else {
         checkRetainedActions(path);
         checkSavedRestore(path);
         checkInputPaths(path, true);
@@ -1215,6 +1239,7 @@ int main() {
         checkContextMenu(path, true);
         checkContextMenu(path, false);
         checkPopupAfterEviction(path);
+        checkMultiRowPatch(path);
         checkReferenceWorkflow(path);
         checkNavigationWorkflow(path);
         checkIntentWorkflows(path);
@@ -1233,8 +1258,12 @@ int main() {
         checkEffectivePatchPreview(path, false);
         checkEffectivePatchPreview(path, true);
         checkLivePatchMappingAndSkippedOutcome(path);
+        checkStaticPatchRestoration(path);
         checkLivePatchByteRestoration(path);
+        checkPatchTabVisibility(path);
+        checkLiveAssemblyScrolling(path);
         checkTraceWorkflow(path);
+        checkExecutionHistoryView();
         checkListingColumns(path);
         checkListingVisualSignals(path);
         checkGameMakerActions(temporary);
@@ -1247,6 +1276,8 @@ int main() {
         checkShellKeyboardNavigation();
         checkUiConsistencyMatrix();
         checkHexRefinement(path); // actual-font matrix runs after default-font fixtures
+        checkPatchPanelRestoration(path);
+        }
     } catch (const std::exception& error) { std::printf("EXCEPTION: %s\n", error.what()); ++failures; }
     ImGui::DestroyContext();
     std::printf("static_listing_actions_test: %s (%d failure(s))\n", failures ? "FAILED" : "passed", failures);

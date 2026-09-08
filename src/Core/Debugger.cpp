@@ -25,6 +25,7 @@
 #include <iterator>
 #include <limits>
 #include <intrin.h>
+#include <Zydis/Zydis.h>
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -516,10 +517,13 @@ uint64_t Debugger::beginSessionControl() {
     cancelPendingWritesLocked();
     activeWrite_.reset();
     pendingBpAdds_.clear();
+    applyingBpAdds_.clear();
     failedBpInstalls_.clear();
+    disabledBps_.clear();
     pendingBpRems_.clear();
     pendingBpConds_.clear();
     pendingBpEveryN_.clear();
+    pendingBpEnabled_.clear();
     pendingHwAdds_.clear();
     pendingHwRems_.clear();
     pendingNetworkSync_ = false;
@@ -768,13 +772,17 @@ bool Debugger::detach() {
     cancelPendingWritesLocked();
     activeWrite_.reset();
     state_ = DbgState::Detached;
+    resetExecutionHistoryLocked();
     bps_.clear();
+    disabledBps_.clear();
     failedBpInstalls_.clear();
     bpAddrs_.clear();
     pendingBpAdds_.clear();
+    applyingBpAdds_.clear();
     pendingBpRems_.clear();
     pendingBpConds_.clear();
     pendingBpEveryN_.clear();
+    pendingBpEnabled_.clear();
     pendingHwAdds_.clear();
     pendingHwRems_.clear();
     pendingNetworkSync_ = false;
@@ -852,6 +860,8 @@ void Debugger::postCommand(Cmd c, uint64_t argument) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (c != Cmd::Detach && (state_ != DbgState::Paused || cleanupOnly_)) return;
+        if (pendingCommand_.command == Cmd::RecordExecution)
+            finishExecutionHistoryLocked("Recording cancelled by another execution command");
         if (pendingCommand_.checkedRunToToken)
             cancelCheckedRunToLocked(
                 "another execution command replaced the pending checked RunTo request");
@@ -868,6 +878,8 @@ bool Debugger::postCommandForSession(Cmd c, uint64_t argument,
         if (state_ != DbgState::Paused || cleanupOnly_ ||
             !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
             return false;
+        if (pendingCommand_.command == Cmd::RecordExecution)
+            finishExecutionHistoryLocked("Recording cancelled by another execution command");
         if (pendingCommand_.checkedRunToToken)
             cancelCheckedRunToLocked(
                 "another execution command replaced the pending checked RunTo request");
@@ -892,6 +904,59 @@ bool Debugger::stepOverForSession(DebugTargetIdentity expected) {
 }
 bool Debugger::stepOutForSession(DebugTargetIdentity expected) {
     return postCommandForSession(Cmd::StepOut, 0, expected);
+}
+
+void Debugger::resetExecutionHistoryLocked() {
+    const uint64_t generation = executionHistory_.generation + 1;
+    const uint64_t revision = executionHistory_.revision + 1;
+    executionHistory_ = {};
+    executionHistory_.generation = generation ? generation : 1;
+    executionHistory_.revision = revision ? revision : 1;
+}
+
+void Debugger::finishExecutionHistoryLocked(std::string status) {
+    if (!executionHistory_.recording) return;
+    executionHistory_.recording = false;
+    executionHistory_.status = std::move(status);
+    ++executionHistory_.revision;
+}
+
+bool Debugger::executionHistorySnapshotIfChanged(ExecutionHistorySnapshot& retained) const {
+    std::lock_guard lock(mtx_);
+    if (retained.generation == executionHistory_.generation &&
+        retained.revision == executionHistory_.revision) return false;
+    retained = executionHistory_;
+    return true;
+}
+
+bool Debugger::recordExecutionPathForSession(DebugTargetIdentity expected, uint32_t expectedTid) {
+    if (!expected.valid() || !expectedTid) return false;
+    {
+        std::lock_guard lock(mtx_);
+        if (state_ != DbgState::Paused || cleanupOnly_ || gmlSnapshot_.stop ||
+            !DebugTargetIdentityMatches({pid_, sessionGeneration_}, expected) ||
+            activeTid_ != expectedTid || suspended_.count(expectedTid) ||
+            pendingCommand_.command != Cmd::None || executionHistory_.recording)
+            return false;
+        const auto owner = std::find_if(threadHandles_.begin(), threadHandles_.end(),
+            [expectedTid](const auto& thread) { return thread.first == expectedTid; });
+        Registers current;
+        if (owner == threadHandles_.end() || !ctxReadFull(owner->second, current)) return false;
+        // Allocate the bounded inventory before publishing the command. A failed
+        // allocation cannot begin an unrecorded run or discard the prior path.
+        ExecutionHistorySnapshot fresh;
+        fresh.entries.reserve(kExecutionHistoryMaxEntries);
+        fresh.target = expected; fresh.tid = expectedTid; fresh.is32 = isWow64_.load();
+        fresh.generation = executionHistory_.generation + 1;
+        if (!fresh.generation) ++fresh.generation;
+        fresh.revision = executionHistory_.revision + 1;
+        fresh.recording = true;
+        fresh.status = "Recording queued; selected thread, user-mode observations only";
+        executionHistory_ = std::move(fresh);
+        pendingCommand_ = {Cmd::RecordExecution, current.rip, controlEpoch_, expectedTid};
+    }
+    cmdCv_.notify_all();
+    return true;
 }
 
 void Debugger::runToCursor(uint64_t va) {
@@ -2759,11 +2824,14 @@ DbgSnapshot Debugger::snapshot() {
     s.mutationError = mutationError_;
     s.mutationErrorRevision = mutationErrorRevision_;
     s.traceOwnedSites = traceBps_.size();
-    s.breakpoints.reserve(bps_.size() + failedBpInstalls_.size());
+    s.breakpoints.reserve(bps_.size() + disabledBps_.size() + failedBpInstalls_.size());
     for (auto& kv : bps_)
         s.breakpoints.push_back({ kv.first, kv.second.cond, kv.second.hits,
                                   kv.second.stops, kv.second.everyN,
                                   kv.second.armed, kv.second.error });
+    for (const auto& [address, bp] : disabledBps_)
+        s.breakpoints.push_back({ address, bp.cond, bp.hits, bp.stops, bp.everyN,
+                                  false, bp.error, false });
     for (const auto& failed : failedBpInstalls_)
         s.breakpoints.push_back(failed);
     for (auto& hs : hwSlots_) if (hs.used) s.hwBreakpoints.push_back({ hs.addr, hs.kind, hs.size });
@@ -2799,7 +2867,7 @@ Debugger::CommandEnvelope Debugger::waitForCommand(uint64_t controlEpoch) {
     const auto hasBreakpointEdits = [this, controlEpoch] {
         return controlEpoch_ == controlEpoch &&
             (!pendingBpAdds_.empty() || !pendingBpRems_.empty() ||
-             !pendingBpConds_.empty() || !pendingBpEveryN_.empty() ||
+             !pendingBpConds_.empty() || !pendingBpEveryN_.empty() || !pendingBpEnabled_.empty() ||
              !pendingHwAdds_.empty() || !pendingHwRems_.empty() ||
              pendingTraceStart_ || pendingTraceStop_ ||
              pendingAuthorizationStart_ || pendingAuthorizationStop_ || pendingNetworkSync_);
@@ -4288,6 +4356,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     { std::lock_guard<std::mutex> lk(mtx_); pid_ = pid; state_ = DbgState::Running;
       ++sessionGeneration_;
       if (!sessionGeneration_) ++sessionGeneration_;
+      resetExecutionHistoryLocked();
       activeSessionGeneration = sessionGeneration_;
       networkProbeBps_.clear(); networkProbeBpAddrs_.clear();
       networkReturnBps_.clear(); networkReturnBpAddrs_.clear();
@@ -4339,6 +4408,90 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     uint32_t stepTid = 0;                      // thread a single-instruction step is armed on; binds
                                                // the trap-flag #DB so another thread's stray single-step
                                                // can't consume our pending step state
+
+    bool recordingPath = false; // event-owner state; UI only receives copied observations
+    uint32_t recordingTid = 0;
+    uint64_t recordingGeneration = 0;
+    auto finishRecordingPath = [&](std::string reason) {
+        recordingPath = false;
+        std::lock_guard lock(mtx_);
+        if (executionHistory_.generation == recordingGeneration)
+            finishExecutionHistoryLocked(std::move(reason));
+    };
+    auto captureExecutionHistory = [&](bool terminal) -> std::string {
+        const auto thread = threads_.find(recordingTid);
+        ExecutionHistoryEntry entry;
+        if (thread == threads_.end() || !ctxReadFull(thread->second, entry.regs))
+            return "Recording stopped: selected thread context is unavailable";
+        size_t wanted = entry.bytes.size();
+        if (UINT64_MAX - entry.regs.rip < wanted) wanted = size_t(UINT64_MAX - entry.regs.rip);
+        size_t got = wanted ? readMemoryMasked(entry.regs.rip, entry.bytes.data(), wanted) : 0;
+        // ReadProcessMemory can reject an entire cross-page request. Retain
+        // only the prefix that can actually be read, never zero-filled guesses.
+        if (!got) {
+            while (got < wanted && readMemoryMasked(entry.regs.rip + got,
+                    entry.bytes.data() + got, 1) == 1) ++got;
+        }
+        entry.byteCount = static_cast<uint8_t>(got);
+        size_t count = 0;
+        {
+            std::lock_guard lock(mtx_);
+            if (executionHistory_.generation != recordingGeneration || !executionHistory_.recording)
+                return "Recording cancelled";
+            auto& entries = executionHistory_.entries;
+            // TF already observed the destination before an INT3 at that same
+            // address. The breakpoint event refines that terminal observation;
+            // it does not mean the original instruction executed twice.
+            if (terminal && !entries.empty() && entries.back().regs.rip == entry.regs.rip) {
+                entry.sequence = entries.back().sequence;
+                entries.back() = entry;
+            } else if (entries.size() < kExecutionHistoryMaxEntries) {
+                entry.sequence = entries.size() + 1;
+                entries.push_back(entry);
+            }
+            count = entries.size();
+            ++executionHistory_.revision;
+        }
+        if (terminal) return {};
+        if (count == kExecutionHistoryMaxEntries)
+            return "Recording stopped at the 10,000-observation limit";
+        IDisassembler* dis = isWow64_.load() ? ownDis32_.get() : ownDis_.get();
+        Instruction instruction;
+        if (!dis || !got || !dis->decodeOne(entry.bytes.data(), got, entry.regs.rip, instruction) ||
+            !instruction.length || instruction.length > got || instruction.length > 15)
+            return "Recording stopped before unreadable or undecodable instruction bytes";
+        if (instruction.isBranch || instruction.isCall || instruction.isRet) {
+            // The decoder's branch type covers immediate pointers, RETF, and
+            // FF /3 and /5 memory operands after their actual legacy/REX
+            // prefixes. Byte-position guesses can confuse these with near
+            // transfers or even with a prefix byte inside another instruction.
+            ZydisDecoder decoder;
+            ZydisDecodedInstruction native{};
+            const bool is32 = isWow64_.load();
+            if (ZYAN_FAILED(ZydisDecoderInit(&decoder,
+                    is32 ? ZYDIS_MACHINE_MODE_LEGACY_32 : ZYDIS_MACHINE_MODE_LONG_64,
+                    is32 ? ZYDIS_STACK_WIDTH_32 : ZYDIS_STACK_WIDTH_64)) ||
+                ZYAN_FAILED(ZydisDecoderDecodeInstruction(&decoder, nullptr,
+                    entry.bytes.data(), got, &native)) || native.length != instruction.length)
+                return "Recording stopped: native branch encoding could not be verified";
+            if (native.meta.branch_type == ZYDIS_BRANCH_TYPE_FAR)
+                return "Recording stopped before a far control transfer; execution-mode changes are unrecorded";
+        }
+        // These instructions can change privilege/mode, save/restore our TF, or
+        // suppress the next #DB. In particular, PUSHF must not leave a saved
+        // debugger stepping bit that a later POPF could restore after recording.
+        const std::string& mnemonic = instruction.mnemonic;
+        if (mnemonic == "syscall" || mnemonic == "sysenter" || mnemonic == "sysexit" ||
+            mnemonic == "sysret" || mnemonic == "int" || mnemonic == "int1" ||
+            mnemonic == "icebp" || mnemonic == "iret" || mnemonic == "iretd" ||
+            mnemonic == "iretq" || mnemonic == "pushf" || mnemonic == "pushfd" ||
+            mnemonic == "pushfq" || mnemonic == "popf" || mnemonic == "popfd" ||
+            mnemonic == "popfq" || mnemonic == "lss" || mnemonic == "xbegin" ||
+            ((mnemonic == "mov" || mnemonic == "pop") &&
+                instruction.operands.rfind("ss", 0) == 0))
+            return "Recording stopped before a system or control-state transition; kernel execution is unrecorded";
+        return {};
+    };
 
     // A selected ntdll hook only conceals selected information classes. Calls
     // outside policy are passed through by restoring the entry byte for exactly
@@ -4415,6 +4568,10 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     // One outstanding event per known thread bounds this metadata by the target's
     // existing thread set, independently of trace restarts and plan length.
     std::unordered_map<uint32_t, QueuedTraceHit> queuedTraceHits;
+    // A paused user breakpoint may already have trapped other threads before
+    // Windows froze the first event. Disabling it must retire those exact queued
+    // exceptions too, without forwarding our old INT3 to the target as native.
+    std::unordered_map<uint32_t, uint64_t> queuedDisabledBreakpointHits;
     std::unordered_map<uint64_t, size_t> queuedTraceAddressRefs;
     auto retireQueuedTraceHit = [&](uint32_t tid) {
         const auto it = queuedTraceHits.find(tid);
@@ -4800,8 +4957,26 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     auto applyPendingBps = [&]() {
         std::vector<PendingBp> adds, conds;
         std::vector<uint64_t>  rems;
+        std::vector<std::pair<uint64_t, bool>> enabledChanges;
+        std::unordered_set<uint64_t> enableRequests, disableRequests;
         { std::lock_guard<std::mutex> lk(mtx_);
-          adds.swap(pendingBpAdds_); rems.swap(pendingBpRems_); conds.swap(pendingBpConds_); }
+          adds.swap(pendingBpAdds_); rems.swap(pendingBpRems_); conds.swap(pendingBpConds_);
+          enabledChanges.swap(pendingBpEnabled_);
+          for (const auto& [va, enabled] : enabledChanges) {
+              if (enabled) {
+                  enableRequests.insert(va);
+                  const auto disabled = disabledBps_.find(va);
+                  const auto failed = std::find_if(failedBpInstalls_.begin(), failedBpInstalls_.end(),
+                      [va](const auto& bp) { return bp.address == va; });
+                  if ((disabled != disabledBps_.end() || failed != failedBpInstalls_.end()) &&
+                      std::none_of(adds.begin(), adds.end(), [va](const auto& add) { return add.va == va; }))
+                      adds.push_back({ va, disabled != disabledBps_.end() ? disabled->second.cond : failed->condition });
+              } else {
+                  disableRequests.insert(va);
+                  rems.push_back(va);
+              }
+          }
+          for (const auto& add : adds) applyingBpAdds_.insert(add.va); }
         bool bpSetChanged = false;   // adds/removes that change the bpAddrs_ key set
         auto installFailure = [&](uint64_t va, const char* why,
                                   const std::string* condition = nullptr) {
@@ -4811,11 +4986,20 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                           (unsigned long long)va, why);
             std::lock_guard<std::mutex> lk(mtx_);
             lastEvent_ = message;
+            if (auto disabled = disabledBps_.find(va); disabled != disabledBps_.end()) {
+                disabled->second.error = why;
+                return; // a failed resume remains one disabled record, never a duplicate diagnostic
+            }
+            if (auto active = bps_.find(va); active != bps_.end())
+                active->second.error = why;
             if (condition) {
+                SwBreakpointInfo failed;
+                const auto previous = std::find_if(failedBpInstalls_.begin(), failedBpInstalls_.end(),
+                    [va](const auto& row) { return row.address == va; });
+                if (previous != failedBpInstalls_.end()) failed = *previous;
                 clearBreakpointInstallFailureLocked(va);
                 if (failedBpInstalls_.size() == kMaxFailedBreakpointInstalls)
                     failedBpInstalls_.pop_front();
-                SwBreakpointInfo failed;
                 failed.address = va;
                 failed.condition = *condition;
                 failed.armed = false;
@@ -4835,6 +5019,24 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 continue;
             }
             const CondProgram compiled = CompileCondition(add.cond);
+            std::optional<SwBp> retained;
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                if (auto disabled = disabledBps_.find(add.va); disabled != disabledBps_.end()) {
+                    disabled->second.cond = add.cond;
+                    disabled->second.prog = compiled;
+                    if (!enableRequests.count(add.va)) continue;
+                    retained = disabled->second;
+                } else if (enableRequests.count(add.va)) {
+                    const auto failed = std::find_if(failedBpInstalls_.begin(), failedBpInstalls_.end(),
+                        [&](const auto& row) { return row.address == add.va; });
+                    if (failed != failedBpInstalls_.end()) {
+                        retained.emplace();
+                        retained->hits = failed->hits; retained->stops = failed->stops;
+                        retained->everyN = failed->everyN;
+                    }
+                }
+            }
             if (bps_.count(add.va)) {   // re-add of an existing bp only updates its condition
                 std::lock_guard<std::mutex> lk(mtx_);
                 bps_[add.va].cond = add.cond; bps_[add.va].prog = compiled;
@@ -4910,27 +5112,48 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 continue;
             }
 
+            const bool resumesParkedInternal = retained && parkedInternalTransfer &&
+                pausedOnBp && pausedOnBpAddr == add.va &&
+                (owner == ExistingOwner::NetworkProbe || owner == ExistingOwner::NetworkReturn ||
+                 owner == ExistingOwner::Authorization || owner == ExistingOwner::AuthorizationReturn);
+            const bool resumesExposedUser = retained && owner == ExistingOwner::None &&
+                ((pausedOnBp && !parkedInternalTransfer && pausedOnBpAddr == add.va) ||
+                 (reArmAddr == add.va && reArmOwner == ReArmOwner::User) ||
+                 (tempReArm == add.va && tempReArmOwner == ReArmOwner::User));
             bool physicalReady = false;
-            if (owner == ExistingOwner::None)
+            if (resumesExposedUser) {
+                uint8_t live = 0;
+                physicalReady = readByteRPM((HANDLE)hProcess_, add.va, live) && live == orig;
+            } else if (owner == ExistingOwner::None)
                 physicalReady = replaceByteIfEqual((HANDLE)hProcess_, add.va, orig, 0xCC);
             else {
                 uint8_t live = 0;
-                physicalReady = readByteRPM((HANDLE)hProcess_, add.va, live) && live == 0xCC;
+                physicalReady = readByteRPM((HANDLE)hProcess_, add.va, live) &&
+                    live == (resumesParkedInternal ? orig : 0xCC);
             }
             if (!physicalReady) {
                 installFailure(add.va, "byte changed or could not be verified", &add.cond);
                 continue;
             }
 
-            SwBp bp;
+            SwBp bp = retained.value_or(SwBp{});
             bp.orig = orig;
             bp.cond = add.cond;
             bp.prog = compiled;
             bp.ownsByte = owner != ExistingOwner::AntiTrap;
-            bp.armed = true;
+            bp.armed = !resumesParkedInternal && !resumesExposedUser;
+            bp.error.clear();
             try {
                 std::lock_guard<std::mutex> lk(mtx_);
                 bps_.emplace(add.va, std::move(bp));
+                disabledBps_.erase(add.va);
+                if (resumesParkedInternal) {
+                    parkedInternalTransfer = false;
+                    parkedInternalOwner = ReArmOwner::User;
+                    pausedUserBpAddr_ = add.va;
+                }
+                if (resumesExposedUser && pausedOnBp && pausedOnBpAddr == add.va)
+                    pausedUserBpAddr_ = add.va;
                 clearBreakpointInstallFailureLocked(add.va);
                 if (owner == ExistingOwner::Trace) {
                     traceBps_.erase(add.va);
@@ -4970,12 +5193,16 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             if (owner == ExistingOwner::Authorization)
                 authorizationWatch_.markArmed(authorizationGeneration, add.va, true);
         }
+        { std::lock_guard<std::mutex> lk(mtx_); applyingBpAdds_.clear(); }
         for (auto& cset : conds) {
             if (!ValidateBreakpointCondition(cset.cond)) continue;
             const CondProgram compiled = CompileCondition(cset.cond);
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = bps_.find(cset.va);
             if (it != bps_.end()) { it->second.cond = cset.cond; it->second.prog = compiled; }
+            if (auto disabled = disabledBps_.find(cset.va); disabled != disabledBps_.end()) {
+                disabled->second.cond = cset.cond; disabled->second.prog = compiled;
+            }
             for (auto& failed : failedBpInstalls_)
                 if (failed.address == cset.va) failed.condition = cset.cond;
         }
@@ -4986,14 +5213,41 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 std::lock_guard<std::mutex> lk(mtx_);
                 auto it = bps_.find(va);
                 if (it != bps_.end()) it->second.everyN = n;
+                if (auto disabled = disabledBps_.find(va); disabled != disabledBps_.end())
+                    disabled->second.everyN = n;
                 for (auto& failed : failedBpInstalls_)
                     if (failed.address == va) failed.everyN = n;
             }
         }
         for (uint64_t va : rems) {
             SwBp bp;
+            const bool disable = disableRequests.count(va) != 0;
             {
                 std::lock_guard<std::mutex> lk(mtx_);
+                if (auto disabled = disabledBps_.find(va); disabled != disabledBps_.end()) {
+                    if (disable) disabled->second.error.clear();
+                    else {
+                        disabledBps_.erase(disabled);
+                        if (pausedOnBp && !parkedInternalTransfer && pausedOnBpAddr == va) {
+                            pausedOnBp = false;
+                            pausedOnBpAddr = 0;
+                        }
+                    }
+                    continue;
+                }
+                if (disable) {
+                    const auto failed = std::find_if(failedBpInstalls_.begin(), failedBpInstalls_.end(),
+                        [va](const auto& row) { return row.address == va; });
+                    if (failed != failedBpInstalls_.end()) {
+                        SwBp inactive;
+                        inactive.cond = failed->condition;
+                        inactive.prog = CompileCondition(inactive.cond);
+                        inactive.hits = failed->hits; inactive.stops = failed->stops;
+                        inactive.everyN = failed->everyN;
+                        inactive.ownsByte = inactive.armed = false;
+                        disabledBps_.emplace(va, std::move(inactive));
+                    }
+                }
                 clearBreakpointInstallFailureLocked(va);
                 auto it = bps_.find(va);
                 if (it == bps_.end()) continue;
@@ -5007,6 +5261,9 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             uint64_t transferredAuthorizationGeneration = 0;
             bool retainedByAntiTrap = false;
             bool parkedHere = false;
+            const bool rearmPendingHere = disable &&
+                ((reArmAddr == va && reArmOwner == ReArmOwner::User) ||
+                 (tempReArm == va && tempReArmOwner == ReArmOwner::User));
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 transferredToDllTarget = [&] {
@@ -5042,6 +5299,16 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                                      transferredToNetworkReturn ||
                                      transferredToAuthorization ||
                                      transferredToAuthorizationReturn;
+            std::vector<uint32_t> disabledPeers;
+            uint8_t ownedByte = 0;
+            const bool provedUserTrap = bp.ownsByte &&
+                (parkedHere || rearmPendingHere ||
+                 (bp.armed && readByteRPM((HANDLE)hProcess_, va, ownedByte) && ownedByte == 0xCC));
+            if (disable && !transferred && !retainedByAntiTrap && provedUserTrap && va != UINT64_MAX) {
+                for (const auto& [peerTid, peerHandle] : threads_)
+                    if (peerHandle && ctxReadRip(peerHandle) == va + 1)
+                        disabledPeers.push_back(peerTid);
+            }
             if (bp.ownsByte && !transferred && !retainedByAntiTrap && !parkedHere) {
                 uint8_t live = 0;
                 if (!readByteRPM((HANDLE)hProcess_, va, live)) {
@@ -5068,14 +5335,14 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     if (auto probe = networkProbeBps_.find(va); probe != networkProbeBps_.end()) {
                         probe->second.orig = bp.orig;
                         probe->second.ownsByte = true;
-                        probe->second.armed = !parkedHere;
+                        probe->second.armed = !parkedHere && !rearmPendingHere;
                     }
                 }
                 if (transferredToNetworkReturn) {
                     if (auto site = networkReturnBps_.find(va); site != networkReturnBps_.end()) {
                         site->second.orig = bp.orig;
                         site->second.ownsByte = true;
-                        site->second.armed = !parkedHere;
+                        site->second.armed = !parkedHere && !rearmPendingHere;
                     }
                 }
                 if (transferredToAuthorization) {
@@ -5083,7 +5350,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                         site != authorizationBps_.end()) {
                         site->second.orig = bp.orig;
                         site->second.ownsByte = true;
-                        site->second.armed = !parkedHere;
+                        site->second.armed = !parkedHere && !rearmPendingHere;
                     }
                     if (auto completion = authorizationReturnBps_.find(va);
                         completion != authorizationReturnBps_.end())
@@ -5094,13 +5361,31 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                         site != authorizationReturnBps_.end()) {
                         site->second.orig = bp.orig;
                         site->second.ownsByte = true;
-                        site->second.armed = !parkedHere;
+                        site->second.armed = !parkedHere && !rearmPendingHere;
                         site->second.sharedWithUserBreakpoint = false;
                     }
+                }
+                if (disable) {
+                    SwBp inactive = bp;
+                    inactive.ownsByte = inactive.armed = false;
+                    inactive.error.clear();
+                    disabledBps_.emplace(va, std::move(inactive));
                 }
                 bps_.erase(va);
                 if (parkedHere) pausedUserBpAddr_.reset();
                 bpSetChanged = true;
+            }
+            for (uint32_t peerTid : disabledPeers) queuedDisabledBreakpointHits[peerTid] = va;
+            if (rearmPendingHere) {
+                const bool persistentTransfer = transferredToNetworkProbe || transferredToNetworkReturn ||
+                    transferredToAuthorization || transferredToAuthorizationReturn;
+                if (persistentTransfer) {
+                    const auto owner = transferredToNetworkProbe ? ReArmOwner::NetworkProbe :
+                        transferredToNetworkReturn ? ReArmOwner::NetworkReturn :
+                        transferredToAuthorization ? ReArmOwner::Authorization : ReArmOwner::AuthorizationReturn;
+                    if (reArmAddr == va && reArmOwner == ReArmOwner::User) reArmOwner = owner;
+                    if (tempReArm == va && tempReArmOwner == ReArmOwner::User) tempReArmOwner = owner;
+                }
             }
             if (parkedHere) {
                 const bool networkTransfer = transferredToNetworkProbe ||
@@ -5131,7 +5416,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                           site->second.armed = false; }
                     installFailure(va, "could not transfer the parked byte to an internal probe");
                 }
-                if (!persistentInternalTransfer) {
+                if (!persistentInternalTransfer && !(disable && !transferred && !retainedByAntiTrap)) {
                     pausedOnBp = false;
                     pausedOnBpAddr = 0;
                 }
@@ -5248,6 +5533,25 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         }
     };
     auto rearmUserBreakpoint = [&](uint64_t va) {
+        bool inactive = false;
+        std::optional<uint8_t> dllOriginal;
+        { std::lock_guard<std::mutex> lk(mtx_);
+          // A pause command can retire the user INT3 while its one-instruction
+          // step-off lease is still in flight. Finish that lease without
+          // resurrecting the paused breakpoint or marking shared probes armed.
+          inactive = !bps_.count(va);
+          if (inactive) {
+              if (const auto dll = dllTargetBps_.find(va);
+                  dll != dllTargetBps_.end() && dll->second.ownsByte)
+                  dllOriginal = dll->second.orig;
+          } }
+        if (inactive) {
+            if (!dllOriginal || replaceByteIfEqual((HANDLE)hProcess_, va, *dllOriginal, 0xCC))
+                return true;
+            breakpointTransitionFailed = true;
+            setEvent("shared DLL breakpoint re-arm failed");
+            return false;
+        }
         if (armBreakpoint(va)) {
             std::lock_guard<std::mutex> lk(mtx_);
             if (auto probe = networkProbeBps_.find(va); probe != networkProbeBps_.end())
@@ -5984,11 +6288,12 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 if (stop) ++it->second.stops;
             }
         }
-        if (stop || authorizationPause) {
+        if (stop || authorizationPause || recordingPath) {
             // Park on it; how we step off + re-arm is decided by the next command.
             pausedOnBp = true; pausedOnBpAddr = a;
             { std::lock_guard<std::mutex> lk(mtx_); pausedUserBpAddr_ = a; }
-            setEvent(stop ? "breakpoint" : "authorization watch");
+            setEvent(stop ? "breakpoint" : authorizationPause ? "authorization watch"
+                                                    : "recorded path reached breakpoint");
             return true;
         }
         // Condition false: single-step the original instruction, re-arm, keep running.
@@ -6108,6 +6413,19 @@ ownerEventPump:
                 }
                 if (retired) retireQueuedTraceHit(pendingTid);
             }
+            for (auto it = queuedDisabledBreakpointHits.begin(); it != queuedDisabledBreakpointHits.end();) {
+                const auto thread = threads_.find(it->first);
+                bool retired = thread == threads_.end() || threadHasExited(thread->second);
+                if (!retired && SuspendThread((HANDLE)thread->second) != DWORD(-1)) {
+                    Registers context{};
+                    const bool read = ctxReadFull(thread->second, context);
+                    const bool resumed = ResumeThread((HANDLE)thread->second) != DWORD(-1);
+                    retired = read && context.rip != it->second + 1;
+                    if (!resumed) { ++exclusiveStepSuspended[it->first]; exclusiveStepOwner = 0; }
+                }
+                if (retired) it = queuedDisabledBreakpointHits.erase(it);
+                else ++it;
+            }
             // Running detach requests an internal debug break first. Wait for
             // that event so cleanup owns a stopped process; if injection failed,
             // cleanup reports a failed attempt without mutating the running target.
@@ -6115,7 +6433,7 @@ ownerEventPump:
                 // The existing lifecycle always completes detach after bounded
                 // cleanup. Preserve that contract while making any unresolved
                 // event ownership explicit instead of claiming a proven drain.
-                if (!queuedTraceHits.empty()) traceEventCleanupComplete = false;
+                if (!queuedTraceHits.empty() || !queuedDisabledBreakpointHits.empty()) traceEventCleanupComplete = false;
                 break;
             }
             continue;
@@ -6148,6 +6466,21 @@ ownerEventPump:
             }
         }
         DWORD contStatus = DBG_CONTINUE;
+        std::optional<uint64_t> delayedDisabledBreakpoint;
+        if (const auto queued = queuedDisabledBreakpointHits.find(ev.dwThreadId);
+            queued != queuedDisabledBreakpointHits.end()) {
+            const uint64_t address = queued->second;
+            const auto thread = threads_.find(ev.dwThreadId);
+            uint8_t current = 0;
+            if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && ev.u.Exception.dwFirstChance &&
+                (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT ||
+                 ev.u.Exception.ExceptionRecord.ExceptionCode == kStatusWx86Breakpoint) &&
+                (uint64_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == address &&
+                thread != threads_.end() && ctxReadRip(thread->second) == address + 1 &&
+                readByteRPM((HANDLE)hProcess_, address, current) && current != 0xCC)
+                delayedDisabledBreakpoint = address;
+            queuedDisabledBreakpointHits.erase(queued);
+        }
         std::optional<QueuedTraceHit> delayedTraceHit;
         if (const auto queued = queuedTraceHits.find(ev.dwThreadId);
             queued != queuedTraceHits.end()) {
@@ -6169,6 +6502,7 @@ ownerEventPump:
         }
         executionFailure_.clear();
         bool  pause = false;
+        bool  recordingStepCompleted = false;
         bool  gmlEvent = false;
         bool  preserveLoaderPhaseOnPause = false;
         bool  antiTrapTransitionFailed = false;
@@ -6653,6 +6987,11 @@ ownerEventPump:
                         retireQueuedTraceHit(pendingTid);
                     } else ++it;
                 }
+                for (auto it = queuedDisabledBreakpointHits.begin(); it != queuedDisabledBreakpointHits.end();) {
+                    if (b && unloadedSize && it->second >= b && it->second - b < unloadedSize)
+                        it = queuedDisabledBreakpointHits.erase(it);
+                    else ++it;
+                }
                 if (b && b == jvmBase) { jvmBase = 0; jvmSize = 0; }
                 uint64_t targetSize = 0;
                 bool targetUnload = false;
@@ -6821,6 +7160,14 @@ ownerEventPump:
                 }
 
                 if (isBpExc) {
+                    if (delayedDisabledBreakpoint) {
+                        const auto thread = threads_.find(ev.dwThreadId);
+                        if (thread == threads_.end() || !ctxSetRip(thread->second, *delayedDisabledBreakpoint)) {
+                            pause = true;
+                            recordExecutionFailure("paused breakpoint peer could not be rewound; target remains paused");
+                        }
+                        break; // no hit/stop count and no resurrection of the paused breakpoint
+                    }
                     const bool knownAntiTrap = [&]() {
                         std::lock_guard<std::mutex> lk(mtx_);
                         return antiTraps_.count(addr) != 0;
@@ -7465,11 +7812,18 @@ ownerEventPump:
                     // A single-step exception is raised both by the trap flag (DR6.BS)
                     // and by a hardware breakpoint hit (DR6 bits 0-3). Read + clear DR6.
                     uint64_t dr6 = 0;
-                    if (!readDr6Clear(ev.dwThreadId, dr6)) {
+                    const bool dr6ReadOk = readDr6Clear(ev.dwThreadId, dr6);
+                    if (!dr6ReadOk) {
                         pause = true;
                         setEvent("could not read/clear hardware-breakpoint state");
                     }
                     const bool hwHit = (dr6 & 0xF) != 0;
+                    // Windows can omit DR6.BS from the exposed context. Use the
+                    // exact thread-bound TF command/re-arm owner that this loop
+                    // itself armed, while hardware hits always remain stops.
+                    recordingStepCompleted = recordingPath && dr6ReadOk && !hwHit &&
+                        ev.dwThreadId == recordingTid && stepTid == recordingTid &&
+                        (stepPause || (reArmAddr && reArmAfter == AfterReArm::Pause));
                     const bool traceFreeStep = !hwHit && traceStepTid == ev.dwThreadId &&
                                                traceStepFreeRun;
                     if (traceStepTid == ev.dwThreadId) {
@@ -7722,24 +8076,105 @@ ownerEventPump:
                 reArmAddr = 0;
             }
         }
+        bool autoRecordingStep = false;
+        bool recordingCommandInFlight = false;
+        if (recordingPath) {
+            std::string stopReason;
+            if (!alive) stopReason = "Recording stopped: target exited";
+            else if (!executionFailure_.empty()) stopReason = executionFailure_;
+            else if (quit_) stopReason = "Recording stopped: detach requested";
+            else if (breakRequested_.load()) stopReason = "Recording stopped: Pause requested";
+            else if (!recordingStepCompleted) {
+                std::lock_guard lock(mtx_);
+                stopReason = ev.dwThreadId != recordingTid
+                    ? "Recording stopped: thread " + std::to_string(ev.dwThreadId) +
+                        " interrupted recorded thread " + std::to_string(recordingTid) + "; " + lastEvent_
+                    : pause ? "Recording stopped: " + lastEvent_
+                    : "Recording stopped: a native debug event interrupted instruction stepping";
+            } else {
+                stopReason = captureExecutionHistory(false);
+                if (stopReason.empty()) {
+                    // The ordinary TF/re-arm handler has already completed its
+                    // physical ownership work. Reuse normal Step Into dispatch
+                    // without stack unwinding, frame snapshots or a UI wait.
+                    autoRecordingStep = true;
+                    pause = true;
+                }
+            }
+            if (!stopReason.empty()) {
+                if (alive && threads_.count(recordingTid)) {
+                    setTrapFlag(recordingTid, false);
+                    // A non-step event may interrupt the source breakpoint's
+                    // one-instruction exposure. Restore its physical owner
+                    // before yielding a normal user pause on any thread.
+                    if (reArmAddr && stepTid == recordingTid) {
+                        if (rearmOwnedBreakpoint(reArmAddr, reArmOwner)) {
+                            reArmAddr = 0;
+                            reArmOwner = ReArmOwner::User;
+                            reArmAfter = AfterReArm::FreeRun;
+                        }
+                    }
+                    const std::string captureError = captureExecutionHistory(true);
+                    if (!captureError.empty()) stopReason += "; " + captureError;
+                    // Nonexception events have no user-selected stopping thread.
+                    // Keep the recorded thread visible instead of a new helper.
+                    if (ev.dwDebugEventCode != EXCEPTION_DEBUG_EVENT)
+                        breakDisplayTid = recordingTid;
+                    stepPause = false;
+                }
+                if (!executionFailure_.empty()) stopReason = executionFailure_;
+                finishRecordingPath(stopReason);
+                if (alive) { pause = true; setEvent(stopReason.c_str()); }
+            }
+        }
         if (pause && alive) {
             if (!gmlEvent) invalidateGameMakerPause();
             endExclusiveStep();
+            if (autoRecordingStep && !executionFailure_.empty()) {
+                // An automatic next step is never authorization to retry a
+                // failed suspension release or native control mutation.
+                autoRecordingStep = false;
+                finishRecordingPath(executionFailure_);
+                setTrapFlag(recordingTid, false);
+            }
             // A source-rejection stop is held on CREATE_PROCESS, before even
             // the canonical loader break. Preserve WOW64 startup handling so
             // an explicit Continue still swallows its later loader INT3s.
             if (!preserveLoaderPhaseOnPause) loaderPhase = false;
             // On a Pause break, present a user thread (not the DebugBreak helper).
             uint32_t showTid = breakDisplayTid ? breakDisplayTid : ev.dwThreadId;
-            captureContext(showTid);
-            refreshThreadList();
-            unwindStack(showTid);   // real DbgHelp StackWalk64 of the stopped thread
-            { std::lock_guard<std::mutex> lk(mtx_); state_ = DbgState::Paused; tid_ = showTid; activeTid_ = showTid; }
+            if (!autoRecordingStep) {
+                captureContext(showTid);
+                refreshThreadList();
+                unwindStack(showTid);   // real DbgHelp StackWalk64 of the stopped thread
+                { std::lock_guard<std::mutex> lk(mtx_); state_ = DbgState::Paused; tid_ = showTid; activeTid_ = showTid; }
+            }
+            recordingCommandInFlight = autoRecordingStep;
 
         waitForPausedCommand:
+            if (recordingCommandInFlight && !autoRecordingStep) {
+                // Every retry edge after a synthetic command rejoins an actual
+                // user pause. Retire its local owner as well as its snapshot,
+                // and publish the real current context before waiting for input.
+                if (recordingPath)
+                    finishRecordingPath(executionFailure_.empty()
+                        ? "Recording stopped before the next instruction could be dispatched"
+                        : executionFailure_);
+                setTrapFlag(recordingTid, false);
+                endExclusiveStep();
+                captureContext(showTid);
+                refreshThreadList();
+                unwindStack(showTid);
+                { std::lock_guard lock(mtx_);
+                  state_ = DbgState::Paused; tid_ = showTid; activeTid_ = showTid; }
+                recordingCommandInFlight = false;
+            }
             CommandEnvelope command{};
             bool processExitPending=false;
-            for (;;) {
+            if (autoRecordingStep) {
+                command = {Cmd::StepInto, 0, controlEpoch, recordingTid};
+                autoRecordingStep = false;
+            } else for (;;) {
                 command = waitForCommand(controlEpoch);
                 DWORD observedExit=STILL_ACTIVE;
                 // TerminateProcess can publish an exit status while the held
@@ -7775,7 +8210,7 @@ ownerEventPump:
             if (c == Cmd::Detach || quit_) {
                 abandonAntiRearms(true);
                 prepareTraceDetach();
-                if (traceSyncBreakRequested_.load() || !queuedTraceHits.empty()) {
+                if (traceSyncBreakRequested_.load() || !queuedTraceHits.empty() || !queuedDisabledBreakpointHits.empty()) {
                     // A running detach may have raced an already-pending event.
                     // Drain both the injected DbgBreakPoint and proved queued
                     // trace peers before detaching; otherwise an unserviced INT3
@@ -7865,7 +8300,7 @@ ownerEventPump:
                     });
                 serviceBreakpointEdits = !pendingBpAdds_.empty() ||
                     !pendingBpRems_.empty() || !pendingBpConds_.empty() ||
-                    !pendingBpEveryN_.empty() || !pendingHwAdds_.empty() ||
+                    !pendingBpEveryN_.empty() || !pendingBpEnabled_.empty() || !pendingHwAdds_.empty() ||
                     !pendingHwRems_.empty() || pendingTraceStart_ || pendingTraceStop_ ||
                     pendingAuthorizationStart_ || pendingAuthorizationStop_ || pendingNetworkSync_;
                 if (!pendingForThisEpoch && !serviceBreakpointEdits) {
@@ -7896,6 +8331,18 @@ ownerEventPump:
             (void)retryPendingInstructionRewinds();
             if (hardwareReconciliationRequired_ && !applyHwAllThreads())
                 recordExecutionFailure("hardware breakpoint reconciliation failed; target remains paused");
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                // Retain the held instruction until this dispatch so an
+                // immediate re-enable can restore its step-off lease. If the
+                // breakpoint is still disabled now, execution is ordinary:
+                // Continue needs neither an exclusive step nor a later re-arm.
+                if (pausedOnBp && !parkedInternalTransfer && disabledBps_.count(pausedOnBpAddr)) {
+                    pausedOnBp = false;
+                    pausedOnBpAddr = 0;
+                    pausedUserBpAddr_.reset();
+                }
+            }
             const bool commandWasOnBreakpoint = pausedOnBp;
             const uint64_t commandBreakpoint = pausedOnBpAddr;
             const bool commandInternalTransfer = parkedInternalTransfer;
@@ -7905,6 +8352,34 @@ ownerEventPump:
             const auto commandThread = threads_.find(tid);
             if (commandThread == threads_.end() || !ctxReadFull(commandThread->second, commandContext))
                 recordExecutionFailure("execution command: thread context could not be read; target remains paused");
+
+            if (c == Cmd::RecordExecution) {
+                recordingCommandInFlight = true;
+                recordingTid = tid;
+                {
+                    std::lock_guard lock(mtx_);
+                    recordingGeneration = executionHistory_.generation;
+                    recordingPath = executionHistory_.recording &&
+                        executionHistory_.tid == tid &&
+                        DebugTargetIdentityMatches(executionHistory_.target, {pid_, sessionGeneration_});
+                }
+                std::string refusal;
+                if (!executionFailure_.empty()) refusal = executionFailure_;
+                else if (!recordingPath || commandContext.rip != command.argument)
+                    refusal = "Recording cancelled: the queued native pause changed";
+                else if (tempBpSet || steppingOut || stepOutFinishing)
+                    refusal = "Recording cannot start while another execution operation owns the pause";
+                else refusal = captureExecutionHistory(false);
+                if (!refusal.empty()) {
+                    finishRecordingPath(refusal);
+                    { std::lock_guard lock(mtx_); state_ = DbgState::Paused; lastEvent_ = refusal; }
+                    goto waitForPausedCommand;
+                }
+                { std::lock_guard lock(mtx_);
+                  executionHistory_.status = "Recording selected-thread user-mode observations; other threads and kernel execution are unrecorded";
+                  ++executionHistory_.revision; }
+                c = Cmd::StepInto;
+            }
 
             // Run-to-cursor: arm a one-shot temp breakpoint at the target, then resume
             // exactly like Continue (which also steps off / re-arms a bp we are parked
@@ -8084,6 +8559,7 @@ ownerEventPump:
             if (antiRearms.find(tid)) setTrapFlag(tid, true);
             reportNativeMutationFailure();
             if (!executionFailure_.empty()) {
+                if (recordingPath) finishRecordingPath(executionFailure_);
                 if (!commandHadTemp && tempBpSet && !clearTempBp())
                     recordExecutionFailure("failed execution command retained its temporary breakpoint; target remains paused");
                 endExclusiveStep();
@@ -8109,7 +8585,7 @@ ownerEventPump:
 
         if (quit_ && alive) {
             prepareTraceDetach();
-            if (!traceSyncBreakRequested_.load() && queuedTraceHits.empty()) {
+            if (!traceSyncBreakRequested_.load() && queuedTraceHits.empty() && queuedDisabledBreakpointHits.empty()) {
                 debugEventHeldForCleanup = true;
                 heldContinueStatus = contStatus;
                 break;
@@ -8147,6 +8623,8 @@ ownerEventPump:
     {
         std::lock_guard lock(mtx_);
         cleanupOnly_ = true;
+        finishExecutionHistoryLocked(alive ? "Recording stopped during debugger cleanup"
+                                          : "Recording stopped: target exited");
         if (alive) state_ = DbgState::Paused;
         cancelPendingWritesLocked();
         if (checkedRunTo_.state == CheckedRunToState::Pending || checkedRunTo_.state == CheckedRunToState::Armed)
@@ -8234,6 +8712,18 @@ ownerEventPump:
                     if (!ctxReadFull(threads_.at(tid), context)) { complete = false; continue; }
                     if (context.rip == hit.address + 1 && !ctxSetRip(threads_.at(tid), hit.address))
                         complete = false;
+                }
+                for (const auto& [tid, address] : queuedDisabledBreakpointHits) {
+                    if (threadExited(tid)) continue;
+                    Registers context{};
+                    if (!ctxReadFull(threads_.at(tid), context)) { complete = false; continue; }
+                    // A RIP+1 sample is only a candidate until its matching
+                    // exception arrives. Never rewind an ordinary instruction
+                    // boundary on detach merely because it resembles a trap.
+                    if (context.rip == address + 1) {
+                        complete = false;
+                        recordExecutionFailure("a paused breakpoint peer exception has not drained; retry detach");
+                    }
                 }
                 complete = retryPendingInstructionRewinds() && complete;
                 {

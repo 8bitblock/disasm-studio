@@ -66,6 +66,12 @@ private:
     void pumpConnectionPoll();
     void connectionWorkerLoop(std::stop_token stop);
     void renderPayloadCapture(AppContext& ctx);   // live send/recv buffer viewer
+    void renderObservationCoverage(bool on);
+    void renderObservationWorkspace(AppContext& ctx, const DbgSnapshot& debug,
+                                    bool on, bool activeRuntimeImageMatches,
+                                    uint64_t matchingBase, uint64_t matchingSize,
+                                    uint32_t eventsTableId = 0);
+    void renderObservationLog(AppContext& ctx, bool& on, bool canStart);
     void renderLocalApiFramework(AppContext& ctx);
 
     struct PollJob { uint64_t epoch = 0; bool clearHistory = false; };
@@ -104,6 +110,10 @@ private:
     double                   observationNextRefresh_ = 0.0;
     uint64_t                 observationSelectedSequence_ = 0;
     char                     observationFilter_[96] = "";
+    int                      observationCompactView_ = 0; // Events / Details
+    float                    observationEventsWidth_ = 0.0f;
+    float                    observationEventsRatio_ = 0.60f;
+    float                    observationLogHeight_ = 0.0f;
     bool                     observationRequiresMatchingTarget_ = false;
     DocumentId               observationExpectedDocument_{};
     uint64_t                 observationExpectedImageGeneration_ = 0;

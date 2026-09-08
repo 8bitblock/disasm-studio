@@ -9,8 +9,11 @@
 #include <stdexcept>
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "Core/PrismSampler.h"
+#include <deque>
+#include <condition_variable>
+#include <unordered_set>
 #define private public
+#include "Core/PrismSampler.h"
 #include "Tabs/CortexTab.h"
 #include "Tabs/SigScannerTab.h"
 #include "Tabs/BinaryTechTab.h"
@@ -61,6 +64,9 @@ static void featureLoadRaw(AppContext& ctx, const std::string& path) {
 #include "cortex_ui_fixture.inc"
 #include "sigscanner_ui_fixture.inc"
 #include "tech_diff_ui_fixture.inc"
+#include "axiom_runtime_layout_fixture.inc"
+#include "axiom_communications_fixture.inc"
+#include "axiom_visual_capture_fixture.inc"
 
 static void checkResponsiveFeatureTools() {
     ImGui::ClosePopupsOverWindow(nullptr, false);
@@ -84,7 +90,7 @@ static void checkResponsiveFeatureTools() {
                 std::strstr(window->Name, fragment)) return window;
         return nullptr;
     };
-    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light, theme::ThemeId::Axiom}) {
         theme::ApplyTheme(palette);
         const float firstSplit = prism.firstPaneSplit_, secondSplit = prism.secondPaneSplit_;
         for (int pane = 0; pane < 3; ++pane) {
@@ -187,7 +193,7 @@ static void checkProjectsProductionUi() {
     tab.selectedHash_ = entry.hash;
     tab.selectedHashValid_ = true;
     std::snprintf(tab.filter_, sizeof(tab.filter_), "no-match");
-    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light, theme::ThemeId::Axiom}) {
         theme::ApplyTheme(palette);
         for (const ImVec2 size : {ImVec2(520, 700), ImVec2(1200, 800)}) {
             for (int i = 0; i < 3; ++i) featureFrame([&] { tab.render(ctx); }, size);
@@ -371,7 +377,7 @@ static void checkMemoryViewerProductionUi() {
     CHECK(tab.viewerSelectionText(false, true) == "AB.");
     tab.selectViewerByte(128, false); tab.selectViewerByte(131, true);
     tab.viewAutoRefresh_ = false;
-    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light, theme::ThemeId::Axiom}) {
         theme::ApplyTheme(palette);
         for (const ImVec2 size : {ImVec2(520, 700), ImVec2(1200, 800)}) {
             for (int i = 0; i < 3; ++i)
@@ -458,6 +464,17 @@ int main() {
         checkTechDiffProductionUi(path);
         checkResponsiveFeatureTools();
         checkNetworkFilterRecovery();
+        checkAxiomCommunicationsUi();
+        checkAxiomRuntimeLayouts();
+        char captureDirectory[MAX_PATH]{};
+        if (GetEnvironmentVariableA("DS_UI_CAPTURE_DIR", captureDirectory, MAX_PATH)) {
+            theme::SetUiScale(1.0f);
+            ui::LoadFonts(theme::UiScale());
+            io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+            captureAxiomAnalysisPages(path, captureDirectory);
+            captureAxiomCommunicationsPages(captureDirectory);
+            captureAxiomRuntimePages(path, captureDirectory);
+        }
     } catch (const std::exception& error) {
         std::printf("EXCEPTION: %s\n", error.what()); ++failures;
     }

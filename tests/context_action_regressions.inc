@@ -109,7 +109,7 @@ static void checkEffectivePatchPreview(const std::string& path, bool disabledSet
     CHECK(f.tab->beginStaticInstructionPatch(f.ctx, kTarget));
     f.tab->patchMode_ = 0;
     f.tab->patchPadNop_ = true;
-    std::snprintf(f.tab->patchHex_, sizeof(f.tab->patchHex_), "C3");
+    f.tab->patchHex_ = "C3";
     auto body = [&] { f.tab->renderPatchPopup(f.ctx); };
     frame(body);
     CHECK(f.tab->patchPreviewOriginal_.size() == 2);

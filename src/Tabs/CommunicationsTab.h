@@ -37,7 +37,10 @@ private:
     void renderModules();
     void renderConnections(AppContext& ctx);
     void renderJdwp(AppContext& ctx);         // Java debug (JDWP) console
+    void renderJdwpConsole(AppContext& ctx, const JdwpSnapshot& snap);
     void renderGameMaker(AppContext& ctx);
+    void renderGameMakerSession(AppContext& ctx, const DbgSnapshot& native,
+                                const GameMakerSessionSnapshot& session);
     void loadJdwpMethod(AppContext& ctx, uint64_t classID, uint64_t methodID,
                         const std::string& label);
 
@@ -128,6 +131,12 @@ private:
     // last stop already reacted to (auto-follow + scroll happen once per stop)
     uint64_t    jdwpSeenStopClass_ = 0, jdwpSeenStopMethod_ = 0, jdwpSeenStopBci_ = ~0ull;
     bool        jdwpScrollToStop_ = false;
+    int         jdwpCompactView_ = 1;           // Browse / Bytecode / Session
+    int         jdwpSessionView_ = 0;           // Threads / Call stack / Breakpoints / Log
+    float       jdwpBrowseWidth_ = 0.0f;
+    float       jdwpSessionHeight_ = 0.0f;
+    float       jdwpBrowseRatio_ = 0.27f;
+    float       jdwpSessionRatio_ = 0.28f;
     // class-filter result cache (rebuilt when the list or the filter changes)
     std::shared_ptr<const std::vector<JdwpClassRow>> jdwpClassesRef_;
     std::string jdwpFilterCache_ = "\x01";         // never matches a real filter initially

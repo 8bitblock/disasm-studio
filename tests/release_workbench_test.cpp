@@ -3,6 +3,8 @@
 #define main staticListingFullSuiteMain
 #include "static_listing_actions_test.cpp"
 #undef main
+#include "axiom_binary_view_fixture.inc"
+#include "axiom_shell_reference_fixture.inc"
 
 int main() {
     char temporary[MAX_PATH]{};
@@ -36,7 +38,17 @@ int main() {
         checkInspectorObservationValidity(path);
         checkNavigatorRefinement(path);
         checkWorkflowRefinement(path);
+        checkAxiomBinaryView(path);
+        checkAxiomShellReference();
         checkHexRefinement(path); // actual-font matrix runs after default-font fixtures
+        char captureDirectory[MAX_PATH]{};
+        if (GetEnvironmentVariableA("DS_UI_CAPTURE_DIR", captureDirectory, MAX_PATH)) {
+            theme::SetUiScale(1.0f);
+            ui::LoadFonts(theme::UiScale());
+            io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+            captureAxiomBinaryView(path, captureDirectory);
+            captureAxiomShellReference(captureDirectory);
+        }
     } catch (const std::exception& error) {
         std::printf("EXCEPTION: %s\n", error.what());
         ++failures;

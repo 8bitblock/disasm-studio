@@ -4,6 +4,7 @@
 #include "../Ui/Theme.h"
 #include "../Ui/Widgets.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -15,9 +16,20 @@ namespace ds {
 
 namespace {
 
+// These tables previously lived directly in the page's pr_funcs/pr_mid
+// children. Retain their ImGui IDs when inserting scrollable report wrappers,
+// so saved column widths also survive compact/wide presentation changes.
+ImGuiID originalReportTableId(const char* child, const char* table) {
+    ImGuiWindow* parent = ImGui::GetCurrentWindow();
+    char suffix[16]{};
+    std::snprintf(suffix, sizeof(suffix), "_%08X", parent->GetID(child));
+    const std::string childWindow = std::string(parent->Name) + "/" + child + suffix;
+    return ImHashStr(table, 0, ImHashStr(childWindow.c_str()));
+}
+
 ImVec4 stateColor(ThreadState state) {
     switch (state) {
-        case ThreadState::Running:        return theme::col::good();
+        case ThreadState::Running:        return theme::col::accent();
         case ThreadState::Waiting:        return theme::col::muted();
         case ThreadState::LockContention: return theme::col::bad();
         case ThreadState::Allocation:     return theme::col::warn();
@@ -79,18 +91,19 @@ bool navigateAddress(AppContext& ctx, uint32_t sampledPid,
 
 void drawQuality(const PrismCollectionQuality& quality) {
     const ImVec4 color = quality.degraded ? theme::col::warn() : theme::col::good();
-    ImGui::TextColored(color, "%s", PrismCollectorName(quality.collector));
-    ImGui::SameLine();
+    ui::Badge(PrismCollectorName(quality.collector), color);
+    ui::SameLineIfFits(ImGui::CalcTextSize("WOW64 target").x);
     if (quality.wow64Target) ImGui::TextDisabled("WOW64 target");
     else                     ImGui::TextDisabled("native target");
     if (!quality.summary.empty()) ImGui::TextWrapped("%s", quality.summary.c_str());
     if (!quality.fallbackReason.empty()) {
-        ImGui::TextColored(theme::col::warn(), "Fallback reason:");
-        ImGui::SameLine();
-        ImGui::TextWrapped("%s", quality.fallbackReason.c_str());
+        ui::KeyValueRow("Fallback reason", "%s", quality.fallbackReason.c_str());
     }
-    if (!quality.warning.empty())
+    if (!quality.warning.empty()) {
+        ImGui::PushTextWrapPos();
         ImGui::TextColored(theme::col::warn(), "%s", quality.warning.c_str());
+        ImGui::PopTextWrapPos();
+    }
 }
 
 void drawFlameGraph(const PrismReport& report, AppContext& ctx, uint32_t sampledPid,
@@ -107,8 +120,7 @@ void drawFlameGraph(const PrismReport& report, AppContext& ctx, uint32_t sampled
 
     const float scale = theme::UiScale();
     const float rowHeight = 21.0f * scale;
-    const float graphHeight = std::min(300.0f * scale,
-                                       std::max(90.0f * scale, rowHeight * maxDepth + 4.0f));
+    const float graphHeight = std::max(1.0f, ImGui::GetContentRegionAvail().y);
     if (!ImGui::BeginChild("pr_flame", ImVec2(0, graphHeight), ImGuiChildFlags_None,
                            ImGuiWindowFlags_HorizontalScrollbar)) {
         ImGui::EndChild();
@@ -197,9 +209,7 @@ void drawVerticalSplitter(const char* id, const ImVec2& localPos,
 void PrismTab::render(AppContext& ctx) {
     const float scale = theme::UiScale();
     bool running = sampler_.running();
-    ImGui::TextUnformatted("Prism");
-    ui::SameLineIfFits(275.0f * scale);
-    ImGui::TextDisabled("Process activity and sampled call paths");
+    ui::PanelHeader("Prism", "Process activity and sampled call paths");
 
     if (running) {
         ImGui::BeginDisabled(stopRequested_);
@@ -208,10 +218,6 @@ void PrismTab::render(AppContext& ctx) {
             stopRequested_ = true;
         }
         ImGui::EndDisabled();
-        if (stopRequested_) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("stopping...");
-        }
     } else {
         stopRequested_ = false;
         if (ui::ToolbarIconButton(DS_ICON_PLAY, "Start", "Start profiling the target process")) {
@@ -260,8 +266,13 @@ void PrismTab::render(AppContext& ctx) {
         selectedFlame_ = -1;
     }
     ui::SameLineIfFits(180.0f * scale);
-    ImGui::TextDisabled("%zu observations%s", sampler_.sampleCount(),
-                        sampler_.sampleCount() >= PrismSampler::kMaxSamples ? " (rolling)" : "");
+    const char* collectionState = running ? (stopRequested_ ? "Stopping" : "Running") : "Idle";
+    ui::Badge(collectionState, running ? theme::col::accent() : theme::col::muted());
+    char observationCount[72];
+    std::snprintf(observationCount, sizeof(observationCount), "%zu observations%s",
+        sampler_.sampleCount(), sampler_.sampleCount() >= PrismSampler::kMaxSamples ? " (rolling)" : "");
+    ui::SameLineIfFits(ImGui::CalcTextSize(observationCount).x);
+    ImGui::TextDisabled("%s", observationCount);
     ImGui::Separator();
 
     if (running || sampler_.reportGeneration() != sampler_.sampleGeneration())
@@ -300,14 +311,28 @@ void PrismTab::render(AppContext& ctx) {
         return;
     }
 
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextColored(theme::col::accent(), "%s", report.headline.c_str());
-    ImGui::TextWrapped("%s", report.verdict.c_str());
-    ImGui::PopTextWrapPos();
-    ImGui::Separator();
+    const DbgSnapshot navigationSnapshot = ctx.debug.snapshot();
+    const uint64_t sampledCreationTime = sampler_.creationTime100ns();
+    const DebugTargetIdentity navigationTarget{
+        navigationSnapshot.pid, navigationSnapshot.sessionGeneration
+    };
+    const bool navigationOwnerExact = navigationSnapshot.attached() &&
+        navigationSnapshot.pid == sampler_.pid() && sampledCreationTime &&
+        ctx.debug.processCreationTimeForSession(navigationTarget) ==
+            sampledCreationTime;
+    renderReportWorkspace(ctx, report, navigationSnapshot, sampledCreationTime,
+                          navigationOwnerExact);
+}
 
+void PrismTab::renderReportWorkspace(AppContext& ctx, const PrismReport& report,
+                                     const DbgSnapshot& navigationSnapshot,
+                                     uint64_t sampledCreationTime, bool canNavigate) {
+    const float scale = theme::UiScale();
+    reportTableIds_[0] = originalReportTableId("pr_funcs", "pr_ftbl");
+    reportTableIds_[1] = originalReportTableId("pr_mid", "pr_thr");
+    reportTableIds_[2] = originalReportTableId("pr_mid", "pr_mod");
     if (!report.timeline.empty()) {
-        ImGui::SeparatorText("Activity timeline");
+        ui::PanelHeader("Activity timeline");
         ui::ItemTooltip("Click a time slice to select its observation count and dominant thread state.");
         const ImVec2 start = ImGui::GetCursorScreenPos();
         const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
@@ -318,8 +343,9 @@ void PrismTab::render(AppContext& ctx) {
         for (size_t i = 0; i < report.timeline.size(); ++i) {
             const ImVec2 a(start.x + static_cast<float>(i) * cellWidth, start.y);
             const ImVec2 b(start.x + static_cast<float>(i + 1) * cellWidth - 1.0f, start.y + height);
-            draw->AddRectFilled(a, b,
-                ImGui::ColorConvertFloat4ToU32(stateColor(report.timeline[i].dominant)));
+            ImVec4 color = stateColor(report.timeline[i].dominant);
+            color.w = selectedTimeline_ == static_cast<int>(i) ? 1.0f : 0.72f;
+            draw->AddRectFilled(a, b, ImGui::ColorConvertFloat4ToU32(color), 2.0f * scale);
             if (selectedTimeline_ == static_cast<int>(i))
                 draw->AddRect(a, b, ImGui::GetColorU32(theme::col::accent()), 0.0f, 0, 2.0f);
         }
@@ -338,59 +364,105 @@ void PrismTab::render(AppContext& ctx) {
                                 slice.startMs / 1000.0, slice.samples,
                                 ThreadStateName(slice.dominant));
         }
-        ImGui::Separator();
     }
 
-    const DbgSnapshot navigationSnapshot = ctx.debug.snapshot();
-    const uint64_t sampledCreationTime = sampler_.creationTime100ns();
-    const DebugTargetIdentity navigationTarget{
-        navigationSnapshot.pid, navigationSnapshot.sessionGeneration
+    auto drawSummary = [&] {
+        ui::PanelHeader("Observation summary");
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(theme::col::accent(), "%s", report.headline.c_str());
+        ImGui::TextWrapped("%s", report.verdict.c_str());
+        ImGui::PopTextWrapPos();
+        ui::PanelHeader("Thread-state observations");
+        ImGui::TextDisabled("Distribution of observations, not CPU utilization");
+        const int stateColumns = std::clamp(
+            static_cast<int>(ImGui::GetContentRegionAvail().x / (220.0f * scale)), 1, 4);
+        if (ImGui::BeginTable("##prism_states", stateColumns,
+                              ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
+            for (const PrismStateStat& state : report.states) {
+                ImGui::TableNextColumn();
+                ImGui::PushID(static_cast<int>(state.state));
+                ImGui::TextWrapped("%s  %.0f%%  (%d)", ThreadStateName(state.state), state.pct, state.samples);
+                ImGui::PushStyleColor(ImGuiCol_PlotHistogram, stateColor(state.state));
+                ImGui::ProgressBar(state.pct / 100.0f, ImVec2(-1, 4.0f * scale), "");
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        ImGui::Separator();
     };
-    const bool navigationOwnerExact = navigationSnapshot.attached() &&
-        navigationSnapshot.pid == sampler_.pid() && sampledCreationTime &&
-        ctx.debug.processCreationTimeForSession(navigationTarget) ==
-            sampledCreationTime;
-    if (ImGui::CollapsingHeader("Flame graph", ImGuiTreeNodeFlags_DefaultOpen)) {
+    auto drawCharts = [&] {
+        if (report.flameTruncated) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextColored(theme::col::warn(), "Flame graph reached its 4,096-node safety bound.");
+            ImGui::PopTextWrapPos();
+        }
         drawFlameGraph(report, ctx, sampler_.pid(), sampledCreationTime,
                        navigationSnapshot, selectedFlame_);
-        if (report.flameTruncated)
-            ImGui::TextColored(theme::col::warn(), "Flame graph reached its 4,096-node safety bound.");
+    };
+    // Short windows show one useful area at a time. Switching does not alter
+    // the wide chart/report ratio or the report's horizontal splitter ratios.
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const bool compact = available.y < 440.0f * scale;
+    if (compact) {
+        static const char* views[] = { "Charts", "Report", "Summary" };
+        compactWorkspaceView_ = ui::TabStrip("##prism_workspace_views", views, 3,
+                                            compactWorkspaceView_);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
+        ImGui::BeginChild("##prism_compact_workspace", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        if (compactWorkspaceView_ == 0) drawCharts();
+        else if (compactWorkspaceView_ == 1)
+            renderReportPanes(ctx, report, navigationSnapshot, sampledCreationTime, canNavigate);
+        else drawSummary();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        return;
     }
-
-    ImGui::SeparatorText("Thread-state observations");
-    ImGui::TextDisabled("Distribution of observations, not CPU utilization");
-    const int stateColumns = std::clamp(
-        static_cast<int>(ImGui::GetContentRegionAvail().x / (220.0f * scale)), 1, 4);
-    if (ImGui::BeginTable("##prism_states", stateColumns,
-                          ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
-        for (const PrismStateStat& state : report.states) {
-            ImGui::TableNextColumn();
-            ImGui::PushID(static_cast<int>(state.state));
-            ImGui::TextWrapped("%s  %.0f%%  (%d)", ThreadStateName(state.state), state.pct, state.samples);
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, stateColor(state.state));
-            ImGui::ProgressBar(state.pct / 100.0f, ImVec2(-1, 4.0f * scale), "");
-            ImGui::PopStyleColor();
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-    ImGui::Separator();
-
-    renderReportPanes(ctx, report, navigationSnapshot, sampledCreationTime,
-                      navigationOwnerExact);
+    const float split = 6.0f * scale;
+    const float height = std::max(1.0f, available.y - split - ImGui::GetStyle().ItemSpacing.y * 2.0f);
+    const float minChart = 150.0f * scale;
+    const float minReport = 220.0f * scale;
+    const float chartHeight = std::clamp(height * chartHeightRatio_, minChart,
+                                         std::max(minChart, height - minReport));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
+    ImGui::BeginChild("##prism_charts", ImVec2(0, chartHeight), ImGuiChildFlags_Borders);
+    static const char* charts[] = { "Flame graph", "Observation summary" };
+    chartView_ = ui::TabStrip("##prism_chart_views", charts, 2, chartView_);
+    if (chartView_ == 0) drawCharts();
+    else drawSummary();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::InvisibleButton("##prism_chart_split", ImVec2(-1, split));
+    const bool splitHot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (splitHot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    if (ImGui::IsItemActive())
+        chartHeightRatio_ = std::clamp((chartHeight + ImGui::GetIO().MouseDelta.y) / height,
+                                      minChart / height, (height - minReport) / height);
+    const ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(lo.x, (lo.y + hi.y) * 0.5f),
+        ImVec2(hi.x, (lo.y + hi.y) * 0.5f),
+        ImGui::GetColorU32(splitHot ? theme::col::accent() : theme::col::lineSoft()));
+    ImGui::BeginChild("##prism_reports", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    renderReportPanes(ctx, report, navigationSnapshot, sampledCreationTime, canNavigate);
+    ImGui::EndChild();
 }
 
 void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
                                  const DbgSnapshot& navigationSnapshot,
                                  uint64_t sampledCreationTime, bool canNavigate) {
     const float scale = theme::UiScale();
+    if (!reportTableIds_[0]) {
+        reportTableIds_[0] = originalReportTableId("pr_funcs", "pr_ftbl");
+        reportTableIds_[1] = originalReportTableId("pr_mid", "pr_thr");
+        reportTableIds_[2] = originalReportTableId("pr_mid", "pr_mod");
+    }
     const bool compact = ImGui::GetContentRegionAvail().x < 900.0f * scale;
     if (compact) {
         static const char* views[] = { "Functions", "Threads & modules", "Call paths" };
         compactReportView_ = ui::TabStrip("##prism_report_views", views, 3, compactReportView_);
     }
     ImVec2 available = ImGui::GetContentRegionAvail();
-    available.y = std::max(220.0f * scale, available.y);
+    available.y = std::max(1.0f, available.y);
     const ImVec2 paneStart = ImGui::GetCursorPos();
     const float splitter = 6.0f * scale;
     const float paneContentWidth = std::max(1.0f, available.x - splitter * 2.0f);
@@ -410,8 +482,8 @@ void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
     if (!compact || compactReportView_ == 0) {
         ImGui::SetCursorPos(paneStart);
         ImGui::BeginChild("pr_funcs", ImVec2(functionWidth, available.y), ImGuiChildFlags_None);
-        ImGui::SeparatorText(haveCpuWeights ? "CPU-weighted functions" : "Sampled leaf functions");
-        if (ImGui::BeginTable("pr_ftbl", 3,
+        ui::PanelHeader(haveCpuWeights ? "CPU-weighted functions" : "Sampled leaf functions");
+        if (ui::BeginDataTableEx("pr_ftbl", reportTableIds_[0], 3,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
             ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
                                     ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
@@ -450,7 +522,7 @@ void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
                 }
                 ImGui::PopID();
             }
-            ImGui::EndTable();
+            ui::EndDataTable();
         }
         ImGui::EndChild();
     }
@@ -466,14 +538,15 @@ void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
         ImGui::BeginChild("pr_mid", ImVec2(middleWidth, available.y), ImGuiChildFlags_None);
         float halfHeight = ImGui::GetContentRegionAvail().y * 0.5f - 24.0f * scale;
         halfHeight = std::max(60.0f * scale, halfHeight);
-        ImGui::SeparatorText("Threads");
-        if (ImGui::BeginTable("pr_thr", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+        ui::PanelHeader("Threads");
+        if (ui::BeginDataTableEx("pr_thr", reportTableIds_[1], 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                         ImGuiTableFlags_ScrollX |
                                          ImGuiTableFlags_Resizable,
-                              ImVec2(0, halfHeight))) {
+                              ImVec2(0, halfHeight), std::max(350.0f * scale, ImGui::GetContentRegionAvail().x))) {
             ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
             ImGui::TableSetupColumn("State");
-            ImGui::TableSetupColumn("Obs", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
-            ImGui::TableSetupColumn("CPU", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
+            ImGui::TableSetupColumn("Share", ImGuiTableColumnFlags_WidthFixed, 46.0f * scale);
+            ImGui::TableSetupColumn("CPU", ImGuiTableColumnFlags_WidthFixed, 46.0f * scale);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
             for (const PrismThreadStat& thread : report.threads) {
@@ -483,18 +556,19 @@ void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
                 if (ImGui::IsItemHovered() && !thread.topSymbol.empty())
                     ImGui::SetTooltip("hottest: %s", thread.topSymbol.c_str());
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextColored(stateColor(thread.dominant), "%s", ThreadStateName(thread.dominant));
+                ui::Badge(ThreadStateName(thread.dominant), stateColor(thread.dominant));
+                ui::ItemTooltip("Dominant observed state; the profile does not imply the thread is in this state now.");
                 ImGui::TableSetColumnIndex(2);
-                ImGui::TextDisabled("%.0f", thread.dominantPct);
+                ImGui::TextDisabled("%.0f%%", thread.dominantPct);
+                ui::ItemTooltip("Share of this thread's observations in the dominant state.");
                 ImGui::TableSetColumnIndex(3);
-                if (haveCpuWeights) ImGui::TextDisabled("%.0f", thread.cpuPct);
+                if (haveCpuWeights) ImGui::TextDisabled("%.0f%%", thread.cpuPct);
                 else ImGui::TextDisabled("--");
             }
-            ImGui::EndTable();
+            ui::EndDataTable();
         }
-        ImGui::Spacing();
-        ImGui::SeparatorText("Modules");
-        if (ImGui::BeginTable("pr_mod", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+        ui::PanelHeader("Modules");
+        if (ui::BeginDataTableEx("pr_mod", reportTableIds_[2], 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                          ImGuiTableFlags_Resizable)) {
             ImGui::TableSetupColumn("Module");
             ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
@@ -511,7 +585,7 @@ void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextDisabled("%.0f%%", haveCpuWeights ? module.cpuPct : module.selfPct);
             }
-            ImGui::EndTable();
+            ui::EndDataTable();
         }
         ImGui::EndChild();
     }
@@ -529,7 +603,7 @@ void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
     if (!compact || compactReportView_ == 2) {
         ImGui::BeginChild("pr_paths", ImVec2(pathWidth, available.y), ImGuiChildFlags_None,
                            ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::SeparatorText("Hot call paths");
+        ui::PanelHeader("Hot call paths");
         for (size_t i = 0; i < report.hotPaths.size(); ++i) {
             const PrismHotPath& path = report.hotPaths[i];
             char header[72];

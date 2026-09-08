@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -206,6 +207,9 @@ struct ProjectState {
     std::vector<uint64_t>                      breakpoints;
     std::unordered_map<uint64_t, std::string>  bpConditions; // addr -> condition
     std::unordered_map<uint64_t, uint32_t>     bpEveryN;     // addr -> break every Nth hit (absent/0/1 = every)
+    // Saved intent only: disabled breakpoints retain their condition/every-N
+    // settings and remain visible. Absence means enabled, including old projects.
+    std::unordered_set<uint64_t>              bpDisabled;
     // Version 5: GML intent uses archive/code/offset identities. These are never
     // native addresses and do not grant permission to attach/inject/arm a helper.
     std::vector<GmlSavedBreakpoint>             gmlBreakpoints;

@@ -3400,6 +3400,19 @@ void App::renderMenuBar() {
                     : "Hosted DLL debugging requires a matching x86/x64 PE machine and decoder mode (active: %s).",
                     ArchName(ctx_.staticArch()));
             ImGui::Separator();
+            const DbgSnapshot* historyLive = ctx_.frameDebugSnapshot;
+            const bool canRecordPath = historyLive && historyLive->state == DbgState::Paused &&
+                !historyLive->cleanupOnly && !ctx_.gmlExecutionMode &&
+                !ctx_.debug.lifecycleSnapshot().busy;
+            if (ImGui::MenuItem("Record Execution Path", nullptr, false, canRecordPath))
+                startExecutionHistory(*historyLive);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Start before the breakpoint. Single-step the selected native thread, retaining up to 10,000 observed instructions and registers. Slower than Continue; replaces the previous recording.");
+            if (ImGui::MenuItem("Step Back in Recorded Path", nullptr, false,
+                    !executionHistory_.recording && executionHistoryView_.canStepBack(executionHistory_)))
+                executionHistoryView_.stepBack(executionHistory_);
+            if (ImGui::MenuItem("Execution History...")) executionHistoryView_.open = true;
+            ImGui::Separator();
             const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
             const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) ||
                 (ctx_.frameDebugSnapshot && ctx_.frameDebugSnapshot->traceOwnedSites != 0);
@@ -3473,13 +3486,16 @@ void App::renderMenuBar() {
                 ImGuiButtonFlags_EnableNav);
             const bool searchHovered = ImGui::IsItemHovered();
             const bool searchFocused = ImGui::IsItemFocused();
+            const float searchRadius = ImGui::GetStyle().FrameRounding;
+            const ImVec4 searchFill = searchHovered || searchFocused
+                ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered) : theme::col::panel();
             dl->AddRectFilled(searchAt,
                 ImVec2(searchAt.x + searchSize.x, searchAt.y + searchSize.y),
-                ImGui::GetColorU32(theme::col::panel()), 4.0f * k);
+                ImGui::GetColorU32(searchFill), searchRadius);
             dl->AddRect(searchAt,
                 ImVec2(searchAt.x + searchSize.x, searchAt.y + searchSize.y),
                 ImGui::GetColorU32(searchHovered || searchFocused
-                    ? theme::col::accent() : theme::col::lineSoft()), 4.0f * k);
+                    ? theme::col::accent() : theme::col::lineSoft()), searchRadius);
             const char* searchLabel = searchWidth >= 230.0f * k
                 ? "Search anything" : "Search";
             const float textY = searchAt.y + (searchSize.y - ImGui::GetTextLineHeight()) * 0.5f;
@@ -4447,18 +4463,25 @@ static bool ToolbarUsesTwoRows() {
     const float k = theme::UiScale();
     float commandLabels = 0.0f;
     for (const char* label : {"Launch & Debug", "Step Into", "Step Over",
-                              "Step Out", "Run to cursor", "Trace", "Detach"})
+                              "Step Out", "Step Back", "Run to cursor", "Trace", "Record", "Detach"})
         commandLabels += ImGui::CalcTextSize(label).x;
     const float iconWidth = ui::IconsLoaded()
         ? ImGui::CalcTextSize(DS_ICON_PLAY).x : ImGui::CalcTextSize(">>").x;
-    const float preferredWidth = commandLabels + 7.0f * (18.0f * k + iconWidth + 6.0f * k)
-        + 98.0f * k + 222.0f * k + 109.0f * k;
+    const float sessionWidth = 320.0f * k;
+    const float preferredWidth = commandLabels + 9.0f * (18.0f * k + iconWidth + 6.0f * k)
+        + 98.0f * k + 222.0f * k + 109.0f * k + sessionWidth;
     return ImGui::GetMainViewport()->WorkSize.x < preferredWidth;
+}
+
+static float ToolbarRowHeight() {
+    const float k = theme::UiScale();
+    return std::max({30.0f * k, ImGui::GetFrameHeight(),
+        ImGui::GetTextLineHeight() * 2.0f + 4.0f * k});
 }
 
 static float ToolbarHeight() {
     const float k = theme::UiScale();
-    const float row = (std::max)(30.0f * k, ImGui::GetFrameHeight());
+    const float row = ToolbarRowHeight();
     return ToolbarUsesTwoRows()
         ? row * 2.0f + 18.0f * k : row + 14.0f * k;
 }
@@ -4582,24 +4605,15 @@ void App::renderDocumentStrip() {
                 ImGui::EndPopup();
             }
 
-            ImVec4 body = document.active ? theme::col::panel()
-                                          : theme::col::menubar();
-            if ((hovered || focused || held) && !document.active) {
-                const float amount = held ? 0.18f : focused ? 0.14f : 0.10f;
-                body.x = body.x * (1.0f - amount) + accent.x * amount;
-                body.y = body.y * (1.0f - amount) + accent.y * amount;
-                body.z = body.z * (1.0f - amount) + accent.z * amount;
-            }
-            dl->AddRectFilled(a, b, ImGui::GetColorU32(body), 4.0f * k,
-                              ImDrawFlags_RoundCornersTop);
-            if (focused)
-                dl->AddRect(a, b, ImGui::GetColorU32(accent), 4.0f * k, 0, k);
-            else if (!document.active)
-                dl->AddLine(ImVec2(b.x, a.y + 8.0f * k), ImVec2(b.x, b.y - 8.0f * k),
-                            ImGui::GetColorU32(theme::col::lineSoft()));
+            const ImVec4 body = hovered || focused || held
+                ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered)
+                : document.active ? theme::col::panel() : theme::col::panelHeader();
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(body));
             if (document.active)
-                dl->AddRectFilled(a, ImVec2(b.x, a.y + 2.0f * k),
-                                  ImGui::GetColorU32(accent));
+                dl->AddLine(ImVec2(a.x, b.y - k), ImVec2(b.x, b.y - k),
+                    ImGui::GetColorU32(accent), 2.0f * k);
+            if (focused)
+                dl->AddRect(a, b, ImGui::GetColorU32(accent), 0.0f, 0, k);
 
             const float iconW = ui::IconsLoaded() && !compactDocument ? 18.0f * k : 0.0f;
             const float closeW = compactDocument ? 0.0f : 20.0f * k;
@@ -4650,6 +4664,11 @@ void App::renderDocumentStrip() {
                 closeHovered = ImGui::IsItemHovered();
                 const bool closeFocused = ImGui::IsItemFocused();
                 showClose = showClose || closeFocused;
+                if (closeHovered || closeFocused) {
+                    ImVec4 closeFill = theme::col::bad(); closeFill.w = 0.18f;
+                    dl->AddRectFilled(closePos, ImVec2(closePos.x + closeSize, closePos.y + closeSize),
+                                      ImGui::GetColorU32(closeFill), 5.0f * k);
+                }
                 const ImU32 closeCol = ImGui::GetColorU32(
                     (closeHovered || closeFocused) ? theme::col::bad()
                                                    : theme::col::muted());
@@ -4695,11 +4714,12 @@ void App::renderDocumentStrip() {
         const bool addHovered = ImGui::IsItemHovered();
         const bool addFocused = ImGui::IsItemFocused();
         const bool addHeld = ImGui::IsItemActive();
-        ImVec4 addBody = (addHovered || addFocused || addHeld)
-            ? theme::col::panel() : theme::col::menubar();
-        dl->AddRectFilled(addA, addB, ImGui::GetColorU32(addBody));
-        if (addFocused)
-            dl->AddRect(addA, addB, ImGui::GetColorU32(accent), 4.0f * k, 0, k);
+        const ImVec4 addBody = addHeld || addHovered || addFocused
+            ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered) : theme::col::menubar();
+        dl->AddRectFilled(addA, addB, ImGui::GetColorU32(addBody),
+            ImGui::GetStyle().FrameRounding);
+        if (addFocused || addHovered)
+            dl->AddRect(addA, addB, ImGui::GetColorU32(accent), 0.0f, 0, k);
         const char* plus = ui::IconsLoaded() ? DS_ICON_ADD : "+";
         const ImVec2 plusSize = ImGui::CalcTextSize(plus);
         dl->AddText(ImVec2(addA.x + (addB.x - addA.x - plusSize.x) * 0.5f,
@@ -4722,9 +4742,12 @@ void App::renderDocumentStrip() {
         const bool listHovered = ImGui::IsItemHovered();
         const bool listFocused = ImGui::IsItemFocused();
         const ImVec2 listAt = ImGui::GetItemRectMin();
-        if (listFocused)
+        if (listHovered || listFocused)
+            dl->AddRectFilled(listAt, ImGui::GetItemRectMax(),
+                ImGui::GetColorU32(ImGuiCol_FrameBgHovered), ImGui::GetStyle().FrameRounding);
+        if (listFocused || listHovered)
             dl->AddRect(listAt, ImGui::GetItemRectMax(), ImGui::GetColorU32(accent),
-                        2.0f * k, 0, (std::max)(1.0f, std::round(k)));
+                        ImGui::GetStyle().FrameRounding, 0, (std::max)(1.0f, std::round(k)));
         const float listCx = listAt.x + 14.0f * k, listCy = listAt.y + tabH * 0.5f;
         const ImU32 listInk = ImGui::GetColorU32(listHovered || listFocused
             ? accent : theme::col::muted());
@@ -4776,14 +4799,43 @@ void App::renderDocumentStrip() {
     ImGui::PopStyleVar(2);
 }
 
+bool App::startExecutionHistory(const DbgSnapshot& captured) {
+    const DebugTargetIdentity target{captured.pid, captured.sessionGeneration};
+    if (ctx_.gmlExecutionMode || captured.state != DbgState::Paused ||
+        captured.cleanupOnly ||
+        !ctx_.debug.recordExecutionPathForSession(target, captured.activeTid)) {
+        ui::Toast(ui::ToastKind::Warn,
+            "Recording requires the same paused native thread and an idle execution command. Try again at a native stop.");
+        return false;
+    }
+    executionHistoryView_.open = true;
+    executionHistoryPoll_ = {};
+    return true;
+}
+
+void App::refreshExecutionHistory(const DbgSnapshot& live) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool sameTarget = DebugTargetIdentityMatches(
+        executionHistory_.target, {live.pid, live.sessionGeneration});
+    // Polling a running recorder is bounded; at a real pause the final path is
+    // adopted immediately so Step Back cannot miss the terminal instruction.
+    if (!sameTarget || live.state != DbgState::Running ||
+        now - executionHistoryPoll_ >= std::chrono::milliseconds(100)) {
+        executionHistoryPoll_ = now;
+        if (ctx_.debug.executionHistorySnapshotIfChanged(executionHistory_))
+            executionHistoryView_.sync(executionHistory_);
+    }
+}
+
 void App::renderDebugToolbar(const DbgSnapshot& s) {
     const float k    = theme::UiScale();
+    const float commandRadius = ImGui::GetStyle().FrameRounding;
     const float docH = DocumentStripHeight();
     const float barH = ToolbarHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float toolbarY = vp->WorkPos.y + docH + TabStripHeight();
     const bool twoRows = ToolbarUsesTwoRows();
-    const float rowH = (std::max)(30.0f * k, ImGui::GetFrameHeight());
+    const float rowH = ToolbarRowHeight();
     const float toolbarPaddingY = (barH - (twoRows ? rowH * 2.0f + 4.0f * k : rowH)) * 0.5f;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, toolbarY));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, barH));
@@ -4812,7 +4864,9 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         const bool gmlTarget = DebugTargetIdentityMatches(gml.target, frameTarget);
         const bool gmlPaused = gmlTarget && paused && gml.state == GameMakerSessionState::Paused &&
             gml.stop && gml.stop->identity.tid == s.activeTid;
+        bool executionRequested = false;
         auto executionCommand = [&](GmlControlCommand command) {
+            executionRequested = true;
             if (ctx_.gmlExecutionMode) {
                 std::string error;
                 if (!d.gameMakerCommand(command, gmlPaused ? gml.stop->identity : GmlPauseIdentity{}, error))
@@ -4845,7 +4899,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         auto commandWidth = [&](const char* icon, const char* fallback,
                                 const char* label) {
-            const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
+            const char* glyph = compactCommands ? "" : ui::IconsLoaded() && icon ? icon : fallback;
             const float glyphW = (glyph && glyph[0])
                 ? ImGui::CalcTextSize(glyph).x : 0.0f;
             const float labelW = ImGui::CalcTextSize(label).x;
@@ -4855,7 +4909,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         auto commandButton = [&](const char* id, const char* icon,
                                  const char* fallback, const char* label,
                                  const char* tip, bool hot, bool enabled) {
-            const char* glyph = ui::IconsLoaded() && icon ? icon : fallback;
+            const char* glyph = compactCommands ? "" : ui::IconsLoaded() && icon ? icon : fallback;
             const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
             const ImVec2 labelSize = ImGui::CalcTextSize(label);
             const float gap = glyph && glyph[0] ? 6.0f * k : 0.0f;
@@ -4870,19 +4924,21 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             const bool held = ImGui::IsItemActive();
             if (!enabled) ImGui::EndDisabled();
 
-            if (hot || ((hovered || focused || held) && enabled)) {
+            if (enabled) {
+                dl->AddRectFilled(p, ImVec2(p.x + width, p.y + commandH),
+                    ImGui::GetColorU32(held ? ImGuiCol_FrameBgActive
+                        : hovered || focused ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
+                    commandRadius);
+                dl->AddRect(p, ImVec2(p.x + width, p.y + commandH),
+                    ImGui::GetColorU32(focused ? theme::col::accent() : theme::col::lineSoft()),
+                    commandRadius, 0, focused ? 1.5f * k : k);
+            } else if (hot) {
                 ImVec4 fill = theme::col::accent();
                 fill.w = hot ? (held ? 0.30f : 0.18f)
                              : held ? 0.20f : focused ? 0.14f : 0.10f;
                 dl->AddRectFilled(p, ImVec2(p.x + width, p.y + commandH),
-                                  ImGui::GetColorU32(fill), 4.0f * k);
+                                  ImGui::GetColorU32(fill), commandRadius);
             }
-            if (focused)
-                dl->AddRect(ImVec2(p.x + 1.0f * k, p.y + 1.0f * k),
-                            ImVec2(p.x + width - 1.0f * k,
-                                   p.y + commandH - 1.0f * k),
-                            ImGui::GetColorU32(theme::col::accent()),
-                            2.0f * k, 0, 1.0f * k);
             const ImVec4 glyphCol = !enabled ? theme::col::muted()
                                   : hot ? theme::col::accent()
                                         : ImGui::GetStyleColorVec4(ImGuiCol_Text);
@@ -4998,6 +5054,15 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                           "Step Out (Shift+F11) - run until the current function returns",
                            false, modePaused)) executionCommand(GmlControlCommand::StepOut);
 
+        const bool historyCurrent = DebugTargetIdentityMatches(executionHistory_.target, frameTarget);
+        const bool canBrowseBack = !ctx_.gmlExecutionMode && historyCurrent &&
+            !executionHistory_.recording && executionHistoryView_.canStepBack(executionHistory_);
+        nextCommand();
+        if (commandButton("##cmd_step_back", nullptr, "<",
+                          compactCommands ? "Back" : "Step Back",
+                          "Step Back - inspect the previous recorded instruction. Start Record before running to a breakpoint. The target stays at its real stop.",
+                          false, canBrowseBack)) executionHistoryView_.stepBack(executionHistory_);
+
         const bool runtimeCursorCurrent = ctx_.runtimeCursorTarget.valid() &&
             DebugTargetIdentityMatches(frameTarget, ctx_.runtimeCursorTarget);
         const bool canRunToCursor = modePaused && !ctx_.gmlExecutionMode &&
@@ -5008,8 +5073,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                           canRunToCursor
                               ? "Run to cursor (Ctrl+F9) - continue to the selected live instruction"
                               : "Run to cursor requires a paused native session and a selected instruction belonging to that session",
-                          false, canRunToCursor))
+                          false, canRunToCursor)) {
+            executionRequested = true;
             d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
+        }
 
         const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
         const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) || s.traceOwnedSites != 0;
@@ -5031,6 +5098,13 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             ctx_.requestedTraceTarget = frameTarget;
             ctx_.requestedTab = "Binary View";
         }
+
+        nextCommand();
+        if (commandButton("##cmd_record_path", nullptr, "", "Record",
+                          "Record execution path - single-step this native thread to a breakpoint, exception, Pause, or the 10,000-record limit. Slower than Continue; starts a fresh history.",
+                          historyCurrent && executionHistory_.recording,
+                          modePaused && !ctx_.gmlExecutionMode && !executionRequested))
+            executionRequested = startExecutionHistory(s);
 
         if (twoRows) {
             ImGui::SetCursorPos(addressRowStart);
@@ -5074,7 +5148,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 ? mirrorTarget : DebugTargetIdentity{};
         }
 
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * k);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, commandRadius);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                             ImVec2(10.0f * k, 6.0f * k));
@@ -5088,6 +5162,9 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             trailingReserve = ImGui::CalcTextSize("Break on JVM init").x +
                               ImGui::GetFrameHeight() + 18.0f * k;
         }
+        // Retain the full status/thread pair when it fits; its own compact
+        // popup keeps the same information reachable below that width.
+        trailingReserve += 300.0f * k;
         const float addressWidth = (std::min)(190.0f * k, (std::max)(
             82.0f * k, ImGui::GetContentRegionAvail().x - trailingReserve -
                          ImGui::GetFrameHeight() - 8.0f * k));
@@ -5183,8 +5260,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             else if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F11)) executionCommand(GmlControlCommand::StepInto);
             if (modePaused && ImGui::IsKeyPressed(ImGuiKey_F10)) executionCommand(GmlControlCommand::StepOver);
             if (canRunToCursor && ImGui::GetIO().KeyCtrl &&
-                ImGui::IsKeyPressed(ImGuiKey_F9))
+                ImGui::IsKeyPressed(ImGuiKey_F9)) {
+                executionRequested = true;
                 d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
+            }
         }
 
         // Less-common controls stay at the end of the command band instead of
@@ -5207,10 +5286,192 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 ui::ItemTooltip(tip, false);
             }
         }
+        ImGui::SameLine(0.0f, 10.0f * k);
+        renderDebugSessionControls(s, ImGui::GetContentRegionAvail().x, rowH,
+                                   executionRequested);
     }
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
+}
+
+bool App::selectDebugToolbarThread(const DbgSnapshot& captured, uint32_t tid) {
+    const DebugTargetIdentity target{captured.pid, captured.sessionGeneration};
+    if (!toolbarThreadPopupPaused_ || captured.state != DbgState::Paused ||
+        captured.cleanupOnly || !target.valid() || !tid ||
+        !DebugTargetIdentityMatches(target, toolbarThreadPopupTarget_) ||
+        captured.activeTid != toolbarThreadPopupTid_ ||
+        captured.regs.rip != toolbarThreadPopupRip_ || ctx_.debug.lifecycleSnapshot().busy ||
+        std::none_of(captured.threads.begin(), captured.threads.end(),
+            [tid](const ThreadInfo& thread) { return thread.tid == tid; })) return false;
+
+    // Revalidate after the popup click, since its rows may have been painted
+    // before execution, a different stop, or a debugger lifecycle transition.
+    const DbgSnapshot current = ctx_.debug.snapshot();
+    if (current.state != DbgState::Paused || current.cleanupOnly ||
+        !DebugTargetIdentityMatches({current.pid, current.sessionGeneration}, target) ||
+        current.activeTid != captured.activeTid || current.regs.rip != captured.regs.rip)
+        return false;
+    return ctx_.debug.setActiveThreadForSession(target, tid);
+}
+
+void App::renderDebugSessionControls(const DbgSnapshot& snap, float availableWidth,
+                                     float height, bool executionRequested) {
+    const float k = theme::UiScale();
+    const float width = (std::max)(1.0f, availableWidth);
+    const auto lifecycle = ctx_.debug.lifecycleSnapshot();
+    const DebugTargetIdentity target{snap.pid, snap.sessionGeneration};
+    const bool paused = snap.state == DbgState::Paused && !snap.cleanupOnly && !lifecycle.busy;
+    const char* state = lifecycle.busy
+        ? (lifecycle.state == DbgLifecycleState::Stopping ? "STOPPING" : "STARTING")
+        : snap.cleanupOnly ? "CLEANUP" : snap.state == DbgState::Paused ? "PAUSED"
+        : snap.state == DbgState::Running ? "RUNNING"
+        : snap.state == DbgState::Terminated ? "EXITED" : "DETACHED";
+    const ImVec4 stateColor = lifecycle.busy || snap.cleanupOnly || paused ? theme::col::warn()
+        : snap.state == DbgState::Running ? theme::col::good() : theme::col::muted();
+    const bool canSelect = paused && target.valid() && !executionRequested;
+    char threadLabel[48];
+    if (snap.activeTid) std::snprintf(threadLabel, sizeof(threadLabel), "Thread %u", snap.activeTid);
+    else std::snprintf(threadLabel, sizeof(threadLabel), "Threads");
+    const float threadWidth = ImGui::CalcTextSize(threadLabel).x + 46.0f * k;
+    const float minimumStatusWidth = ImGui::CalcTextSize(state).x + 33.0f * k;
+    const bool showThread = width >= threadWidth + minimumStatusWidth + 8.0f * k;
+    const float statusWidth = (std::min)(200.0f * k,
+        showThread ? width - threadWidth - 8.0f * k : width);
+    const float radius = height * 0.5f;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    auto openSessionPopup = [&] {
+        toolbarThreadPopupTarget_ = target;
+        toolbarThreadPopupTid_ = snap.activeTid;
+        toolbarThreadPopupRip_ = snap.regs.rip;
+        toolbarThreadPopupPaused_ = canSelect;
+        ImGui::OpenPopup("##toolbar_session_popup");
+    };
+    if (ImGui::InvisibleButton("##toolbar_debug_status", ImVec2(statusWidth, height),
+                              ImGuiButtonFlags_EnableNav)) openSessionPopup();
+    const bool focused = ImGui::IsItemFocused();
+    draw->AddRectFilled(origin, ImVec2(origin.x + statusWidth, origin.y + height),
+        ImGui::GetColorU32(paused ? theme::col::pauseSurface() : theme::col::panelHeader()), radius);
+    ImVec4 outline = stateColor;
+    outline.w = focused ? 1.0f : 0.45f;
+    draw->AddRect(origin, ImVec2(origin.x + statusWidth, origin.y + height),
+        ImGui::GetColorU32(outline), radius, 0, (std::max)(1.0f, std::round(k)));
+    draw->AddCircleFilled(ImVec2(origin.x + 11.0f * k, origin.y + height * 0.5f),
+        3.5f * k, ImGui::GetColorU32(stateColor));
+
+    const float stateFontSize = ImGui::GetFontSize();
+    const float reasonFontSize = ImGui::GetFontSize();
+    const float textX = origin.x + 23.0f * k;
+    const float textRight = origin.x + statusWidth - (showThread ? 8.0f : 18.0f) * k;
+    const ImVec4 textClip(textX, origin.y, (std::max)(textX, textRight), origin.y + height);
+    auto abbreviated = [&](const std::string& value, float fontSize) {
+        const float room = (std::max)(0.0f, textRight - textX);
+        std::string shown = value;
+        if (ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0, shown.c_str()).x <= room)
+            return shown;
+        while (!shown.empty() && ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0,
+                (shown + "...").c_str()).x > room) {
+            size_t last = shown.size() - 1;
+            while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
+            shown.resize(last);
+        }
+        return shown + "...";
+    };
+    // lastEvent is observation text from the debugger; never synthesize a stop
+    // explanation from the selected command or the reference image.
+    const std::string reason = abbreviated(snap.lastEvent, reasonFontSize);
+    const bool hasReason = !snap.lastEvent.empty();
+    const float blockH = stateFontSize + (hasReason ? reasonFontSize : 0.0f);
+    const float textY = origin.y + (height - blockH) * 0.5f;
+    draw->AddText(ImGui::GetFont(), stateFontSize, ImVec2(textX, textY),
+        ImGui::GetColorU32(stateColor), state, nullptr, 0, &textClip);
+    if (hasReason)
+        draw->AddText(ImGui::GetFont(), reasonFontSize, ImVec2(textX, textY + stateFontSize),
+            ImGui::GetColorU32(theme::col::muted()), reason.c_str(), nullptr, 0, &textClip);
+    if (!showThread) {
+        const float cx = origin.x + statusWidth - 10.0f * k, cy = origin.y + height * 0.5f;
+        draw->AddLine(ImVec2(cx - 3.0f * k, cy - k), ImVec2(cx, cy + 2.0f * k),
+            ImGui::GetColorU32(theme::col::muted()), k);
+        draw->AddLine(ImVec2(cx, cy + 2.0f * k), ImVec2(cx + 3.0f * k, cy - k),
+            ImGui::GetColorU32(theme::col::muted()), k);
+    }
+    ui::ItemTooltip("Debugger status and full event reason. Open to inspect or select a native thread.", false);
+
+    if (showThread) {
+        ImGui::SameLine(0.0f, 8.0f * k);
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        if (ImGui::InvisibleButton("##toolbar_thread", ImVec2(threadWidth, height),
+                                  ImGuiButtonFlags_EnableNav)) openSessionPopup();
+        const bool hover = ImGui::IsItemHovered(), focus = ImGui::IsItemFocused();
+        draw->AddRectFilled(at, ImVec2(at.x + threadWidth, at.y + height),
+            ImGui::GetColorU32(hover || focus ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
+            ImGui::GetStyle().FrameRounding);
+        draw->AddRect(at, ImVec2(at.x + threadWidth, at.y + height),
+            ImGui::GetColorU32(focus ? theme::col::accent() : theme::col::lineSoft()),
+            ImGui::GetStyle().FrameRounding);
+        const ImU32 ink = ImGui::GetColorU32(theme::col::muted());
+        const float cy = at.y + height * 0.5f, ix = at.x + 12.0f * k;
+        draw->AddCircle(ImVec2(ix, cy - 3.0f * k), 3.0f * k, ink, 0, k);
+        draw->AddLine(ImVec2(ix - 5.0f * k, cy + 5.0f * k), ImVec2(ix - 2.0f * k, cy + 2.0f * k), ink, k);
+        draw->AddLine(ImVec2(ix - 2.0f * k, cy + 2.0f * k), ImVec2(ix + 2.0f * k, cy + 2.0f * k), ink, k);
+        draw->AddLine(ImVec2(ix + 2.0f * k, cy + 2.0f * k), ImVec2(ix + 5.0f * k, cy + 5.0f * k), ink, k);
+        draw->AddText(ImVec2(at.x + 24.0f * k, cy - ImGui::GetTextLineHeight() * 0.5f),
+            ImGui::GetColorU32(ImGuiCol_Text), threadLabel);
+        const float cx = at.x + threadWidth - 11.0f * k;
+        draw->AddLine(ImVec2(cx - 3.0f * k, cy - k), ImVec2(cx, cy + 2.0f * k), ink, k);
+        draw->AddLine(ImVec2(cx, cy + 2.0f * k), ImVec2(cx + 3.0f * k, cy - k), ink, k);
+        ui::ItemTooltip(canSelect ? "Select the native thread to inspect at this pause."
+            : "Native thread selection requires a paused debugger session with no pending execution or cleanup.", false);
+    }
+    if (ImGui::BeginPopup("##toolbar_session_popup")) {
+        const bool sameOwner = target.pid == toolbarThreadPopupTarget_.pid &&
+            target.sessionGeneration == toolbarThreadPopupTarget_.sessionGeneration;
+        const bool sameStop = toolbarThreadPopupTid_ == snap.activeTid &&
+            toolbarThreadPopupRip_ == snap.regs.rip;
+        if (!sameOwner || (toolbarThreadPopupPaused_ && (!canSelect || !sameStop))) {
+            ImGui::CloseCurrentPopup();
+        } else {
+            ui::StatePill(state, stateColor);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::min)(
+                440.0f * k, ImGui::GetMainViewport()->WorkSize.x - 32.0f * k));
+            ImGui::TextUnformatted(snap.lastEvent.c_str());
+            if (snap.pid) ImGui::TextDisabled("PID %u | session %llu | %s controls", snap.pid,
+                static_cast<unsigned long long>(snap.sessionGeneration), ctx_.gmlExecutionMode ? "GML" : "Native");
+            if (!lifecycle.error.empty()) ImGui::TextWrapped("%s", lifecycle.error.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+            ImGui::TextDisabled("Native threads (%zu)", snap.threads.size());
+            if (snap.threads.empty()) ImGui::TextDisabled("No native threads are available.");
+            const bool selectionEnabled = canSelect && toolbarThreadPopupPaused_ && sameStop;
+            ImGui::BeginDisabled(!selectionEnabled);
+            ImGui::BeginChild("##toolbar_threads", ImVec2((std::min)(300.0f * k,
+                ImGui::GetMainViewport()->WorkSize.x - 40.0f * k),
+                (std::min)(8.0f, (std::max)(1.0f, static_cast<float>(snap.threads.size()))) *
+                    ImGui::GetTextLineHeightWithSpacing()), false);
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(snap.threads.size()));
+            while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const auto& thread = snap.threads[static_cast<size_t>(row)];
+                ImGui::PushID(static_cast<int>(thread.tid));
+                char label[96];
+                std::snprintf(label, sizeof(label), "Thread %u%s", thread.tid,
+                    thread.suspended ? " (suspended)" : "");
+                if (ImGui::Selectable(label, thread.tid == snap.activeTid)) {
+                    if (thread.tid != snap.activeTid && !selectDebugToolbarThread(snap, thread.tid))
+                        ui::Toast(ui::ToastKind::Warn, "The debugger pause or thread changed. Reopen the thread selector.");
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Thread %u | RIP 0x%llX%s", thread.tid,
+                        static_cast<unsigned long long>(thread.rip), thread.suspended ? " | user-suspended" : "");
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+            ImGui::EndDisabled();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void App::resolveWorkbenchNavigation() {
@@ -5359,27 +5620,17 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             const bool focused = ImGui::IsItemFocused();
             const bool held = ImGui::IsItemActive();
 
-            // A quiet active surface and underline distinguish workspaces from
-            // open-document tabs without surrounding every label in a box.
-            ImVec4 bodyCol = active ? theme::col::panel() : theme::col::panelHeader();
-            if (active) {
-                bodyCol.x = bodyCol.x * 0.94f + acc.x * 0.06f;
-                bodyCol.y = bodyCol.y * 0.94f + acc.y * 0.06f;
-                bodyCol.z = bodyCol.z * 0.94f + acc.z * 0.06f;
-            } else if (hovered || focused || held) {
-                bodyCol.x = bodyCol.x * 0.92f + acc.x * 0.08f;
-                bodyCol.y = bodyCol.y * 0.92f + acc.y * 0.08f;
-                bodyCol.z = bodyCol.z * 0.92f + acc.z * 0.08f;
-            }
+            // Keep broad shell surfaces neutral; the active workspace uses a
+            // small underline rather than a filled colour card.
+            const ImVec4 bodyCol = hovered || focused || held
+                ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered)
+                : active ? theme::col::panel() : theme::col::panelHeader();
             dl->AddRectFilled(a, b, ImGui::GetColorU32(bodyCol));
             if (active)
                 dl->AddRectFilled(ImVec2(a.x + 8.0f * k, b.y - 2.0f * k),
-                                  ImVec2(b.x - 8.0f * k, b.y),
-                                  ImGui::GetColorU32(acc));
+                    ImVec2(b.x - 8.0f * k, b.y), ImGui::GetColorU32(acc));
             if (focused)
-                dl->AddRect(ImVec2(a.x + 2.0f * k, a.y + 3.0f * k),
-                            ImVec2(b.x - 2.0f * k, b.y - 2.0f * k),
-                            ImGui::GetColorU32(acc), 2.0f * k, 0, 1.0f * k);
+                dl->AddRect(a, b, ImGui::GetColorU32(acc), 0.0f, 0, k);
 
             bool badge = false;
             ImVec4 badgeCol(0, 0, 0, 1);
@@ -5626,6 +5877,8 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             std::snprintf(activityText, sizeof(activityText), "Trace cleanup needed");
         else if (statusIssues)
             std::snprintf(activityText, sizeof(activityText), "Status warning");
+        else
+            std::snprintf(activityText, sizeof(activityText), "Idle");
         const float activityHeight = ImGui::GetFrameHeight();
         const float stopWidth = activityCount ? activityHeight : 0.0f;
         const float statusRight = statusPos.x + ImGui::GetWindowSize().x - 12.0f * scale;
@@ -5650,7 +5903,7 @@ void App::renderStatusBar(const DbgSnapshot& d) {
 
         const bool hasBinary = ctx_.staticBinary().loaded();
         if (!hasBinary && !d.attached()) {
-            ImGui::TextDisabled("Ready");
+            ui::StatePill("Ready", theme::col::muted());
             statusDot();
             ImGui::TextDisabled("Open a binary (Ctrl+O) or attach from Communications");
         } else {
@@ -5680,10 +5933,10 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                                   : "Attached";
             const ImVec4 stateCol = !d.attached() ? theme::col::muted()
                                   : d.state == DbgState::Running ? theme::col::good()
-                                  : d.state == DbgState::Paused ? theme::col::accent()
+                                  : d.state == DbgState::Paused ? theme::col::warn()
                                   : d.state == DbgState::Terminated ? theme::col::bad()
                                   : theme::col::warn();
-            ImGui::TextColored(stateCol, "%s", stateText);
+            ui::StatePill(stateText, stateCol);
             if (ImGui::IsItemHovered() && d.attached()) {
                 ImGui::BeginTooltip();
                 ImGui::Text("PID %u  %s 0x%llX", d.pid, d.is32 ? "EIP" : "RIP",
@@ -5906,10 +6159,6 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             ImGui::OpenPopup("##status_activity_popup");
         const bool activityHovered = ImGui::IsItemHovered();
         const bool activityFocused = ImGui::IsItemFocused();
-        if (activityFocused)
-            dl->AddRect(activityPos, ImGui::GetItemRectMax(),
-                ImGui::GetColorU32(theme::col::accent()), 2.0f * scale, 0,
-                (std::max)(1.0f, std::round(scale)));
         const ImVec4 issueColor = analysisHealth.jobsFailed || moduleHealth.jobsFailed || saveFailure
             ? theme::col::bad() : theme::col::warn();
         const ImVec4 jobColor = activityCount && (activities[0].kind == StatusActivity::Live ||
@@ -5917,10 +6166,24 @@ void App::renderStatusBar(const DbgSnapshot& d) {
             ? theme::col::good()
             : activityCount && activities[0].kind == StatusActivity::Export
                 ? theme::col::warn() : theme::col::accent();
-        const ImVec4 activityColor = statusIssues ? issueColor : jobColor;
-        const float dotX = activityPos.x + 7.0f * scale;
+        const ImVec4 activityColor = statusIssues ? issueColor
+            : activityCount ? jobColor : theme::col::muted();
+        const ImVec2 activityEnd(activityPos.x + labelWidth + stopWidth,
+                                activityPos.y + activityHeight);
+        const float activityRadius = activityHeight * 0.5f;
+        dl->AddRectFilled(activityPos, activityEnd,
+            ImGui::GetColorU32(theme::col::panelHeader()), activityRadius);
+        ImVec4 activityTint = activityColor;
+        activityTint.w = activityHovered || activityFocused ? 0.12f : 0.06f;
+        dl->AddRectFilled(activityPos, activityEnd,
+            ImGui::GetColorU32(activityTint), activityRadius);
+        ImVec4 activityOutline = activityFocused ? theme::col::accent() : activityColor;
+        activityOutline.w = activityFocused ? 1.0f : 0.45f;
+        dl->AddRect(activityPos, activityEnd, ImGui::GetColorU32(activityOutline),
+            activityRadius, 0, (std::max)(1.0f, std::round(scale)));
+        const float dotX = activityPos.x + 8.0f * scale;
         const float midY = activityPos.y + activityHeight * 0.5f;
-        if (activityCount || statusIssues) {
+        {
             if (statusIssues) {
                 dl->AddText(ImVec2(dotX - ImGui::CalcTextSize("!").x * 0.5f,
                                   midY - lh * 0.5f), ImGui::GetColorU32(activityColor), "!");
@@ -5946,10 +6209,6 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                         ImGui::GetColorU32(activityHovered || activityFocused
                             ? theme::col::accent() : theme::col::muted()),
                         displayLabel);
-        } else {
-            for (int i = -1; i <= 1; ++i)
-                dl->AddCircleFilled(ImVec2(activityPos.x + labelWidth * 0.5f + i * 4.0f * scale, midY),
-                                    1.1f * scale, ImGui::GetColorU32(theme::col::muted()));
         }
         if (activityHovered) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -7340,6 +7599,18 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
             add(nullptr, "Step Out", "Shift+F11", [this, paletteTarget] {
                 ctx_.debug.stepOutForSession(paletteTarget);
             });
+            add(nullptr, "Record Execution Path", "Debug / slower single-step recording", [this, captured = dbg] {
+                startExecutionHistory(captured);
+            });
+        }
+        add(nullptr, "Execution History", "Inspect recorded instructions and registers", [this] {
+            executionHistoryView_.open = true;
+        });
+        if (!executionHistory_.recording && executionHistoryView_.canStepBack(executionHistory_)) {
+            add(nullptr, "Step Back in Recorded Path", "Inspection only", [this, paletteTarget] {
+                if (DebugTargetIdentityMatches(executionHistory_.target, paletteTarget))
+                    executionHistoryView_.stepBack(executionHistory_);
+            });
         }
         const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
         const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) || dbg.traceOwnedSites != 0;
@@ -7522,6 +7793,8 @@ void App::renderHelpWindow() {
             { "F10",            "Step over the current instruction." },
             { "F11",            "Step into the current instruction." },
             { "Shift+F11",      "Step out of the current function." },
+            { "Record",         "Record this native thread to a breakpoint or the 10,000-record limit; slower than Continue." },
+            { "Step Back",      "Inspect earlier recorded instructions and registers in Execution History; the target stays at its real stop." },
             { "Ctrl+F9",        "Run to the Binary View cursor." },
             { "Trace toolbar / Debug menu", "Start or stop one-shot basic-block coverage; Clear Trace removes the retained green execution map." },
         });
@@ -7812,6 +8085,7 @@ void App::render() {
     // after cancellation or bounded result loss.
     ctx_.drainModuleAnalysisResults();
     ctx_.debug.traceCoverageSnapshotIfChanged(traceSnapshot_);
+    refreshExecutionHistory(dbg);
     ctx_.frameDebugSnapshot = &dbg;
     ctx_.frameTraceCoverageSnapshot = &traceSnapshot_;
     struct ResetFrameDebugSnapshot {
@@ -7883,6 +8157,7 @@ void App::render() {
     renderAntiDebugPopup();
     renderPassiveDumpPopup();
     renderSymbolSettingsPopup();
+    executionHistoryView_.render(executionHistory_, dbg);
     if (binaryView_ && binaryView_->renderTypeDraftPrompt(ctx_)) requestExit();
 
     // Binary View's Java banner can't open the Save dialog itself (it has no

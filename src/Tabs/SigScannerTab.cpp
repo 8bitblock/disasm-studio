@@ -8,6 +8,7 @@
 #include "../Core/SigMatch.h"
 #include "../Disasm/DisassemblerFactory.h"
 #include "../Ui/Icons.h"
+#include "../Ui/Fonts.h"
 #include "../Ui/Theme.h"
 #include "../Ui/Widgets.h"
 #include "imgui.h"
@@ -1257,13 +1258,10 @@ void SigScannerTab::render(AppContext& ctx) {
             scan(ctx);   // populate Results (the default sub-tab) right away
         }
     }
-    ImGui::TextUnformatted("Signature Scanner");
-    ImGui::PushTextWrapPos();
-    ImGui::TextDisabled("Find byte patterns, check uniqueness and browse functions.");
-    ImGui::PopTextWrapPos();
+    ui::PanelHeader("Signature Scanner", "Byte patterns, uniqueness and functions");
 
     if (!ctx.staticBinary().loaded() && !snap.attached()) {
-        if (ImGui::Button("Open Binary...")) ctx.openBinaryDialog();
+        if (ui::AccentButton("Open Binary...", theme::col::accent())) ctx.openBinaryDialog();
         ui::SameLineIfFits(ImGui::CalcTextSize("Your saved signature library is available below.").x);
         ImGui::PushTextWrapPos();
         ImGui::TextDisabled("Your saved signature library is available below.");
@@ -1277,7 +1275,6 @@ void SigScannerTab::render(AppContext& ctx) {
         return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
     };
     const bool previousLive = live_;
-    ImGui::Separator();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("Scan target");
     ui::SameLineIfFits(buttonWidth("FILE") + ImGui::GetFrameHeight());
@@ -1310,16 +1307,22 @@ void SigScannerTab::render(AppContext& ctx) {
     else ImGui::TextDisabled(live_ ? "Attach a process in Communications."
                                   : "Open a binary to scan file bytes.");
     ImGui::PopTextWrapPos();
+    ui::SameLineIfFits(100.0f * s);
+    ui::StatePill(workerPending_ ? "RUNNING" : scanCompleted_ ? (scanPartial_ ? "PARTIAL" : "COMPLETE") : "IDLE",
+        workerPending_ ? theme::col::accent() : scanCompleted_ ? (scanPartial_ ? theme::col::warn() : theme::col::good())
+                                                              : theme::col::muted());
 
-    ImGui::TextDisabled("Byte pattern");
-    const float scanWidth = buttonWidth("Scan") +
-        (ui::IconsLoaded() ? ImGui::CalcTextSize(DS_ICON_SEARCH " ").x : 0.0f);
+    const float scanWidth = buttonWidth("Scan");
     const float inputWidth = ImGui::GetContentRegionAvail().x;
     const bool scanFits = inputWidth >= 360.0f * s + scanWidth;
     ImGui::SetNextItemWidth(std::max(1.0f, inputWidth -
         (scanFits ? scanWidth + ImGui::GetStyle().ItemSpacing.x : 0.0f)));
-    const bool enterScan = ImGui::InputTextWithHint("##pattern", "48 89 ?? 24  |  ? or ?? matches any byte", patternInput_,
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::col::code());
+    ui::PushMono();
+    const bool enterScan = ImGui::InputTextWithHint("##pattern", "Byte pattern: 48 89 ?? 24", patternInput_,
         sizeof(patternInput_), ImGuiInputTextFlags_EnterReturnsTrue);
+    ui::PopMono();
+    ImGui::PopStyleColor();
     if (ImGui::IsItemEdited()) patternClipped_ = false;
     ui::ItemTooltip("Hex byte pairs, with ? or ?? for any byte. Spaces are optional. Press Enter to scan.");
     SigPattern savePattern;
@@ -1327,7 +1330,7 @@ void SigScannerTab::render(AppContext& ctx) {
     if (enterScan && canScan && validPattern && !workerPending_) scan(ctx);
     if (scanFits) ImGui::SameLine();
     ImGui::BeginDisabled(!canScan || !validPattern || workerPending_);
-    if (ui::ToolbarIconButton(DS_ICON_SEARCH, "Scan", !canScan ? "Choose an available FILE or LIVE target."
+    if (ui::AccentButton("Scan###tbib_Scan", theme::col::accent(), !canScan ? "Choose an available FILE or LIVE target."
             : !validPattern ? "Enter valid hex byte pairs and optional ? or ?? wildcards."
             : workerPending_ ? "Wait for the current work or cancel it first."
             : live_ ? "Scan every readable committed region in the captured debugger session."
@@ -1347,6 +1350,10 @@ void SigScannerTab::render(AppContext& ctx) {
     }
     ImGui::PopTextWrapPos();
 
+    ImGui::Separator();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Library");
+    ui::SameLineIfFits(190.0f * s);
     ImGui::SetNextItemWidth(std::min(190.0f * s, ImGui::GetContentRegionAvail().x));
     ImGui::InputTextWithHint("##signame", "signature name", sigName_, sizeof(sigName_));
     ui::SameLineIfFits(buttonWidth(selectedSignatureId_ ? "Update Sig" : "Save Sig") + ImGui::GetFrameHeight());
@@ -1429,7 +1436,7 @@ void SigScannerTab::render(AppContext& ctx) {
 
     if (ImGui::BeginTabBar("sigsub")) {
         const int selectSub = std::exchange(requestedSub_, -1);
-        if (ImGui::BeginTabItem("Results", nullptr, selectSub == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        if (ui::BeginCountTabItem("Results", results_.size(), selectSub == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
             ui::SearchBox("##resultfilter", "Filter address, module or pattern...", resultFilter_,
                           sizeof(resultFilter_), std::min(310.0f * s, ImGui::GetContentRegionAvail().x));
             if (resultsFilterDirty_ || cachedResultFilter_ != resultFilter_) {
@@ -1472,7 +1479,7 @@ void SigScannerTab::render(AppContext& ctx) {
                 ui::EmptyState(DS_ICON_SEARCH, "Find a byte pattern",
                     "Enter hex bytes above and choose Scan, or select a saved pattern in Sig Health.");
             }
-            if (!visibleResults_.empty() && ImGui::BeginTable("res", 3,
+            if (!visibleResults_.empty() && ui::BeginDataTable("res", 3,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                     ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
@@ -1517,7 +1524,7 @@ void SigScannerTab::render(AppContext& ctx) {
                         // and copy preserves the complete pattern without a huge tooltip.
                         ImGui::PopID();
                     }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
             ImGui::EndTabItem();
         }
@@ -1552,7 +1559,8 @@ void SigScannerTab::render(AppContext& ctx) {
                     ImGui::PopStyleColor();
                 }
             } else {
-                ImGui::TextDisabled("No signature work is currently queued.");
+                ui::EmptyState(DS_ICON_SEARCH, "No scan in progress",
+                    "Choose FILE or LIVE, enter a byte pattern and select Scan. Completed work keeps its captured target and pattern here.");
             }
             if (!scanPattern_.empty() && (!workerPending_ || activeWorkerKind_ == WorkerKind::StaticScan || activeWorkerKind_ == WorkerKind::LiveScan)) {
                 ImGui::Separator();
@@ -1568,9 +1576,9 @@ void SigScannerTab::render(AppContext& ctx) {
             }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Sig Health", nullptr, selectSub == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        if (ui::BeginCountTabItem("Sig Health", sigs_.size(), selectSub == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
             ImGui::BeginDisabled(!ctx.staticBinary().loaded() || workerPending_ || !libraryReady_ || libraryIo_.valid());
-            if (ImGui::Button("Recompute health")) refreshHealth(ctx);
+            if (ui::AccentButton("Recompute health", theme::col::accent())) refreshHealth(ctx);
             ImGui::EndDisabled();
             ui::ItemTooltip("Count each saved pattern against the current FILE image, including active patches. A unique match is a useful signature candidate.");
             ui::SameLineIfFits(300.0f * s);
@@ -1585,7 +1593,7 @@ void SigScannerTab::render(AppContext& ctx) {
                     libraryReady_ ? "Name and save a pattern above, or import an existing signature library."
                                   : "Saved definitions will appear here when loading finishes.");
             }
-            if (!sigs_.empty() && ImGui::BeginTable("health", 4,
+            if (!sigs_.empty() && ui::BeginDataTable("health", 4,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                     ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
@@ -1643,7 +1651,7 @@ void SigScannerTab::render(AppContext& ctx) {
                     ImGui::TextColored(col, "%s", s.health.c_str());
                     ImGui::PopID();
                 }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
             if (removeSignature) {
                 auto candidate = librarySnapshot();
@@ -1652,10 +1660,10 @@ void SigScannerTab::render(AppContext& ctx) {
             }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("All Functions", nullptr, selectSub == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        if (ui::BeginCountTabItem("All Functions", functions_.size(), selectSub == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
             ImGui::BeginDisabled(!ctx.staticBinary().loaded() ||
                                  !ctx.staticDisassembler() || workerPending_);
-            if (ImGui::Button("Analyze Functions")) {
+            if (ui::AccentButton("Analyze Functions", theme::col::accent())) {
                 analyzeFunctions(ctx);
             }
             ImGui::EndDisabled();
@@ -1696,7 +1704,7 @@ void SigScannerTab::render(AppContext& ctx) {
                                           : "Choose Analyze Functions to build the list for this FILE image.");
                 }
             }
-            if (!visibleFunctions_.empty() && ImGui::BeginTable("fns", 3,
+            if (!visibleFunctions_.empty() && ui::BeginDataTable("fns", 3,
                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
                     ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX,
                     ImVec2(0, ImGui::GetContentRegionAvail().y))) {
@@ -1727,7 +1735,7 @@ void SigScannerTab::render(AppContext& ctx) {
                         ImGui::TableSetColumnIndex(2); ImGui::Text("%u", f.size);
                         ImGui::PopID();
                     }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
             ImGui::EndTabItem();
         }

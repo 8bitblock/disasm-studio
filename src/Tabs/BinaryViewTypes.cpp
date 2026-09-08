@@ -218,7 +218,7 @@ void BinaryViewTab::renderTypeWorkbench(AppContext& ctx) {
                 typeDraftDirty_ = true;
             }
             ImGui::EndDisabled();
-            if (ImGui::BeginTable("##type_fields", 4, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerH)) {
+            if (ui::BeginDataTable("##type_fields", 4, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerH)) {
                 ImGui::TableSetupColumn("Name"); ImGui::TableSetupColumn("Type");
                 ImGui::TableSetupColumn(function ? "" : "Offset (bytes)");
                 ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 40.0f * scale);
@@ -238,7 +238,7 @@ void BinaryViewTab::renderTypeWorkbench(AppContext& ctx) {
                     ImGui::PopID();
                 }
                 if (remove >= 0) { fields.erase(fields.begin() + remove); typeDraftDirty_ = true; }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
         }
         if (typeDraft_.kind == TypeKind::Enum) {

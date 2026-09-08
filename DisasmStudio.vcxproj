@@ -115,6 +115,7 @@
     <ClCompile Include="src\Ui\Theme.cpp" />
     <ClCompile Include="src\Ui\Fonts.cpp" />
     <ClCompile Include="src\Ui\Widgets.cpp" />
+    <ClCompile Include="src\Ui\ExecutionHistoryView.cpp" />
     <ClCompile Include="src\Ui\CommandPalette.cpp" />
     <ClCompile Include="src\Core\BinaryFile.cpp" />
     <ClCompile Include="src\Core\AddressInspector.cpp" />
@@ -257,6 +258,7 @@
     <ClInclude Include="src\Ui\Fonts.h" />
     <ClInclude Include="src\Ui\Icons.h" />
     <ClInclude Include="src\Ui\Widgets.h" />
+    <ClInclude Include="src\Ui\ExecutionHistoryView.h" />
     <ClInclude Include="src\Ui\NotesEditor.h" />
     <ClInclude Include="src\Ui\GraphViewport.h" />
     <ClInclude Include="src\Ui\CommandPalette.h" />

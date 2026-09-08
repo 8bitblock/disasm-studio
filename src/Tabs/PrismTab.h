@@ -17,6 +17,9 @@ public:
     void render(AppContext& ctx) override;
 
 private:
+    void renderReportWorkspace(AppContext& ctx, const PrismReport& report,
+                               const DbgSnapshot& navigationSnapshot,
+                               uint64_t sampledCreationTime, bool canNavigate);
     void renderReportPanes(AppContext& ctx, const PrismReport& report,
                            const DbgSnapshot& navigationSnapshot,
                            uint64_t sampledCreationTime, bool canNavigate);
@@ -29,6 +32,10 @@ private:
     int          selectedFlame_ = -1;
     bool         stopRequested_ = false;
     int          compactReportView_ = 0;
+    int          compactWorkspaceView_ = 0;
+    int          chartView_ = 0;
+    float        chartHeightRatio_ = 0.43f;
+    uint32_t     reportTableIds_[3]{};
 
     // Retained ratios for the draggable functions | details | paths panes.
     // Boundaries are expressed against the available content width so the

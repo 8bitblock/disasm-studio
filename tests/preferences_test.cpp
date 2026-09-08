@@ -43,8 +43,22 @@ static PreferencesData sample(int theme, std::string query) {
 }
 
 int main() {
-    const PreferencesBounds bounds{9, 0, 2};
+    const PreferencesBounds bounds{10, 0, 2};
     const PreferencesData defaults = sample(8, "default");
+
+    // Appending Axiom keeps all existing numeric theme IDs readable and never
+    // changes saved zoom, density, or analyst pane preferences on round-trip.
+    for (int themeId = 0; themeId < bounds.themeCount; ++themeId) {
+        PreferencesData expected = sample(themeId, "FILE:0");
+        expected.uiZoomPercent = 90;
+        expected.navigatorOptionalMask = 85;
+        std::string encoded;
+        PreferencesData decoded;
+        CHECK(SerializePreferences(expected, bounds, encoded));
+        CHECK(ParsePreferences(encoded, defaults, bounds, decoded));
+        CHECK(decoded.theme == themeId && decoded.uiZoomPercent == 90);
+        CHECK(decoded.density == expected.density && decoded.navigatorOptionalMask == 85);
+    }
 
     // Pure codec: round-trip every persisted class, including FILE/LIVE identity.
     {

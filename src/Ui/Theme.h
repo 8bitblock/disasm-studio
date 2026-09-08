@@ -21,6 +21,7 @@ enum class ThemeId {
     Nord,           // cold blue-gray
     Matrix,         // black + phosphor green
     Paper,          // warm paper + ink, amber accent
+    Axiom,          // midnight navy, blue selection, pastel syntax accents
     Count
 };
 
@@ -59,6 +60,7 @@ const char* DensityName(Density d);   // human label for menus
 // each invent their own and recolor automatically when the theme changes.
 namespace col {
     ImVec4 accent();     // primary accent
+    ImVec4 accentAlt();  // decorative secondary accent; status colors remain semantic
     ImVec4 good();       // green (running / ok)
     ImVec4 warn();       // amber (paused / multiple)
     ImVec4 bad();        // red (return / error / breakpoint)
@@ -74,6 +76,10 @@ namespace col {
     // independent of this deliberately subdued surrounding chrome.
     ImVec4 panel();        // panel body background (child bg)
     ImVec4 panelHeader();  // panel tab-strip / toolbar background
+    ImVec4 code();         // recessed code / hex / preview canvas
+    ImVec4 breakpointFill();    // subdued breakpoint row background
+    ImVec4 breakpointOutline(); // breakpoint row outline
+    ImVec4 pauseSurface();      // amber capsule surface
     ImVec4 line();         // primary pane/widget divider
     ImVec4 lineSoft();     // soft inner divider line
 }

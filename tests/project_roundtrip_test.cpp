@@ -138,6 +138,8 @@ int main() {
     st.bookmarks.push_back({ 0x1400003000ull, "table" });
     st.breakpoints.push_back(0x1400004000ull);
     st.bpConditions[0x1400004000ull] = "x0 == 0";
+    st.bpEveryN[0x1400004000ull] = 7;
+    st.bpDisabled.insert(0x1400004000ull);
     st.patchSets.push_back({ 7, "Global gate only", true });
     st.patchSets.push_back({ 11, "Global + feature gates", false });
     st.patches.push_back({ 0x1400005000ull, { 0x01, 0x02 },
@@ -282,6 +284,7 @@ int main() {
           rt.dataOverrides[1].kind == PjDataKind::PointerTable);
     CHECK(rt.bookmarks.size() == 1 && rt.bookmarks[0].address == 0x1400003000ull);
     CHECK(rt.breakpoints.size() == 1 && rt.breakpoints[0] == 0x1400004000ull);
+    CHECK(rt.bpDisabled == st.bpDisabled && rt.bpEveryN == st.bpEveryN);
     CHECK(rt.bpConditions[0x1400004000ull] == "x0 == 0");
     CHECK(rt.patches.size() == 1 && rt.patches[0].address == 0x1400005000ull
           && rt.patches[0].bytes.size() == 2 && rt.patches[0].bytes[0] == 0x90
@@ -290,6 +293,44 @@ int main() {
           rt.patchSets[0].name == "Global gate only" &&
           rt.patchSets[0].enabled && rt.patchSets[1].id == 11 &&
           !rt.patchSets[1].enabled);
+
+    // Pausing a saved breakpoint keeps its address and all trigger settings.
+    // The optional field also reads old projects as enabled without migration.
+    {
+        ProjectState breakpointIntent;
+        CHECK(DeserializeProject(R"({"version":1,"breakpoints":[
+            {"a":"0x0","cond":"rax == 0","everyN":3},
+            {"a":"0xFFFFFFFFFFFFFFFF","enabled":true},
+            {"a":"0x1000000000000001","enabled":false,"cond":"rcx != 7","everyN":9}
+        ]})", breakpointIntent));
+        CHECK(breakpointIntent.breakpoints.size() == 3);
+        CHECK(!breakpointIntent.bpDisabled.contains(0));
+        CHECK(!breakpointIntent.bpDisabled.contains(UINT64_MAX));
+        CHECK(breakpointIntent.bpDisabled.contains(0x1000000000000001ull));
+        breakpointIntent.bpDisabled.insert(0);
+        breakpointIntent.bpDisabled.insert(0xDEAD); // removed/stale metadata cannot create a breakpoint
+        ProjectState paused;
+        CHECK(DeserializeProject(SerializeProject(breakpointIntent), paused));
+        CHECK(paused.breakpoints.size() == 3 && paused.bpDisabled.size() == 2);
+        CHECK(paused.bpDisabled.contains(0) && !paused.bpDisabled.contains(0xDEAD));
+        CHECK(paused.bpConditions.at(0) == "rax == 0" && paused.bpEveryN.at(0) == 3);
+        CHECK(paused.bpConditions.at(0x1000000000000001ull) == "rcx != 7" &&
+              paused.bpEveryN.at(0x1000000000000001ull) == 9);
+        paused.bpDisabled.erase(0);
+        ProjectState resumed;
+        CHECK(DeserializeProject(SerializeProject(paused), resumed));
+        CHECK(resumed.breakpoints == paused.breakpoints && resumed.bpDisabled.size() == 1);
+        CHECK(!resumed.bpDisabled.contains(0) && resumed.bpConditions == paused.bpConditions &&
+              resumed.bpEveryN == paused.bpEveryN);
+        resumed.name = "preserved after rejection";
+        for (const char* invalid : {"0", "1", "\"false\"", "null"}) {
+            const std::string malformed =
+                std::string(R"({"version":5,"breakpoints":[{"a":"0x0","enabled":)") +
+                invalid + "}]}";
+            CHECK(!DeserializeProject(malformed, resumed));
+            CHECK(resumed.name == "preserved after rejection");
+        }
+    }
 
     // Patch vector order is semantic: later entries win where patches overlap.
     // Deliberately append the higher-address patch first so address sorting would
@@ -669,6 +710,10 @@ int main() {
         CHECK(LoadProject(st.hash, completeStateReloaded));
         CHECK(completeStateReloaded.connectionEvents.size() == 1 &&
               completeStateReloaded.rawDecoderFeatureBits == st.rawDecoderFeatureBits);
+        CHECK(completeStateReloaded.breakpoints == st.breakpoints &&
+              completeStateReloaded.bpDisabled == st.bpDisabled &&
+              completeStateReloaded.bpConditions == st.bpConditions &&
+              completeStateReloaded.bpEveryN == st.bpEveryN);
         const ProjectSaveResult largePatchSave = SaveProjectDetailed(largePatch);
         CHECK(largePatchSave.saved && largePatchSave.sidecarWritten &&
               largePatchSave.recentsUpdated && largePatchSave.error.empty());

@@ -152,6 +152,7 @@ private:
     int welcomeLastFrame_ = -1;
     std::string welcomeOpenError_;
     void renderAssembly(AppContext& ctx);          // dispatcher: full-program or windowed
+    void renderListingToolbar(AppContext& ctx, bool live); // bounded view actions; execution stays in the shell
     void renderAssemblyWindow(AppContext& ctx);    // ~256 instructions around the cursor
     void renderAssemblyFull(AppContext& ctx);      // entire program, clipper-rendered
     void buildFullListing(AppContext& ctx);        // queue an off-thread listing plan/build
@@ -166,6 +167,9 @@ private:
                       const std::string& hoverTok, std::string& nextHoverTok,
                       bool autoScrollHere, bool boundaryExact);
     void selectRange(AppContext& ctx, uint64_t a, uint64_t b);             // retain selected displayed instructions
+    void assemblyRowSelection(AppContext& ctx, const Instruction& in, bool live,
+                              const std::vector<Instruction>* liveInstructions,
+                              bool addressActivated, const char* popupId);
     void asmSelectionMenu(AppContext& ctx, const struct DbgSnapshot& snap); // batch actions over selVAs_ (static listing)
     void liveSelectionMenu(AppContext& ctx, const struct DbgSnapshot& snap); // batch actions over selVAs_ (live listing)
     void emitInstrCopyMenu(const Instruction& in, Arch arch, bool shortcuts = true);
@@ -275,6 +279,8 @@ private:
     void armPendingStaticBreakpoints(AppContext& ctx);
     void restoreSavedBreakpointBoundaries(AppContext& ctx);
     void resetStaticBreakpointArming(uint64_t fileVA);
+    bool setBreakpointEnabled(AppContext& ctx, uint64_t projectKey, bool file,
+                              uint64_t runtimeVA, bool enabled);
     void markStaticBreakpointBoundariesChanged() { staticBreakpointSweepDirty_ = true; }
     const char* staticBreakpointStatus(AppContext& ctx, uint64_t fileVA,
                                        std::string& detail) const;
@@ -317,6 +323,9 @@ private:
     void renderSidePanel(AppContext& ctx);
     void renderSectionsTab(AppContext& ctx);            // PE header + per-section visibility/fold controls
     void renderLowerTabs(AppContext& ctx, bool headerOnly);
+    void renderBreakpoints(AppContext& ctx);
+    size_t breakpointDisplayCount(AppContext& ctx) const;
+    void addBreakpointAtCursor(AppContext& ctx);
     void renderExportsTab(AppContext& ctx);             // complete PE EAT browser (aliases/ordinals/forwarders)
     void renderResourcesTab(AppContext& ctx);           // PE resource-directory browser (tree + decode/preview + save)
     void buildResourcePreview(AppContext& ctx);         // (re)build the cached preview for resourceSel_
@@ -458,16 +467,20 @@ private:
     float    liveBoxW_   = 252.0f;       // Live listing | register-box split
     // Decompiler view: pseudo-C pane | synced asm pane split, and the asm VA hovered
     // (or whose pseudo line is hovered) so the two panes cross-highlight each other.
-    float    decompSplitW_ = 360.0f;     // pseudo pane width (decompiler view)
+    float    decompSplitW_ = 0.0f;       // unset until first use; then retained pseudo pane width
     uint64_t decompHoverVA_ = 0;         // VA cross-highlighted between the two panes
     bool     decompHoverValid_ = false;
 
-    // Multi-line selection in the full assembly listing: click = single,
-    // Shift+click = range from the anchor, Ctrl+click = toggle one line.
+    // Assembly Address/Bytes/Instruction cells: click = single, drag/Shift+click
+    // = range from the anchor, Ctrl+click = toggle one line.
     std::unordered_set<uint64_t> selVAs_;
     uint64_t                     selAnchorVA_ = 0;
     bool                         selAnchorValid_ = false;
     int                          selView_ = -1;   // which listing (0=static,4=live) owns the current selection
+    bool                         assemblySelectionDragging_ = false;
+    int                          assemblySelectionDragView_ = -1;
+    double                       assemblySelectionMouseDownTime_ = -1.0;
+    uint64_t                     assemblySelectionDragLastVA_ = 0;
 
     // Full-program listing: a worker-built, clipper-friendly row index containing
     // instruction/function/string rows plus modeled section/header/data-directive
@@ -545,6 +558,8 @@ private:
     bool validateListingInstructionBoundary(AppContext& ctx, uint64_t address, std::string& error);
     bool restoreListingInstructionBoundary(AppContext& ctx, uint64_t address, std::string& error);
     bool beginStaticInstructionPatch(AppContext& ctx, uint64_t address);
+    bool beginLiveInstructionPatch(AppContext& ctx, const DbgSnapshot& snap, uint64_t address);
+    bool prepareInstructionPatchDraft(const std::vector<Instruction>& instructions, Arch arch);
     bool applyStaticInstructionPatch(AppContext& ctx, uint64_t address,
                                       std::vector<uint8_t> bytes, uint32_t span, bool padNop,
                                       const ListingInstructionSnapshot* retainedOriginal = nullptr,
@@ -769,6 +784,7 @@ private:
     std::unordered_map<uint64_t,int> liveIdxOf_;        // address -> index within liveInsns_
     std::unordered_set<uint64_t>     liveFuncSet_;      // divider addresses (runtime VAs)
     uint64_t                         liveCacheStart_ = 0;
+    uint64_t                         liveCacheFocusVA_ = 0;
     uint64_t                         liveCacheSig_   = ~0ull;
     uint32_t                         liveGen_        = 0;  // bumped on live write / patch / re-analyze / detach
     // Manual edge scrolling gets a refill focus separate from cursor/RIP. This
@@ -776,6 +792,10 @@ private:
     bool                             liveBrowseValid_ = false;
     uint64_t                         liveBrowseVA_ = 0;
     int8_t                           liveBrowseRefillDirection_ = 0;
+    bool                             liveWindowPanScrollValid_ = false;
+    uint8_t                          liveWindowScrollSettleFrames_ = 0; // shared focus/pan correction budget
+    uint64_t                         liveWindowPanScrollVA_ = 0;
+    float                            liveWindowPanScrollOffsetY_ = 0.0f;
     bool                             liveWindowScrollSampleValid_ = false;
     float                            liveWindowLastScrollY_ = 0.0f;
     bool                             wasAttached_    = false; // detach-edge detector (clear caches once)
@@ -808,8 +828,8 @@ private:
     int                   patchMode_ = 1;       // 0 = hex bytes, 1 = assembly (Keystone)
     uint64_t              patchVA_  = 0;
     uint32_t              patchLen_ = 0;
-    char                  patchHex_[128] = "";
-    char                  patchAsmText_[256] = "";
+    std::string           patchHex_;
+    std::string           patchAsmText_;
     std::string           patchAsm_;            // disasm preview of edited bytes
     std::string           patchStatus_;
     std::string           runErr_;               // last "> Run" launch error, shown in the asm toolbar
@@ -817,6 +837,7 @@ private:
     bool                  closePatchPopup_ = false; // debugger identity changed under an open live draft
     bool                  patchPopupLive_ = false;
     std::vector<ListingInstructionSnapshot> patchInstructionRecords_;
+    std::vector<uint8_t> patchLiveOriginal_;
     std::vector<uint8_t> patchPreviewOriginal_;
     PatchApplyOutcome patchPopupOutcome_{};
     uint32_t              patchPopupPid_ = 0;
@@ -1225,6 +1246,7 @@ private:
 
     std::vector<Bookmark> bookmarks_;
     std::unordered_set<uint64_t> breakpoints_;   // O(1) membership in the hot render path
+    std::unordered_set<uint64_t> disabledBreakpoints_; // retained FILE intent; not physical arming state
     // Saved FILE-space intent is separate from debugger acknowledgement. A
     // queued command is owned by one session and one module incarnation.
     struct StaticBreakpointArming {
@@ -1273,6 +1295,8 @@ private:
     std::unordered_map<uint64_t, std::string> liveCondEditDraft_; // exact-session runtime VAs
     std::unordered_map<uint64_t, std::string> liveCondEditError_;
     std::unordered_map<uint64_t, uint32_t> everyNBuf_;  // per-bp "break every Nth hit" (0/1 = every)
+    uint32_t breakpointActionsPopupId_ = 0;
+    uint64_t breakpointActionsContext_ = 0;
     char                  fcCodeBuf_[16] = "";          // first-chance whitelist hex-code entry
     size_t                dbgOutSeen_ = 0;              // Debug Output auto-scroll watermark
     // Heuristic function naming: address -> the basis for the guessed name (tooltip).

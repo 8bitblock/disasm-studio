@@ -200,9 +200,7 @@ void BinaryTechTab::render(AppContext& ctx) {
         scanned_ = false;
     }
 
-    ImGui::TextUnformatted("Binary Tech");
-    ui::SameLineIfFits(270.0f * theme::UiScale());
-    ImGui::TextDisabled("Capabilities and supporting evidence");
+    ui::PanelHeader("Binary Tech", "Capabilities and supporting evidence");
 
     if (!ctx.staticBinary().loaded()) {
         if (ui::EmptyState(DS_ICON_SHIELD, "No binary loaded",
@@ -221,7 +219,7 @@ void BinaryTechTab::render(AppContext& ctx) {
     }
 
     ImGui::BeginDisabled(pending_);
-    if (ui::ToolbarIconButton(DS_ICON_SHIELD, "Run Tech Scan",
+    if (ui::AccentButton("Run Tech Scan###tbib_Run Tech Scan", theme::col::accent(),
                               "Detect capabilities and techniques from imports, section names, and byte patterns"))
         runTechScan(ctx);
     ImGui::EndDisabled();
@@ -234,10 +232,9 @@ void BinaryTechTab::render(AppContext& ctx) {
     ui::SameLineIfFits(240.0f * theme::UiScale());
     ui::SearchBox("##techfilter", "filter capabilities or evidence...", filter_, sizeof(filter_),
                   std::min(240.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x));
-    ui::SameLineIfFits(140.0f * theme::UiScale());
-    if (pending_) ImGui::TextDisabled("scanning...");
-    else if (scanned_) ImGui::TextDisabled("%d capabilit%s", (int)caps_.size(), caps_.size() == 1 ? "y" : "ies");
-    else          ImGui::TextDisabled("not scanned");
+    ui::SameLineIfFits(100.0f * theme::UiScale());
+    ui::StatePill(pending_ ? "RUNNING" : scanned_ ? "COMPLETE" : "IDLE",
+                  pending_ ? theme::col::accent() : scanned_ ? theme::col::good() : theme::col::muted());
     if (!status_.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
         ImGui::TextWrapped("%s", status_.c_str());
@@ -246,8 +243,8 @@ void BinaryTechTab::render(AppContext& ctx) {
     ImGui::Separator();
 
     if (pending_) {
-        ImGui::TextWrapped("Scanning imports, sections, runtime wrappers, and byte signatures...");
-        ImGui::TextDisabled("You can keep working in other tabs while the scan runs.");
+        ui::EmptyState(DS_ICON_SEARCH, "Scanning capabilities",
+            "Reading imports, sections, runtime wrappers and byte signatures. You can keep working in other tabs while the scan runs.");
         return;
     }
     if (!scanned_) {
@@ -303,10 +300,10 @@ void BinaryTechTab::render(AppContext& ctx) {
     const float listHeight = stacked
         ? std::max(1.0f, std::min(240.0f * scale, workspaceSize.y * 0.42f)) : 0.0f;
     ImGui::BeginChild("caplist", ImVec2(stacked ? 0.0f : listWidth_, listHeight), ImGuiChildFlags_Borders);
-    ImGui::TextUnformatted("Findings");
-    ui::SameLineIfFits(130.0f * scale);
-    ImGui::TextDisabled("%zu of %zu", visible.size(), caps_.size());
-    if (ImGui::BeginTable("caps", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+    char findingCount[64]{};
+    std::snprintf(findingCount, sizeof(findingCount), "%zu of %zu", visible.size(), caps_.size());
+    ui::PanelHeader("Findings", findingCount);
+    if (ui::BeginDataTable("caps", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                    ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Capability");
         ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 84 * scale);
@@ -329,14 +326,15 @@ void BinaryTechTab::render(AppContext& ctx) {
             ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", c.category.c_str());
             ui::ItemTooltip(c.category.c_str());
             ImGui::TableSetColumnIndex(2);
-            ImVec4 col = c.confidence > 0.85f ? theme::col::good()
+            // Confidence is strength of static evidence, not a safe/unsafe verdict.
+            ImVec4 col = c.confidence > 0.85f ? theme::col::accent()
                        : c.confidence > 0.65f ? theme::col::warn()
                                               : theme::col::muted();
             ImGui::TextColored(col, "%.0f%%", c.confidence * 100.0f);
             ui::ItemTooltip("Heuristic confidence in this finding. Review its supporting evidence.");
             ImGui::PopID();
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
     ImGui::EndChild();
 
@@ -346,10 +344,10 @@ void BinaryTechTab::render(AppContext& ctx) {
     ImGui::BeginChild("capdetail", ImVec2(0, 0), ImGuiChildFlags_Borders);
     if (selected_ >= 0 && selected_ < (int)caps_.size()) {
         auto& c = caps_[selected_];
+        ui::PanelHeader("Capability evidence", c.category.c_str());
         ImGui::PushTextWrapPos();
-        ImGui::TextUnformatted(c.name.c_str());
+        ImGui::TextColored(theme::col::accent(), "%s", c.name.c_str());
         ImGui::PopTextWrapPos();
-        ui::KeyValueRow("Category", "%s", c.category.c_str());
         ui::KeyValueRow("Confidence", "%.0f%% (heuristic)", c.confidence * 100.0f);
         if (c.addressValid)
             ui::KeyValueRow("Address", "0x%llX", (unsigned long long)c.address);
@@ -370,9 +368,7 @@ void BinaryTechTab::render(AppContext& ctx) {
             if (ImGui::SmallButton("Open network trail"))
                 ctx.openCrackmeTriage(TriageWorkspaceView::NetworkTrail);
         }
-        if (!c.analyzer.empty())
-            ImGui::TextColored(theme::col::muted(), "Source: %s", c.analyzer.c_str());
-        ImGui::SeparatorText("Evidence");
+        ui::PanelHeader("Evidence", c.analyzer.empty() ? nullptr : c.analyzer.c_str());
         ImGui::TextWrapped("%s", c.detail.c_str());
         if (c.hitCount) {
             ImGui::PushTextWrapPos();
@@ -418,12 +414,17 @@ void BinaryTechTab::render(AppContext& ctx) {
                     previewAddress_ = c.address;
                     previewDecoder_ = decoder;
                 }
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
                 ImGui::BeginChild("##tech_code", ImVec2(0, std::max(1.0f, std::min(200.0f * scale,
                     ImGui::GetContentRegionAvail().y))), ImGuiChildFlags_None,
                     ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::PopStyleColor();
                 ui::PushMono();
-                for (const auto& [address, text] : previewLines_)
-                    ImGui::Text("0x%llX  %s", (unsigned long long)address, text.c_str());
+                for (const auto& [address, text] : previewLines_) {
+                    ImGui::TextColored(theme::col::muted(), "0x%llX", (unsigned long long)address);
+                    ImGui::SameLine(0.0f, ImGui::CalcTextSize("  ").x);
+                    ImGui::TextUnformatted(text.c_str());
+                }
                 if (previewLines_.empty()) ImGui::TextDisabled("No instruction could be decoded at this address.");
                 ui::PopMono();
                 ImGui::EndChild();
@@ -432,9 +433,11 @@ void BinaryTechTab::render(AppContext& ctx) {
                 ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
                 ImGui::TextWrapped("Use Find references in Binary View to inspect call sites.");
                 ImGui::PopStyleColor();
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
                 ImGui::BeginChild("##tech_data", ImVec2(0, std::max(1.0f, std::min(120.0f * scale,
                     ImGui::GetContentRegionAvail().y))), ImGuiChildFlags_None,
                     ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::PopStyleColor();
                 ui::PushMono();
                 size_t n = std::min<size_t>(avail, 64);
                 for (size_t r = 0; r < n; r += 16) {

@@ -1,5 +1,11 @@
 # DisasmStudio — project memory
 
+## September 2026 — shared Axiom components
+
+- Axiom component geometry now applies to every theme: compact breakpoint tables/count tabs, arming rings, row actions, function/section navigator, steady execution markers, checked shell thread selector, status capsules and rounded shared controls. Palettes retain their own colors and saved IDs; do not reintroduce theme gates for these components.
+- Detached/Running/Paused and background Idle use consistent capsules. Preserve actual state meaning, checked target/thread ownership, saved table choices, density, zoom and font baselines. Execution uses the palette accent; trace coverage remains the success color. See `docs/AXIOM_UI.md` and the all-theme entries in `additions.md`.
+- All feature pages and Binary View data drawers share `ui::BeginDataTable` / `BeginDataTableEx` with matched `EndDataTable`, quiet headers/rows and horizontal separators. Keep specialized code/hex/graph/layout tables distinct. `BeginCountTabItem` must retain the original native label/ID and native text rendering so overflow menus and arrows remain visible; counts are real inventory, with clipping and hover details. See `docs/ALL_TABS_UI.md` for page scope and compact-layout verification.
+
 ## September 2026 workflow and analysis update
 
 - Memory Tools uses per-byte validity for page-boundary reads, bounded session-owned viewer history, keyboard/ASCII selection, explicit exact/AOB copying with manual wildcard marks, and a typed value preview. Selection/navigation retire write drafts. `Core/MemoryValueHint.h` and Binary View's Values toggle display decoder-width FILE/LIVE scalar observations; never infer dereferences from LEA/immediates or turn partial reads into zero. Cached LIVE values require `Debugger::memorySessionMatches` and expire after 250 ms. Assembly copying uses `Core/InstructionBytePattern.h` for decoder-accurate x86 wildcard masks and preserves disjoint selections as separate lines. See `docs/MEMORY_VIEWER_VALUES_AND_COPY.md` and the production memory-viewer/value-hint fixtures.
@@ -485,3 +491,20 @@ src/Tabs/               One file per tab (BinaryViewTab is the big one, ~3300 li
 - Explicit Arm now normalizes an idle leftover native drag-input flag only when the verified scene owns no mouse ball; retained cleanup responsibility precedes the checked write. The final upgrade branch was compiled/reviewed, not separately live-exercised.
 - Added `tools/peggle_cursor/peggle-aob-trainer.json` and `AOB_TRAINER.md` for the user's AOB-scanning trainer: six instruction patches handle native capture, ordinary first-shot fallback, zero offsets and active collision state without fixed heap addresses. A separate post-disable mouse-up patch invokes native release; main OFF alone does not clear the captured reference.
 - Verified the trainer profile with the installed AOB Forge production JSON loader and checked instruction patterns/branch targets read-only against the live game. The complete trainer patch group has not been activated or gameplay-tested; keep that distinction from the earlier helper's live collision verification. No AOB Forge source changes or scripting/plugin API were added.
+
+## September 2026 — continuous live assembly browsing
+
+- Live Assembly retains its committed window start across idle frames and refreshes; never reapply a function-start alignment hint on the frame after an earlier refill, because it can undo backward progress after a string-reference jump.
+- Edge refills preserve an overlapping row's vertical position and only commit directional progress. Manual scrolling releases Follow RIP, explicit navigation resets centering, and failed edge reads preserve the last useful extent. Keep target/session ownership, selected addresses and history independent of viewport movement.
+- See docs/LIVE_ASSEMBLY_SCROLLING.md and the opt-in contained-child live_scroll_fixture.inc production regression.
+
+## September 2026 — patch revert controls and visibility
+
+- Keep Patches as a fixed tab in both lower drawer groups and their collapsed rails, even with zero records. Ordinary tab scrolling and workflow presets must not hide patch recovery.
+- Keep patch records/actions before set-management details, with Revert outside any spanning row-selection hitbox and reachable in narrow drawers. Preserve exact-row/set/session restoration authority and display the actual refusal reason.
+- See docs/PATCH_BYTE_RESTORATION.md and the production patch restoration, panel and tab-visibility fixtures.
+
+## September 2026 — recorded execution history
+
+- Native Record runs the selected paused thread through bounded single stepping and retains ordered captured contexts/code bytes for Step Back inspection. This is independent of the one-shot Trace coverage map; never infer order from coverage counts or label historical browsing as target rollback.
+- Execution history is session/thread-owned and retired on detach or replacement. Decode captured bytes, keep unknown reads explicit, preserve repeated RIPs and show the actual live stop separately. The final observed instruction has not necessarily executed. See docs/EXECUTION_HISTORY.md.

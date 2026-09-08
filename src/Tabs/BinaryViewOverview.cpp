@@ -36,12 +36,11 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
     const std::string& path = binary.path();
     const size_t slash = path.find_last_of("/\\");
     const char* name = slash == std::string::npos ? path.c_str() : path.c_str() + slash + 1;
-    ImGui::TextUnformatted(name);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path.c_str());
-    ImGui::TextDisabled("%s | %s | %s | %zu bytes", binary.formatName(),
-                        ArchName(ctx.staticArch()),
-                        binary.isMappedImage() ? "Memory snapshot" : "File image",
-                        binary.bytes().size());
+    char imageDetail[192];
+    std::snprintf(imageDetail, sizeof(imageDetail), "%s / %s / %s / %zu bytes",
+        binary.formatName(), ArchName(ctx.staticArch()),
+        binary.isMappedImage() ? "Memory snapshot" : "File image", binary.bytes().size());
+    ui::PanelHeader(name, imageDetail);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", path.c_str());
     ImGui::TextDisabled("%zu sections | %zu imports | %zu exports / symbols",
                         binary.sections().size(), binary.imports().size(), binary.exports().size());
@@ -127,7 +126,7 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
             ImGui::TextDisabled("Analysis is running. Available results are ready to explore.");
         }
         const char* unavailable = busy ? "Result not available yet" : "Not available - use Analyze";
-        if (ImGui::BeginTable("overview_coverage", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        if (ui::BeginDataTable("overview_coverage", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("Analysis", ImGuiTableColumnFlags_WidthStretch, 1.0f);
             ImGui::TableSetupColumn("Coverage", ImGuiTableColumnFlags_WidthStretch, 2.0f);
             ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted("Function candidates");
@@ -144,7 +143,7 @@ void BinaryViewTab::renderOverview(AppContext& ctx) {
                 ImGui::Text("%zu referenced addresses%s", xrefs->toTarget.size(), xrefs->complete ? "" : " (partial)");
                 if (!xrefs->complete) ImGui::TextColored(theme::col::warn(), "%s", xrefs->incompleteReason());
             } else ImGui::TextDisabled("%s", unavailable);
-            ImGui::EndTable();
+            ui::EndDataTable();
         }
         if (codeData && codeData->imageRevision == binary.imageRevision()) {
             const auto& stats = codeData->stats;

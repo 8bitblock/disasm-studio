@@ -27,7 +27,11 @@ bool Debugger::addBreakpoint(uint64_t va, const std::string& condition) {
         // Keep adds/removals sorted: large ascending listing selections append
         // after logarithmic lookup instead of scanning every prior request.
         const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
-        if (removal != pendingBpRems_.end() && *removal == va) pendingBpRems_.erase(removal);
+        if (removal != pendingBpRems_.end() && *removal == va) {
+            pendingBpRems_.erase(removal);
+            std::erase_if(pendingBpEnabled_, [va](const auto& pending) { return pending.first == va; });
+            pendingBpEnabled_.push_back({ va, true }); // remove/re-add is a fresh enabled request
+        }
         std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
         const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
             [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
@@ -48,7 +52,11 @@ bool Debugger::addBreakpointForSession(DebugTargetIdentity expected, uint64_t va
             return false;
         if (gameMakerOwnsRangeLocked(va,1)) return false;
         const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
-        if (removal != pendingBpRems_.end() && *removal == va) pendingBpRems_.erase(removal);
+        if (removal != pendingBpRems_.end() && *removal == va) {
+            pendingBpRems_.erase(removal);
+            std::erase_if(pendingBpEnabled_, [va](const auto& pending) { return pending.first == va; });
+            pendingBpEnabled_.push_back({ va, true });
+        }
         std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
         const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
             [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
@@ -68,6 +76,7 @@ bool Debugger::removeBreakpoint(uint64_t va) {
         if (addition != pendingBpAdds_.end() && addition->va == va) pendingBpAdds_.erase(addition);
         std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
         std::erase_if(pendingBpEveryN_, [va](const auto& pending) { return pending.first == va; });
+        std::erase_if(pendingBpEnabled_, [va](const auto& pending) { return pending.first == va; });
         const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
         if (removal == pendingBpRems_.end() || *removal != va) pendingBpRems_.insert(removal, va);
     }
@@ -86,6 +95,7 @@ bool Debugger::removeBreakpointForSession(DebugTargetIdentity expected, uint64_t
         if (addition != pendingBpAdds_.end() && addition->va == va) pendingBpAdds_.erase(addition);
         std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
         std::erase_if(pendingBpEveryN_, [va](const auto& pending) { return pending.first == va; });
+        std::erase_if(pendingBpEnabled_, [va](const auto& pending) { return pending.first == va; });
         const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
         if (removal == pendingBpRems_.end() || *removal != va) pendingBpRems_.insert(removal, va);
     }
@@ -94,7 +104,30 @@ bool Debugger::removeBreakpointForSession(DebugTargetIdentity expected, uint64_t
 }
 bool Debugger::hasBreakpoint(uint64_t va) {
     std::lock_guard<std::mutex> lk(mtx_);
-    return bps_.count(va) != 0;
+    return bps_.count(va) != 0 || disabledBps_.count(va) != 0;
+}
+bool Debugger::setBreakpointEnabledForSession(DebugTargetIdentity expected,
+                                               uint64_t va, bool enabled) {
+    if (!expected.valid()) return false;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (cleanupOnly_ || (state_ != DbgState::Running && state_ != DbgState::Paused) ||
+            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected) ||
+            (enabled && gameMakerOwnsRangeLocked(va, 1)) ||
+            std::binary_search(pendingBpRems_.begin(), pendingBpRems_.end(), va))
+            return false;
+        const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
+            [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
+        const bool adding = addition != pendingBpAdds_.end() && addition->va == va;
+        const bool failed = std::any_of(failedBpInstalls_.begin(), failedBpInstalls_.end(),
+            [va](const auto& bp) { return bp.address == va; });
+        if (!bps_.count(va) && !disabledBps_.count(va) && !adding &&
+            !applyingBpAdds_.count(va) && !failed) return false;
+        std::erase_if(pendingBpEnabled_, [va](const auto& pending) { return pending.first == va; });
+        pendingBpEnabled_.push_back({ va, enabled });
+    }
+    requestTraceSyncBreak(expected);
+    return true;
 }
 bool Debugger::setBreakpointCondition(uint64_t va, const std::string& condition) {
     if (!ValidateBreakpointCondition(condition)) return false;

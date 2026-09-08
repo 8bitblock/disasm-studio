@@ -30,6 +30,28 @@ int main() {
     io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
     ds::theme::ApplyTheme();
 
+    // Long source names and counters must wrap inside a section header without
+    // covering its following actions or treating literal ## as an ImGui ID.
+    for (int theme = 0; theme < static_cast<int>(ds::theme::ThemeId::Count); ++theme) {
+        ds::theme::ApplyTheme(static_cast<ds::theme::ThemeId>(theme));
+        for (float paneWidth : {240.0f, 700.0f}) {
+            frame(paneWidth, [&] {
+                const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+                ImGui::LogToBuffer();
+                ds::ui::PanelHeader("Selected target ## analyst name",
+                    "A long file name with spaces and explicit FILE ownership");
+                const ImVec2 headerEnd = ImGui::GetItemRectMax();
+                assert(headerEnd.x <= right + 1.0f);
+                assert(std::strstr(GImGui->LogBuffer.c_str(), "## analyst name"));
+                ImGui::LogFinish();
+                ImGui::Button("Open target");
+                assert(ImGui::GetItemRectMin().y >= headerEnd.y);
+                assert(GImGui->ErrorCountCurrentFrame == 0);
+            });
+        }
+    }
+    ds::theme::ApplyTheme(ds::theme::ThemeId::Midnight);
+
     // A toolbar wraps only when the next complete control would be clipped.
     frame(280, [] {
         ImGui::Button("First", ImVec2(150, 30));
@@ -121,6 +143,80 @@ int main() {
     selected = 6;
     for (int i = 0; i < 3; ++i) frame(1000, tabs);
     assert(selected == 0); // disabled external destinations never become active
+
+    // The first count tab performs native tab-bar layout, including its overflow
+    // controls and open tab-list popup. Hiding Text around BeginTabItem used to
+    // hide the popup's actual glyphs as well. Exercise the native menu, not just
+    // its item IDs or the custom count drawing.
+    io.ClearInputKeys();
+    io.ClearInputMouse();
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    const char* countLabels[] = {"Breakpoints###count-breakpoints", "Threads", "Modules"};
+    ImGuiID nativeTabIds[3]{};
+    ImGuiID nativeNestedId = 0;
+    ImGuiTabBar* countBar = nullptr;
+    ImVec2 countBarOrigin;
+    auto countTabs = [&](bool counted) {
+        countBarOrigin = ImGui::GetCursorScreenPos();
+        if (ImGui::BeginTabBar("count-overflow", ImGuiTabBarFlags_TabListPopupButton |
+                              ImGuiTabBarFlags_FittingPolicyScroll)) {
+            countBar = GImGui->CurrentTabBar;
+            for (int index = 0; index < 3; ++index) {
+                const bool open = counted
+                    ? ds::ui::BeginCountTabItem(countLabels[index], 12 + index)
+                    : ImGui::BeginTabItem(countLabels[index]);
+                if (counted) assert(GImGui->LastItemData.ID == nativeTabIds[index]);
+                else nativeTabIds[index] = GImGui->LastItemData.ID;
+                if (open) {
+                    if (index == 0) {
+                        if (counted) assert(ImGui::GetID("nested-table") == nativeNestedId);
+                        else nativeNestedId = ImGui::GetID("nested-table");
+                    }
+                    ImGui::EndTabItem();
+                }
+            }
+            ImGui::EndTabBar();
+        }
+        assert(GImGui->ErrorCountCurrentFrame == 0);
+    };
+    for (int index = 0; index < 3; ++index) frame(210, [&] { countTabs(false); });
+    assert(nativeNestedId != 0);
+    for (int index = 0; index < 4; ++index) frame(210, [&] { countTabs(true); });
+    assert(countBar && countBar->WidthAllTabsIdeal > countBar->BarRect.GetWidth());
+    // The list button sits immediately before the native tab labels.
+    const ImVec2 countMenu(countBarOrigin.x + ImGui::GetFontSize() * 0.5f,
+                          countBar->BarRect.GetCenter().y);
+    io.AddMousePosEvent(countMenu.x, countMenu.y);
+    frame(210, [&] { countTabs(true); });
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+    frame(210, [&] { countTabs(true); });
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    for (int index = 0; index < 3; ++index) frame(210, [&] { countTabs(true); });
+    bool visibleMenuGlyphs = false;
+    const ImFontGlyph* menuGlyph = ImGui::GetFont()->FindGlyph('B');
+    assert(menuGlyph); // the first menu item is Breakpoints
+    for (ImGuiWindow* window : GImGui->Windows) {
+        if (window->LastFrameActive != ImGui::GetFrameCount() ||
+            !(window->Flags & ImGuiWindowFlags_Popup) ||
+            std::strncmp(window->Name, "##Combo_", 8) != 0) continue;
+        for (const ImDrawVert& vertex : window->DrawList->VtxBuffer) {
+            // Check an actual menu-letter UV, excluding textured anti-aliased
+            // borders as well as ordinary backgrounds and arrow triangles.
+            if ((vertex.col & IM_COL32_A_MASK) != 0 &&
+                vertex.uv.x == menuGlyph->U0 && vertex.uv.y == menuGlyph->V0) {
+                visibleMenuGlyphs = true;
+                break;
+            }
+        }
+    }
+    assert(visibleMenuGlyphs);
+    io.AddKeyEvent(ImGuiKey_Escape, true);
+    frame(210, [&] { countTabs(true); });
+    io.AddKeyEvent(ImGuiKey_Escape, false);
+    frame(210, [&] { countTabs(true); });
+    io.ClearInputKeys();
+    io.ClearInputMouse();
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
 
     // Custom pills participate in keyboard navigation and activate with Space.
     bool pressed = false;

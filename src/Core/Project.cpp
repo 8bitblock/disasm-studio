@@ -571,6 +571,7 @@ std::string SerializeProject(const ProjectState& st) {
             if (it != st.bpConditions.end() && !it->second.empty()) e.set("cond", Value::Str(it->second));
             auto en = st.bpEveryN.find(a);
             if (en != st.bpEveryN.end() && en->second > 1) e.set("everyN", Value::Int(en->second));
+            if (st.bpDisabled.contains(a)) e.set("enabled", Value::Bool(false));
             arr.push(std::move(e));
         }
         root.set("breakpoints", std::move(arr));
@@ -958,14 +959,17 @@ static bool DeserializeProjectImpl(const std::string& text, ProjectState& out) {
             if (!e.isObj()) return false;
             uint64_t addr = 0;
             std::string condition;
+            bool enabled = true;
             if (!optionalHexField(e, "a", addr) || !e.find("a") ||
-                !optionalBoundedString(e, "cond", condition, 4096))
+                !optionalBoundedString(e, "cond", condition, 4096) ||
+                !optionalBool(e, "enabled", enabled, true))
                 return false;
             // Keep the breakpoints vector and the bpConditions map 1:1 — a duplicate
             // address would otherwise break that implicit invariant.
             if (std::find(st.breakpoints.begin(), st.breakpoints.end(), addr) != st.breakpoints.end())
                 return false;
             st.breakpoints.push_back(addr);
+            if (!enabled) st.bpDisabled.insert(addr);
             if (!condition.empty()) st.bpConditions[addr] = std::move(condition);
             if (const Value* everyN = e.find("everyN")) {
                 if (!everyN->isNum() || !std::isfinite(everyN->num) ||

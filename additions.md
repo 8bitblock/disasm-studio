@@ -211,3 +211,98 @@ subject to Windows elevation/profile-policy constraints and reports those constr
 - Added the standalone offline Peggle cursor controller, read-only probe and VS2022 build wrapper, with documented native capture/release behavior and collision verification.
 - Added the AOB trainer profile and release recipe, retaining the distinction between the helper's earlier live verification and the trainer group's untested gameplay behavior.
 - Rebuilt the helper and probe successfully with VS2022 `/W4`, checked all seven profile patches for valid byte syntax, equal original/replacement lengths and in-pattern offsets, and removed a trailing blank line from the JSON. This integration did not run either tool against the game.
+
+### Axiom-inspired UI implementation — 2026-09-08
+
+- Added a separate Axiom theme with near-black code surfaces, navy panels, blue selection and restrained syntax colors; preserved previous theme IDs/defaults, readable font baselines, zoom and density.
+- Applied shared compact headers and clearer action/evidence grouping across Projects, Communications, Sig Scanner, Binary View, Memory Tools, Binary Diff, Binary Tech, Cortex and Prism.
+- Consolidated Assembly/Live Assembly display options into Display and instruction/rebuild actions into More; retained seven representations, Functions/Strings, independent drawers/inspector and checked shell execution controls.
+- Added responsive JDWP Browse/Bytecode/Session layouts and Server Watch events/details layouts; retained GML verification, coverage/drop/error visibility and identity-checked logging behavior.
+- Added independently scrollable Prism chart/report areas and compact views; preserved table identities and retained split choices. Corrected scaled Memory region columns with horizontal access.
+- Added production-object interaction/retention fixtures and optional hardware DX11 captures with production fonts. Main-agent build, test and visual verification scope is recorded in docs/AXIOM_UI.md.
+- Fixed the Core test runner's compiler discovery when multiple cl.exe paths are available by selecting the first resolved command.
+- Corrected Pseudocode's initial space allocation and horizontal access while preserving manual split choices; clarified captured live-flag hints, retained a full Memory address-table row at compact 150% zoom, and replaced unsupported runtime-page glyphs.
+- Verified the Release x64 candidate and embedded helper, preferences/shared-widget checks, and feature/full/release production UI suites with zero failures and 126 matching candidate objects per production suite. Main-agent visual review covered 75 hardware DX11 fixture captures; interactive live-target and physical multi-monitor DPI checks remain pending, and the optional live patch-restoration test was not rerun.
+- Verified unsaved register-editor text, exact pause ownership, populated back/forward history and FILE selection across Axiom, Midnight and Light theme switching without submitting target writes.
+
+### Axiom color and rounding refinement — 2026-09-08
+
+- Increased Axiom's color with richer navy panels, bright blue selections and controls, violet document tabs and panel headers, and more vivid syntax/status accents.
+- Rounded Axiom's shared controls/tabs, badges, search fields, panels and popups; removed theme-specific square-corner overrides while preserving existing themes, fonts, spacing, hit targets, IDs and state.
+- Updated the custom shell's document/feature tabs, execution controls, search and address fields with rounded fills and clearer hover/focus outlines.
+- Built the refreshed Release x64 candidate in build/x64/AxiomRounded, verified its embedded helper, reran all five preferences/widget/production UI suites with zero failures and matching objects, and refreshed the 75 hardware DX11 captures for main/page-agent visual review. Interactive live-target and physical monitor DPI checks remain pending.
+
+### Multi-row instruction patching — 2026-09-08
+
+- Fixed normal Patch, More > Patch and P to use the complete adjacent selection, including the last instruction, in FILE and LIVE assembly; disjoint selections remain refused.
+- Enabled Shift/Ctrl selection and dragging across address, byte and instruction cells, preserved selected rows on right-click, and kept the listing stable under pointer selection.
+- Replaced the small patch text buffers with complete assembly/hex drafts and retained exact session/byte validation for live region patches.
+- Added production-object regressions for mouse selection, normal Patch dispatch, replacement bounds, retained instruction snapshots, long drafts and hex-only architectures; documented the workflow in docs/MULTI_ROW_PATCHING.md.
+- Verified the final Release x64 build and embedded helper, then the full 126-production-object listing UI suite with zero failures, including address/byte/instruction drag selection and contained-child live multi-row apply/revert and stale-byte/session rejection. Logs: build/multi-row-patch-build.log and build/multi-row-patch-final-tests.log.
+
+### Axiom screenshot reference correction — 2026-09-08
+
+- Replaced the rejected broad violet/blue fills with screenshot-sampled near-black panels, neutral controls and restrained blue selection; limited rounding to compact controls, selected rows and status capsules.
+- Refined the function and optional Sections navigator with function marks, right-aligned addresses, a blue selection keyline and actual section sizes; retained existing navigation, filters and analyst metadata.
+- Restyled the breakpoint drawer with arming rings, muted red selected rows, explicit status capsules, Add breakpoint and row actions; preserved real FILE/LIVE ownership, arming failures, condition/every-N editing, hardware controls and exception settings.
+- Added a genuine pause-reason capsule and compact thread selector, retaining normal text size and checking the popup's target and pause before using the existing checked debugger action.
+- Added focused shell/breakpoint interaction and retained-table fixtures; main-agent candidate build, visual review and verification scope are recorded in docs/AXIOM_UI.md.
+- Added the reference breakpoint tab's red dot and actual unique count capsule while preserving its original tab identity; corrected stale popup ownership, failed-condition retry and saved column retention across theme changes.
+- Verified the final AxiomReference Release x64 candidate and embedded helper: all five preferences/widget/production UI suites passed, with 126 matching candidate objects per production suite. Main-agent and page-agent visual review covered 80 hardware DX11 fixture captures; interactive live-target and physical multi-monitor DPI checks remain pending, and the optional live patch-restoration test was not rerun.
+
+### Axiom components across every theme — 2026-09-08
+
+- Applied the Axiom breakpoint drawer, count tab, arming rings, row actions, function/section navigator and steady execution markers to all ten themes while retaining each palette's colors.
+- Shared the checked thread selector and pause-reason capsule across the shell, with consistent Detached/Running/Paused status pills and an explicit clickable Idle activity capsule.
+- Unified rounded controls, search fields, tabs, badges, state dots and quiet panel headers throughout the UI; preserved theme IDs, fonts, zoom, density, table columns, analyst drafts and checked debugger actions.
+- Updated existing breakpoint/shell fixtures to exercise every theme and adjusted the listing regression for the shared accent execution marker; trace coverage retains its separate success color.
+- Built `build/x64/AxiomAllThemes/DisasmStudio.exe` and verified its embedded GameMaker helper. Shared-widget, feature-page and focused release-workbench checks passed; dark/light breakpoint captures and twelve shell state/layout captures were visually reviewed without clipping or overlap defects.
+- The full production workbench suite also passed with zero failures, including its all-theme/density/zoom matrix; all three production suites used 126 identical object snapshots. Logs: `build/axiom-all-themes-build.log`, `build/axiom-all-themes-feature-tests.log`, `build/axiom-all-themes-workbench-tests.log`, and `build/axiom-all-themes-full-final-tests.log`. The opt-in live patch-restoration test remained skipped; this presentation change did not perform a live-target walkthrough.
+
+### Pause breakpoints without removal — 2026-09-08
+
+- Added a clickable Enabled ring and Pause breakpoint / Enable breakpoint row actions across themes; retained breakpoint rows, conditions, every-N settings, counters and condition drafts.
+- Persisted paused FILE breakpoint intent with backward-compatible optional enabled state; disabled saved sites stay out of automatic arming, and enabling after reopen preserves instruction-boundary validation.
+- Added checked native software breakpoint enable/disable requests with retained metadata and separate byte ownership; shared internal hooks, stale-session refusal, failure reporting and instruction step-off remain authoritative.
+- Added project save/reopen, production UI and native debugger regressions; verification details are recorded in docs/BREAKPOINT_PAUSE.md.
+- Corrected held-instruction pause/re-enable and multi-thread queued-hit handling, kept disable/remove/re-add ordering consistent, preserved failed-install retry settings, and avoided an unnecessary exclusive step when continuing with the current breakpoint disabled.
+- Verified the BreakpointPause Release x64 build and embedded helper, project round-trip checks, focused native pause/resume checks, and release/full production UI suites with zero failures; the UI suites retain 126 identical candidate object snapshots and 47 refreshed hardware DX11 captures. The broader native x64 suite still has four checked-RunTo assertions failing on a safe peer-suspension refusal, reproduced without pause/enable calls; this limitation is recorded in docs/BREAKPOINT_PAUSE.md.
+
+### Consistent content styling across every tab — 2026-09-08
+
+- Extended the Axiom presentation throughout Projects, Communications, Sig Scanner, Binary View, Memory Tools, Binary Diff, Binary Tech, Cortex and Prism, including their nested pages and data drawers.
+- Shared quiet table headers, alternating rows, horizontal separators, compact section headings, real inventory counts and status capsules; retained native IDs, saved column choices, fonts, zoom, density and checked actions.
+- Cleaned up Threads, Watch, Results, Patches, Call Stack, annotations, types, triage, references and other Binary View data panels; scaled fixed columns and kept specialized code, hex and graph views intact.
+- Improved compact/high-zoom readability: Memory viewer actions stay accessible, region permission filters stay together, Communications module names can scroll, Server Watch details wrap to the viewport, and long annotation notes elide with full-text hover details.
+- Preserved visible native tab overflow arrows/menu text and full count tooltips; added a focused shared-widget regression for menu glyph visibility and stable tab/nested-table identities.
+- Built build/x64/AxiomAllTabs/DisasmStudio.exe and verified its embedded helper. Shared-widget, feature-page, focused release-workbench and full production-workbench suites passed with zero failures; the three production suites used 126 identical object snapshots before the final local annotation-text correction.
+- Visually reviewed the feature pages plus 25 additional Binary View drawer captures, including compact 150% zoom and labelled authored records. Implementation, final focused recheck and verification scope are documented in docs/ALL_TABS_UI.md.
+- The final annotation ellipsis build passed the focused release-workbench suite with zero failures, and refreshed hardware DX11 drawer captures confirmed clean text/confidence separation. Log: build/all-tabs-workbench-reviewed-tests.log. Final candidate SHA256: DF52D016FF5FDA626806E85EF1A8B939594471E826F08E735BCB572621EF14CB.
+
+### Live Assembly scrolling after string references — 2026-09-08
+
+- Fixed upward live browsing snapping back to an analyzed function start on the frame after a refill; committed window alignment now survives idle frames and content refreshes.
+- Preserved the visible instruction position across bounded refills, retained decoded overlap when scrolling forward, and kept useful rows at unreadable/nonadvancing boundaries.
+- Made manual scrolling release Follow RIP immediately and repeated reference navigation recenter its instruction, while preserving selected addresses and history during browsing.
+- Added contained-child production-object tests for decoded LIVE string references, repeated wheel/Page navigation, viewport continuity, function boundaries, Follow RIP release and unreadable memory boundaries; implementation details are in docs/LIVE_ASSEMBLY_SCROLLING.md.
+- Fixed process reads spanning an unreadable next page so the valid preceding instructions remain visible, using bounded page reads and checked session validation.
+- Verified the final Release x64 build and embedded helper, focused contained-child live scrolling (32 stable refills), full production UI suite, and listing layout helpers with zero failures. All 126 test object snapshots match the final build; logs and scope are recorded in docs/LIVE_ASSEMBLY_SCROLLING.md.
+
+### Patch revert controls, fit and permanent visibility — 2026-09-08
+
+- Fixed the patch-row selection hitbox covering Revert; exact-row actions remain accessible before the scrollable byte columns.
+- Put patch records first in short drawers and moved set management/comparison into a sized, scrollable manager, retaining action feedback in the patch panel.
+- Kept Patches fixed in both lower tab groups, including empty projects and collapsed drawers, so presets and ordinary tab scrolling cannot hide it.
+- Preserved precise restoration failures and stale-record feedback; FILE-only failures no longer report a fictional LIVE rollback.
+- Added production regressions for actual mouse clicks, compact patch layout, permanent tab visibility, FILE refusal/recovery and contained-child LIVE restoration. Verification is recorded in docs/PATCH_BYTE_RESTORATION.md.
+- Verified all five focused Core tests, production FILE/LIVE restoration and mouse/compact-layout checks, Release x64 build and the focused release-workbench suite. Reviewed 90%/150% DX11 captures. The broader suite reported one unrelated execution-history layout assertion; exact logs and snapshot scope are recorded in docs/PATCH_BYTE_RESTORATION.md.
+
+### Recorded execution path and Step Back — 2026-09-08
+
+- Added explicit native Record controls and a bounded, session/thread-owned instruction history for inspecting the path leading to a breakpoint.
+- Added Step Back and forward history navigation with captured instruction bytes and read-only register observations, preserving repeated addresses and loop order.
+- Kept the real target stop distinct from the selected historical record; history browsing never rewinds or writes process state, and ordinary Continue cannot reconstruct an earlier unrecorded path.
+- Documented recording limits, single-step overhead, single-thread user-mode scope and ownership in docs/EXECUTION_HISTORY.md.
+- Added real x64/WOW64 child-process regressions for chronological loops and calls/returns, captured code/registers, checked ownership, recording bounds, exception stops, unsupported transition guards and cleanup; the focused x64 history test and full WOW64 suite pass.
+- Verified the Release x64 build and helper resource, plus isolated production UI/captured-byte tests and visually checked normal/narrow DX11 captures. The broader x64 suite reports six WinINet Network Watch assertions after peer-suspension access denied; its history case passes. Exact evidence and limitations are recorded in docs/EXECUTION_HISTORY.md.
+- Verified the final 127-object production static-listing/UI integration suite with zero failures, including recorded-history controls, captured instruction decoding, viewport shrinking and existing all-theme compact shell checks (build/execution-history-ui-test.log).

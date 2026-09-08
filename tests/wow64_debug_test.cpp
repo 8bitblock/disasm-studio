@@ -463,6 +463,65 @@ int main(int argc, char** argv) {
                 }
                 CHECK(d.removeHardwareBreakpoint(scratch + 32));
 
+                // Record the actual WOW64 CALL/RET path, including the callee,
+                // and stop at the user's return-site breakpoint. The retained
+                // contexts must use 32-bit EIP/ESP and preserve execution order.
+                Registers historyStart = d.snapshot().regs;
+                historyStart.rip = scratch;
+                historyStart.rax = 0;
+                CHECK(d.setRegisters(historyStart));
+                CHECK(d.addBreakpointForSession(session, scratch));
+                CHECK(d.addBreakpointForSession(session, scratch + 5));
+                CHECK(d.continueForSession(session));
+                const bool historyAtStart = waitSoftwareStop(d, scratch, 4000);
+                CHECK(historyAtStart);
+                if (historyAtStart) {
+                    const uint32_t historyTid = d.snapshot().activeTid;
+                    ExecutionHistorySnapshot history;
+                    d.executionHistorySnapshotIfChanged(history);
+                    const uint64_t previousGeneration = history.generation;
+                    CHECK(d.recordExecutionPathForSession(session, historyTid));
+                    bool recorded = false;
+                    for (int elapsed = 0; elapsed < 5000; elapsed += 5) {
+                        d.executionHistorySnapshotIfChanged(history);
+                        if (history.generation != previousGeneration && !history.recording &&
+                            d.snapshot().state == DbgState::Paused) {
+                            recorded = true;
+                            break;
+                        }
+                        Sleep(5);
+                    }
+                    if (!recorded || history.entries.size() != 4)
+                        std::printf("[diag] WOW64 history count=%zu status=%s event=%s\n",
+                            history.entries.size(), history.status.c_str(), d.snapshot().lastEvent.c_str());
+                    CHECK(recorded && history.entries.size() == 4);
+                    CHECK(history.is32 && history.tid == historyTid);
+                    CHECK(DebugTargetIdentityMatches(history.target, session));
+                    static constexpr uint64_t expectedOffsets[] = {0, 16, 21, 5};
+                    for (size_t i = 0; i < history.entries.size(); ++i) {
+                        const auto& entry = history.entries[i];
+                        if (i < 4) CHECK(entry.regs.rip == scratch + expectedOffsets[i]);
+                        CHECK(entry.regs.rip < 0x100000000ull && entry.regs.rsp < 0x100000000ull);
+                        CHECK(entry.byteCount > 0 && entry.byteCount <= entry.bytes.size());
+                        if (entry.regs.rip >= scratch && entry.regs.rip < scratch + sizeof(code))
+                            CHECK(entry.bytes[0] == code[entry.regs.rip - scratch]);
+                        if (i) CHECK(entry.sequence == history.entries[i - 1].sequence + 1);
+                    }
+                    if (history.entries.size() == 4) {
+                        CHECK(history.entries[1].regs.rsp + 4 == history.entries.front().regs.rsp);
+                        CHECK(history.entries.back().regs.rsp == history.entries.front().regs.rsp);
+                        CHECK(history.entries.front().regs.rax == 0);
+                        CHECK(history.entries.back().regs.rax == resultValue);
+                        CHECK(history.entries.front().byteCount >= 6 && history.entries.front().bytes[5] == 0x90);
+                    }
+                    CHECK(d.snapshot().activeTid == historyTid && d.snapshot().regs.rip == scratch + 5);
+                    CHECK(d.snapshot().regs.rax == resultValue);
+                    CHECK(!d.executionHistorySnapshotIfChanged(history));
+                    CHECK(d.snapshot().regs.rip == scratch + 5);
+                }
+                CHECK(d.removeBreakpointForSession(session, scratch));
+                CHECK(d.removeBreakpointForSession(session, scratch + 5));
+
                 const DbgSnapshot owner = d.snapshot();
                 HANDLE process = static_cast<HANDLE>(d.duplicateProcessHandleForSession(
                     { owner.pid, owner.sessionGeneration }));

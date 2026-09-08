@@ -369,7 +369,7 @@ static void checkSigScannerProductionUi(const std::string& path) {
 
     // Both palettes and narrow/large-scale geometry retain the result guidance
     // and all workbench controls without a horizontal shell scrollbar.
-    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light}) {
+    for (const auto palette : {theme::ThemeId::Midnight, theme::ThemeId::Light, theme::ThemeId::Axiom}) {
         for (float scale : {1.0f, 1.5f, 2.0f}) {
             theme::SetUiScale(scale);
             theme::ApplyTheme(palette);

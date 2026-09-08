@@ -16,6 +16,7 @@
 //   - process memory reads for disassembly
 //
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
@@ -90,6 +91,27 @@ struct Registers {
     uint64_t r8 = 0, r9 = 0, r10 = 0, r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;
 };
 
+// Ordered observations from an explicitly recorded native user-mode run. Each
+// row is the state BEFORE its instruction executes; the last row is the held
+// stop. These values are inspection evidence, never a restorable process state.
+struct ExecutionHistoryEntry {
+    uint64_t sequence = 0;
+    Registers regs;
+    std::array<uint8_t, 15> bytes{};
+    uint8_t byteCount = 0; // only this contiguous prefix was actually readable
+};
+
+struct ExecutionHistorySnapshot {
+    DebugTargetIdentity target{};
+    uint32_t tid = 0;
+    bool is32 = false;
+    bool recording = false;
+    uint64_t generation = 0;
+    uint64_t revision = 0;
+    std::vector<ExecutionHistoryEntry> entries;
+    std::string status;
+};
+
 // Stable register evidence from one exact user-visible debugger stop.  EAX and
 // AL are derived while the same lock protects the whole RAX value, preventing a
 // UI adapter from accidentally combining aliases from different stops.
@@ -153,6 +175,7 @@ struct SwBreakpointInfo {
     uint32_t    everyN = 0;  // 0/1 = stop on every (condition-true) hit; N = every Nth
     bool        armed = true; // false on install/re-arm failure or while stepped off a held breakpoint
     std::string error;        // asynchronous install/re-arm failure, when present
+    bool        enabled = true; // analyst intent; false retains the breakpoint without owning a trap
 };
 
 // One loaded module of the debuggee, tracked live from LOAD_DLL/UNLOAD_DLL
@@ -326,6 +349,11 @@ public:
     bool stepOverForSession(DebugTargetIdentity expected);
     bool stepOutForSession(DebugTargetIdentity expected);
     bool pauseForSession(DebugTargetIdentity expected);
+    // Explicit opt-in from an exact native pause. Records one selected thread
+    // through bounded instruction steps; does not reverse or replay execution.
+    static constexpr size_t kExecutionHistoryMaxEntries = 10000;
+    bool recordExecutionPathForSession(DebugTargetIdentity expected, uint32_t expectedTid);
+    bool executionHistorySnapshotIfChanged(ExecutionHistorySnapshot& retained) const;
     void runToCursor(uint64_t va);   // one-shot temp breakpoint, then continue
 
     // Checked counterpart for a live authorization experiment.  The request is
@@ -447,6 +475,10 @@ public:
     bool addBreakpointForSession(DebugTargetIdentity expected, uint64_t va,
                                  const std::string& condition = "");
     bool removeBreakpointForSession(DebugTargetIdentity expected, uint64_t va);
+    // Pause/resume a retained software breakpoint. Success means queued against
+    // this exact session; snapshot enabled/error report the applied result.
+    bool setBreakpointEnabledForSession(DebugTargetIdentity expected, uint64_t va,
+                                         bool enabled);
     bool hasBreakpoint(uint64_t va);
     // Returns false without queuing any change when `condition` is malformed or
     // names a register the breakpoint evaluator cannot resolve. Empty remains a
@@ -634,6 +666,7 @@ private:
         GmlResume,
         Continue,
         StepInto,
+        RecordExecution,
         StepOver,
         StepOut,
         RunTo,
@@ -644,7 +677,7 @@ private:
         Cmd      command = Cmd::None;
         uint64_t argument = 0;
         uint64_t epoch = 0;
-        // Non-zero only for an exact-thread checked run-to request. Ordinary
+        // Non-zero for an exact-thread checked run-to or recording request. Ordinary
         // execution controls continue to resolve the currently displayed
         // thread when the debug thread consumes them.
         uint32_t ownerTid = 0;
@@ -685,6 +718,8 @@ private:
     bool   waitForStartup(std::string& err);
     void   lifecycleWorkerLoop();
     void   captureContext(uint32_t tid);
+    void   resetExecutionHistoryLocked(); // caller owns mtx_
+    void   finishExecutionHistoryLocked(std::string status); // caller owns mtx_
     void   applyContext(uint32_t tid);
     CommandEnvelope waitForCommand(uint64_t controlEpoch); // blocks until an epoch-valid UI command
     void   postCommand(Cmd c, uint64_t argument = 0);
@@ -812,7 +847,7 @@ private:
     bool               initialProcessEventReady_ = false; // mtx_: bitness/main module published
 
     // Shared state (guarded by mtx_).
-    std::mutex                       mtx_;
+    mutable std::mutex               mtx_;
     std::condition_variable          cmdCv_;
     CommandEnvelope                  pendingCommand_{};
     uint64_t                         controlEpoch_ = 0; // invalidates commands/mutations at each session boundary
@@ -822,6 +857,7 @@ private:
     DbgState                         state_   = DbgState::Detached;
     uint32_t                         pid_ = 0, tid_ = 0;
     uint64_t                         sessionGeneration_ = 0;
+    ExecutionHistorySnapshot         executionHistory_; // guarded by mtx_
     uint32_t                         activeTid_ = 0;
     Registers                        regs_;
     std::string                      lastEvent_ = "idle";
@@ -854,6 +890,10 @@ private:
                   bool     armed = true;
                   std::string error; };
     std::unordered_map<uint64_t, SwBp> bps_;            // va -> {original byte, condition, compiled}
+    // Disabled records retain conditions/counters but own no displaced byte.
+    // Keeping these outside bps_ prevents masking reads, detachment restoration,
+    // or internal-hook priority from treating an inactive record as an INT3.
+    std::unordered_map<uint64_t, SwBp> disabledBps_;
     // Bounded, oldest-first diagnostics only: failed installations never own a
     // byte, enter bpAddrs_, mask a read, or take priority over internal hooks.
     // Guarded by mtx_; exposed through the existing armed/error snapshot fields.
@@ -868,9 +908,11 @@ private:
     void   rebuildBpAddrs_();                            // refill bpAddrs_ from bps_ (under mtx_)
     struct PendingBp { uint64_t va; std::string cond; };
     std::vector<PendingBp>           pendingBpAdds_;
+    std::unordered_set<uint64_t>     applyingBpAdds_; // accepted adds in the event owner's current drain
     std::vector<uint64_t>            pendingBpRems_;
     std::vector<PendingBp>           pendingBpConds_;    // condition updates
     std::vector<std::pair<uint64_t, uint32_t>> pendingBpEveryN_; // every-Nth-hit updates
+    std::vector<std::pair<uint64_t, bool>> pendingBpEnabled_; // last applied enable intent per address
     std::optional<uint64_t>         pausedUserBpAddr_; // physically restored while parked in the UI
     std::optional<uint64_t>         runtimeTempBpAddr_; // rejects live writes that would stale temp ownership
 

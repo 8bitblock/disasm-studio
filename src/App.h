@@ -41,6 +41,7 @@
 #include "Disasm/DisassemblerFactory.h"
 #include "Disasm/JvmDisassembler.h"   // AttachJvmClass (JavaClass symbolication)
 #include "Ui/CommandPalette.h"
+#include "Ui/ExecutionHistoryView.h"
 #include "Ui/Theme.h"
 
 namespace ds {
@@ -756,6 +757,7 @@ private:
 
 class App {
     friend struct AppExitTestAccess;
+    friend struct AxiomShellTestAccess;
 public:
     // `startupPath` is the optional file supplied as the first command-line
     // argument (`DisasmStudio <path>`). It is loaded through the same path as
@@ -795,6 +797,9 @@ private:
     void retireActiveDocumentRequests();
     void renderMenuBar();
     void renderDebugToolbar(const DbgSnapshot& snap);
+    void renderDebugSessionControls(const DbgSnapshot& snap, float availableWidth,
+                                    float height, bool executionRequested);
+    bool selectDebugToolbarThread(const DbgSnapshot& snap, uint32_t tid);
     void pollExit();
     void resolveWorkbenchNavigation();                 // apply requests/shortcuts before drawing the strip
     void renderMainWindow(const DbgSnapshot& snap);
@@ -805,6 +810,8 @@ private:
     void rememberInvestigationQuery(std::string query,
                                     InvestigationIdentity identity);
     void renderHelpWindow();                            // grouped F1 shortcut / interaction reference
+    bool startExecutionHistory(const DbgSnapshot& captured);
+    void refreshExecutionHistory(const DbgSnapshot& live);
     void openFileDialog();
     void openRawFileDialog();   // pick a file, then prompt for base + arch
     bool prepareRawLoadPath(const std::string& path);
@@ -835,6 +842,9 @@ private:
 
     AppContext                          ctx_;
     TraceCoverageSnapshot               traceSnapshot_; // retained across unchanged frames
+    ExecutionHistorySnapshot            executionHistory_;
+    ui::ExecutionHistoryView             executionHistoryView_;
+    std::chrono::steady_clock::time_point executionHistoryPoll_{};
     std::vector<std::unique_ptr<ITab>>  tabs_;
     BinaryViewHostTab*                  binaryView_ = nullptr;  // per-document Binary View owner + investigation source
     InvestigationService                investigation_;         // sole worker for unified index build/query
@@ -873,6 +883,10 @@ private:
     bool                                toolbarAddressMirrorLive_ = false;
     DebugTargetIdentity                 toolbarAddressMirrorTarget_{};
     bool                                toolbarAddressEditing_ = false;
+    DebugTargetIdentity                 toolbarThreadPopupTarget_{};
+    uint32_t                            toolbarThreadPopupTid_ = 0;
+    uint64_t                            toolbarThreadPopupRip_ = 0;
+    bool                                toolbarThreadPopupPaused_ = false;
 
     // Raw-load prompt state.
     bool                                openRawPopup_ = false;

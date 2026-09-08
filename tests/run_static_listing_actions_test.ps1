@@ -73,7 +73,7 @@ $symbols = & dumpbin.exe /nologo /symbols $testObject
 foreach ($line in $symbols) {
     if ($line -match 'UNDEF.*External\s+\|\s+(\?\S+)') {
         $symbol = $matches[1]
-        foreach ($fixtureClass in @('BinaryViewTab', 'CortexTab', 'SigScannerTab', 'BinaryTechTab', 'BinaryDiffTab', 'ProjectsTab', 'MemoryToolsTab', 'PrismTab', 'CommunicationsTab')) {
+        foreach ($fixtureClass in @('BinaryViewTab', 'CortexTab', 'SigScannerTab', 'BinaryTechTab', 'BinaryDiffTab', 'ProjectsTab', 'MemoryToolsTab', 'PrismTab', 'CommunicationsTab', 'ConnectionsTab')) {
             if ($symbol.Contains('@' + $fixtureClass + '@ds@@QE')) {
                 $original = $symbol.Replace('@' + $fixtureClass + '@ds@@QE', '@' + $fixtureClass + '@ds@@AE')
                 $linkArguments += ('/ALTERNATENAME:' + $symbol + '=' + $original)

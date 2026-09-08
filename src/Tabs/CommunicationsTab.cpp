@@ -7,6 +7,7 @@
 #include "../Core/NetworkEndpoint.h"
 #include "../Core/GameMakerArchive.h"
 #include "../Disasm/JvmDisassembler.h"
+#include "../Ui/Fonts.h"
 #include "../Ui/Icons.h"
 #include "../Ui/Theme.h"
 #include "../Ui/Widgets.h"
@@ -285,32 +286,40 @@ void CommunicationsTab::refreshProcesses() {
 
 void CommunicationsTab::renderProcesses(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::SeparatorText("Native Processes");
+    ui::PanelHeader("Native processes");
     if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh", "Re-enumerate running processes") || !enumerated_)
         refreshProcesses();
-    ImGui::SameLine();
+    ui::SameLineIfFits(115.0f * scale);
     ImGui::TextDisabled("%d process(es)", (int)procs_.size());
 
     DbgSnapshot snap = ctx.debug.snapshot();
     const auto lifecycle = ctx.debug.lifecycleSnapshot();
-    if (snap.attached()) {
-        ui::SameLineIfFits(160.0f * scale);
-        char b[40]; std::snprintf(b, sizeof(b), "debugging PID %u", snap.pid);
-        ui::Badge(b, theme::col::good());
-    }
+    ui::SameLineIfFits(210.0f * scale);
+    char targetDetail[40]{};
+    if (snap.attached()) std::snprintf(targetDetail, sizeof(targetDetail), "PID %u", snap.pid);
+    const char* targetState = lifecycle.busy
+        ? lifecycle.state == DbgLifecycleState::Starting ? "Starting" : "Stopping"
+        : snap.state == DbgState::Paused ? "Paused"
+        : snap.state == DbgState::Running ? "Running"
+        : snap.state == DbgState::Terminated ? "Terminated" : "Detached";
+    ui::StatePill(targetState, lifecycle.busy || snap.state == DbgState::Paused ? theme::col::warn()
+        : snap.state == DbgState::Running ? theme::col::accent() : theme::col::muted(), targetDetail);
     if (lifecycle.busy) {
         ImGui::TextColored(theme::col::warn(), "%s",
             lifecycle.state == DbgLifecycleState::Starting
                 ? "Starting debugger..." : "Stopping debugger; restoring owned state...");
         if (lifecycle.command != DbgLifecycleCommand::Detach &&
             lifecycle.state == DbgLifecycleState::Starting) {
-            ImGui::SameLine();
+            ui::SameLineIfFits(120.0f * scale);
             if (ImGui::SmallButton("Cancel startup"))
                 ctx.debug.cancelLifecycle(lifecycle.requestId);
         }
     } else if (lifecycle.completed && !lifecycle.error.empty()) {
-        ImGui::TextWrapped("%s", lifecycle.error.c_str());
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(theme::col::bad(), "%s", lifecycle.error.c_str());
+        ImGui::PopTextWrapPos();
     }
+    ImGui::SetNextItemWidth(-1.0f);
     ui::SearchBox("##pfilter", "process name or PID...", filter_, sizeof(filter_), -1.0f);
     if (!status_.empty()) ImGui::TextWrapped("%s", status_.c_str());
 
@@ -336,7 +345,7 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
     if (filter_[0]) ImGui::TextDisabled("%zu of %zu processes", visible.size(), procs_.size());
 
     // Fill the remaining height so the list only scrolls when truly overflowing.
-    if (ImGui::BeginTable("procs", 5,
+    if (ui::BeginDataTable("procs", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
         ImGui::TableSetupScrollFreeze(0, 1);
@@ -396,14 +405,15 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
             ImGui::PopID();
         }
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
 void CommunicationsTab::renderModules() {
-    ImGui::SeparatorText("Modules");
+    ui::PanelHeader("Loaded modules");
     if (selProc_ < 0 || selProc_ >= (int)procs_.size()) {
-        ImGui::TextDisabled("Select a process to list its loaded modules.");
+        ui::EmptyState(DS_ICON_SEARCH, "No process selected",
+            "Select a process to inspect its loaded modules.");
         return;
     }
     uint32_t pid = procs_[selProc_].pid;
@@ -412,30 +422,37 @@ void CommunicationsTab::renderModules() {
 
     ImGui::TextWrapped("%s (PID %u) - %d module(s)", procs_[selProc_].name.c_str(), pid, (int)mods_.size());
     if (mods_.empty()) {
-        ImGui::TextWrapped("No readable module list. The process may have exited or denied access; refresh after it initializes.");
+        ui::EmptyState(DS_ICON_SEARCH, "No readable modules",
+            "The process may have exited or denied access. Refresh after it initializes.");
         return;
     }
-    if (ImGui::BeginTable("mods", 3,
+    if (ui::BeginDataTable("mods", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+            ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+            ImVec2(0, ImGui::GetContentRegionAvail().y),
+            (std::max)(ImGui::GetContentRegionAvail().x, 560.0f * theme::UiScale()))) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Module");
+        ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, 150 * theme::UiScale());
         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90 * theme::UiScale());
         ImGui::TableHeadersRow();
         for (auto& m : mods_) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(m.name.c_str());
+            const std::string moduleDetail = m.name + (m.path.empty() ? "" : "\n" + m.path);
+            ui::ItemTooltip(moduleDetail.c_str());
+            ui::PushMono();
             ImGui::TableSetColumnIndex(1); ImGui::Text("0x%llX", (unsigned long long)m.base);
             ImGui::TableSetColumnIndex(2); ImGui::Text("%llu KB", (unsigned long long)(m.size / 1024));
+            ui::PopMono();
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
 void CommunicationsTab::renderConnections(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::SeparatorText("Connections (selected process)");
+    ui::PanelHeader("Process connections");
     pumpConnectionRefresh();
     uint32_t pid = (selProc_ >= 0 && selProc_ < (int)procs_.size()) ? procs_[selProc_].pid : 0;
     if (!pid) {
@@ -490,23 +507,25 @@ void CommunicationsTab::renderConnections(AppContext& ctx) {
         connNextRefresh_ = now + 1.0;
     }
     ui::SameLineIfFits(70.0f * scale); ImGui::Checkbox("Auto##conn", &connAutoRefresh_);
-    ui::SameLineIfFits(65.0f * scale); ImGui::Checkbox("IPv4", &connShowV4_);
+    ui::SameLineIfFits(125.0f * scale);
+    ui::StatePill(refreshing ? "Refreshing" : connAutoRefresh_ ? "Monitoring" : "Idle",
+        refreshing || connAutoRefresh_ ? theme::col::accent() : theme::col::muted());
+    ImGui::Checkbox("IPv4", &connShowV4_);
     ui::SameLineIfFits(65.0f * scale); ImGui::Checkbox("IPv6", &connShowV6_);
     ui::SameLineIfFits(60.0f * scale); ImGui::Checkbox("TCP", &connShowTcp_);
     ui::SameLineIfFits(60.0f * scale); ImGui::Checkbox("UDP", &connShowUdp_);
+    ImGui::SetNextItemWidth(-1.0f);
     ui::SearchBox("##connfilter", "filter endpoint / state...", connFilter_, sizeof(connFilter_),
                   -1.0f);
-    if (connRefreshRunning_.load(std::memory_order_acquire)) {
-        ImGui::TextDisabled("Refreshing\xE2\x80\xA6");
-    }
     if (!connStatus_.empty()) {
         ImGui::PushTextWrapPos();
         ImGui::TextColored(theme::col::warn(), "Partial refresh: %s", connStatus_.c_str());
         ImGui::PopTextWrapPos();
     }
     if (conns_.empty()) {
-        if (!refreshing)
-            ImGui::TextWrapped("No active IPv4/IPv6 TCP/UDP endpoints were reported for this process.");
+        ui::EmptyState(DS_ICON_NETWORK, refreshing ? "Reading process endpoints" : "No active endpoints",
+            refreshing ? "The process connection table is refreshing."
+                : "No IPv4/IPv6 TCP/UDP endpoints were reported for this process.");
         return;
     }
     if (!shown) {
@@ -518,10 +537,11 @@ void CommunicationsTab::renderConnections(AppContext& ctx) {
         return;
     }
 
-    if (ImGui::BeginTable("conns", 5,
+    if (ui::BeginDataTable("conns", 5,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
-                          ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+                          ImVec2(0, ImGui::GetContentRegionAvail().y),
+                          (std::max)(ImGui::GetContentRegionAvail().x, 680.0f * scale))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Local endpoint");
         ImGui::TableSetupColumn("Remote endpoint");
@@ -532,15 +552,19 @@ void CommunicationsTab::renderConnections(AppContext& ctx) {
         for (const Conn& c : conns_) {
             if (!visible(c)) continue;
             ImGui::TableNextRow();
+            ui::PushMono();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(c.local.c_str());
+            ui::ItemTooltip(c.local.c_str());
             ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(c.remote.c_str());
+            ui::ItemTooltip(c.remote.c_str());
+            ui::PopMono();
             ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", c.protocol.c_str());
             ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", c.family.c_str());
             ImGui::TableSetColumnIndex(4);
             if (c.state == "ESTABLISHED") ImGui::TextColored(theme::col::good(), "%s", c.state.c_str());
             else ImGui::TextDisabled("%s", c.state.c_str());
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
@@ -567,6 +591,7 @@ static std::string jdwpShortClass(const std::string& name) {
 // The listing's addresses are the method's bytecode indices (VA == bci).
 void CommunicationsTab::loadJdwpMethod(AppContext& ctx, uint64_t classID, uint64_t methodID,
                                        const std::string& label) {
+    jdwpCompactView_ = 1;
     std::vector<uint8_t> bc;
     if (!ctx.jdwp.bytecodesOf(classID, methodID, bc) || bc.empty()) {
         // Never leave breakpoint actions pointing at a previous method when a
@@ -605,15 +630,14 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
     JdwpSnapshot snap = ctx.jdwp.snapshot();
     if (!snap.attached()) ctx.jdwpTargetPid = 0;
 
-    const char* st = "detached";
-    if (snap.state == JdwpState::Running)   st = "running";
-    if (snap.state == JdwpState::Suspended) st = "suspended";
-    if (snap.state == JdwpState::Dead)      st = "connection lost";
-    char hdr[192];
-    std::snprintf(hdr, sizeof(hdr), "Java debug (JDWP) \xE2\x80\x94 %s%s%s###jdwp_hdr",
-                  st, snap.vmName.empty() ? "" : ", ", snap.vmName.c_str());
-    if (!ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen))
-        return;
+    const char* st = "Detached";
+    if (snap.state == JdwpState::Running)   st = "Running";
+    if (snap.state == JdwpState::Suspended) st = "Paused";
+    if (snap.state == JdwpState::Dead)      st = "Connection lost";
+    ui::PanelHeader("Java / JDWP", snap.vmName.empty() ? "Live JVM bytecode debugging" : snap.vmName.c_str());
+    ui::StatePill(st, snap.state == JdwpState::Suspended ? theme::col::warn()
+        : snap.state == JdwpState::Running ? theme::col::accent()
+        : snap.state == JdwpState::Dead ? theme::col::bad() : theme::col::muted());
 
     // Housekeeping shared by both attach paths: clear stale per-session UI state.
     auto onAttached = [&] {
@@ -636,7 +660,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
 
         // --- Primary path: inject the JDWP agent into a RUNNING JVM (no -agentlib
         //     prelaunch flag). Selection is local to the Java workspace. ---
-        ImGui::SeparatorText("Attach to a running Java process");
+        ui::PanelHeader("Attach to a running Java process", "Inject JDWP into a supported local JVM");
         if (!enumerated_) refreshProcesses();
         if (ui::ToolbarIconButton(DS_ICON_REFRESH, "Refresh processes", "Refresh running processes and re-check the selected JVM"))
             refreshProcesses();
@@ -645,6 +669,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
             : "Select a Java process...";
         ImGui::SetNextItemWidth((std::min)(500.0f * scale, ImGui::GetContentRegionAvail().x));
         if (ImGui::BeginCombo("##jdwp_process", processPreview.c_str())) {
+            ImGui::SetNextItemWidth(-1.0f);
             ui::SearchBox("##jdwp_process_filter", "process name or PID...",
                           jdwpProcessFilter_, sizeof(jdwpProcessFilter_), -1.0f);
             std::string needle = jdwpProcessFilter_;
@@ -680,7 +705,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         if (!selPid) {
             ImGui::TextWrapped("Choose a process above to detect its JVM and enable attachment. No JVM debug flags are needed for supported HotSpot x64 targets.");
         } else {
-            ImGui::Text("Selected: %s (PID %u)", selName.c_str(), selPid);
+            ui::KeyValueRow("Selected", "%s (PID %u)", selName.c_str(), selPid);
             ui::SameLineIfFits(125.0f * scale);
             if (ji.flavor == JvmFlavor::HotSpot)
                 ui::Badge(ji.is64 ? "HotSpot x64" : "HotSpot x86", theme::col::good());
@@ -750,7 +775,7 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
 
         // --- Secondary path: connect to an agent that is ALREADY listening
         //     (remote target, or a VM launched with -agentlib:jdwp). ---
-        ImGui::SeparatorText("Or connect to a listening JDWP agent");
+        ui::PanelHeader("Connect to a listening JDWP agent", "Use the existing agent host and port");
         ImGui::SetNextItemWidth(150.0f * scale);
         ImGui::InputTextWithHint("##jdwphost", "host", jdwpHost_, sizeof(jdwpHost_));
         ui::SameLineIfFits(135.0f * scale);
@@ -822,282 +847,427 @@ void CommunicationsTab::renderJdwp(AppContext& ctx) {
         jdwpScrollToStop_ = true;
     }
 
-    // ---- three-column console -------------------------------------------------
-    ImGui::SetNextWindowContentSize(ImVec2(
-        (std::max)(ImGui::GetContentRegionAvail().x - ImGui::GetStyle().WindowPadding.x * 2.0f,
-                    940.0f * scale), 0.0f));
-    ImGui::BeginChild("jdwp_body", ImVec2(0, (std::max)(380.0f * scale,
-        ImGui::GetContentRegionAvail().y)), ImGuiChildFlags_Borders,
-        ImGuiWindowFlags_HorizontalScrollbar);
-    const float colW = ImGui::GetContentRegionAvail().x;
+    renderJdwpConsole(ctx, snap);
+}
 
-    // -- column 1: threads / breakpoints / session log --
-    ImGui::BeginChild("jdwp_left", ImVec2(colW * 0.28f, 0));
-    ImGui::SeparatorText("Threads");
-    ImGui::BeginChild("jdwp_threads", ImVec2(0, 110.0f * scale));
-    for (const auto& t : snap.threads) {
-        const bool isStop = suspended && t.id == snap.stopThread;
-        if (isStop) ImGui::TextColored(theme::col::good(), "> %s", t.name.c_str());
-        else        ImGui::Text("  %s", t.name.c_str());
-        ImGui::SameLine();
-        ImGui::TextDisabled("(%s)", jdwpThreadStatusName(t.status));
+// Presentation consumes the immutable session publication; actions still go
+// through JdwpClient and keep the exact class/method/BCI location.
+void CommunicationsTab::renderJdwpConsole(AppContext& ctx, const JdwpSnapshot& snap) {
+    const float scale = theme::UiScale();
+    const bool suspended = snap.state == JdwpState::Suspended;
+    const bool compact = ImGui::GetContentRegionAvail().x < 860.0f * scale;
+    if (jdwpScrollToStop_) jdwpCompactView_ = 1;
+    if (compact) {
+        static const char* views[] = { "Browse", "Bytecode", "Session" };
+        jdwpCompactView_ = ui::TabStrip("##jdwp_compact_views", views, 3, jdwpCompactView_);
     }
-    if (snap.threads.empty()) ImGui::TextDisabled("(suspend to list threads)");
-    ImGui::EndChild();
-
-    ImGui::SeparatorText("Breakpoints");
-    ImGui::BeginChild("jdwp_bps", ImVec2(0, 90.0f * scale));
-    int removeBp = INT32_MIN;
-    for (const auto& b : snap.breakpoints) {
-        ImGui::PushID(b.requestID);
-        if (ImGui::SmallButton("x")) removeBp = b.requestID;
-        ImGui::SameLine();
-        ImGui::Text("%s", b.label.c_str());
-        ImGui::SameLine();
-        ImGui::TextDisabled("hits %u", b.hits);
-        ImGui::PopID();
-    }
-    if (snap.breakpoints.empty()) ImGui::TextDisabled("(right-click a bytecode row)");
-    ImGui::EndChild();
-    if (removeBp != INT32_MIN) ctx.jdwp.clearBreakpoint(removeBp);
-
-    ImGui::SeparatorText("Events");
-    ImGui::BeginChild("jdwp_log", ImVec2(0, 0));
-    const size_t logStart = snap.events.size() > 50 ? snap.events.size() - 50 : 0;
-    for (size_t i = logStart; i < snap.events.size(); ++i)
-        ImGui::TextDisabled("%s", snap.events[i].c_str());
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);
-    ImGui::EndChild();
-    ImGui::EndChild();   // jdwp_left
-    ImGui::SameLine();
-
-    // -- column 2: class browser + methods --
-    ImGui::BeginChild("jdwp_mid", ImVec2(colW * 0.30f, 0));
-    ImGui::SeparatorText("Classes");
-    ui::SearchBox("##jdwpclsfilter", "filter classes...", jdwpClassFilter_, sizeof(jdwpClassFilter_), -1.0f);
-    // Rebuild the filtered index when the class list or the filter changes.
-    if (snap.classes != jdwpClassesRef_ || jdwpFilterCache_ != jdwpClassFilter_) {
-        jdwpClassesRef_ = snap.classes;
-        jdwpFilterCache_ = jdwpClassFilter_;
-        jdwpFiltered_.clear();
-        if (jdwpClassesRef_) {
-            std::string needle = jdwpFilterCache_;
-            for (char& ch : needle) ch = (char)std::tolower((unsigned char)ch);
-            for (int i = 0; i < (int)jdwpClassesRef_->size(); ++i) {
-                if (!needle.empty()) {
-                    std::string hay = (*jdwpClassesRef_)[i].name;
-                    for (char& ch : hay) ch = (char)std::tolower((unsigned char)ch);
-                    if (hay.find(needle) == std::string::npos) continue;
+    auto drawBrowse = [&] {
+        ui::PanelHeader("Classes");
+        ImGui::SetNextItemWidth(-1.0f);
+        ui::SearchBox("##jdwpclsfilter", "filter classes...", jdwpClassFilter_, sizeof(jdwpClassFilter_), -1.0f);
+        // Rebuild the filtered index when the class list or the filter changes.
+        if (snap.classes != jdwpClassesRef_ || jdwpFilterCache_ != jdwpClassFilter_) {
+            jdwpClassesRef_ = snap.classes;
+            jdwpFilterCache_ = jdwpClassFilter_;
+            jdwpFiltered_.clear();
+            if (jdwpClassesRef_) {
+                std::string needle = jdwpFilterCache_;
+                for (char& ch : needle) ch = (char)std::tolower((unsigned char)ch);
+                for (int i = 0; i < (int)jdwpClassesRef_->size(); ++i) {
+                    if (!needle.empty()) {
+                        std::string hay = (*jdwpClassesRef_)[i].name;
+                        for (char& ch : hay) ch = (char)std::tolower((unsigned char)ch);
+                        if (hay.find(needle) == std::string::npos) continue;
+                    }
+                    jdwpFiltered_.push_back(i);
+                    if (jdwpFiltered_.size() >= 2000) break;   // plenty for a filtered browse
                 }
-                jdwpFiltered_.push_back(i);
-                if (jdwpFiltered_.size() >= 2000) break;   // plenty for a filtered browse
             }
         }
-    }
-    ImGui::TextDisabled("%zu class(es)%s", jdwpFiltered_.size(),
-                        jdwpFiltered_.size() >= 2000 ? " (capped, narrow the filter)" : "");
-    ImGui::BeginChild("jdwp_classes", ImVec2(0, 160.0f * scale), ImGuiChildFlags_Borders);
-    {
-        ImGuiListClipper clip;
-        clip.Begin((int)jdwpFiltered_.size());
-        while (clip.Step()) {
-            for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
-                const JdwpClassRow& c = (*jdwpClassesRef_)[jdwpFiltered_[row]];
-                ImGui::PushID(row);
-                if (ImGui::Selectable(c.name.c_str(), c.typeID == jdwpSelClass_)) {
-                    jdwpSelClass_     = c.typeID;
-                    jdwpSelClassName_ = c.name;
-                    jdwpMethods_.clear();
-                    if (!ctx.jdwp.methodsOf(c.typeID, jdwpMethods_))
-                        jdwpStatus_ = "method list fetch failed";
+        ImGui::TextDisabled("%zu class(es)%s", jdwpFiltered_.size(),
+                            jdwpFiltered_.size() >= 2000 ? " (capped, narrow the filter)" : "");
+        ImGui::BeginChild("jdwp_classes", ImVec2(0, (std::max)(80.0f * scale, ImGui::GetContentRegionAvail().y * 0.40f)), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+        {
+            if (jdwpFiltered_.empty())
+                ui::EmptyState(DS_ICON_SEARCH, jdwpClassFilter_[0] ? "No matching classes" : "No classes available",
+                    jdwpClassFilter_[0] ? "Try another class name."
+                        : "Refresh classes after the JVM has loaded them.");
+            ImGuiListClipper clip;
+            clip.Begin((int)jdwpFiltered_.size());
+            while (clip.Step()) {
+                for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
+                    const JdwpClassRow& c = (*jdwpClassesRef_)[jdwpFiltered_[row]];
+                    ImGui::PushID(row);
+                    if (ImGui::Selectable(c.name.c_str(), c.typeID == jdwpSelClass_)) {
+                        jdwpSelClass_     = c.typeID;
+                        jdwpSelClassName_ = c.name;
+                        jdwpMethods_.clear();
+                        if (!ctx.jdwp.methodsOf(c.typeID, jdwpMethods_))
+                            jdwpStatus_ = "method list fetch failed";
+                    }
+                    ui::ItemTooltip(c.name.c_str());
+                    ImGui::PopID();
                 }
-                ImGui::PopID();
             }
-        }
-    }
-    ImGui::EndChild();
-
-    ImGui::SeparatorText("Methods");
-    ImGui::BeginChild("jdwp_methods", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    for (size_t i = 0; i < jdwpMethods_.size(); ++i) {
-        const auto& m = jdwpMethods_[i];
-        ImGui::PushID((int)i);
-        const bool cur = jdwpSelClass_ == jdwpInsnsClass_ && m.methodID == jdwpInsnsMethod_;
-        char row[320];
-        std::snprintf(row, sizeof(row), "%s%s", m.name.c_str(), m.signature.c_str());
-        if (ImGui::Selectable(row, cur))
-            loadJdwpMethod(ctx, jdwpSelClass_, m.methodID,
-                           jdwpShortClass(jdwpSelClassName_) + "." + m.name);
-        ImGui::PopID();
-    }
-    if (jdwpMethods_.empty()) ImGui::TextDisabled("(select a class)");
-    ImGui::EndChild();
-    ImGui::EndChild();   // jdwp_mid
-    ImGui::SameLine();
-
-    // -- column 3: call stack + live bytecode listing --
-    ImGui::BeginChild("jdwp_right", ImVec2(0, 0));
-    if (suspended && !snap.frames.empty()) {
-        ImGui::SeparatorText("Call stack");
-        ImGui::BeginChild("jdwp_frames", ImVec2(0, 84.0f * scale));
-        for (size_t i = 0; i < snap.frames.size(); ++i) {
-            const auto& f = snap.frames[i];
-            ImGui::PushID((int)i);
-            char row[300];
-            std::snprintf(row, sizeof(row), "#%zu  %s", i, f.label.c_str());
-            const bool cur = f.loc.classID == jdwpInsnsClass_ && f.loc.methodID == jdwpInsnsMethod_ && i == 0;
-            if (ImGui::Selectable(row, cur))
-                loadJdwpMethod(ctx, f.loc.classID, f.loc.methodID, f.label);
-            ImGui::PopID();
         }
         ImGui::EndChild();
-    }
 
-    ImGui::SeparatorText(jdwpInsns_.empty() ? "Bytecode" : ("Bytecode \xE2\x80\x94 " + jdwpInsnsLabel_).c_str());
-    ImGui::BeginChild("jdwp_code", ImVec2(0, 0), ImGuiChildFlags_Borders);
-    if (jdwpInsns_.empty()) {
-        ImGui::TextDisabled("Select a class, then a method \xE2\x80\x94 or hit a breakpoint \xE2\x80\x94 to see its live bytecode.");
-        ImGui::TextDisabled("Right-click a row to set a JDWP breakpoint at that bci.");
-    } else {
-        const bool stopHere = suspended &&
-            snap.stopLoc.classID == jdwpInsnsClass_ && snap.stopLoc.methodID == jdwpInsnsMethod_;
-        // The stop row must be submitted for SetScrollHereY to reach it, even
-        // when the clipper would skip it (same pattern as the static listing).
-        int stopRow = -1;
-        if (stopHere && jdwpScrollToStop_)
-            for (int i = 0; i < (int)jdwpInsns_.size(); ++i)
-                if (jdwpInsns_[i].address == snap.stopLoc.index) { stopRow = i; break; }
-        ImGuiListClipper clip;
-        clip.Begin((int)jdwpInsns_.size());
-        if (stopRow >= 0) clip.IncludeItemByIndex(stopRow);
-        while (clip.Step()) {
-            for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
-                const Instruction& in = jdwpInsns_[row];
-                ImGui::PushID(row);
-                const bool isStopRow = stopHere && in.address == snap.stopLoc.index;
-                bool hasBp = false;
-                for (const auto& b : snap.breakpoints)
-                    if (b.loc.classID == jdwpInsnsClass_ && b.loc.methodID == jdwpInsnsMethod_ &&
-                        b.loc.index == in.address) { hasBp = true; break; }
-
-                const std::string instruction = InstructionText(in);
-                char line[512];
-                std::snprintf(line, sizeof(line), "%c%5llu:  %-39s%s%s",
-                              isStopRow ? '>' : hasBp ? '*' : ' ',
-                              (unsigned long long)in.address,
-                              instruction.c_str(),
-                              in.comment.empty() ? "" : "  ; ",
-                              in.comment.c_str());
-                if (isStopRow)    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::good());
-                else if (hasBp)   ImGui::PushStyleColor(ImGuiCol_Text, theme::col::bad());
-                ImGui::Selectable(line, isStopRow);
-                if (isStopRow || hasBp) ImGui::PopStyleColor();
-                if (isStopRow && jdwpScrollToStop_) {
-                    ImGui::SetScrollHereY(0.4f);
-                    jdwpScrollToStop_ = false;
-                }
-                if (ImGui::BeginPopupContextItem("jdwp_row_ctx")) {
-                    if (!hasBp && ImGui::MenuItem("Set breakpoint here")) {
-                        JdwpLocation loc{1, jdwpInsnsClass_, jdwpInsnsMethod_, in.address};
-                        char lbl[256];
-                        std::snprintf(lbl, sizeof(lbl), "%s bci=%llu", jdwpInsnsLabel_.c_str(),
-                                      (unsigned long long)in.address);
-                        std::string err;
-                        if (!ctx.jdwp.setBreakpoint(loc, lbl, err)) jdwpStatus_ = err;
-                    }
-                    if (hasBp && ImGui::MenuItem("Remove breakpoint")) {
-                        for (const auto& b : snap.breakpoints)
-                            if (b.loc.classID == jdwpInsnsClass_ &&
-                                b.loc.methodID == jdwpInsnsMethod_ &&
-                                b.loc.index == in.address) {
-                                ctx.jdwp.clearBreakpoint(b.requestID);
-                                break;
-                            }
-                    }
-                    ImGui::EndPopup();
-                }
-                ImGui::PopID();
-            }
+        ui::PanelHeader("Methods");
+        ImGui::BeginChild("jdwp_methods", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+        for (size_t i = 0; i < jdwpMethods_.size(); ++i) {
+            const auto& m = jdwpMethods_[i];
+            ImGui::PushID((int)i);
+            const bool cur = jdwpSelClass_ == jdwpInsnsClass_ && m.methodID == jdwpInsnsMethod_;
+            char row[320];
+            std::snprintf(row, sizeof(row), "%s%s", m.name.c_str(), m.signature.c_str());
+            if (ImGui::Selectable(row, cur))
+                loadJdwpMethod(ctx, jdwpSelClass_, m.methodID,
+                               jdwpShortClass(jdwpSelClassName_) + "." + m.name);
+            ImGui::PopID();
         }
-    }
-    ImGui::EndChild();   // jdwp_code
-    ImGui::EndChild();   // jdwp_right
+        if (jdwpMethods_.empty())
+            ui::EmptyState(DS_ICON_SEARCH, "No methods to display",
+                "Select a loaded class to browse its methods.");
+        ImGui::EndChild();
+    };
+    auto drawCode = [&] {
+        ui::PanelHeader("Bytecode", jdwpInsnsLabel_.empty() ? "Live method bytecode indices" : jdwpInsnsLabel_.c_str());
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
+        ImGui::BeginChild("jdwp_code", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_HorizontalScrollbar);
+        if (jdwpInsns_.empty()) {
+            ui::EmptyState(DS_ICON_SEARCH, "No method selected",
+                "Select a class and method, or pause at a Java breakpoint, to inspect live bytecode. Right-click an instruction to set a breakpoint.");
+        } else {
+            ui::PushMono();
+            const bool stopHere = suspended &&
+                snap.stopLoc.classID == jdwpInsnsClass_ && snap.stopLoc.methodID == jdwpInsnsMethod_;
+            // The stop row must be submitted for SetScrollHereY to reach it, even
+            // when the clipper would skip it (same pattern as the static listing).
+            int stopRow = -1;
+            if (stopHere && jdwpScrollToStop_)
+                for (int i = 0; i < (int)jdwpInsns_.size(); ++i)
+                    if (jdwpInsns_[i].address == snap.stopLoc.index) { stopRow = i; break; }
+            ImGuiListClipper clip;
+            clip.Begin((int)jdwpInsns_.size());
+            if (stopRow >= 0) clip.IncludeItemByIndex(stopRow);
+            while (clip.Step()) {
+                for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
+                    const Instruction& in = jdwpInsns_[row];
+                    ImGui::PushID(row);
+                    const bool isStopRow = stopHere && in.address == snap.stopLoc.index;
+                    bool hasBp = false;
+                    for (const auto& b : snap.breakpoints)
+                        if (b.loc.classID == jdwpInsnsClass_ && b.loc.methodID == jdwpInsnsMethod_ &&
+                            b.loc.index == in.address) { hasBp = true; break; }
 
-    ImGui::EndChild();   // jdwp_body
+                    const std::string instruction = InstructionText(in);
+                    char line[512];
+                    std::snprintf(line, sizeof(line), "%c%5llu:  %-39s%s%s",
+                                  isStopRow ? '>' : hasBp ? '*' : ' ',
+                                  (unsigned long long)in.address,
+                                  instruction.c_str(),
+                                  in.comment.empty() ? "" : "  ; ",
+                                  in.comment.c_str());
+                    if (isStopRow)    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::accent());
+                    else if (hasBp)   ImGui::PushStyleColor(ImGuiCol_Text, theme::col::bad());
+                    ImGui::Selectable(line, isStopRow);
+                    if (isStopRow || hasBp) ImGui::PopStyleColor();
+                    if (isStopRow && jdwpScrollToStop_) {
+                        ImGui::SetScrollHereY(0.4f);
+                        jdwpScrollToStop_ = false;
+                    }
+                    if (ImGui::BeginPopupContextItem("jdwp_row_ctx")) {
+                        if (!hasBp && ImGui::MenuItem("Set breakpoint here")) {
+                            JdwpLocation loc{1, jdwpInsnsClass_, jdwpInsnsMethod_, in.address};
+                            char lbl[256];
+                            std::snprintf(lbl, sizeof(lbl), "%s bci=%llu", jdwpInsnsLabel_.c_str(),
+                                          (unsigned long long)in.address);
+                            std::string err;
+                            if (!ctx.jdwp.setBreakpoint(loc, lbl, err)) jdwpStatus_ = err;
+                        }
+                        if (hasBp && ImGui::MenuItem("Remove breakpoint")) {
+                            for (const auto& b : snap.breakpoints)
+                                if (b.loc.classID == jdwpInsnsClass_ &&
+                                    b.loc.methodID == jdwpInsnsMethod_ &&
+                                    b.loc.index == in.address) {
+                                    ctx.jdwp.clearBreakpoint(b.requestID);
+                                    break;
+                                }
+                        }
+                        ImGui::EndPopup();
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ui::PopMono();
+        }
+        ImGui::EndChild();   // jdwp_code
+        ImGui::PopStyleColor();
+    };
+    auto drawSession = [&] {
+        static const char* views[] = { "Threads", "Call stack", "Breakpoints", "Session log" };
+        jdwpSessionView_ = ui::TabStrip("##jdwp_session_views", views, 4, jdwpSessionView_);
+        ImGui::BeginChild("jdwp_session_content", ImVec2(0, 0), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        if (jdwpSessionView_ == 0) {
+            if (!snap.threads.empty() && ui::BeginDataTable("##jdwp_threads", 3,
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                ImGui::TableSetupColumn("Thread");
+                ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 85.0f * scale);
+                ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 110.0f * scale);
+                ImGui::TableHeadersRow();
+                for (const auto& t : snap.threads) {
+                    const bool isStop = suspended && t.id == snap.stopThread;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    if (isStop) ImGui::TextColored(theme::col::accent(), "%s", t.name.c_str());
+                    else ImGui::TextUnformatted(t.name.c_str());
+                    ui::ItemTooltip(t.name.c_str());
+                    ImGui::TableNextColumn();
+                    ui::PushMono(); ImGui::Text("%llu", (unsigned long long)t.id); ui::PopMono();
+                    ImGui::TableNextColumn();
+                    // The event location proves this thread's stop. Other rows
+                    // retain the JVM's reported scheduler status, not an inferred stop.
+                    ui::Badge(isStop ? "Stopped here" : jdwpThreadStatusName(t.status),
+                        isStop ? theme::col::warn()
+                        : !suspended && t.status == JDWP_TS_RUNNING ? theme::col::accent() : theme::col::muted());
+                    ui::ItemTooltip("The event thread is marked Stopped here. Other rows show the JVM-reported scheduler state, which is separate from suspension.");
+                }
+                ui::EndDataTable();
+            }
+            if (snap.threads.empty()) ui::EmptyState(DS_ICON_SEARCH, "No threads available",
+                "Suspend the JVM to inspect its threads.");
+        } else if (jdwpSessionView_ == 1) {
+            if (!snap.frames.empty() && ui::BeginDataTable("##jdwp_frames", 2,
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                ImGui::TableSetupColumn("Location");
+                ImGui::TableSetupColumn("BCI", ImGuiTableColumnFlags_WidthFixed, 85.0f * scale);
+                ImGui::TableHeadersRow();
+                for (size_t i = 0; i < snap.frames.size(); ++i) {
+                    const auto& f = snap.frames[i];
+                    ImGui::PushID((int)i);
+                    ImGui::TableNextRow(); ImGui::TableNextColumn();
+                    char row[300];
+                    std::snprintf(row, sizeof(row), "#%zu  %s", i, f.label.c_str());
+                    const bool cur = f.loc.classID == jdwpInsnsClass_ && f.loc.methodID == jdwpInsnsMethod_ && i == 0;
+                    if (ImGui::Selectable(row, cur, ImGuiSelectableFlags_SpanAllColumns))
+                        loadJdwpMethod(ctx, f.loc.classID, f.loc.methodID, f.label);
+                    ui::ItemTooltip(f.label.c_str());
+                    ImGui::TableNextColumn();
+                    ui::PushMono(); ImGui::Text("%llu", (unsigned long long)f.loc.index); ui::PopMono();
+                    ImGui::PopID();
+                }
+                ui::EndDataTable();
+            }
+            if (snap.frames.empty()) ui::EmptyState(DS_ICON_SEARCH, "No Java frames available",
+                "Suspend at a Java location to inspect the call stack.");
+        } else if (jdwpSessionView_ == 2) {
+            int removeBp = INT32_MIN;
+            if (!snap.breakpoints.empty() && ui::BeginDataTable("##jdwp_breakpoints", 3,
+                    ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                ImGui::TableSetupColumn("Breakpoint");
+                ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 55.0f * scale);
+                ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
+                ImGui::TableHeadersRow();
+                for (const auto& b : snap.breakpoints) {
+                    ImGui::PushID(b.requestID);
+                    ImGui::TableNextRow(); ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(b.label.c_str());
+                    ui::ItemTooltip(b.label.c_str());
+                    ImGui::TableNextColumn();
+                    ui::PushMono(); ImGui::Text("%u", b.hits); ui::PopMono();
+                    ImGui::TableNextColumn();
+                    if (ImGui::SmallButton("x")) removeBp = b.requestID;
+                    ui::ItemTooltip("Remove this Java breakpoint");
+                    ImGui::PopID();
+                }
+                ui::EndDataTable();
+            }
+            if (snap.breakpoints.empty()) ui::EmptyState(DS_ICON_SEARCH, "No Java breakpoints",
+                "Right-click a bytecode instruction to add a breakpoint.");
+            if (removeBp != INT32_MIN) ctx.jdwp.clearBreakpoint(removeBp);
+        } else {
+            const size_t logStart = snap.events.size() > 50 ? snap.events.size() - 50 : 0;
+            for (size_t i = logStart; i < snap.events.size(); ++i)
+                ImGui::TextWrapped("%s", snap.events[i].c_str());
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);
+            if (snap.events.empty()) ImGui::TextDisabled("No session events yet.");
+        }
+        ImGui::EndChild();
+    };
+    if (compact) {
+        ImGui::BeginChild("jdwp_compact", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        if (jdwpCompactView_ == 0) drawBrowse();
+        else if (jdwpCompactView_ == 1) drawCode();
+        else drawSession();
+        ImGui::EndChild();
+        return;
+    }
+
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float splitter = 6.0f * scale;
+    jdwpBrowseWidth_ = std::clamp(available.x * jdwpBrowseRatio_, 240.0f * scale,
+                                 available.x - 500.0f * scale - splitter);
+    ImGui::BeginChild("jdwp_browse", ImVec2(jdwpBrowseWidth_, 0), ImGuiChildFlags_Borders);
+    drawBrowse();
+    ImGui::EndChild();
+    ui::VSplitter("##jdwp_browse_split", &jdwpBrowseWidth_, 240.0f * scale,
+                  500.0f * scale, splitter);
+    if (ImGui::IsItemActive()) jdwpBrowseRatio_ = jdwpBrowseWidth_ / available.x;
+    ImGui::BeginChild("jdwp_work", ImVec2(0, 0), ImGuiChildFlags_None);
+    const float height = (std::max)(1.0f, ImGui::GetContentRegionAvail().y);
+    const float minDrawer = (std::min)(110.0f * scale, height * 0.30f);
+    const float maxDrawer = (std::max)(minDrawer, height * 0.55f);
+    jdwpSessionHeight_ = std::clamp(height * jdwpSessionRatio_, minDrawer, maxDrawer);
+    const float drawer = jdwpSessionHeight_;
+    const float codeHeight = (std::max)(1.0f,
+        height - drawer - splitter - ImGui::GetStyle().ItemSpacing.y * 2.0f);
+    ImGui::BeginChild("jdwp_bytecode", ImVec2(0, codeHeight), ImGuiChildFlags_Borders);
+    drawCode();
+    ImGui::EndChild();
+    ImGui::InvisibleButton("##jdwp_session_split", ImVec2(-1, splitter));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    const ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(lo.x, (lo.y + hi.y) * 0.5f),
+        ImVec2(hi.x, (lo.y + hi.y) * 0.5f), ImGui::GetColorU32(theme::col::lineSoft()));
+    if (ImGui::IsItemActive()) {
+        jdwpSessionHeight_ = std::clamp(drawer - ImGui::GetIO().MouseDelta.y,
+                                       minDrawer, maxDrawer);
+        jdwpSessionRatio_ = jdwpSessionHeight_ / height;
+    }
+    ImGui::BeginChild("jdwp_session", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    drawSession();
+    ImGui::EndChild();
+    ImGui::EndChild();
 }
 
 void CommunicationsTab::renderGameMaker(AppContext& ctx) {
+    const auto session = ctx.debug.gameMakerSnapshot();
+    const auto fallback = ctx.frameDebugSnapshot ? DbgSnapshot{} : ctx.debug.snapshot();
+    const auto& native = ctx.frameDebugSnapshot ? *ctx.frameDebugSnapshot : fallback;
+    renderGameMakerSession(ctx, native, session);
+}
+
+void CommunicationsTab::renderGameMakerSession(AppContext& ctx,
+        const DbgSnapshot& native, const GameMakerSessionSnapshot& session) {
     const float scale = theme::UiScale();
-    const auto archive=ctx.staticBinary().gameMakerArchive();
-    const auto session=ctx.debug.gameMakerSnapshot();
-    const auto fallback=ctx.frameDebugSnapshot?DbgSnapshot{}:ctx.debug.snapshot();
-    const auto& native=ctx.frameDebugSnapshot?*ctx.frameDebugSnapshot:fallback;
-    const bool matching=native.attached() && DebugTargetIdentityMatches(session.target,{native.pid,native.sessionGeneration});
-    const bool paused=matching && native.state==DbgState::Paused && session.state==GameMakerSessionState::Paused && session.stop && session.stop->identity.tid==native.activeTid;
-    ImGui::TextUnformatted("GameMaker / GML instruction debugger");
-    ImGui::TextWrapped("Open the game's data.win as a document, attach its running process in Processes & Attach, then start GML debugging here.");
-    ImGui::Text("Native target: %s",native.attached()?std::to_string(native.pid).c_str():"not attached");
-    if(archive)ImGui::Text("Archive: %s (%zu code entries)",archive->gameName.c_str(),archive->code.size());
+    const auto archive = ctx.staticBinary().gameMakerArchive();
+    const bool matching = native.attached() &&
+        DebugTargetIdentityMatches(session.target, {native.pid, native.sessionGeneration});
+    const bool paused = matching && native.state == DbgState::Paused &&
+        session.state == GameMakerSessionState::Paused && session.stop &&
+        session.stop->identity.tid == native.activeTid;
+    ui::PanelHeader("GameMaker / GML", "Instruction debugging for a verified runner and archive");
+    const char* stateLabel = native.attached() ? "Native attached" : "Detached";
+    ImVec4 stateColor = theme::col::muted();
+    if (matching) {
+        switch (session.state) {
+            case GameMakerSessionState::Preparing: stateLabel = "Preparing"; stateColor = theme::col::warn(); break;
+            case GameMakerSessionState::Loading: stateLabel = "Loading"; stateColor = theme::col::warn(); break;
+            case GameMakerSessionState::Initializing: stateLabel = "Initializing"; stateColor = theme::col::warn(); break;
+            case GameMakerSessionState::Installing: stateLabel = "Installing"; stateColor = theme::col::warn(); break;
+            case GameMakerSessionState::Disabling: stateLabel = "Stopping"; stateColor = theme::col::warn(); break;
+            case GameMakerSessionState::Inert: stateLabel = "Disabled"; break;
+            case GameMakerSessionState::Failed: stateLabel = "Failed"; stateColor = theme::col::bad(); break;
+            case GameMakerSessionState::Running:
+            case GameMakerSessionState::Paused:
+                stateLabel = paused ? "GML paused" : native.state == DbgState::Paused ? "Native paused" : "Running";
+                stateColor = native.state == DbgState::Paused ? theme::col::warn() : theme::col::accent();
+                break;
+            default: break;
+        }
+    }
+    ui::StatePill(stateLabel, stateColor);
+    ui::SameLineIfFits(175.0f * scale);
+    ImGui::TextDisabled("Native target: %s", native.attached() ? std::to_string(native.pid).c_str() : "not attached");
+    if (archive) ui::KeyValueRow("Archive", "%s (%zu code entries)", archive->gameName.c_str(), archive->code.size());
     else ImGui::TextDisabled("The active document is not a GameMaker archive.");
-    const bool canStart=native.attached() && archive && archive->ok && archive->bytecodeSupported &&
-        session.state==GameMakerSessionState::Disconnected;
+    const bool canStart = native.attached() && archive && archive->ok && archive->bytecodeSupported &&
+        session.state == GameMakerSessionState::Disconnected;
     ImGui::BeginDisabled(!canStart);
-    if(ImGui::Button("Start GML debugging")){
+    if (ui::AccentButton("Start GML debugging", theme::col::accent())) {
         gmlStatus_.clear();
-        if(ctx.debug.connectGameMaker(archive,ctx.staticBinary().path(),ctx.staticBinary().contentHash(),ctx.staticProject().gmlBreakpoints,gmlStatus_))ctx.gmlExecutionMode=true;
+        if (ctx.debug.connectGameMaker(archive, ctx.staticBinary().path(), ctx.staticBinary().contentHash(),
+                                      ctx.staticProject().gmlBreakpoints, gmlStatus_))
+            ctx.gmlExecutionMode = true;
     }
-    ImGui::EndDisabled();ui::SameLineIfFits(170.0f * scale);
-    ImGui::BeginDisabled(session.state==GameMakerSessionState::Disconnected || session.state==GameMakerSessionState::Inert);
-    if(ImGui::Button("Stop GML debugging"))ctx.debug.disconnectGameMaker();
     ImGui::EndDisabled();
-    ImGui::TextWrapped("The built-in helper verifies the runner and archive, then observes GML instruction boundaries. Game files are unchanged.");
-    ImGui::Separator();
-    if(!session.runnerName.empty())ImGui::Text("Runner: %s",session.runnerName.c_str());
-    if(!session.status.empty())ImGui::TextWrapped("%s",session.status.c_str());
-    ImGui::Text("Breakpoints: %u requested / %u bound",session.requestedBreakpoints,session.boundBreakpoints);
-    if(session.capabilities.runtimeVerified){
-        ImGui::TextDisabled("Verified adapter: instruction stops, call-aware steps, frames and numeric storage");
-        ImGui::TextDisabled("Packed operand-stack values and complex-value edits are unavailable in this adapter.");
-    }
-    ImGui::Text("Instruction stops: %s",session.instructionStopsVerified?"verified":"not yet verified");
-    if(session.mappingRetained){
-        if(session.ready() || session.state==GameMakerSessionState::Initializing || session.state==GameMakerSessionState::Installing)
-            ImGui::TextDisabled("The verified helper is loaded for this connection.");
-        else if(session.state==GameMakerSessionState::Inert)ImGui::TextDisabled("The disabled helper mapping remains until the target exits.");
-        else if(session.state==GameMakerSessionState::Disabling)ImGui::TextDisabled("Waiting for callback draining and helper unload.");
-        else ImGui::TextDisabled("The helper mapping is retained; review the connection error before continuing.");
-    }
-    if(!session.error.empty())ImGui::TextColored(theme::col::warn(),"%s",session.error.c_str());
-    if(!gmlStatus_.empty())ImGui::TextColored(theme::col::warn(),"%s",gmlStatus_.c_str());
-    auto command=[&](GmlControlCommand c){gmlStatus_.clear();ctx.debug.gameMakerCommand(c,paused?session.stop->identity:GmlPauseIdentity{},gmlStatus_);};
-    ImGui::SeparatorText("Execution");
-    ImGui::BeginDisabled(!matching || !session.ready() || (!paused && native.state!=DbgState::Running));
-    if(ImGui::Button(paused?"Continue GML":"Pause GML"))command(paused?GmlControlCommand::Continue:GmlControlCommand::Pause);
-    ImGui::EndDisabled();ui::SameLineIfFits(125.0f * scale);
-    ImGui::BeginDisabled(!paused);
-    if(ImGui::Button("Step Into GML"))command(GmlControlCommand::StepInto);ui::SameLineIfFits(130.0f * scale);
-    if(ImGui::Button("Step Over GML"))command(GmlControlCommand::StepOver);ui::SameLineIfFits(125.0f * scale);
-    if(ImGui::Button("Step Out GML"))command(GmlControlCommand::StepOut);
+    ui::SameLineIfFits(170.0f * scale);
+    ImGui::BeginDisabled(session.state == GameMakerSessionState::Disconnected || session.state == GameMakerSessionState::Inert);
+    if (ImGui::Button("Stop GML debugging")) ctx.debug.disconnectGameMaker();
     ImGui::EndDisabled();
-    if(native.state==DbgState::Paused && matching && !paused)ImGui::TextDisabled("This is a native pause. GML frame and numeric-edit authority are unavailable.");
-    ImGui::Checkbox("Use GML execution controls in the toolbar",&ctx.gmlExecutionMode);
-    ImGui::Checkbox("Follow GML stops in Binary View",&ctx.gmlAutoFollow);
-    if(paused && session.archive && session.stop->location.codeIndex<session.archive->code.size()){
-        const auto& code=session.archive->code[session.stop->location.codeIndex];
-        ImGui::Text("Stopped in %s + %u",code.name.c_str(),session.stop->location.byteOffset);
-        const bool sameArchive=archive && ctx.staticBinary().contentHash()==session.archiveHash;
-        ImGui::BeginDisabled(!sameArchive);
-        if(ImGui::Button("Show GML instruction"))ctx.gotoAddress(code.bytecodeOffset+session.stop->location.byteOffset);
+    if (!(matching && session.ready()) && (!native.attached() || !archive))
+        ImGui::TextWrapped("Open the game's data.win as a document, attach its running process in Processes & Attach, then start GML debugging here.");
+
+    const bool wide = ImGui::GetContentRegionAvail().x >= 860.0f * scale;
+    if (ImGui::BeginTable("##gml_workspace", wide ? 2 : 1,
+            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableNextColumn();
+        ui::PanelHeader("Session status");
+        ImGui::PushTextWrapPos();
+        if (!session.runnerName.empty()) ui::KeyValueRow("Runner", "%s", session.runnerName.c_str());
+        if (!session.status.empty()) ImGui::TextWrapped("%s", session.status.c_str());
+        ui::KeyValueRow("Breakpoints", "%u requested / %u bound", session.requestedBreakpoints, session.boundBreakpoints);
+        ui::KeyValueRow("Instruction stops", "%s", session.instructionStopsVerified ? "verified" : "not yet verified");
+        if (session.capabilities.runtimeVerified) {
+            ImGui::TextDisabled("Verified adapter: instruction stops, call-aware steps, frames and numeric storage");
+            ImGui::TextDisabled("Packed operand-stack values and complex-value edits are unavailable in this adapter.");
+        }
+        if (session.mappingRetained) {
+            if (session.ready() || session.state == GameMakerSessionState::Initializing || session.state == GameMakerSessionState::Installing)
+                ImGui::TextDisabled("The verified helper is loaded for this connection.");
+            else if (session.state == GameMakerSessionState::Inert)
+                ImGui::TextDisabled("The disabled helper mapping remains until the target exits.");
+            else if (session.state == GameMakerSessionState::Disabling)
+                ImGui::TextDisabled("Waiting for callback draining and helper unload.");
+            else ImGui::TextDisabled("The helper mapping is retained; review the connection error before continuing.");
+        }
+        if (!session.error.empty()) ImGui::TextColored(theme::col::warn(), "%s", session.error.c_str());
+        if (!gmlStatus_.empty()) ImGui::TextColored(theme::col::warn(), "%s", gmlStatus_.c_str());
+        ImGui::TextDisabled("The built-in helper verifies the runner and archive, then observes GML instruction boundaries. Game files are unchanged.");
+        ImGui::PopTextWrapPos();
+
+        ImGui::TableNextColumn();
+        ui::PanelHeader("Execution");
+        auto command = [&](GmlControlCommand c) {
+            gmlStatus_.clear();
+            ctx.debug.gameMakerCommand(c, paused ? session.stop->identity : GmlPauseIdentity{}, gmlStatus_);
+        };
+        ImGui::BeginDisabled(!matching || !session.ready() || (!paused && native.state != DbgState::Running));
+        if (ImGui::Button(paused ? "Continue GML" : "Pause GML"))
+            command(paused ? GmlControlCommand::Continue : GmlControlCommand::Pause);
         ImGui::EndDisabled();
-        if(!sameArchive)ImGui::TextDisabled("Activate the connected archive document to navigate this stop.");
+        ui::SameLineIfFits(125.0f * scale);
+        ImGui::BeginDisabled(!paused);
+        if (ImGui::Button("Step Into GML")) command(GmlControlCommand::StepInto);
+        ui::SameLineIfFits(130.0f * scale);
+        if (ImGui::Button("Step Over GML")) command(GmlControlCommand::StepOver);
+        ui::SameLineIfFits(125.0f * scale);
+        if (ImGui::Button("Step Out GML")) command(GmlControlCommand::StepOut);
+        ImGui::EndDisabled();
+        if (native.state == DbgState::Paused && matching && !paused)
+            ImGui::TextWrapped("This is a native pause. GML frame and numeric-edit authority are unavailable.");
+        if (paused && session.archive && session.stop->location.codeIndex < session.archive->code.size()) {
+            const auto& code = session.archive->code[session.stop->location.codeIndex];
+            ui::PanelHeader("Current GML stop");
+            ImGui::TextWrapped("Stopped in %s + %u", code.name.c_str(), session.stop->location.byteOffset);
+            const bool sameArchive = archive && ctx.staticBinary().contentHash() == session.archiveHash;
+            ImGui::BeginDisabled(!sameArchive);
+            if (ImGui::Button("Show GML instruction")) ctx.gotoAddress(code.bytecodeOffset + session.stop->location.byteOffset);
+            ImGui::EndDisabled();
+            if (!sameArchive) ImGui::TextWrapped("Activate the connected archive document to navigate this stop.");
+        }
+        ui::PanelHeader("Workflow");
+        ImGui::Checkbox("Use GML execution controls in the toolbar", &ctx.gmlExecutionMode);
+        ImGui::Checkbox("Follow GML stops in Binary View", &ctx.gmlAutoFollow);
+        ImGui::EndTable();
     }
 }
 
 void CommunicationsTab::render(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::TextUnformatted("Communications");
-    ui::SameLineIfFits(330.0f * scale);
-    ImGui::TextDisabled("Processes, connections and runtime debugging");
+    ui::PanelHeader("Communications", "Processes, connections and runtime debugging");
     static const char* views[] = {
         "Processes & Attach", "Network Monitor", "Java / JDWP", "GameMaker / GML"
     };
@@ -1117,7 +1287,8 @@ void CommunicationsTab::render(AppContext& ctx) {
     workspaceView_ = ui::TabStrip("##communications_views", views, 4,
                                    workspaceView_);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding,
+        ImGui::GetStyle().ChildRounding);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(7.0f * scale, 6.0f * scale));
@@ -1155,6 +1326,12 @@ void CommunicationsTab::render(AppContext& ctx) {
                           380.0f * scale, 340.0f * scale, divider);
         ImGui::BeginChild("c_right", ImVec2(0, 0),
                           ImGuiChildFlags_Borders);
+        if (selProc_ >= 0 && selProc_ < static_cast<int>(procs_.size())) {
+            const auto& selected = procs_[selProc_];
+            ui::PanelHeader(selected.name.c_str(), "Selected process");
+            ImGui::TextDisabled("PID %u  |  %s  |  %s", selected.pid,
+                selected.is64 ? "x64" : "x86", selected.canOpen ? "query access" : "access denied");
+        }
         if (ImGui::BeginTabBar("##process_details")) {
             if (ImGui::BeginTabItem("Modules")) {
                 renderModules();

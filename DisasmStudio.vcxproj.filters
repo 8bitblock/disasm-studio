@@ -19,6 +19,7 @@
     <ClCompile Include="src\Ui\Theme.cpp"><Filter>Source\Ui</Filter></ClCompile>
     <ClCompile Include="src\Ui\Fonts.cpp"><Filter>Source\Ui</Filter></ClCompile>
     <ClCompile Include="src\Ui\Widgets.cpp"><Filter>Source\Ui</Filter></ClCompile>
+    <ClCompile Include="src\Ui\ExecutionHistoryView.cpp"><Filter>Source\Ui</Filter></ClCompile>
     <ClCompile Include="src\Ui\CommandPalette.cpp"><Filter>Source\Ui</Filter></ClCompile>
     <ClCompile Include="src\Core\BinaryFile.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\GameMakerArchive.cpp"><Filter>Source\Core</Filter></ClCompile>
@@ -129,6 +130,7 @@
     <ClInclude Include="src\Ui\Splitter.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Ui\Icons.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Ui\Widgets.h"><Filter>Headers\Ui</Filter></ClInclude>
+    <ClInclude Include="src\Ui\ExecutionHistoryView.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Ui\GraphViewport.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Ui\CommandPalette.h"><Filter>Headers\Ui</Filter></ClInclude>
     <ClInclude Include="src\Core\Fuzzy.h"><Filter>Headers\Core</Filter></ClInclude>

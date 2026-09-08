@@ -136,6 +136,7 @@ void Debugger::recordExecutionFailure(std::string error) {
     if (executionFailure_.empty()) executionFailure_ = std::move(error);
     std::lock_guard lock(mtx_);
     mutationError_ = executionFailure_;
+    finishExecutionHistoryLocked(executionFailure_);
     lastEvent_ = executionFailure_;
     ++mutationErrorRevision_;
     // The queued command was authorized before this failure was visible. It

@@ -13,7 +13,9 @@
 #include "../Ui/Icons.h"
 #include "../Ui/Theme.h"
 #include "../Ui/Widgets.h"
+#include "../Ui/Splitter.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -498,19 +500,20 @@ void ConnectionsTab::renderLocalApiFramework(AppContext& ctx) {
         std::snprintf(apiTokenBuf_, sizeof(apiTokenBuf_), "%s", cfg.accessToken.c_str());
     }
 
-    ImGui::SeparatorText("Local API");
+    ui::PanelHeader("Local API schema");
+    ImGui::PushTextWrapPos();
     ImGui::TextColored(theme::col::warn(),
                        "Not included in DisasmStudio 1.0: no listener is shipped in this build.");
     bool enabled = cfg.enabled;
     ImGui::BeginDisabled();
     ImGui::Checkbox("Enabled", &enabled);
-    ImGui::SameLine();
+    ui::SameLineIfFits(125.0f * theme::UiScale());
     bool localOnly = cfg.localhostOnly;
     ImGui::Checkbox("Localhost only", &localOnly);
-    ImGui::SameLine();
+    ui::SameLineIfFits(65.0f * theme::UiScale());
     bool auth = cfg.authEnabled;
     ImGui::Checkbox("Auth", &auth);
-    ImGui::SameLine();
+    ui::SameLineIfFits(220.0f * theme::UiScale());
     ImGui::SetNextItemWidth(220.0f * theme::UiScale());
     ImGui::InputTextWithHint("##apitoken", "per-project token", apiTokenBuf_, sizeof(apiTokenBuf_));
     ImGui::EndDisabled();
@@ -545,20 +548,21 @@ void ConnectionsTab::renderLocalApiFramework(AppContext& ctx) {
                 apiStatus_ = err;
             }
         }
-        ImGui::SameLine();
+        ui::SameLineIfFits(95.0f * theme::UiScale());
         if (ImGui::SmallButton("Clear events") &&
             !ctx.staticProject().connectionEvents.empty()) {
             ctx.staticProject().connectionEvents.clear();
             ctx.markProjectDirty();
         }
         if (!apiStatus_.empty()) {
-            ImGui::SameLine();
             ImGui::TextDisabled("%s", apiStatus_.c_str());
         }
 
-        if (ImGui::BeginTable("apievents", 6,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY,
-                ImVec2(0, 150.0f * theme::UiScale()))) {
+        if (ui::BeginDataTable("apievents", 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX,
+                ImVec2(0, 150.0f * theme::UiScale()),
+                (std::max)(ImGui::GetContentRegionAvail().x, 820.0f * theme::UiScale()))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.0f * theme::UiScale());
             ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 95.0f * theme::UiScale());
             ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f * theme::UiScale());
@@ -586,10 +590,11 @@ void ConnectionsTab::renderLocalApiFramework(AppContext& ctx) {
                 ImGui::TableNextColumn(); ImGui::TextDisabled("%s", e.timestamp.c_str());
                 ImGui::PopID();
             }
-            ImGui::EndTable();
+            ui::EndDataTable();
         }
         ImGui::TreePop();
     }
+    ImGui::PopTextWrapPos();
 }
 
 void ConnectionsTab::render(AppContext& ctx) {
@@ -604,10 +609,7 @@ void ConnectionsTab::render(AppContext& ctx) {
         return;
     }
 
-    ImGui::TextUnformatted("Connection history");
-    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
-    ImGui::TextWrapped("Live process endpoints and traffic history. Server Watch shows debugger-observed API calls and payloads.");
-    ImGui::PopStyleColor();
+    ui::PanelHeader("Connection history", "Live process endpoints and retained traffic observations");
 
     // The unavailable legacy API schema is still inspectable, but it no longer
     // occupies the prime viewport above the live monitor on every visit.
@@ -623,7 +625,13 @@ void ConnectionsTab::render(AppContext& ctx) {
 
     if (ImGui::Button("Refresh now")) requestConnectionPoll();
     ui::SameLineIfFits(70.0f * scale); ImGui::Checkbox("Auto", &auto_);
-    ui::SameLineIfFits(105.0f * scale); ImGui::Checkbox("Active only", &activeOnly_);
+    ui::SameLineIfFits(115.0f * scale);
+    if (ImGui::Button("Clear history")) requestConnectionPoll(true);
+    ui::SameLineIfFits(125.0f * scale);
+    const bool refreshing = pollRunning_.load(std::memory_order_acquire);
+    ui::StatePill(refreshing ? "Refreshing" : auto_ ? "Monitoring" : "Idle",
+        refreshing || auto_ ? theme::col::accent() : theme::col::muted());
+    ImGui::Checkbox("Active only", &activeOnly_);
     ui::SameLineIfFits(95.0f * scale); ImGui::Checkbox("TCP only", &tcpOnly_);
     ui::SameLineIfFits(185.0f * scale);
     ImGui::BeginDisabled(attachedPid == 0);
@@ -631,8 +639,7 @@ void ConnectionsTab::render(AppContext& ctx) {
     ImGui::EndDisabled();
     if (attachedPid && ImGui::IsItemHovered())
         ImGui::SetTooltip("Show only connections owned by the debugged process (PID %u)", attachedPid);
-    ui::SameLineIfFits(115.0f * scale);
-    if (ImGui::Button("Clear history")) requestConnectionPoll(true);
+    ImGui::SetNextItemWidth(-1.0f);
     ui::SearchBox("##connfilter", "filter IP / port / process / PID...", filter_, sizeof(filter_), -1.0f);
     if (attachedPid == 0) attachedOnly_ = false;   // nothing attached: don't hide everything
 
@@ -644,7 +651,6 @@ void ConnectionsTab::render(AppContext& ctx) {
     }
     if (pollRunning_.load(std::memory_order_acquire)) {
         ctx.wantContinuousRedraw = true;
-        ImGui::TextDisabled("Refreshing network tables\xE2\x80\xA6");
     }
     ImGui::PushTextWrapPos();
     if (!pollError_.empty())
@@ -687,7 +693,8 @@ void ConnectionsTab::render(AppContext& ctx) {
 
     if (view.empty()) {
         if (log_.empty()) {
-            ImGui::TextWrapped("No connections have been sampled yet. Use Refresh now or leave Auto enabled.");
+            ui::EmptyState(DS_ICON_NETWORK, refreshing ? "Reading network tables" : "No connections recorded",
+                "Use Refresh now or leave Auto enabled to collect process endpoints.");
         } else if (ui::EmptyState(DS_ICON_SEARCH, "No matching connections",
                                  "Your search or scope filters hide the tracked connections.", "Reset filters")) {
             filter_[0] = '\0';
@@ -698,7 +705,7 @@ void ConnectionsTab::render(AppContext& ctx) {
     // Server Watch owns its own workspace. History retains the full viewport
     // regardless of whether a native debugger happens to be attached.
     const float tableH = ImGui::GetContentRegionAvail().y;
-    if (ImGui::BeginTable("conn_tbl", 9,
+    if (ui::BeginDataTable("conn_tbl", 9,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable, ImVec2(0, tableH),
             (std::max)(ImGui::GetContentRegionAvail().x, 1100.0f * scale))) {
@@ -721,31 +728,38 @@ void ConnectionsTab::render(AppContext& ctx) {
                 const ConnRecord& r = log_[view[row]];
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                if (r.proc.empty()) ImGui::Text("(pid %u)", r.pid);
-                else                ImGui::Text("%s (%u)", r.proc.c_str(), r.pid);
+                const std::string processLabel = r.proc.empty()
+                    ? "(pid " + std::to_string(r.pid) + ")"
+                    : r.proc + " (" + std::to_string(r.pid) + ")";
+                ImGui::TextUnformatted(processLabel.c_str());
+                ui::ItemTooltip(processLabel.c_str());
                 ImGui::TableSetColumnIndex(1); ImGui::TextDisabled("%s", r.proto.c_str());
                 ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(r.local.c_str());
+                ui::ItemTooltip(r.local.c_str());
                 ImGui::TableSetColumnIndex(3);
                 if (r.remote == "*") ImGui::TextDisabled("*");
                 else                 ImGui::TextUnformatted(r.remote.c_str());
+                ui::ItemTooltip(r.remote.c_str());
                 ImGui::TableSetColumnIndex(4); ImGui::TextDisabled("%s", r.state.c_str());
                 ImGui::TableSetColumnIndex(5);
                 if (r.haveBytes) ImGui::TextUnformatted(humanBytes(r.bytesIn).c_str());
-                else             ImGui::TextDisabled("\xE2\x80\x94");
+                else             ImGui::TextDisabled("--");
                 ImGui::TableSetColumnIndex(6);
                 if (r.haveBytes) ImGui::TextUnformatted(humanBytes(r.bytesOut).c_str());
-                else             ImGui::TextDisabled("\xE2\x80\x94");
+                else             ImGui::TextDisabled("--");
                 ImGui::TableSetColumnIndex(7);
-                if (r.active && (r.rateIn > 1.0 || r.rateOut > 1.0))
-                    ImGui::TextColored(theme::col::accent(), "\xE2\x86\x93%s \xE2\x86\x91%s",
+                if (r.active && (r.rateIn > 1.0 || r.rateOut > 1.0)) {
+                    ImGui::TextColored(theme::col::accent(), "in %s  out %s",
                                        humanRate(r.rateIn).c_str(), humanRate(r.rateOut).c_str());
-                else ImGui::TextDisabled("\xE2\x80\x94");
+                    const std::string rates = "Inbound: " + humanRate(r.rateIn) + "\nOutbound: " + humanRate(r.rateOut);
+                    ui::ItemTooltip(rates.c_str());
+                } else ImGui::TextDisabled("--");
                 ImGui::TableSetColumnIndex(8);
-                if (r.active) ImGui::TextColored(theme::col::good(), "\xE2\x97\x8f active");
+                if (r.active) ImGui::TextColored(theme::col::good(), "active");
                 else          ImGui::TextColored(theme::col::muted(), "closed %us ago", (now - r.lastSeen) / 1000);
             }
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
@@ -1034,9 +1048,12 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
         observationNextRefresh_ = now + (on ? 0.20 : 1.0);
     }
 
-    ImGui::TextUnformatted("Server Watch");
-    ui::SameLineIfFits(370.0f * scale);
-    ImGui::TextDisabled("resolve -> connect -> request -> response / payload");
+    ui::PanelHeader("Server Watch", "Resolve / connect / request / response / payload");
+    ui::StatePill(on ? observation_.coverage.active ? "Observing" : "Arming" : "Stopped",
+        on ? observation_.coverage.active ? theme::col::accent() : theme::col::warn() : theme::col::muted());
+    ui::SameLineIfFits(240.0f * scale);
+    if (debugLive) ImGui::TextDisabled("LIVE PID %u  |  %s", debug.pid, observationRequiresMatchingTarget_ ? "Triage target" : "attached process");
+    else ImGui::TextDisabled("No native debugger target");
     ImGui::PushTextWrapPos();
     ImGui::TextColored(theme::col::warn(),
         "Live observation runs only against an attached process. Use it only on targets you are authorized to execute and inspect.");
@@ -1045,7 +1062,8 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
     const bool canStart = debugLive &&
         (!observationRequiresMatchingTarget_ || matchingTarget);
     ImGui::BeginDisabled(!canStart && !on);
-    if (ImGui::Button(on ? "Stop Server Watch" : "Start Server Watch")) {
+    if (ui::AccentButton(on ? "Stop Server Watch" : "Start Server Watch",
+            on ? theme::col::warn() : theme::col::accent())) {
         if (on) ctx.debug.stopNetworkObservation();
         else    ctx.debug.startNetworkObservation();
         on = !on;
@@ -1083,756 +1101,821 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
             ImGui::SetTooltip("This removes the Triage target-identity guard; Server Watch still starts only when you press Start.");
     }
 
-    const NetworkProbeCoverage& coverage = observation_.coverage;
-    if (coverage.requested || on) {
-        ImGui::SeparatorText("Observation coverage");
-        ImGui::PushTextWrapPos();
-        const ImVec4 stateColor = coverage.active ? theme::col::good() : theme::col::warn();
-        ImGui::TextColored(stateColor, "%u/%u probes armed%s",
-                           coverage.probesArmed, coverage.probesAvailable,
-                           coverage.wow64 ? " (WOW64)" : "");
-        ImGui::TextDisabled(
-            "Coverage: DNS %s  Winsock %s  WinHTTP %s  WinINet %s  URLMon %s  payloads %s",
-            coverage.nameResolution ? "yes" : "no",
-            coverage.winsock ? "yes" : "no",
-            coverage.winHttp ? "yes" : "no",
-            coverage.winInet ? "yes" : "no",
-            coverage.urlMon ? "yes" : "no",
-            coverage.payloads ? "yes" : "no");
-        ImGui::TextDisabled(
-            "Probe accounting: %u skipped  %u shared with user breakpoints  %u return frames dropped",
-            coverage.probesSkipped,
-            coverage.probesSharedWithUserBreakpoints,
-            coverage.pendingReturnsDropped);
-        ImGui::TextDisabled(
-            "Retention: %zu / %zu events  %llu / %zu payload bytes",
+    renderObservationCoverage(on);
+    const float availableHeight = (std::max)(1.0f, ImGui::GetContentRegionAvail().y);
+    const float footerHeight = (std::max)(86.0f * scale, observationLogHeight_);
+    const float bodyHeight = (std::max)(1.0f,
+        availableHeight - footerHeight - ImGui::GetStyle().ItemSpacing.y);
+    // Keep the pre-layout table ID, so saved column widths/order survive the
+    // new child panes and compact/wide presentation changes.
+    const ImGuiID eventsTableId = ImGui::GetID("server_watch_events");
+    ImGui::BeginChild("##observation_workspace", ImVec2(0, bodyHeight), ImGuiChildFlags_None);
+    renderObservationWorkspace(ctx, debug, on, activeRuntimeImageMatches, matchingBase, matchingSize, eventsTableId);
+    ImGui::EndChild();
+    ImGui::BeginChild("##observation_log_footer", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+    renderObservationLog(ctx, on, canStart);
+    ImGui::EndChild();
+    observationLogHeight_ = ImGui::GetItemRectSize().y;
+}
+
+void ConnectionsTab::renderObservationCoverage(bool on) {
+    const auto& coverage = observation_.coverage;
+    if (!coverage.requested && !on) return;
+    ImGui::PushTextWrapPos();
+    ImGui::TextColored(coverage.active ? theme::col::good() : theme::col::warn(),
+        "%u/%u probes armed%s", coverage.probesArmed, coverage.probesAvailable,
+        coverage.wow64 ? " (WOW64)" : "");
+    ui::SameLineIfFits(290.0f * theme::UiScale());
+    ImGui::TextDisabled("%zu events  |  %llu payload bytes", observation_.events.size(),
+                       (unsigned long long)coverage.retainedPayloadBytes);
+    // Loss and incomplete coverage never disappear into a collapsed detail panel.
+    if (coverage.eventsDropped || coverage.payloadBytesDropped)
+        ImGui::TextColored(theme::col::warn(), "%u event(s) and %llu payload byte(s) dropped at the bounded retention caps",
+            coverage.eventsDropped, (unsigned long long)coverage.payloadBytesDropped);
+    if (coverage.pendingReturnsDropped || coverage.handleStatesDropped)
+        ImGui::TextColored(theme::col::warn(), "%u return frames dropped  |  %u handle-lineage states dropped",
+            coverage.pendingReturnsDropped, coverage.handleStatesDropped);
+    if (!coverage.limitations.empty())
+        ImGui::TextColored(theme::col::warn(), "%zu coverage limitation(s); review Observation coverage", coverage.limitations.size());
+    if (ImGui::CollapsingHeader("Observation coverage")) {
+        ImGui::TextDisabled("DNS %s  |  Winsock %s  |  WinHTTP %s  |  WinINet %s  |  URLMon %s  |  payloads %s",
+            coverage.nameResolution ? "yes" : "no", coverage.winsock ? "yes" : "no",
+            coverage.winHttp ? "yes" : "no", coverage.winInet ? "yes" : "no",
+            coverage.urlMon ? "yes" : "no", coverage.payloads ? "yes" : "no");
+        ImGui::TextDisabled("Probe accounting: %u skipped  |  %u shared with user breakpoints  |  %u return frames dropped",
+            coverage.probesSkipped, coverage.probesSharedWithUserBreakpoints, coverage.pendingReturnsDropped);
+        ImGui::TextDisabled("Retention: %zu / %zu events  |  %llu / %zu payload bytes",
             observation_.events.size(), kNetworkObservationEventCap,
-            (unsigned long long)coverage.retainedPayloadBytes,
-            kNetworkObservationRetainedPayloadCap);
-        if (coverage.eventsDropped || coverage.payloadBytesDropped)
-            ImGui::TextColored(theme::col::warn(),
-                "%u event(s) and %llu payload byte(s) dropped at the bounded retention caps",
-                coverage.eventsDropped,
-                (unsigned long long)coverage.payloadBytesDropped);
-        if (coverage.handleStatesDropped)
-            ImGui::TextColored(theme::col::warn(),
-                "%u handle-lineage state record(s) dropped at the 4,096-record cap",
-                coverage.handleStatesDropped);
-        if (!coverage.limitations.empty() && ImGui::TreeNode("Coverage limits")) {
-            for (const std::string& limitation : coverage.limitations)
-                ImGui::BulletText("%s", limitation.c_str());
-            ImGui::TreePop();
-        }
-        ImGui::PopTextWrapPos();
+            (unsigned long long)coverage.retainedPayloadBytes, kNetworkObservationRetainedPayloadCap);
+        for (const auto& limitation : coverage.limitations) ImGui::BulletText("%s", limitation.c_str());
     }
+    ImGui::PopTextWrapPos();
+}
 
-    ImGui::SeparatorText("Observed calls");
-    ImGui::SetNextItemWidth(260.0f * scale);
-    ui::SearchBox("##observationfilter", "filter host / endpoint / API...",
-                  observationFilter_, sizeof(observationFilter_), -1.0f);
-    std::string eventNeedle = observationFilter_;
-    for (char& c : eventNeedle) c = (char)std::tolower((unsigned char)c);
-    std::vector<int> eventView;
-    eventView.reserve(observation_.events.size());
-    for (int i = (int)observation_.events.size() - 1; i >= 0; --i) {
-        const NetworkObservationEvent& event = observation_.events[(size_t)i];
-        if (debugLive &&
-            (event.pid != debug.pid ||
-             event.sessionGeneration != debug.sessionGeneration))
-            continue;
-        std::string hay = std::string(observationStageName(event.stage)) + ' ' +
-                          observationApiName(event.api) + ' ' + event.hostname + ' ' +
-                          event.ip + ' ' + event.endpoint + ' ' + event.method + ' ' +
-                          event.object + ' ' + event.path + ' ' +
-                          (event.portValid ? std::to_string(event.port) : std::string()) + ' ' +
-                          event.detail + ' ' + observationOutcome(event);
-        if (const auto contract = observationReturnContract(event.api)) {
-            hay += ' '; hay += contract->successMeaning;
-            hay += ' '; hay += contract->failureMeaning;
-        }
-        for (char& c : hay) c = (char)std::tolower((unsigned char)c);
-        if (eventNeedle.empty() || hay.find(eventNeedle) != std::string::npos)
-            eventView.push_back(i);
+void ConnectionsTab::renderObservationWorkspace(AppContext& ctx, const DbgSnapshot& debug,
+        bool on, bool activeRuntimeImageMatches, uint64_t matchingBase, uint64_t matchingSize,
+        uint32_t eventsTableId) {
+    const float scale = theme::UiScale();
+    if (!eventsTableId) eventsTableId = ImGui::GetID("server_watch_events");
+    const bool debugLive = debug.state == DbgState::Running || debug.state == DbgState::Paused;
+    const bool compact = ImGui::GetContentRegionAvail().x < 1020.0f * scale;
+    if (compact) {
+        static const char* views[] = { "Events", "Details" };
+        observationCompactView_ = ui::TabStrip("##observation_compact_views", views, 2, observationCompactView_);
     }
-    ImGui::TextDisabled("%d shown / %zu events", (int)eventView.size(), observation_.events.size());
-
-    if (ImGui::BeginTable("server_watch_events", 6,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
-            ImVec2(0, 230.0f * scale),
-            (std::max)(ImGui::GetContentRegionAvail().x, 960.0f * scale))) {
-        ImGui::TableSetupScrollFreeze(1, 1);
-        ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthFixed, 78.0f * scale);
-        ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, 155.0f * scale);
-        ImGui::TableSetupColumn("Server / request");
-        ImGui::TableSetupColumn("Detail");
-        ImGui::TableSetupColumn("Outcome", ImGuiTableColumnFlags_WidthFixed, 135.0f * scale);
-        ImGui::TableSetupColumn("Continuation", ImGuiTableColumnFlags_WidthFixed, 112.0f * scale);
-        ImGui::TableHeadersRow();
-        ImGuiListClipper eventClip;
-        eventClip.Begin((int)eventView.size());
-        while (eventClip.Step()) {
-            for (int row = eventClip.DisplayStart; row < eventClip.DisplayEnd; ++row) {
-                const NetworkObservationEvent& event =
-                    observation_.events[(size_t)eventView[(size_t)row]];
-                ImGui::TableNextRow();
-                ImGui::PushID((int)event.sequence);
-                ImGui::TableNextColumn();
-                if (ImGui::Selectable(observationStageName(event.stage),
-                                      observationSelectedSequence_ == event.sequence,
-                                      ImGuiSelectableFlags_SpanAllColumns))
-                    observationSelectedSequence_ = event.sequence;
-                ImGui::TableNextColumn(); ImGui::TextDisabled("%s", observationApiName(event.api));
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(observationSummary(event).c_str());
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(event.detail.c_str());
-                ImGui::TableNextColumn();
-                const std::string outcome = observationOutcome(event);
-                const ImVec4 outcomeColor = outcome.rfind("success", 0) == 0
-                    ? theme::col::good()
-                    : outcome.rfind("failure", 0) == 0 ? theme::col::bad()
-                    : theme::col::muted();
-                ImGui::TextColored(outcomeColor, "%s", outcome.c_str());
-                ImGui::TableNextColumn();
-                if (event.caller) ImGui::Text("0x%llX", (unsigned long long)event.caller);
-                else              ImGui::TextDisabled("-");
-                ImGui::PopID();
+    // Retained split choices survive compact presentation and never alter the
+    // observation snapshot, selection identity, filters or collection state.
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float splitter = 6.0f * scale;
+    if (!compact) {
+        observationEventsWidth_ = std::clamp(availableWidth * observationEventsRatio_, 550.0f * scale,
+                                            availableWidth - 340.0f * scale - splitter);
+    }
+    const int activeCompactView = observationCompactView_;
+    if (!compact || activeCompactView == 0) {
+        ImGui::BeginChild("##observation_events", ImVec2(compact ? 0.0f : observationEventsWidth_, 0), ImGuiChildFlags_Borders);
+        ui::PanelHeader("Observed calls");
+        ImGui::SetNextItemWidth(-1.0f);
+        ui::SearchBox("##observationfilter", "filter host / endpoint / API...",
+                      observationFilter_, sizeof(observationFilter_), -1.0f);
+        std::string eventNeedle = observationFilter_;
+        for (char& c : eventNeedle) c = (char)std::tolower((unsigned char)c);
+        std::vector<int> eventView;
+        eventView.reserve(observation_.events.size());
+        for (int i = (int)observation_.events.size() - 1; i >= 0; --i) {
+            const NetworkObservationEvent& event = observation_.events[(size_t)i];
+            if (debugLive &&
+                (event.pid != debug.pid ||
+                 event.sessionGeneration != debug.sessionGeneration))
+                continue;
+            std::string hay = std::string(observationStageName(event.stage)) + ' ' +
+                              observationApiName(event.api) + ' ' + event.hostname + ' ' +
+                              event.ip + ' ' + event.endpoint + ' ' + event.method + ' ' +
+                              event.object + ' ' + event.path + ' ' +
+                              (event.portValid ? std::to_string(event.port) : std::string()) + ' ' +
+                              event.detail + ' ' + observationOutcome(event);
+            if (const auto contract = observationReturnContract(event.api)) {
+                hay += ' '; hay += contract->successMeaning;
+                hay += ' '; hay += contract->failureMeaning;
             }
+            for (char& c : hay) c = (char)std::tolower((unsigned char)c);
+            if (eventNeedle.empty() || hay.find(eventNeedle) != std::string::npos)
+                eventView.push_back(i);
         }
-        ImGui::EndTable();
-    }
-    if (observation_.events.empty())
-        ImGui::TextDisabled(on ? "Waiting for the target's networking APIs..."
-                               : "Start Server Watch to capture a grounded live network trail.");
+        ImGui::TextDisabled("%d shown / %zu events", (int)eventView.size(), observation_.events.size());
 
-    const NetworkObservationEvent* selectedEvent = nullptr;
-    for (const NetworkObservationEvent& event : observation_.events)
-        if (event.sequence == observationSelectedSequence_ &&
-            (!debugLive ||
-             (event.pid == debug.pid &&
-              event.sessionGeneration == debug.sessionGeneration))) {
-            selectedEvent = &event;
-            break;
-        }
-    if (selectedEvent) {
-        ImGui::Text("%s", observationSummary(*selectedEvent).c_str());
-        ImGui::SameLine(); ImGui::TextDisabled("tid %u%s", selectedEvent->tid,
-                                                selectedEvent->truncated ? "  truncated" : "");
-        if (const auto contract = observationReturnContract(selectedEvent->api)) {
-            const std::string expected = observationContractSummary(*contract);
-            const std::string outputs = observationOutputSummary(*contract);
-            ImGui::TextWrapped("Expected API result: %s", expected.c_str());
-            ImGui::TextWrapped("Expected reply/output fields: %s", outputs.c_str());
-        } else {
-            ImGui::TextDisabled("Expected API result: exact contract unavailable");
-        }
-        const std::string outcome = observationOutcome(*selectedEvent);
-        const std::string rawResult = observationRawResultText(*selectedEvent);
-        std::string observed = outcome + "; raw return " + rawResult;
-        if (selectedEvent->requestedBytesValid)
-            observed += "; requested " + std::to_string(selectedEvent->requestedBytes) + " byte(s)";
-        if (selectedEvent->transferredValid)
-            observed += "; transferred " + std::to_string(selectedEvent->transferred) + " byte(s)";
-        const ImVec4 observedColor = outcome.rfind("success", 0) == 0
-            ? theme::col::good()
-            : outcome.rfind("failure", 0) == 0 ? theme::col::bad()
-            : theme::col::warn();
-        ImGui::TextColored(observedColor, "Observed: %s", observed.c_str());
-        const bool selectedReplySide =
-            selectedEvent->stage == NetworkObservationStage::Receive ||
-            selectedEvent->stage == NetworkObservationStage::Response;
-        if (selectedReplySide) {
-            ImGui::TextColored(theme::col::warn(),
-                "This confirms the API operation/output evidence only; it does not prove that the server accepted the license or that reply content passed validation.");
-        }
-        ImGui::TextDisabled("Evidence: %s%s%s", observationEvidenceName(selectedEvent->evidenceQuality),
-                            selectedEvent->asyncPartial ? "  | asynchronous body is partial" : "",
-                            selectedEvent->payloadOpaque ? "  | payload is opaque" : "");
-        if (!selectedEvent->hostname.empty() || !selectedEvent->ip.empty() ||
-            selectedEvent->portValid || !selectedEvent->path.empty()) {
-            ImGui::TextDisabled("Target: host %s  ip %s  port %s  path %s",
-                                selectedEvent->hostname.empty() ? "-" : selectedEvent->hostname.c_str(),
-                                selectedEvent->ip.empty() ? "-" : selectedEvent->ip.c_str(),
-                                selectedEvent->portValid
-                                    ? std::to_string(selectedEvent->port).c_str() : "-",
-                                selectedEvent->path.empty() ? "-" : selectedEvent->path.c_str());
-        }
-        if (!selectedEvent->runtimeModule.empty() || selectedEvent->fileOffsetValid) {
-            if (selectedEvent->fileOffsetValid)
-                ImGui::TextDisabled("Continuation mapping: %s + file 0x%llX",
-                                    selectedEvent->runtimeModule.c_str(),
-                                    (unsigned long long)selectedEvent->fileOffset);
-            else
-                ImGui::TextDisabled("Continuation module: %s (FILE mapping unproven)",
-                                    selectedEvent->runtimeModule.c_str());
-            if (!selectedEvent->mappingEvidence.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", selectedEvent->mappingEvidence.c_str());
-        }
-        const bool eventMatchesActiveSession =
-            selectedEvent->pid == debug.pid &&
-            selectedEvent->sessionGeneration == debug.sessionGeneration;
-        bool eventMappingStillLoaded = false;
-        if (debugLive && eventMatchesActiveSession) {
-            for (const DbgModule& module : debug.modules) {
-                if (NetworkObservationEventMatchesMapping(
-                        *selectedEvent, debug.pid, debug.sessionGeneration,
-                        module.base, module.size, module.loadGeneration)) {
-                    eventMappingStillLoaded = true;
-                    break;
+        if (!eventView.empty() && ui::BeginDataTableEx("server_watch_events", eventsTableId, 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable,
+                ImVec2(0, ImGui::GetContentRegionAvail().y),
+                (std::max)(ImGui::GetContentRegionAvail().x, 960.0f * scale))) {
+            ImGui::TableSetupScrollFreeze(1, 1);
+            ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthFixed, 78.0f * scale);
+            ImGui::TableSetupColumn("API", ImGuiTableColumnFlags_WidthFixed, 155.0f * scale);
+            ImGui::TableSetupColumn("Server / request");
+            ImGui::TableSetupColumn("Detail");
+            ImGui::TableSetupColumn("Outcome", ImGuiTableColumnFlags_WidthFixed, 135.0f * scale);
+            ImGui::TableSetupColumn("Continuation", ImGuiTableColumnFlags_WidthFixed, 112.0f * scale);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper eventClip;
+            eventClip.Begin((int)eventView.size());
+            while (eventClip.Step()) {
+                for (int row = eventClip.DisplayStart; row < eventClip.DisplayEnd; ++row) {
+                    const NetworkObservationEvent& event =
+                        observation_.events[(size_t)eventView[(size_t)row]];
+                    ImGui::TableNextRow();
+                    ImGui::PushID((int)event.sequence);
+                    ImGui::TableNextColumn();
+                    if (ImGui::Selectable(observationStageName(event.stage),
+                                          observationSelectedSequence_ == event.sequence,
+                                          ImGuiSelectableFlags_SpanAllColumns))
+                    {
+                        observationSelectedSequence_ = event.sequence;
+                        observationCompactView_ = 1;
+                    }
+                    ImGui::TableNextColumn(); ImGui::TextDisabled("%s", observationApiName(event.api));
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(observationSummary(event).c_str());
+                    ui::ItemTooltip(observationSummary(event).c_str());
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(event.detail.c_str());
+                    ui::ItemTooltip(event.detail.c_str());
+                    ImGui::TableNextColumn();
+                    const std::string outcome = observationOutcome(event);
+                    const ImVec4 outcomeColor = outcome.rfind("success", 0) == 0
+                        ? theme::col::good()
+                        : outcome.rfind("failure", 0) == 0 ? theme::col::bad()
+                        : theme::col::muted();
+                    ImGui::TextColored(outcomeColor, "%s", outcome.c_str());
+                    ImGui::TableNextColumn();
+                    if (event.caller) ImGui::Text("0x%llX", (unsigned long long)event.caller);
+                    else              ImGui::TextDisabled("-");
+                    ImGui::PopID();
                 }
             }
+            ui::EndDataTable();
         }
-        if (selectedEvent->caller && eventMappingStillLoaded) {
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Open continuation in Live Assembly"))
-                ctx.gotoAddressLive(
-                    selectedEvent->caller,
-                    { selectedEvent->pid, selectedEvent->sessionGeneration });
+        if (observation_.events.empty())
+            ui::EmptyState(DS_ICON_NETWORK, on ? "Waiting for observed calls" : "No observed calls",
+                on ? "Supported networking API calls appear here as the target executes."
+                    : "Start Server Watch to capture a grounded live network trail.");
+
+        else if (eventView.empty() && !observation_.events.empty()) {
+            if (ui::EmptyState(DS_ICON_SEARCH, "No matching observed calls",
+                    "Your filter hides the retained observation events.", "Clear filter"))
+                observationFilter_[0] = '\0';
         }
-        if (debugLive && eventMatchesActiveSession &&
-            selectedEvent->runtimeModuleBase && !eventMappingStillLoaded)
-            ImGui::TextColored(theme::col::warn(),
-                "This event belongs to an unloaded or replaced module mapping; live/static navigation is disabled.");
-        const DocumentRuntimeMetadata::LiveImageIdentity& activeIdentity =
-            ctx.staticRuntimeMetadata().liveImage;
-        const bool eventInActiveRuntimeImage = activeRuntimeImageMatches &&
-            NetworkObservationEventMatchesMapping(
-                *selectedEvent, debug.pid, debug.sessionGeneration,
-                matchingBase, matchingSize,
-                activeIdentity.moduleLoadGeneration);
-        const bool mappedActiveImage = ctx.staticBinary().isMappedImage();
-        if (eventInActiveRuntimeImage &&
-            (mappedActiveImage || selectedEvent->fileOffsetValid)) {
-            uint64_t staticContinuation = 0;
-            const DocumentAnalysisCache& cache = ctx.staticAnalysisCache();
-            const NetworkProbeDescriptor* descriptor =
-                NetworkProbeDescriptorFor(selectedEvent->api);
-            const auto exactApi = descriptor
-                ? LookupNetworkApi(descriptor->dll, descriptor->symbol)
-                : std::nullopt;
-            NetworkReturnDisposition observedDisposition =
-                NetworkReturnDisposition::Indeterminate;
-            bool observedDispositionValid = false;
-            if (selectedEvent->resultValid) {
-                if (const auto observedContract =
-                        observationReturnContract(selectedEvent->api)) {
-                    observedDisposition = InterpretNetworkApiReturn(
-                        *observedContract, selectedEvent->rawResult,
-                        std::nullopt,
-                        selectedEvent->pointerWidthBits
-                            ? selectedEvent->pointerWidthBits : 64u);
-                    observedDispositionValid = true;
-                }
+        ImGui::EndChild();
+    }
+    if (!compact) {
+        ui::VSplitter("##observation_split", &observationEventsWidth_, 550.0f * scale,
+                      340.0f * scale, splitter);
+        if (ImGui::IsItemActive()) observationEventsRatio_ = observationEventsWidth_ / availableWidth;
+    }
+    if (!compact || activeCompactView == 1) {
+        // Prose follows the actual viewport after a wide/compact resize. The
+        // payload editor owns its own horizontal scroll independently.
+        ImGui::BeginChild("##observation_details", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        ui::PanelHeader("Selected observation");
+        ImGui::Checkbox("Display selected payload as hex##caps", &capHex_);
+        ImGui::PushTextWrapPos();
+        auto besideAction = [](const char* label) {
+            ui::SameLineIfFits(ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+        };
+        const NetworkObservationEvent* selectedEvent = nullptr;
+        for (const NetworkObservationEvent& event : observation_.events)
+            if (event.sequence == observationSelectedSequence_ &&
+                (!debugLive ||
+                 (event.pid == debug.pid &&
+                  event.sessionGeneration == debug.sessionGeneration))) {
+                selectedEvent = &event;
+                break;
             }
-            const NetworkReturnFlow* staticFlow = nullptr;
-            const char* staticFlowMatchEvidence = nullptr;
-            bool staticFlowExactContinuation = false;
-            const CrackmeTriageReturnDecisionInput* staticStatusDecision = nullptr;
-            const NetworkReplyDecisionFlow* staticReplyDecision = nullptr;
-            size_t staticReplyDecisionIndex = 0;
-            bool staticReplyDecisionIndexValid = false;
-            bool staticReplyExactCallsite = false;
-            const AuthorizationFlow* downstreamValidation = nullptr;
-            size_t downstreamValidationCount = 0;
-            bool staticStatusCodeValidationAvailable = false;
-            bool staticStatusCodeValidated = false;
-            bool staticStatusCodeMismatch = false;
-            bool staticReplyCodeValidationAvailable = false;
-            bool staticReplyCodeValidated = false;
-            bool staticReplyCodeMismatch = false;
-            bool staticContinuationValid = false;
-            if (mappedActiveImage) {
-                // A live-memory BinaryFile stores mapped layout (section raw
-                // offsets are RVAs), while NetworkObservationEvent::fileOffset
-                // is an original-PE raw offset projected from remote headers.
-                // The exact runtime caller is therefore the authoritative
-                // address for an exact-session mapped document.
-                staticContinuation = selectedEvent->caller;
-                size_t available = 0;
-                staticContinuationValid =
-                    ctx.staticBinary().ptrFromVA(staticContinuation, available) &&
-                    available != 0;
+        if (selectedEvent) {
+            ImGui::TextWrapped("%s", observationSummary(*selectedEvent).c_str());
+            ImGui::TextDisabled("tid %u%s", selectedEvent->tid,
+                                                    selectedEvent->truncated ? "  truncated" : "");
+            if (const auto contract = observationReturnContract(selectedEvent->api)) {
+                const std::string expected = observationContractSummary(*contract);
+                const std::string outputs = observationOutputSummary(*contract);
+                ImGui::TextWrapped("Expected API result: %s", expected.c_str());
+                ImGui::TextWrapped("Expected reply/output fields: %s", outputs.c_str());
             } else {
-                staticContinuationValid = ctx.staticBinary().offsetToVA(
-                    selectedEvent->fileOffset, staticContinuation);
+                ImGui::TextDisabled("Expected API result: exact contract unavailable");
             }
-            if (cache.crackmeTriage && exactApi && staticContinuationValid) {
-                for (const NetworkReturnFlow& candidate :
-                     cache.crackmeTriage->returnFlows) {
-                    if (!candidate.apiIndexValid ||
-                        candidate.apiIndex >= cache.crackmeTriage->apis.size())
-                        continue;
-                    const CrackmeTriageApiEvidence& api =
-                        cache.crackmeTriage->apis[candidate.apiIndex];
-                    if (api.dll != exactApi->dll ||
-                        api.canonicalName != exactApi->canonicalName)
-                        continue;
-                    const bool exactContinuation = mappedActiveImage
-                        ? candidate.continuationAddressValid &&
-                          candidate.continuationAddress == staticContinuation
-                        : candidate.continuationFileOffsetValid &&
-                          candidate.continuationFileOffset ==
-                              selectedEvent->fileOffset;
-                    const bool continuationIsUse =
-                        candidate.useAddressValid &&
-                        candidate.useAddress == staticContinuation;
-                    const bool followsCallsite =
-                        candidate.callsiteValid &&
-                        staticContinuation > candidate.callsite &&
-                        staticContinuation - candidate.callsite <= 16;
-                    if (exactContinuation) {
-                        staticFlow = &candidate;
-                        staticFlowExactContinuation = true;
-                        staticFlowMatchEvidence =
-                            "exact API return continuation";
+            const std::string outcome = observationOutcome(*selectedEvent);
+            const std::string rawResult = observationRawResultText(*selectedEvent);
+            std::string observed = outcome + "; raw return " + rawResult;
+            if (selectedEvent->requestedBytesValid)
+                observed += "; requested " + std::to_string(selectedEvent->requestedBytes) + " byte(s)";
+            if (selectedEvent->transferredValid)
+                observed += "; transferred " + std::to_string(selectedEvent->transferred) + " byte(s)";
+            const ImVec4 observedColor = outcome.rfind("success", 0) == 0
+                ? theme::col::good()
+                : outcome.rfind("failure", 0) == 0 ? theme::col::bad()
+                : theme::col::warn();
+            ImGui::TextColored(observedColor, "Observed: %s", observed.c_str());
+            const bool selectedReplySide =
+                selectedEvent->stage == NetworkObservationStage::Receive ||
+                selectedEvent->stage == NetworkObservationStage::Response;
+            if (selectedReplySide) {
+                ImGui::TextColored(theme::col::warn(),
+                    "This confirms the API operation/output evidence only; it does not prove that the server accepted the license or that reply content passed validation.");
+            }
+            ImGui::TextDisabled("Evidence: %s%s%s", observationEvidenceName(selectedEvent->evidenceQuality),
+                                selectedEvent->asyncPartial ? "  | asynchronous body is partial" : "",
+                                selectedEvent->payloadOpaque ? "  | payload is opaque" : "");
+            if (!selectedEvent->hostname.empty() || !selectedEvent->ip.empty() ||
+                selectedEvent->portValid || !selectedEvent->path.empty()) {
+                ImGui::TextDisabled("Target: host %s  ip %s  port %s  path %s",
+                                    selectedEvent->hostname.empty() ? "-" : selectedEvent->hostname.c_str(),
+                                    selectedEvent->ip.empty() ? "-" : selectedEvent->ip.c_str(),
+                                    selectedEvent->portValid
+                                        ? std::to_string(selectedEvent->port).c_str() : "-",
+                                    selectedEvent->path.empty() ? "-" : selectedEvent->path.c_str());
+            }
+            if (!selectedEvent->runtimeModule.empty() || selectedEvent->fileOffsetValid) {
+                if (selectedEvent->fileOffsetValid)
+                    ImGui::TextDisabled("Continuation mapping: %s + file 0x%llX",
+                                        selectedEvent->runtimeModule.c_str(),
+                                        (unsigned long long)selectedEvent->fileOffset);
+                else
+                    ImGui::TextDisabled("Continuation module: %s (FILE mapping unproven)",
+                                        selectedEvent->runtimeModule.c_str());
+                if (!selectedEvent->mappingEvidence.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", selectedEvent->mappingEvidence.c_str());
+            }
+            const bool eventMatchesActiveSession =
+                selectedEvent->pid == debug.pid &&
+                selectedEvent->sessionGeneration == debug.sessionGeneration;
+            bool eventMappingStillLoaded = false;
+            if (debugLive && eventMatchesActiveSession) {
+                for (const DbgModule& module : debug.modules) {
+                    if (NetworkObservationEventMatchesMapping(
+                            *selectedEvent, debug.pid, debug.sessionGeneration,
+                            module.base, module.size, module.loadGeneration)) {
+                        eventMappingStillLoaded = true;
                         break;
                     }
-                    if (!staticFlow && (continuationIsUse || followsCallsite)) {
-                        staticFlow = &candidate;
-                        staticFlowMatchEvidence = continuationIsUse
-                            ? "heuristic same-API use at the observed continuation"
-                            : "heuristic same-API callsite within 16 bytes of the observed continuation";
+                }
+            }
+            if (selectedEvent->caller && eventMappingStillLoaded) {
+                besideAction("Open continuation in Live Assembly");
+                if (ImGui::SmallButton("Open continuation in Live Assembly"))
+                    ctx.gotoAddressLive(
+                        selectedEvent->caller,
+                        { selectedEvent->pid, selectedEvent->sessionGeneration });
+            }
+            if (debugLive && eventMatchesActiveSession &&
+                selectedEvent->runtimeModuleBase && !eventMappingStillLoaded)
+                ImGui::TextColored(theme::col::warn(),
+                    "This event belongs to an unloaded or replaced module mapping; live/static navigation is disabled.");
+            const DocumentRuntimeMetadata::LiveImageIdentity& activeIdentity =
+                ctx.staticRuntimeMetadata().liveImage;
+            const bool eventInActiveRuntimeImage = activeRuntimeImageMatches &&
+                NetworkObservationEventMatchesMapping(
+                    *selectedEvent, debug.pid, debug.sessionGeneration,
+                    matchingBase, matchingSize,
+                    activeIdentity.moduleLoadGeneration);
+            const bool mappedActiveImage = ctx.staticBinary().isMappedImage();
+            if (eventInActiveRuntimeImage &&
+                (mappedActiveImage || selectedEvent->fileOffsetValid)) {
+                uint64_t staticContinuation = 0;
+                const DocumentAnalysisCache& cache = ctx.staticAnalysisCache();
+                const NetworkProbeDescriptor* descriptor =
+                    NetworkProbeDescriptorFor(selectedEvent->api);
+                const auto exactApi = descriptor
+                    ? LookupNetworkApi(descriptor->dll, descriptor->symbol)
+                    : std::nullopt;
+                NetworkReturnDisposition observedDisposition =
+                    NetworkReturnDisposition::Indeterminate;
+                bool observedDispositionValid = false;
+                if (selectedEvent->resultValid) {
+                    if (const auto observedContract =
+                            observationReturnContract(selectedEvent->api)) {
+                        observedDisposition = InterpretNetworkApiReturn(
+                            *observedContract, selectedEvent->rawResult,
+                            std::nullopt,
+                            selectedEvent->pointerWidthBits
+                                ? selectedEvent->pointerWidthBits : 64u);
+                        observedDispositionValid = true;
                     }
                 }
-
-                if (staticFlow) {
-                    float bestStatusScore = -1.0f;
-                    for (const CrackmeTriageReturnDecisionInput& decision :
-                         staticFlow->decisions) {
-                        float score = decision.confidence +
-                            static_cast<float>(decision.hops.size()) * 0.001f;
-                        if (observedDispositionValid &&
-                            observedDisposition ==
-                                NetworkReturnDisposition::Failure &&
-                            decision.failureAddressValid)
-                            score += 10.0f;
-                        else if (observedDispositionValid &&
-                                 observedDisposition ==
-                                     NetworkReturnDisposition::Success &&
-                                 decision.successAddressValid)
-                            score += 10.0f;
-                        if (!staticStatusDecision || score > bestStatusScore) {
-                            bestStatusScore = score;
-                            staticStatusDecision = &decision;
-                        }
-                    }
+                const NetworkReturnFlow* staticFlow = nullptr;
+                const char* staticFlowMatchEvidence = nullptr;
+                bool staticFlowExactContinuation = false;
+                const CrackmeTriageReturnDecisionInput* staticStatusDecision = nullptr;
+                const NetworkReplyDecisionFlow* staticReplyDecision = nullptr;
+                size_t staticReplyDecisionIndex = 0;
+                bool staticReplyDecisionIndexValid = false;
+                bool staticReplyExactCallsite = false;
+                const AuthorizationFlow* downstreamValidation = nullptr;
+                size_t downstreamValidationCount = 0;
+                bool staticStatusCodeValidationAvailable = false;
+                bool staticStatusCodeValidated = false;
+                bool staticStatusCodeMismatch = false;
+                bool staticReplyCodeValidationAvailable = false;
+                bool staticReplyCodeValidated = false;
+                bool staticReplyCodeMismatch = false;
+                bool staticContinuationValid = false;
+                if (mappedActiveImage) {
+                    // A live-memory BinaryFile stores mapped layout (section raw
+                    // offsets are RVAs), while NetworkObservationEvent::fileOffset
+                    // is an original-PE raw offset projected from remote headers.
+                    // The exact runtime caller is therefore the authoritative
+                    // address for an exact-session mapped document.
+                    staticContinuation = selectedEvent->caller;
+                    size_t available = 0;
+                    staticContinuationValid =
+                        ctx.staticBinary().ptrFromVA(staticContinuation, available) &&
+                        available != 0;
+                } else {
+                    staticContinuationValid = ctx.staticBinary().offsetToVA(
+                        selectedEvent->fileOffset, staticContinuation);
                 }
-
-                uint64_t continuationOwner = 0;
-                bool continuationOwnerValid = false;
-                if (cache.functions) {
-                    for (const FuncResult& function : *cache.functions) {
-                        const uint64_t end = function.address + function.size;
-                        if (staticContinuation >= function.address &&
-                            end >= function.address &&
-                            staticContinuation < end) {
-                            continuationOwner = function.address;
-                            continuationOwnerValid = true;
+                if (cache.crackmeTriage && exactApi && staticContinuationValid) {
+                    for (const NetworkReturnFlow& candidate :
+                         cache.crackmeTriage->returnFlows) {
+                        if (!candidate.apiIndexValid ||
+                            candidate.apiIndex >= cache.crackmeTriage->apis.size())
+                            continue;
+                        const CrackmeTriageApiEvidence& api =
+                            cache.crackmeTriage->apis[candidate.apiIndex];
+                        if (api.dll != exactApi->dll ||
+                            api.canonicalName != exactApi->canonicalName)
+                            continue;
+                        const bool exactContinuation = mappedActiveImage
+                            ? candidate.continuationAddressValid &&
+                              candidate.continuationAddress == staticContinuation
+                            : candidate.continuationFileOffsetValid &&
+                              candidate.continuationFileOffset ==
+                                  selectedEvent->fileOffset;
+                        const bool continuationIsUse =
+                            candidate.useAddressValid &&
+                            candidate.useAddress == staticContinuation;
+                        const bool followsCallsite =
+                            candidate.callsiteValid &&
+                            staticContinuation > candidate.callsite &&
+                            staticContinuation - candidate.callsite <= 16;
+                        if (exactContinuation) {
+                            staticFlow = &candidate;
+                            staticFlowExactContinuation = true;
+                            staticFlowMatchEvidence =
+                                "exact API return continuation";
                             break;
                         }
-                    }
-                }
-                int bestReplyScore = -1;
-                for (size_t candidateIndex = 0;
-                     candidateIndex < cache.crackmeTriage->replyDecisionFlows.size();
-                     ++candidateIndex) {
-                    const NetworkReplyDecisionFlow& candidate =
-                        cache.crackmeTriage->replyDecisionFlows[candidateIndex];
-                    if (!candidate.apiIndexValid ||
-                        candidate.apiIndex >= cache.crackmeTriage->apis.size() ||
-                        !candidate.comparisonAddressValid)
-                        continue;
-                    const CrackmeTriageApiEvidence& api =
-                        cache.crackmeTriage->apis[candidate.apiIndex];
-                    const bool sameApi = api.dll == exactApi->dll &&
-                        api.canonicalName == exactApi->canonicalName;
-                    const bool continuationIsComparison =
-                        candidate.comparisonAddress == staticContinuation ||
-                        (candidate.decisionAddressValid &&
-                         candidate.decisionAddress == staticContinuation);
-                    const bool followsCallsite = candidate.callsiteValid &&
-                        staticContinuation > candidate.callsite &&
-                        staticContinuation - candidate.callsite <= 16;
-                    const bool sameOwner = continuationOwnerValid &&
-                        candidate.functionAddressValid &&
-                        candidate.functionAddress == continuationOwner;
-                    const bool sameObservedStaticCall = staticFlow &&
-                        staticFlow->callsiteValid && candidate.callsiteValid &&
-                        candidate.callsite == staticFlow->callsite;
-                    int score = -1;
-                    if (sameApi && sameObservedStaticCall)
-                        score = 8;
-                    else if (sameApi &&
-                             (continuationIsComparison || followsCallsite))
-                        score = 5;
-                    else if (sameApi && sameOwner)
-                        score = 4;
-                    if (score < 0) continue;
-                    if (candidate.decisionAddressValid) ++score;
-                    if (score > bestReplyScore) {
-                        bestReplyScore = score;
-                        staticReplyDecision = &candidate;
-                        staticReplyDecisionIndex = candidateIndex;
-                        staticReplyDecisionIndexValid = true;
-                    }
-                }
-                staticReplyExactCallsite = staticReplyDecision && staticFlow &&
-                    staticReplyDecision->callsiteValid &&
-                    staticFlow->callsiteValid &&
-                    staticReplyDecision->callsite == staticFlow->callsite;
-                if (staticReplyDecisionIndexValid) {
-                    for (const AuthorizationFlow& flow :
-                         cache.crackmeTriage->authorization.flows) {
-                        if (!flow.networkReplyFlowIndexValid ||
-                            flow.networkReplyFlowIndex != staticReplyDecisionIndex)
-                            continue;
-                        if (!downstreamValidation) downstreamValidation = &flow;
-                        ++downstreamValidationCount;
-                    }
-                }
-            }
-            if (staticFlowExactContinuation && staticFlow &&
-                debug.state == DbgState::Paused) {
-                auto liveSignatureMatches = [&](uint64_t runtimeAddress,
-                                                const CodeByteSignature& signature,
-                                                bool& available) {
-                    available = false;
-                    if (!runtimeAddress || !ValidCodeByteSignature(signature))
-                        return false;
-                    std::array<uint8_t, kCodeByteSignatureMax> live{};
-                    const size_t got = ctx.debug.readMemoryMaskedForSession(
-                        debug.pid, debug.sessionGeneration, runtimeAddress,
-                        live.data(), signature.length);
-                    available = got == signature.length;
-                    return available && CodeByteSignatureMatches(
-                        signature, live.data(), got);
-                };
-                auto staticSignatureMatches = [&](uint64_t staticAddress,
-                                                  bool addressValid,
-                                                  const CodeByteSignature& signature,
-                                                  bool& available) {
-                    available = false;
-                    uint64_t runtimeAddress = 0;
-                    if (!addressValid || !ctx.debuggerStaticRuntimeVA(
-                            debug, staticAddress, runtimeAddress))
-                        return false;
-                    return liveSignatureMatches(runtimeAddress, signature,
-                                                available);
-                };
-
-                bool continuationAvailable = false;
-                bool comparisonAvailable = false;
-                bool branchAvailable = false;
-                const bool continuationMatches = liveSignatureMatches(
-                    selectedEvent->caller, staticFlow->continuationSignature,
-                    continuationAvailable);
-                if (staticStatusDecision) {
-                    const bool comparisonMatches = staticSignatureMatches(
-                        staticStatusDecision->comparisonAddress,
-                        staticStatusDecision->comparisonAddressValid,
-                        staticStatusDecision->comparisonSignature,
-                        comparisonAvailable);
-                    const bool branchMatches = staticSignatureMatches(
-                        staticStatusDecision->decisionAddress,
-                        staticStatusDecision->decisionAddressValid,
-                        staticStatusDecision->decisionSignature,
-                        branchAvailable);
-                    staticStatusCodeValidationAvailable =
-                        continuationAvailable && comparisonAvailable &&
-                        branchAvailable;
-                    staticStatusCodeValidated =
-                        staticStatusCodeValidationAvailable &&
-                        continuationMatches && comparisonMatches && branchMatches;
-                    staticStatusCodeMismatch =
-                        staticStatusCodeValidationAvailable &&
-                        !staticStatusCodeValidated;
-                }
-                if (staticReplyDecision && staticReplyExactCallsite) {
-                    comparisonAvailable = false;
-                    branchAvailable = false;
-                    const bool comparisonMatches = staticSignatureMatches(
-                        staticReplyDecision->comparisonAddress,
-                        staticReplyDecision->comparisonAddressValid,
-                        staticReplyDecision->comparisonSignature,
-                        comparisonAvailable);
-                    const bool branchMatches = staticSignatureMatches(
-                        staticReplyDecision->decisionAddress,
-                        staticReplyDecision->decisionAddressValid,
-                        staticReplyDecision->decisionSignature,
-                        branchAvailable);
-                    staticReplyCodeValidationAvailable =
-                        continuationAvailable && comparisonAvailable &&
-                        branchAvailable;
-                    staticReplyCodeValidated =
-                        staticReplyCodeValidationAvailable &&
-                        continuationMatches && comparisonMatches && branchMatches;
-                    staticReplyCodeMismatch =
-                        staticReplyCodeValidationAvailable &&
-                        !staticReplyCodeValidated;
-                }
-            }
-            if (staticFlow) {
-                ImGui::TextColored(staticFlowExactContinuation
-                        ? theme::col::good() : theme::col::warn(),
-                    "Live/static address match: %s",
-                    staticFlowMatchEvidence ? staticFlowMatchEvidence
-                                            : "unclassified static candidate");
-                if (!staticFlowExactContinuation)
-                    ImGui::TextDisabled(
-                        "The exact continuation record was unavailable. Comparison/branch links are heuristic review leads; arm prediction is disabled.");
-                else if (debug.state != DbgState::Paused)
-                    ImGui::TextColored(theme::col::warn(),
-                        "Pause the target to validate the live continuation, comparison, and branch instructions. Static arm prediction is disabled while it runs.");
-                else if (staticStatusDecision && staticStatusCodeValidated)
-                    ImGui::TextColored(theme::col::good(),
-                        "Current live continuation, comparison, and branch instruction bytes exactly match this static lineage. For on-disk images, relocation-overlapping instructions are unavailable rather than wildcarded." );
-                else if (staticStatusDecision && staticStatusCodeMismatch)
-                    ImGui::TextColored(theme::col::warn(),
-                        "Current live instruction bytes differ from the analyzed continuation/comparison/branch. The static lineage remains a review lead; arm prediction is disabled.");
-                else if (staticStatusDecision &&
-                         !staticStatusCodeValidationAvailable)
-                    ImGui::TextColored(theme::col::warn(),
-                        "A complete live/static instruction-byte comparison is unavailable. The static lineage remains a review lead; arm prediction is disabled.");
-                std::string staticHandling;
-                if (!staticFlow->decisions.empty()) {
-                    staticHandling = "traced through " + std::to_string(
-                        staticStatusDecision ? staticStatusDecision->hops.size() : 0) +
-                        " provenance hop(s) to a comparison branch";
-                } else if (staticFlow->returnValueUseKnown) {
-                    staticHandling = staticFlow->useSummary.empty()
-                        ? NetworkReturnUseKindText(staticFlow->useKind)
-                        : staticFlow->useSummary;
-                } else if (staticFlow->lineageAnalysisAttempted) {
-                    staticHandling = staticFlow->lineageComplete
-                        ? "bounded scalar lineage found no terminal comparison"
-                        : "bounded scalar lineage is partial";
-                } else {
-                    staticHandling = "use not recovered inside the annotation window";
-                }
-                ImGui::TextWrapped("Static caller handling (%s): %s",
-                    staticFlow->decisions.empty()
-                        ? "bounded first use" : "bounded multi-hop provenance",
-                    staticHandling.c_str());
-                if (!staticFlow->honestyLabel.empty() && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", staticFlow->honestyLabel.c_str());
-                if (staticFlow->callsiteValid) {
-                    if (ImGui::SmallButton("Open static call"))
-                        ctx.gotoAddress(staticFlow->callsite);
-                }
-                if (staticFlow->useAddressValid) {
-                    if (staticFlow->callsiteValid) ImGui::SameLine();
-                    if (ImGui::SmallButton("Open static use"))
-                        ctx.gotoAddress(staticFlow->useAddress);
-                }
-                if (staticFlow->decisionAddressValid) {
-                    if (staticFlow->callsiteValid || staticFlow->useAddressValid)
-                        ImGui::SameLine();
-                    if (ImGui::SmallButton("Open static decision"))
-                        ctx.gotoAddress(staticFlow->decisionAddress);
-                }
-                if (staticStatusDecision) {
-                    ImGui::SeparatorText("Static transport-status prediction");
-                    ImGui::TextWrapped("%s%s%s",
-                        staticStatusDecision->predicate.empty()
-                            ? "network API return is checked"
-                            : staticStatusDecision->predicate.c_str(),
-                        staticStatusDecision->expectedValue.empty()
-                            ? "" : " against ",
-                        staticStatusDecision->expectedValue.c_str());
-                    ImGui::TextDisabled("Taken: %s  |  fallthrough: %s  |  %zu provenance hop%s",
-                        NetworkReturnDispositionText(
-                            staticStatusDecision->takenDisposition),
-                        NetworkReturnDispositionText(
-                            staticStatusDecision->fallthroughDisposition),
-                        staticStatusDecision->hops.size(),
-                        staticStatusDecision->hops.size() == 1 ? "" : "s");
-                    ImGui::TextDisabled(
-                        "Server Watch observed the API return only. The comparison, branch, and arm below are static lineage; downstream execution was not observed.");
-                    if (staticStatusDecision->comparisonAddressValid &&
-                        ImGui::SmallButton("Open static status comparison"))
-                        ctx.gotoAddress(staticStatusDecision->comparisonAddress);
-                    if (staticStatusDecision->decisionAddressValid) {
-                        if (staticStatusDecision->comparisonAddressValid)
-                            ImGui::SameLine();
-                        if (ImGui::SmallButton("Open static status branch"))
-                            ctx.gotoAddress(staticStatusDecision->decisionAddress);
-                    }
-                    if (staticStatusCodeValidated && observedDispositionValid &&
-                        observedDisposition == NetworkReturnDisposition::Failure &&
-                        staticStatusDecision->failureAddressValid) {
-                        if (staticStatusDecision->comparisonAddressValid ||
-                            staticStatusDecision->decisionAddressValid)
-                            ImGui::SameLine();
-                        if (ImGui::SmallButton("Open predicted failure arm"))
-                            ctx.gotoAddress(staticStatusDecision->failureAddress);
-                    } else if (staticStatusCodeValidated && observedDispositionValid &&
-                               observedDisposition == NetworkReturnDisposition::Success &&
-                               staticStatusDecision->successAddressValid) {
-                        if (staticStatusDecision->comparisonAddressValid ||
-                            staticStatusDecision->decisionAddressValid)
-                            ImGui::SameLine();
-                        if (ImGui::SmallButton("Open predicted success arm"))
-                            ctx.gotoAddress(staticStatusDecision->successAddress);
-                    } else if (staticStatusCodeValidated && observedDispositionValid &&
-                               observedDisposition ==
-                               NetworkReturnDisposition::Indeterminate) {
-                        ImGui::TextColored(theme::col::warn(),
-                            "The observed sentinel may be asynchronous/pending; no static arm is predicted without decisive error/completion state.");
-                    }
-                    if (!staticStatusDecision->hops.empty() &&
-                        ImGui::TreeNode("##live_status_provenance",
-                            "Full status provenance (%zu hop%s)",
-                            staticStatusDecision->hops.size(),
-                            staticStatusDecision->hops.size() == 1 ? "" : "s")) {
-                        for (size_t hopIndex = 0;
-                             hopIndex < staticStatusDecision->hops.size();
-                             ++hopIndex) {
-                            const ValueProvenanceHop& hop =
-                                staticStatusDecision->hops[hopIndex];
-                            ImGui::PushID(static_cast<int>(hopIndex));
-                            if (hop.addressValid) {
-                                char label[48];
-                                std::snprintf(label, sizeof(label), "0x%llX",
-                                    (unsigned long long)hop.address);
-                                if (ImGui::SmallButton(label))
-                                    ctx.gotoAddress(hop.address);
-                                ImGui::SameLine();
-                            }
-                            ImGui::TextWrapped("%s%s%s%s%s",
-                                ValueProvenanceHopKindText(hop.kind),
-                                hop.functionName.empty() ? "" : " in ",
-                                hop.functionName.c_str(),
-                                hop.instruction.empty() ? "" : ": ",
-                                hop.instruction.c_str());
-                            if (ImGui::IsItemHovered() && !hop.evidence.empty())
-                                ImGui::SetTooltip("%s", hop.evidence.c_str());
-                            ImGui::PopID();
+                        if (!staticFlow && (continuationIsUse || followsCallsite)) {
+                            staticFlow = &candidate;
+                            staticFlowMatchEvidence = continuationIsUse
+                                ? "heuristic same-API use at the observed continuation"
+                                : "heuristic same-API callsite within 16 bytes of the observed continuation";
                         }
-                        ImGui::TreePop();
                     }
-                    if (!staticFlow->lineageComplete &&
-                        !staticFlow->lineageIncompleteReason.empty())
-                        ImGui::TextColored(theme::col::warn(),
-                            "Static lineage is partial: %s",
-                            staticFlow->lineageIncompleteReason.c_str());
+
+                    if (staticFlow) {
+                        float bestStatusScore = -1.0f;
+                        for (const CrackmeTriageReturnDecisionInput& decision :
+                             staticFlow->decisions) {
+                            float score = decision.confidence +
+                                static_cast<float>(decision.hops.size()) * 0.001f;
+                            if (observedDispositionValid &&
+                                observedDisposition ==
+                                    NetworkReturnDisposition::Failure &&
+                                decision.failureAddressValid)
+                                score += 10.0f;
+                            else if (observedDispositionValid &&
+                                     observedDisposition ==
+                                         NetworkReturnDisposition::Success &&
+                                     decision.successAddressValid)
+                                score += 10.0f;
+                            if (!staticStatusDecision || score > bestStatusScore) {
+                                bestStatusScore = score;
+                                staticStatusDecision = &decision;
+                            }
+                        }
+                    }
+
+                    uint64_t continuationOwner = 0;
+                    bool continuationOwnerValid = false;
+                    if (cache.functions) {
+                        for (const FuncResult& function : *cache.functions) {
+                            const uint64_t end = function.address + function.size;
+                            if (staticContinuation >= function.address &&
+                                end >= function.address &&
+                                staticContinuation < end) {
+                                continuationOwner = function.address;
+                                continuationOwnerValid = true;
+                                break;
+                            }
+                        }
+                    }
+                    int bestReplyScore = -1;
+                    for (size_t candidateIndex = 0;
+                         candidateIndex < cache.crackmeTriage->replyDecisionFlows.size();
+                         ++candidateIndex) {
+                        const NetworkReplyDecisionFlow& candidate =
+                            cache.crackmeTriage->replyDecisionFlows[candidateIndex];
+                        if (!candidate.apiIndexValid ||
+                            candidate.apiIndex >= cache.crackmeTriage->apis.size() ||
+                            !candidate.comparisonAddressValid)
+                            continue;
+                        const CrackmeTriageApiEvidence& api =
+                            cache.crackmeTriage->apis[candidate.apiIndex];
+                        const bool sameApi = api.dll == exactApi->dll &&
+                            api.canonicalName == exactApi->canonicalName;
+                        const bool continuationIsComparison =
+                            candidate.comparisonAddress == staticContinuation ||
+                            (candidate.decisionAddressValid &&
+                             candidate.decisionAddress == staticContinuation);
+                        const bool followsCallsite = candidate.callsiteValid &&
+                            staticContinuation > candidate.callsite &&
+                            staticContinuation - candidate.callsite <= 16;
+                        const bool sameOwner = continuationOwnerValid &&
+                            candidate.functionAddressValid &&
+                            candidate.functionAddress == continuationOwner;
+                        const bool sameObservedStaticCall = staticFlow &&
+                            staticFlow->callsiteValid && candidate.callsiteValid &&
+                            candidate.callsite == staticFlow->callsite;
+                        int score = -1;
+                        if (sameApi && sameObservedStaticCall)
+                            score = 8;
+                        else if (sameApi &&
+                                 (continuationIsComparison || followsCallsite))
+                            score = 5;
+                        else if (sameApi && sameOwner)
+                            score = 4;
+                        if (score < 0) continue;
+                        if (candidate.decisionAddressValid) ++score;
+                        if (score > bestReplyScore) {
+                            bestReplyScore = score;
+                            staticReplyDecision = &candidate;
+                            staticReplyDecisionIndex = candidateIndex;
+                            staticReplyDecisionIndexValid = true;
+                        }
+                    }
+                    staticReplyExactCallsite = staticReplyDecision && staticFlow &&
+                        staticReplyDecision->callsiteValid &&
+                        staticFlow->callsiteValid &&
+                        staticReplyDecision->callsite == staticFlow->callsite;
+                    if (staticReplyDecisionIndexValid) {
+                        for (const AuthorizationFlow& flow :
+                             cache.crackmeTriage->authorization.flows) {
+                            if (!flow.networkReplyFlowIndexValid ||
+                                flow.networkReplyFlowIndex != staticReplyDecisionIndex)
+                                continue;
+                            if (!downstreamValidation) downstreamValidation = &flow;
+                            ++downstreamValidationCount;
+                        }
+                    }
                 }
-            } else {
-                ImGui::TextDisabled(
-                    "Static caller handling was not matched to this continuation in the current bounded FILE report.");
-            }
-            if (selectedReplySide) {
-                ImGui::SeparatorText("Static reply-content comparison lead");
-                if (staticReplyDecision) {
-                    ImGui::TextWrapped("%s",
-                        staticReplyDecision->comparisonSummary.empty()
-                            ? staticReplyDecision->comparisonInstruction.c_str()
-                            : staticReplyDecision->comparisonSummary.c_str());
-                    if (!staticReplyDecision->expectedValue.empty())
-                        ImGui::TextColored(theme::col::accent(),
-                            "Expected/other operand: %s",
-                            staticReplyDecision->expectedValue.c_str());
-                    ImGui::TextDisabled(
-                        "Match/mismatch is proven only for this comparison. The live event does not prove either path executed or that either path means business acceptance.");
-                    if (!staticFlowExactContinuation ||
-                        !staticReplyExactCallsite)
-                        ImGui::TextColored(theme::col::warn(),
-                            "No exact observed-callsite/API-return continuation was matched. Match/mismatch path navigation is disabled; these are heuristic static review leads.");
+                if (staticFlowExactContinuation && staticFlow &&
+                    debug.state == DbgState::Paused) {
+                    auto liveSignatureMatches = [&](uint64_t runtimeAddress,
+                                                    const CodeByteSignature& signature,
+                                                    bool& available) {
+                        available = false;
+                        if (!runtimeAddress || !ValidCodeByteSignature(signature))
+                            return false;
+                        std::array<uint8_t, kCodeByteSignatureMax> live{};
+                        const size_t got = ctx.debug.readMemoryMaskedForSession(
+                            debug.pid, debug.sessionGeneration, runtimeAddress,
+                            live.data(), signature.length);
+                        available = got == signature.length;
+                        return available && CodeByteSignatureMatches(
+                            signature, live.data(), got);
+                    };
+                    auto staticSignatureMatches = [&](uint64_t staticAddress,
+                                                      bool addressValid,
+                                                      const CodeByteSignature& signature,
+                                                      bool& available) {
+                        available = false;
+                        uint64_t runtimeAddress = 0;
+                        if (!addressValid || !ctx.debuggerStaticRuntimeVA(
+                                debug, staticAddress, runtimeAddress))
+                            return false;
+                        return liveSignatureMatches(runtimeAddress, signature,
+                                                    available);
+                    };
+
+                    bool continuationAvailable = false;
+                    bool comparisonAvailable = false;
+                    bool branchAvailable = false;
+                    const bool continuationMatches = liveSignatureMatches(
+                        selectedEvent->caller, staticFlow->continuationSignature,
+                        continuationAvailable);
+                    if (staticStatusDecision) {
+                        const bool comparisonMatches = staticSignatureMatches(
+                            staticStatusDecision->comparisonAddress,
+                            staticStatusDecision->comparisonAddressValid,
+                            staticStatusDecision->comparisonSignature,
+                            comparisonAvailable);
+                        const bool branchMatches = staticSignatureMatches(
+                            staticStatusDecision->decisionAddress,
+                            staticStatusDecision->decisionAddressValid,
+                            staticStatusDecision->decisionSignature,
+                            branchAvailable);
+                        staticStatusCodeValidationAvailable =
+                            continuationAvailable && comparisonAvailable &&
+                            branchAvailable;
+                        staticStatusCodeValidated =
+                            staticStatusCodeValidationAvailable &&
+                            continuationMatches && comparisonMatches && branchMatches;
+                        staticStatusCodeMismatch =
+                            staticStatusCodeValidationAvailable &&
+                            !staticStatusCodeValidated;
+                    }
+                    if (staticReplyDecision && staticReplyExactCallsite) {
+                        comparisonAvailable = false;
+                        branchAvailable = false;
+                        const bool comparisonMatches = staticSignatureMatches(
+                            staticReplyDecision->comparisonAddress,
+                            staticReplyDecision->comparisonAddressValid,
+                            staticReplyDecision->comparisonSignature,
+                            comparisonAvailable);
+                        const bool branchMatches = staticSignatureMatches(
+                            staticReplyDecision->decisionAddress,
+                            staticReplyDecision->decisionAddressValid,
+                            staticReplyDecision->decisionSignature,
+                            branchAvailable);
+                        staticReplyCodeValidationAvailable =
+                            continuationAvailable && comparisonAvailable &&
+                            branchAvailable;
+                        staticReplyCodeValidated =
+                            staticReplyCodeValidationAvailable &&
+                            continuationMatches && comparisonMatches && branchMatches;
+                        staticReplyCodeMismatch =
+                            staticReplyCodeValidationAvailable &&
+                            !staticReplyCodeValidated;
+                    }
+                }
+                if (staticFlow) {
+                    ImGui::TextColored(staticFlowExactContinuation
+                            ? theme::col::good() : theme::col::warn(),
+                        "Live/static address match: %s",
+                        staticFlowMatchEvidence ? staticFlowMatchEvidence
+                                                : "unclassified static candidate");
+                    if (!staticFlowExactContinuation)
+                        ImGui::TextDisabled(
+                            "The exact continuation record was unavailable. Comparison/branch links are heuristic review leads; arm prediction is disabled.");
                     else if (debug.state != DbgState::Paused)
                         ImGui::TextColored(theme::col::warn(),
-                            "Pause the target to validate the live continuation, reply comparison, and branch instructions before opening a match/mismatch path.");
-                    else if (staticReplyCodeValidated)
+                            "Pause the target to validate the live continuation, comparison, and branch instructions. Static arm prediction is disabled while it runs.");
+                    else if (staticStatusDecision && staticStatusCodeValidated)
                         ImGui::TextColored(theme::col::good(),
-                            "Current live continuation, reply comparison, and branch instruction bytes exactly match this static lineage. For on-disk images, relocation-overlapping instructions are unavailable rather than wildcarded." );
-                    else if (staticReplyCodeMismatch)
+                            "Current live continuation, comparison, and branch instruction bytes exactly match this static lineage. For on-disk images, relocation-overlapping instructions are unavailable rather than wildcarded." );
+                    else if (staticStatusDecision && staticStatusCodeMismatch)
                         ImGui::TextColored(theme::col::warn(),
-                            "Current live bytes differ from the analyzed continuation/reply comparison/branch. Match/mismatch path navigation is disabled.");
-                    else if (!staticReplyCodeValidationAvailable)
+                            "Current live instruction bytes differ from the analyzed continuation/comparison/branch. The static lineage remains a review lead; arm prediction is disabled.");
+                    else if (staticStatusDecision &&
+                             !staticStatusCodeValidationAvailable)
                         ImGui::TextColored(theme::col::warn(),
-                            "A complete live/static continuation/reply comparison/branch byte check is unavailable. Match/mismatch path navigation is disabled.");
-                    if (staticReplyDecision->comparisonAddressValid &&
-                        ImGui::SmallButton("Open reply comparison"))
-                        ctx.gotoAddress(staticReplyDecision->comparisonAddress);
-                    if (staticReplyDecision->decisionAddressValid) {
-                        if (staticReplyDecision->comparisonAddressValid)
-                            ImGui::SameLine();
-                        if (ImGui::SmallButton("Open comparison branch"))
-                            ctx.gotoAddress(staticReplyDecision->decisionAddress);
+                            "A complete live/static instruction-byte comparison is unavailable. The static lineage remains a review lead; arm prediction is disabled.");
+                    std::string staticHandling;
+                    if (!staticFlow->decisions.empty()) {
+                        staticHandling = "traced through " + std::to_string(
+                            staticStatusDecision ? staticStatusDecision->hops.size() : 0) +
+                            " provenance hop(s) to a comparison branch";
+                    } else if (staticFlow->returnValueUseKnown) {
+                        staticHandling = staticFlow->useSummary.empty()
+                            ? NetworkReturnUseKindText(staticFlow->useKind)
+                            : staticFlow->useSummary;
+                    } else if (staticFlow->lineageAnalysisAttempted) {
+                        staticHandling = staticFlow->lineageComplete
+                            ? "bounded scalar lineage found no terminal comparison"
+                            : "bounded scalar lineage is partial";
+                    } else {
+                        staticHandling = "use not recovered inside the annotation window";
                     }
-                    if (staticReplyDecision->matchAddressValid) {
-                        if (staticReplyDecision->comparisonAddressValid ||
-                            staticReplyDecision->decisionAddressValid)
-                            ImGui::SameLine();
-                        ImGui::BeginDisabled(!staticReplyCodeValidated);
-                        if (ImGui::SmallButton("Open match path"))
-                            ctx.gotoAddress(staticReplyDecision->matchAddress);
-                        ImGui::EndDisabled();
-                        if (ImGui::IsItemHovered(
-                                ImGuiHoveredFlags_AllowWhenDisabled) &&
-                            !staticReplyDecision->takenPathSummary.empty())
-                            ImGui::SetTooltip("%s",
-                                (staticReplyDecision->matchAddress ==
-                                     staticReplyDecision->decisionTarget
-                                     ? staticReplyDecision->takenPathSummary
-                                     : staticReplyDecision->fallthroughPathSummary)
-                                    .c_str());
+                    ImGui::TextWrapped("Static caller handling (%s): %s",
+                        staticFlow->decisions.empty()
+                            ? "bounded first use" : "bounded multi-hop provenance",
+                        staticHandling.c_str());
+                    if (!staticFlow->honestyLabel.empty() && ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", staticFlow->honestyLabel.c_str());
+                    if (staticFlow->callsiteValid) {
+                        if (ImGui::SmallButton("Open static call"))
+                            ctx.gotoAddress(staticFlow->callsite);
                     }
-                    if (staticReplyDecision->mismatchAddressValid) {
-                        if (staticReplyDecision->comparisonAddressValid ||
-                            staticReplyDecision->decisionAddressValid ||
-                            staticReplyDecision->matchAddressValid)
-                            ImGui::SameLine();
-                        ImGui::BeginDisabled(!staticReplyCodeValidated);
-                        if (ImGui::SmallButton("Open mismatch path"))
-                            ctx.gotoAddress(staticReplyDecision->mismatchAddress);
-                        ImGui::EndDisabled();
-                        if (ImGui::IsItemHovered(
-                                ImGuiHoveredFlags_AllowWhenDisabled) &&
-                            !staticReplyDecision->takenPathSummary.empty())
-                            ImGui::SetTooltip("%s",
-                                (staticReplyDecision->mismatchAddress ==
-                                     staticReplyDecision->decisionTarget
-                                     ? staticReplyDecision->takenPathSummary
-                                     : staticReplyDecision->fallthroughPathSummary)
-                                    .c_str());
+                    if (staticFlow->useAddressValid) {
+                        if (staticFlow->callsiteValid) besideAction("Open static use");
+                        if (ImGui::SmallButton("Open static use"))
+                            ctx.gotoAddress(staticFlow->useAddress);
                     }
-                    if (!staticReplyDecision->evidence.empty())
-                        ImGui::TextWrapped("Static evidence: %s",
-                            staticReplyDecision->evidence.c_str());
-                    if (downstreamValidation) {
-                        if (ImGui::SmallButton("Open downstream validation"))
-                            ctx.openCrackmeAuthorization(downstreamValidation->id);
-                        ImGui::SameLine();
+                    if (staticFlow->decisionAddressValid) {
+                        if (staticFlow->callsiteValid || staticFlow->useAddressValid)
+                            besideAction("Open static decision");
+                        if (ImGui::SmallButton("Open static decision"))
+                            ctx.gotoAddress(staticFlow->decisionAddress);
+                    }
+                    if (staticStatusDecision) {
+                        ImGui::SeparatorText("Static transport-status prediction");
+                        ImGui::TextWrapped("%s%s%s",
+                            staticStatusDecision->predicate.empty()
+                                ? "network API return is checked"
+                                : staticStatusDecision->predicate.c_str(),
+                            staticStatusDecision->expectedValue.empty()
+                                ? "" : " against ",
+                            staticStatusDecision->expectedValue.c_str());
+                        ImGui::TextDisabled("Taken: %s  |  fallthrough: %s  |  %zu provenance hop%s",
+                            NetworkReturnDispositionText(
+                                staticStatusDecision->takenDisposition),
+                            NetworkReturnDispositionText(
+                                staticStatusDecision->fallthroughDisposition),
+                            staticStatusDecision->hops.size(),
+                            staticStatusDecision->hops.size() == 1 ? "" : "s");
                         ImGui::TextDisabled(
-                            "%zu linked allow/deny flow%s; includes remembered-state and startup gates when proven",
-                            downstreamValidationCount,
-                            downstreamValidationCount == 1 ? "" : "s");
+                            "Server Watch observed the API return only. The comparison, branch, and arm below are static lineage; downstream execution was not observed.");
+                        if (staticStatusDecision->comparisonAddressValid &&
+                            ImGui::SmallButton("Open static status comparison"))
+                            ctx.gotoAddress(staticStatusDecision->comparisonAddress);
+                        if (staticStatusDecision->decisionAddressValid) {
+                            if (staticStatusDecision->comparisonAddressValid)
+                                besideAction("Open static status branch");
+                            if (ImGui::SmallButton("Open static status branch"))
+                                ctx.gotoAddress(staticStatusDecision->decisionAddress);
+                        }
+                        if (staticStatusCodeValidated && observedDispositionValid &&
+                            observedDisposition == NetworkReturnDisposition::Failure &&
+                            staticStatusDecision->failureAddressValid) {
+                            if (staticStatusDecision->comparisonAddressValid ||
+                                staticStatusDecision->decisionAddressValid)
+                                besideAction("Open predicted failure arm");
+                            if (ImGui::SmallButton("Open predicted failure arm"))
+                                ctx.gotoAddress(staticStatusDecision->failureAddress);
+                        } else if (staticStatusCodeValidated && observedDispositionValid &&
+                                   observedDisposition == NetworkReturnDisposition::Success &&
+                                   staticStatusDecision->successAddressValid) {
+                            if (staticStatusDecision->comparisonAddressValid ||
+                                staticStatusDecision->decisionAddressValid)
+                                besideAction("Open predicted success arm");
+                            if (ImGui::SmallButton("Open predicted success arm"))
+                                ctx.gotoAddress(staticStatusDecision->successAddress);
+                        } else if (staticStatusCodeValidated && observedDispositionValid &&
+                                   observedDisposition ==
+                                   NetworkReturnDisposition::Indeterminate) {
+                            ImGui::TextColored(theme::col::warn(),
+                                "The observed sentinel may be asynchronous/pending; no static arm is predicted without decisive error/completion state.");
+                        }
+                        if (!staticStatusDecision->hops.empty() &&
+                            ImGui::TreeNode("##live_status_provenance",
+                                "Full status provenance (%zu hop%s)",
+                                staticStatusDecision->hops.size(),
+                                staticStatusDecision->hops.size() == 1 ? "" : "s")) {
+                            for (size_t hopIndex = 0;
+                                 hopIndex < staticStatusDecision->hops.size();
+                                 ++hopIndex) {
+                                const ValueProvenanceHop& hop =
+                                    staticStatusDecision->hops[hopIndex];
+                                ImGui::PushID(static_cast<int>(hopIndex));
+                                if (hop.addressValid) {
+                                    char label[48];
+                                    std::snprintf(label, sizeof(label), "0x%llX",
+                                        (unsigned long long)hop.address);
+                                    if (ImGui::SmallButton(label))
+                                        ctx.gotoAddress(hop.address);
+                                    ui::SameLineIfFits(160.0f * scale);
+                                }
+                                ImGui::TextWrapped("%s%s%s%s%s",
+                                    ValueProvenanceHopKindText(hop.kind),
+                                    hop.functionName.empty() ? "" : " in ",
+                                    hop.functionName.c_str(),
+                                    hop.instruction.empty() ? "" : ": ",
+                                    hop.instruction.c_str());
+                                if (ImGui::IsItemHovered() && !hop.evidence.empty())
+                                    ImGui::SetTooltip("%s", hop.evidence.c_str());
+                                ImGui::PopID();
+                            }
+                            ImGui::TreePop();
+                        }
+                        if (!staticFlow->lineageComplete &&
+                            !staticFlow->lineageIncompleteReason.empty())
+                            ImGui::TextColored(theme::col::warn(),
+                                "Static lineage is partial: %s",
+                                staticFlow->lineageIncompleteReason.c_str());
                     }
                 } else {
-                    ImGui::TextColored(theme::col::warn(),
-                        "No reply-buffer comparison was matched to this continuation in the bounded FILE report. Follow the payload/header output from the receive API; the API-result branch above is only status handling.");
+                    ImGui::TextDisabled(
+                        "Static caller handling was not matched to this continuation in the current bounded FILE report.");
+                }
+                if (selectedReplySide) {
+                    ImGui::SeparatorText("Static reply-content comparison lead");
+                    if (staticReplyDecision) {
+                        ImGui::TextWrapped("%s",
+                            staticReplyDecision->comparisonSummary.empty()
+                                ? staticReplyDecision->comparisonInstruction.c_str()
+                                : staticReplyDecision->comparisonSummary.c_str());
+                        if (!staticReplyDecision->expectedValue.empty())
+                            ImGui::TextColored(theme::col::accent(),
+                                "Expected/other operand: %s",
+                                staticReplyDecision->expectedValue.c_str());
+                        ImGui::TextDisabled(
+                            "Match/mismatch is proven only for this comparison. The live event does not prove either path executed or that either path means business acceptance.");
+                        if (!staticFlowExactContinuation ||
+                            !staticReplyExactCallsite)
+                            ImGui::TextColored(theme::col::warn(),
+                                "No exact observed-callsite/API-return continuation was matched. Match/mismatch path navigation is disabled; these are heuristic static review leads.");
+                        else if (debug.state != DbgState::Paused)
+                            ImGui::TextColored(theme::col::warn(),
+                                "Pause the target to validate the live continuation, reply comparison, and branch instructions before opening a match/mismatch path.");
+                        else if (staticReplyCodeValidated)
+                            ImGui::TextColored(theme::col::good(),
+                                "Current live continuation, reply comparison, and branch instruction bytes exactly match this static lineage. For on-disk images, relocation-overlapping instructions are unavailable rather than wildcarded." );
+                        else if (staticReplyCodeMismatch)
+                            ImGui::TextColored(theme::col::warn(),
+                                "Current live bytes differ from the analyzed continuation/reply comparison/branch. Match/mismatch path navigation is disabled.");
+                        else if (!staticReplyCodeValidationAvailable)
+                            ImGui::TextColored(theme::col::warn(),
+                                "A complete live/static continuation/reply comparison/branch byte check is unavailable. Match/mismatch path navigation is disabled.");
+                        if (staticReplyDecision->comparisonAddressValid &&
+                            ImGui::SmallButton("Open reply comparison"))
+                            ctx.gotoAddress(staticReplyDecision->comparisonAddress);
+                        if (staticReplyDecision->decisionAddressValid) {
+                            if (staticReplyDecision->comparisonAddressValid)
+                                besideAction("Open comparison branch");
+                            if (ImGui::SmallButton("Open comparison branch"))
+                                ctx.gotoAddress(staticReplyDecision->decisionAddress);
+                        }
+                        if (staticReplyDecision->matchAddressValid) {
+                            if (staticReplyDecision->comparisonAddressValid ||
+                                staticReplyDecision->decisionAddressValid)
+                                besideAction("Open match path");
+                            ImGui::BeginDisabled(!staticReplyCodeValidated);
+                            if (ImGui::SmallButton("Open match path"))
+                                ctx.gotoAddress(staticReplyDecision->matchAddress);
+                            ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(
+                                    ImGuiHoveredFlags_AllowWhenDisabled) &&
+                                !staticReplyDecision->takenPathSummary.empty())
+                                ImGui::SetTooltip("%s",
+                                    (staticReplyDecision->matchAddress ==
+                                         staticReplyDecision->decisionTarget
+                                         ? staticReplyDecision->takenPathSummary
+                                         : staticReplyDecision->fallthroughPathSummary)
+                                        .c_str());
+                        }
+                        if (staticReplyDecision->mismatchAddressValid) {
+                            if (staticReplyDecision->comparisonAddressValid ||
+                                staticReplyDecision->decisionAddressValid ||
+                                staticReplyDecision->matchAddressValid)
+                                besideAction("Open mismatch path");
+                            ImGui::BeginDisabled(!staticReplyCodeValidated);
+                            if (ImGui::SmallButton("Open mismatch path"))
+                                ctx.gotoAddress(staticReplyDecision->mismatchAddress);
+                            ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(
+                                    ImGuiHoveredFlags_AllowWhenDisabled) &&
+                                !staticReplyDecision->takenPathSummary.empty())
+                                ImGui::SetTooltip("%s",
+                                    (staticReplyDecision->mismatchAddress ==
+                                         staticReplyDecision->decisionTarget
+                                         ? staticReplyDecision->takenPathSummary
+                                         : staticReplyDecision->fallthroughPathSummary)
+                                        .c_str());
+                        }
+                        if (!staticReplyDecision->evidence.empty())
+                            ImGui::TextWrapped("Static evidence: %s",
+                                staticReplyDecision->evidence.c_str());
+                        if (downstreamValidation) {
+                            if (ImGui::SmallButton("Open downstream validation"))
+                                ctx.openCrackmeAuthorization(downstreamValidation->id);
+                            ui::SameLineIfFits(160.0f * scale);
+                            ImGui::TextDisabled(
+                                "%zu linked allow/deny flow%s; includes remembered-state and startup gates when proven",
+                                downstreamValidationCount,
+                                downstreamValidationCount == 1 ? "" : "s");
+                        }
+                    } else {
+                        ImGui::TextColored(theme::col::warn(),
+                            "No reply-buffer comparison was matched to this continuation in the bounded FILE report. Follow the payload/header output from the receive API; the API-result branch above is only status handling.");
+                    }
                 }
             }
+            if (!selectedEvent->payload.empty() && ImGui::TreeNode("Observed payload")) {
+                std::string body = (capHex_ || !mostlyText(selectedEvent->payload))
+                                 ? toHexDump(selectedEvent->payload)
+                                 : toText(selectedEvent->payload);
+                ui::PushMono();
+                ImGui::InputTextMultiline("##observationpayload", body.data(), body.size() + 1,
+                                          ImVec2(-1, 100.0f * scale), ImGuiInputTextFlags_ReadOnly);
+                ui::PopMono();
+                ImGui::TreePop();
+            }
         }
-        if (!selectedEvent->payload.empty() && ImGui::TreeNode("Observed payload")) {
-            std::string body = (capHex_ || !mostlyText(selectedEvent->payload))
-                             ? toHexDump(selectedEvent->payload)
-                             : toText(selectedEvent->payload);
-            ui::PushMono();
-            ImGui::InputTextMultiline("##observationpayload", body.data(), body.size() + 1,
-                                      ImVec2(-1, 100.0f * scale), ImGuiInputTextFlags_ReadOnly);
-            ui::PopMono();
-            ImGui::TreePop();
-        }
-    }
 
-    ImGui::SeparatorText("Observation log");
-    ImGui::Checkbox("Display selected payload as hex##caps", &capHex_);
-    ImGui::SameLine();
+        if (!selectedEvent) ImGui::TextWrapped("Select an observed call to inspect its API contract, observed result, payload and continuation evidence.");
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+    }
+}
+
+void ConnectionsTab::renderObservationLog(AppContext& ctx, bool& on, bool canStart) {
+    ImGui::PushTextWrapPos();
+    ui::PanelHeader("Observation log");
     const bool logging = ctx.debug.netCaptureLogEnabled();
     // Starting a file log is also an observation start edge. Apply the same
     // attachment/document identity guard as the visible Start Server Watch
     // button so a routed Triage watch cannot be redirected through this path.
     ImGui::BeginDisabled(!logging && !on && !canStart);
-    if (ImGui::SmallButton(logging ? "Stop file log##caps" : "Start file log...##caps")) {
+    if (ImGui::SmallButton(logging ? "Stop file log##caps"
+            : on ? "Start file log...##caps" : "Start watch + file log...##caps")) {
         if (logging) {
             ctx.debug.closeNetCaptureLogFile();
             capLogStatus_ = "Finishing queued network log records...";
@@ -1891,17 +1974,19 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Queue captured buffers for a background text/hex writer. Queue drops and storage errors are shown below.");
     const auto logStatus = ctx.debug.netCaptureLogStatus();
+    ui::SameLineIfFits(105.0f * theme::UiScale());
+    ui::StatePill(!logStatus.error.empty() ? "Failed" : logStatus.opening ? "Opening"
+        : logStatus.draining ? "Finishing" : logStatus.enabled ? "Recording" : "Idle",
+        !logStatus.error.empty() ? theme::col::bad()
+        : logStatus.opening || logStatus.draining ? theme::col::warn()
+        : logStatus.enabled ? theme::col::accent() : theme::col::muted());
     if (!logStatus.enabled && !logStatus.draining &&
         capLogStatus_ == "Finishing queued network log records...")
         capLogStatus_ = "Network payload log stopped.";
     if (ctx.debug.netCaptureLogEnabled()) {
         std::string path = ctx.debug.netCaptureLogPath();
-        ImGui::TextColored(logStatus.opening ? theme::col::warn() : theme::col::good(), "%s",
-            logStatus.opening ? "Opening log file..." : "Logging to file");
         if (!path.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", path.c_str());
-            ImGui::SameLine();
+            ImGui::TextWrapped("%s", path.c_str());
             if (ImGui::SmallButton("Copy path##caplog")) ImGui::SetClipboardText(path.c_str());
         }
     } else if (logStatus.draining) {
@@ -1920,13 +2005,11 @@ void ConnectionsTab::renderPayloadCapture(AppContext& ctx) {
     if (logStatus.opening || logStatus.draining || logStatus.queuedRecords)
         ctx.wantContinuousRedraw = true;
     if (!on) {
-        ImGui::TextDisabled(
-            "Server Watch follows exact Winsock, WinHTTP, and WinINet calls, including handle lineage and WOW64 targets where probes are available.");
-        ImGui::TextDisabled(
-            "Plaintext request/response buffers are readable; custom TLS and encrypted transport payloads remain ciphertext. Coverage limits are reported above.");
-        return;
+        ImGui::TextDisabled("Observation follows supported API calls; custom TLS may remain opaque.");
+        ui::ItemTooltip("Server Watch follows exact Winsock, WinHTTP, and WinINet calls, including handle lineage and WOW64 targets where probes are available. Plaintext request/response buffers are readable; custom TLS and encrypted transport payloads remain ciphertext. Review Observation coverage for limits.");
     }
-    ctx.wantContinuousRedraw = true;   // stream captures live
+    ImGui::PopTextWrapPos();
+    if (on) ctx.wantContinuousRedraw = true;   // stream captures live
 }
 
 } // namespace ds

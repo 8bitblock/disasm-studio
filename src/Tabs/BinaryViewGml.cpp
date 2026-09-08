@@ -186,7 +186,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
 
     const auto tableFlags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
         ImGuiTableFlags_Resizable;
-    if (gmlBrowseKind_ <= 2 && ImGui::BeginTable("gml_archive", 4, tableFlags, ImVec2(0, 0))) {
+    if (gmlBrowseKind_ <= 2 && ui::BeginDataTable("gml_archive", 4, tableFlags, ImVec2(0, 0))) {
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 76 * scale);
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 130 * scale);
@@ -281,7 +281,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
             }
             ImGui::PopID();
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     } else if (gmlBrowseKind_ == 3) {
         auto& rows = ctx.staticProject().gmlBreakpoints;
         if(session.archiveHash==ctx.staticBinary().contentHash())ImGui::TextDisabled("%u requested / %u bound | %s",session.requestedBreakpoints,session.boundBreakpoints,session.status.c_str());
@@ -332,7 +332,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
         const size_t savedCount=saved.size(),total=savedCount+gmlTransientWatches_.size();
         for(size_t i=0;i<total;++i){const auto& w=i<savedCount?saved[i]:gmlTransientWatches_[i-savedCount];if(filter.empty() || foldName(w.label+" "+w.target.variableName).find(filter)!=std::string::npos)rows.push_back(i);}
         size_t remove=SIZE_MAX;
-        if(ImGui::BeginTable("gml_watches",4,tableFlags,ImVec2(0,0))){
+        if(ui::BeginDataTable("gml_watches",4,tableFlags,ImVec2(0,0))){
             ImGui::TableSetupColumn("Watch");ImGui::TableSetupColumn("Scope");ImGui::TableSetupColumn("Value / status");ImGui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthFixed,70*scale);ImGui::TableSetupScrollFreeze(0,1);ImGui::TableHeadersRow();
             ImGuiListClipper clip;clip.Begin(static_cast<int>(rows.size()),ImGui::GetFrameHeightWithSpacing());
             while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;++i){
@@ -373,14 +373,14 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
                     if(ImGui::SmallButton("Inspect")){std::string error;if(!ctx.debug.inspectGameMakerInstance(stop->identity,watch.target.scope==GmlVariableScope::UniqueObject?watch.target.objectIndex:kGmlNoCodeIndex,watch.target.scope==GmlVariableScope::SessionInstance?watch.target.instanceId:0,error))ui::Toast(ui::ToastKind::Warn,error);}
                 }else{ImGui::BeginDisabled(!slot || !editable(*slot));if(ImGui::SmallButton("Edit"))editSlot(static_cast<uint32_t>(resolution.slotIndex));ImGui::EndDisabled();}ImGui::PopID();
             }
-            ImGui::EndTable();
+            ui::EndDataTable();
         }
         if(remove!=SIZE_MAX){if(remove<savedCount){saved.erase(saved.begin()+remove);ctx.markProjectDirty();}else gmlTransientWatches_.erase(gmlTransientWatches_.begin()+(remove-savedCount));}
     } else if(gmlBrowseKind_==5){
         if(!stop)ImGui::TextDisabled("Frames are available while paused at a verified GML instruction.");
         else{
             if(!stop->framesComplete)ImGui::TextDisabled("Frame ancestry is partial.");
-            if(ImGui::BeginTable("gml_frames",4,tableFlags,ImVec2(0,0))){
+            if(ui::BeginDataTable("gml_frames",4,tableFlags,ImVec2(0,0))){
                 ImGui::TableSetupColumn("Frame",ImGuiTableColumnFlags_WidthFixed,90*scale);ImGui::TableSetupColumn("Script / location");ImGui::TableSetupColumn("Scope availability");ImGui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthFixed,120*scale);ImGui::TableSetupScrollFreeze(0,1);ImGui::TableHeadersRow();
                 ImGuiListClipper clip;clip.Begin(static_cast<int>(stop->frameCount),ImGui::GetFrameHeightWithSpacing());
                 while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;++i){const auto& frame=stop->frames[i];const auto* code=frame.location.codeIndex<archive->code.size()?&archive->code[frame.location.codeIndex]:nullptr;
@@ -390,7 +390,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
                     ImGui::TableSetColumnIndex(3);if(ImGui::SmallButton("Values")){gmlSelectedFrameId_=frame.frameId;gmlSelectedInstanceId_=0;gmlBrowseKind_=6;}ImGui::SameLine();
                     const uint64_t offset=code?code->bytecodeOffset+frame.location.byteOffset:0;ImGui::BeginDisabled(!code || !archive->isInstructionOffset(offset));if(ImGui::SmallButton("Code")){mainView_=0;navigateTo(offset);}ImGui::EndDisabled();ImGui::PopID();
                 }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
         }
     } else if(gmlBrowseKind_==6){
@@ -403,7 +403,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
             ImGui::TextDisabled("Copied and computed values are read-only. Right-click a named variable to add a watch.");
             std::vector<uint32_t> rows;
             for(uint32_t i=0;i<stop->numericSlotCount;++i){const auto& slot=stop->numericSlots[i];if(slot.scope==GmlVariableScope::FrameLocal && slot.frameId!=gmlSelectedFrameId_)continue;if(slot.scope==GmlVariableScope::SessionInstance && selected && slot.instanceId!=(gmlSelectedInstanceId_?gmlSelectedInstanceId_:selected->instanceId))continue;const std::string_view name=exactSlotName(slot)?std::string_view(slot.name,slot.nameLength):std::string_view{};if(filter.empty() || foldName(name).find(filter)!=std::string::npos)rows.push_back(i);}
-            if(ImGui::BeginTable("gml_live_values",5,tableFlags,ImVec2(0,0))){
+            if(ui::BeginDataTable("gml_live_values",5,tableFlags,ImVec2(0,0))){
                 ImGui::TableSetupColumn("Variable");ImGui::TableSetupColumn("Scope");ImGui::TableSetupColumn("Type / storage");ImGui::TableSetupColumn("Value");ImGui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthFixed,70*scale);ImGui::TableSetupScrollFreeze(0,1);ImGui::TableHeadersRow();
                 ImGuiListClipper clip;clip.Begin(static_cast<int>(rows.size()),ImGui::GetFrameHeightWithSpacing());
                 while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;++i){const uint32_t index=rows[i];const auto& slot=stop->numericSlots[index];const std::string name=exactSlotName(slot)?std::string(slot.name,slot.nameLength):"runtime #"+std::to_string(slot.runtimeVariableId)+" (name unavailable)";
@@ -425,7 +425,7 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
                     ImGui::TableSetColumnIndex(1);ImGui::TextUnformatted(scopeText(slot.scope));ImGui::TableSetColumnIndex(2);ImGui::Text("%s / %s",numericType(slot.kind),slot.storage==GmlSlotStorage::Canonical?"storage":slot.storage==GmlSlotStorage::Copied?"copy":"unavailable");
                     ImGui::TableSetColumnIndex(3);ImGui::TextUnformatted(numericText(slot).c_str());ImGui::TableSetColumnIndex(4);ImGui::BeginDisabled(!editable(slot));if(ImGui::SmallButton("Edit"))editSlot(index);ImGui::EndDisabled();ImGui::PopID();
                 }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
         }
     } else if(gmlBrowseKind_==7){
@@ -433,14 +433,14 @@ void BinaryViewTab::renderGameMakerTab(AppContext& ctx) {
         else{
             ImGui::TextDisabled("%u instances | registry %s | instance tokens expire on destruction or detach",stop->instanceCount,stop->instancesComplete?"complete":"partial");
             std::vector<uint32_t> rows;for(uint32_t i=0;i<stop->instanceCount;++i){const auto& instance=stop->instances[i];const auto* object=instance.objectIndex<archive->objects.size()?&archive->objects[instance.objectIndex]:nullptr;if(filter.empty() || (object && foldName(object->name).find(filter)!=std::string::npos))rows.push_back(i);}
-            if(ImGui::BeginTable("gml_instances",4,tableFlags,ImVec2(0,0))){
+            if(ui::BeginDataTable("gml_instances",4,tableFlags,ImVec2(0,0))){
                 ImGui::TableSetupColumn("Object");ImGui::TableSetupColumn("Runtime id / session token");ImGui::TableSetupColumn("Variables");ImGui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthFixed,90*scale);ImGui::TableSetupScrollFreeze(0,1);ImGui::TableHeadersRow();
                 ImGuiListClipper clip;clip.Begin(static_cast<int>(rows.size()),ImGui::GetFrameHeightWithSpacing());
                 while(clip.Step())for(int i=clip.DisplayStart;i<clip.DisplayEnd;++i){const uint32_t index=rows[i];const auto& instance=stop->instances[index];const auto* object=instance.objectIndex<archive->objects.size()?&archive->objects[instance.objectIndex]:nullptr;
                     ImGui::PushID(static_cast<int>(index));ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);ImGui::TextUnformatted(object?object->name.c_str():"Unknown object");ImGui::TableSetColumnIndex(1);ImGui::Text("%u / %llu",instance.runtimeInstanceNumber,static_cast<unsigned long long>(instance.instanceId));ImGui::TableSetColumnIndex(2);ImGui::TextUnformatted(availabilityText(instance.variablesAvailability));ImGui::TableSetColumnIndex(3);
                     if(ImGui::SmallButton("Inspect")){std::string error;if(ctx.debug.inspectGameMakerInstance(stop->identity,kGmlNoCodeIndex,instance.instanceId,error)){gmlSelectedInstanceId_=instance.instanceId;gmlBrowseKind_=6;}else ui::Toast(ui::ToastKind::Warn,error);}ImGui::PopID();
                 }
-                ImGui::EndTable();
+                ui::EndDataTable();
             }
         }
     }

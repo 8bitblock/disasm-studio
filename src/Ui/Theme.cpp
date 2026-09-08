@@ -121,6 +121,20 @@ static Palette PaletteFor(ThemeId id) {
             p.jump=V(0.530f,0.290f,0.700f);
             p.light=true;
             break;
+        case ThemeId::Axiom:
+            // Sampled from the user's component references. Color identifies
+            // selection and real state; broad surfaces stay near-black.
+            p.bg0=V(14/255.f,20/255.f,29/255.f); p.bg1=V(21/255.f,29/255.f,40/255.f);
+            p.bg2=V(26/255.f,39/255.f,56/255.f); p.bg3=V(35/255.f,53/255.f,74/255.f);
+            p.child=V(13/255.f,19/255.f,27/255.f); p.popup=V(17/255.f,24/255.f,33/255.f);
+            p.menubar=V(14/255.f,20/255.f,29/255.f);
+            p.text=V(230/255.f,237/255.f,247/255.f); p.muted=V(145/255.f,164/255.f,188/255.f);
+            p.border=V(28/255.f,38/255.f,52/255.f);
+            p.accent=V(125/255.f,184/255.f,255/255.f); p.good=V(86/255.f,221/255.f,187/255.f);
+            p.warn=V(246/255.f,196/255.f,83/255.f); p.bad=V(255/255.f,96/255.f,120/255.f);
+            p.call=V(107/255.f,217/255.f,234/255.f); p.branch=V(191/255.f,160/255.f,255/255.f);
+            p.jump=V(177/255.f,144/255.f,242/255.f);
+            break;
     }
     return p;
 }
@@ -151,22 +165,20 @@ static void applyMetrics() {
     // integer pixel even at fractional Windows DPI scales (125%, 150%, ...).
     const float linePx = std::max(1.0f, std::round(k));
     const float separatorPx = linePx;
-    // Workbench surfaces are contiguous IDE panes, not floating cards.  Keep
-    // rounding for dialogs/popups, but make child panels and tabs share crisp
-    // square edges like the approved desktop concept.
-    s.WindowRounding    = 4.0f * k;
+    // Round compact controls and selection rows, while structural panes stay
+    // contiguous like the user's references. Geometry is shared by every palette.
+    s.WindowRounding    = 6.0f * k;
     s.ChildRounding     = 0.0f;
-    s.FrameRounding     = 2.0f * k;
-    s.PopupRounding     = 4.0f * k;
-    s.ScrollbarRounding = 2.0f * k;
-    s.GrabRounding      = 2.0f * k;
-    s.TabRounding       = 0.0f;
+    s.FrameRounding     = 5.0f * k;
+    s.PopupRounding     = 6.0f * k;
+    s.ScrollbarRounding = 4.0f * k;
+    s.GrabRounding      = 4.0f * k;
+    s.TabRounding       = 5.0f * k;
 
     s.WindowBorderSize  = linePx;
     s.ChildBorderSize   = linePx;
-    // Light palettes need a quiet keyline around white form fields. Dark
-    // controls are already separated by their raised surface color.
-    s.FrameBorderSize   = g_pal.light ? linePx : 0.0f;
+    // A quiet keyline separates compact controls on every palette.
+    s.FrameBorderSize   = linePx;
     s.TabBorderSize     = 0.0f;
     s.PopupBorderSize   = linePx;
 
@@ -251,6 +263,22 @@ static void applyColors(const Palette& p) {
     c[ImGuiCol_NavWindowingHighlight] = p.text;
     c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.0f, 0.0f, 0.0f, p.light ? 0.12f : 0.32f);
     c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.0f, 0.0f, 0.0f, p.light ? 0.18f : 0.54f);
+
+    if (g_theme == ThemeId::Axiom) {
+        c[ImGuiCol_Button]            = p.bg1;
+        c[ImGuiCol_ButtonHovered]     = p.bg2;
+        c[ImGuiCol_ButtonActive]      = p.bg3;
+        c[ImGuiCol_FrameBgActive]     = p.bg2;
+        c[ImGuiCol_Header]            = V(19/255.f,38/255.f,60/255.f);
+        c[ImGuiCol_HeaderHovered]     = V(23/255.f,43/255.f,65/255.f);
+        c[ImGuiCol_HeaderActive]      = V(28/255.f,49/255.f,70/255.f);
+        c[ImGuiCol_TabHovered]        = p.bg2;
+        c[ImGuiCol_TabActive]         = p.bg2;
+        c[ImGuiCol_TabUnfocusedActive]= p.bg1;
+        c[ImGuiCol_TableHeaderBg]     = p.menubar;
+        c[ImGuiCol_TableRowBgAlt]     = ImVec4(1, 1, 1, 0.012f);
+        c[ImGuiCol_TextSelectedBg]    = ImVec4(acc.x, acc.y, acc.z, 0.26f);
+    }
 }
 
 } // namespace
@@ -298,12 +326,14 @@ const char* ThemeName(ThemeId id) {
         case ThemeId::Nord:          return "Nord";
         case ThemeId::Matrix:        return "Matrix";
         case ThemeId::Paper:         return "Paper";
+        case ThemeId::Axiom:         return "Axiom";
         default:                     return "?";
     }
 }
 
 namespace col {
     ImVec4 accent()    { return g_pal.accent; }
+    ImVec4 accentAlt() { return g_pal.accent; }
     ImVec4 good()      { return g_pal.good; }
     ImVec4 warn()      { return g_pal.warn; }
     ImVec4 bad()       { return g_pal.bad; }
@@ -317,6 +347,13 @@ namespace col {
 
     ImVec4 panel()       { return g_pal.child; }
     ImVec4 panelHeader() { return g_pal.menubar; }
+    ImVec4 code()        { return g_theme == ThemeId::Axiom ? g_pal.bg0 : g_pal.child; }
+    ImVec4 breakpointFill() { return g_theme == ThemeId::Axiom
+        ? V(44/255.f,22/255.f,28/255.f) : mix(g_pal.child, g_pal.bad, 0.12f); }
+    ImVec4 breakpointOutline() { return g_theme == ThemeId::Axiom
+        ? V(78/255.f,34/255.f,43/255.f) : mix(g_pal.border, g_pal.bad, 0.30f); }
+    ImVec4 pauseSurface() { return g_theme == ThemeId::Axiom
+        ? V(37/255.f,30/255.f,16/255.f) : mix(g_pal.child, g_pal.warn, 0.08f); }
     ImVec4 line()        { return ImVec4(g_pal.border.x, g_pal.border.y, g_pal.border.z, 1.0f); }
     ImVec4 lineSoft()    { return mix(g_pal.border, g_pal.bg1, 0.60f); }
 }

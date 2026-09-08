@@ -1214,8 +1214,9 @@ void CortexTab::ask(AppContext& ctx, const std::string& q) {
 
 void CortexTab::renderBehaviors(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::SeparatorText("Behaviours");
-    ImGui::TextDisabled("%zu findings  |  Select to inspect evidence", rep_.behaviors.size());
+    char behaviorCount[64]{};
+    std::snprintf(behaviorCount, sizeof(behaviorCount), "%zu findings", rep_.behaviors.size());
+    ui::PanelHeader("Behaviours", behaviorCount);
     if (rep_.behaviors.empty()) {
         ui::EmptyState(DS_ICON_CODE, "No notable behaviours",
             "The available static evidence did not identify a notable behaviour. Explore the function briefs or ask about imports and strings.");
@@ -1226,7 +1227,7 @@ void CortexTab::renderBehaviors(AppContext& ctx) {
     const float availableH = ImGui::GetContentRegionAvail().y;
     const float tableH = std::max(ImGui::GetFrameHeight() * 2.0f,
         availableH * 0.44f);
-    if (ImGui::BeginTable("cx_behtbl", 2,
+    if (ui::BeginDataTable("cx_behtbl", 2,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
             ImVec2(0.0f, tableH))) {
         ImGui::TableSetupColumn("Finding", ImGuiTableColumnFlags_WidthStretch);
@@ -1260,14 +1261,16 @@ void CortexTab::renderBehaviors(AppContext& ctx) {
             ui::ItemTooltip("Heuristic confidence from the available static evidence; this is not a runtime observation.");
             ImGui::PopID();
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 
     if (behSel_ < 0 || static_cast<size_t>(behSel_) >= rep_.behaviors.size()) return;
     if (selectionChanged) ImGui::SetNextWindowScroll(ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
     ImGui::BeginChild("cx_evidence", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
     const CortexBehavior& selected = rep_.behaviors[behSel_];
-    ImGui::SeparatorText("Selected evidence");
+    ui::PanelHeader("Selected evidence");
     ImGui::TextWrapped("%s", selected.title.c_str());
     if (!selected.explanation.empty()) ImGui::TextWrapped("%s", selected.explanation.c_str());
     if (!selected.specifics.empty()) {
@@ -1314,7 +1317,7 @@ void CortexTab::renderBehaviors(AppContext& ctx) {
 
 void CortexTab::renderFunctions(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::SeparatorText("Function briefs");
+    ui::PanelHeader("Function briefs", "Static interpretation");
     ImGui::SetNextItemWidth(std::min(165.0f * scale, ImGui::GetContentRegionAvail().x));
     int scope = allFunctions_ ? 1 : 0;
     if (ImGui::Combo("##cx_function_scope", &scope, "Notable functions\0All functions\0")) {
@@ -1322,6 +1325,7 @@ void CortexTab::renderFunctions(AppContext& ctx) {
         functionRowsDirty_ = true;
     }
     const auto& functions = allFunctions_ ? rep_.functions : rep_.highlights;
+    ui::SameLineIfFits(230.0f * scale);
     ImGui::SetNextItemWidth(-1.0f);
     if (ui::SearchBox("##cx_function_filter", "Filter name, address or summary...",
                       functionFilter_, sizeof(functionFilter_)))
@@ -1352,7 +1356,7 @@ void CortexTab::renderFunctions(AppContext& ctx) {
         return;
     }
 
-    if (ImGui::BeginTable("cx_hitbl", 2,
+    if (ui::BeginDataTable("cx_hitbl", 2,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthStretch, 0.44f);
         ImGui::TableSetupColumn("Static interpretation", ImGuiTableColumnFlags_WidthStretch, 0.56f);
@@ -1404,17 +1408,19 @@ void CortexTab::renderFunctions(AppContext& ctx) {
             ui::ItemTooltip(function.brief.c_str());
             ImGui::PopID();
         }
-        ImGui::EndTable();
+        ui::EndDataTable();
     }
 }
 
 void CortexTab::renderQuestions(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::SeparatorText("Ask Cortex");
+    ui::PanelHeader("Ask Cortex", "Answers from this static report");
     const float composerH = ImGui::GetFrameHeightWithSpacing() * 2.0f;
     const float historyH = std::max(ImGui::GetTextLineHeightWithSpacing(),
         ImGui::GetContentRegionAvail().y - composerH);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::col::code());
     ImGui::BeginChild("cx_chatlog", ImVec2(0.0f, historyH), ImGuiChildFlags_None);
+    ImGui::PopStyleColor();
     ImGui::PushTextWrapPos(0.0f);
     if (chat_.empty()) {
         ImGui::TextWrapped("Explore this report with a question or choose a topic below.");
@@ -1480,7 +1486,7 @@ void CortexTab::renderQuestions(AppContext& ctx) {
     ImGui::SameLine();
     const bool hasQuestion = std::string_view(input_).find_first_not_of(" \t\r\n") != std::string_view::npos;
     ImGui::BeginDisabled(!hasQuestion);
-    const bool send = ImGui::Button("Ask", ImVec2(askW, 0.0f));
+    const bool send = ui::AccentButton("Ask", theme::col::accent());
     ImGui::EndDisabled();
     if ((enter || send) && hasQuestion) {
         ask(ctx, input_);
@@ -1492,9 +1498,7 @@ void CortexTab::renderQuestions(AppContext& ctx) {
 
 void CortexTab::render(AppContext& ctx) {
     const float scale = theme::UiScale();
-    ImGui::TextUnformatted("Cortex");
-    ui::SameLineIfFits(260.0f * scale);
-    ImGui::TextDisabled("Static findings and questions");
+    ui::PanelHeader("Cortex", "Static findings and questions");
     const DocumentResultIdentity currentIdentity = currentCortexIdentity(ctx);
     if (observedIdentity_ != currentIdentity) {
         // Cortex is an app-wide tab today, so explicitly retire every cached
@@ -1542,8 +1546,8 @@ void CortexTab::render(AppContext& ctx) {
     if (busy) {
         if (ui::ToolbarIconButton(DS_ICON_STOP, "Cancel", "Cancel Cortex analysis"))
             cancelAnalysis();
-    } else if (ui::ToolbarIconButton(
-                   DS_ICON_LIGHTNING, analyzed_ ? "Re-analyze" : "Analyze",
+    } else if (ui::AccentButton(
+                   analyzed_ ? "Re-analyze###tbib_Re-analyze" : "Analyze###tbib_Analyze", theme::col::accent(),
                    "Read the binary on a background worker and reason over it")) {
         analyze(ctx);
         busy = async_->staging || async_->running.load(std::memory_order_acquire);
@@ -1560,6 +1564,9 @@ void CortexTab::render(AppContext& ctx) {
                 ui::Toast(ui::ToastKind::Warn, msg);
         }
     }
+    ui::SameLineIfFits(100.0f * scale);
+    ui::StatePill(busy ? "RUNNING" : analyzed_ ? "COMPLETE" : "IDLE",
+                  busy ? theme::col::accent() : analyzed_ ? theme::col::good() : theme::col::muted());
     ui::SameLineIfFits(240.0f * scale);
     if (busy) {
         const auto phase = static_cast<AsyncState::Phase>(
@@ -1582,7 +1589,6 @@ void CortexTab::render(AppContext& ctx) {
     } else if (analyzed_) ImGui::TextDisabled("%d behaviour%s · %zu functions",
                                        (int)rep_.behaviors.size(), rep_.behaviors.size() == 1 ? "" : "s",
                                        rep_.functions.size());
-    else           ImGui::TextDisabled("not analyzed");
     ImGui::Separator();
 
     if (busy) {
@@ -1669,7 +1675,7 @@ void CortexTab::render(AppContext& ctx) {
     const float behaviorW = contentW * appliedBehaviorRatio;
 
     ImGui::SetCursorPos(layoutStart);
-    ImGui::BeginChild("cx_beh", ImVec2(behaviorW, upperH), ImGuiChildFlags_None);
+    ImGui::BeginChild("cx_beh", ImVec2(behaviorW, upperH), ImGuiChildFlags_Borders);
     renderBehaviors(ctx);
     ImGui::EndChild();
 
@@ -1681,7 +1687,7 @@ void CortexTab::render(AppContext& ctx) {
     if (ImGui::IsItemActive()) behaviorPaneRatio_ = draggedBehaviorRatio;
 
     ImGui::SetCursorPos(ImVec2(layoutStart.x + behaviorW + split, layoutStart.y));
-    ImGui::BeginChild("cx_hi", ImVec2(contentW - behaviorW, upperH), ImGuiChildFlags_None);
+    ImGui::BeginChild("cx_hi", ImVec2(contentW - behaviorW, upperH), ImGuiChildFlags_Borders);
     renderFunctions(ctx);
     ImGui::EndChild();
 
@@ -1693,7 +1699,7 @@ void CortexTab::render(AppContext& ctx) {
     if (ImGui::IsItemActive()) chatPaneRatio_ = draggedChatRatio;
 
     ImGui::SetCursorPos(ImVec2(layoutStart.x, layoutStart.y + upperH + split));
-    ImGui::BeginChild("cx_chat", ImVec2(avail.x, chatH), ImGuiChildFlags_None);
+    ImGui::BeginChild("cx_chat", ImVec2(avail.x, chatH), ImGuiChildFlags_Borders);
     renderQuestions(ctx);
     ImGui::EndChild();
 }
