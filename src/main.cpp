@@ -89,6 +89,19 @@ static std::string Utf8FromWide(const wchar_t* text) {
     return out;
 }
 
+static std::wstring WideFromUtf8(const std::string& text) {
+    if (text.empty()) return {};
+    const int n = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                        text.c_str(), -1, nullptr, 0);
+    if (n <= 1) return {};
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    if (!::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                text.c_str(), -1, out.data(), n))
+        return {};
+    out.pop_back();
+    return out;
+}
+
 static int RunApplication(HINSTANCE hInstance) {
     std::string startupPath;
     int argc = 0;
@@ -201,6 +214,22 @@ static int RunApplication(HINSTANCE hInstance) {
     g_App = &app;
 
     bool running = true;
+    bool graphicsUnavailable = false;
+    bool graphicsFailurePrompted = false;
+    const wchar_t* graphicsFailure = L"Rendering is unavailable.";
+    auto beginGraphicsShutdown = [&](const wchar_t* reason) {
+        if (graphicsUnavailable) return;
+        graphicsUnavailable = true;
+        graphicsFailure = reason;
+        graphicsFailurePrompted = false;
+        std::wstring message = reason;
+        message += L"\n\nRendering has stopped. DisasmStudio will finish accepted file writes, "
+                   L"detach the debugger and save the current document before closing. "
+                   L"If any step needs attention, the application will stay open and show the reason.";
+        ::MessageBoxW(hwnd, message.c_str(), L"DisasmStudio graphics error",
+                      MB_OK | MB_ICONERROR);
+        app.requestExit();
+    };
     // Idle throttle: when nothing is animating, block waiting for input instead of
     // spinning the GPU at vsync. `framesToRender` keeps a short burst of frames going
     // after any activity so ImGui animations (fades, scrolls) settle, and the finite
@@ -210,7 +239,7 @@ static int RunApplication(HINSTANCE hInstance) {
     while (running) {
         // Sleep until an input message arrives (or the fallback elapses) only when
         // fully idle: no queued frames and nothing the app wants animated.
-        if (framesToRender <= 0 && !app.wantsContinuousRedraw())
+        if (!graphicsUnavailable && framesToRender <= 0 && !app.wantsContinuousRedraw())
             ::MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
 
         MSG msg;
@@ -223,11 +252,39 @@ static int RunApplication(HINSTANCE hInstance) {
         }
         if (g_CloseRequested) {
             g_CloseRequested = false;
+            graphicsFailurePrompted = false;
             app.requestExit();
             framesToRender = 4;
         }
         if (!running) break;
         if (gotMsg) framesToRender = 4;   // keep rendering briefly after any input
+
+        // Cleanup and file completions must advance even when rendering is
+        // occluded or unavailable. Only App can authorize final teardown.
+        if (graphicsUnavailable || app.exitPending())
+            app.pollExitWithoutRendering();
+        if (app.wantsExit()) break;
+        if (graphicsUnavailable) {
+            if (!app.exitPending() && !graphicsFailurePrompted) {
+                std::wstring message = graphicsFailure;
+                message += L"\n\nClosing has stopped because cleanup or document saving "
+                           L"still needs attention:\n\n";
+                const std::wstring reason = WideFromUtf8(app.exitFailureReason());
+                message += reason.empty() ? L"The current document or debugger session needs attention." : reason;
+                message += L"\n\nRetry attempts a safe close again. Cancel keeps the application "
+                           L"and its retained session open without rendering. Use the window's Close "
+                           L"command to retry later.";
+                graphicsFailurePrompted = true;
+                if (::MessageBoxW(hwnd, message.c_str(), L"DisasmStudio could not close",
+                                    MB_RETRYCANCEL | MB_ICONERROR | MB_DEFBUTTON2) == IDRETRY) {
+                    graphicsFailurePrompted = false;
+                    app.requestExit();
+                }
+            }
+            if (app.wantsExit()) break;
+            ::MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
+            continue;
+        }
 
         // WM_DPICHANGED may arrive in a burst while the window crosses monitor
         // boundaries. Consume only the latest value, outside any ImGui frame,
@@ -242,9 +299,16 @@ static int RunApplication(HINSTANCE hInstance) {
         }
 
         // Skip rendering when minimized/occluded to save GPU.
-        if (g_SwapChainOccluded && g_pSwapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
-            ::Sleep(10);
-            continue;
+        if (g_SwapChainOccluded) {
+            const HRESULT visibility = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
+            if (visibility == DXGI_STATUS_OCCLUDED) {
+                ::MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+                continue;
+            }
+            if (FAILED(visibility)) {
+                beginGraphicsShutdown(L"The Direct3D display check failed. The graphics device may have been removed or reset.");
+                continue;
+            }
         }
         g_SwapChainOccluded = false;
 
@@ -252,13 +316,10 @@ static int RunApplication(HINSTANCE hInstance) {
             CleanupRenderTarget();
             HRESULT hr = g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
-            // On device-removed/reset ResizeBuffers fails; don't (re)create an RTV from a
-            // dead swapchain — leave it null and let the render guard below skip the frame.
+            // Do not recreate or use resources from a failed swap chain. Keep
+            // native message handling and App's safe-close boundary alive.
             if (FAILED(hr) || !CreateRenderTarget()) {
-                ::MessageBoxW(hwnd,
-                              L"The Direct3D swap chain could not be resized. The graphics device may have been removed or reset.",
-                              L"DisasmStudio graphics error", MB_OK | MB_ICONERROR);
-                running = false;
+                beginGraphicsShutdown(L"The Direct3D swap chain could not be resized. The graphics device may have been removed or reset.");
                 continue;
             }
         }
@@ -268,9 +329,8 @@ static int RunApplication(HINSTANCE hInstance) {
         ImGui::NewFrame();
 
         app.render();
-        if (app.wantsExit()) running = false;
-
         ImGui::Render();
+        if (app.wantsExit()) break;
         // Skip the main target when it is unavailable (e.g. a failed ResizeBuffers on
         // device-removed) so we never bind/clear a null render-target view.
         if (g_mainRenderTargetView) {
@@ -289,10 +349,7 @@ static int RunApplication(HINSTANCE hInstance) {
         HRESULT hr = g_pSwapChain->Present(1, 0); // vsync on
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
         if (FAILED(hr) && hr != DXGI_STATUS_OCCLUDED) {
-            ::MessageBoxW(hwnd,
-                          L"The Direct3D device was removed or reset. DisasmStudio will close cleanly; reopen it to continue.",
-                          L"DisasmStudio graphics error", MB_OK | MB_ICONERROR);
-            running = false;
+            beginGraphicsShutdown(L"The Direct3D device could not present the frame. It may have been removed or reset.");
         }
 
         // Decide whether to keep rendering: stay at full rate while the app wants

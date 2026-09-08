@@ -24,6 +24,11 @@
     Optional vcpkg checkout used by MSBuild. CI passes its pinned repo-local
     checkout; local builds may continue to use their integrated vcpkg root.
 
+.PARAMETER VcpkgInstalledDir
+    Optional vcpkg installed-tree parent containing x64-windows-static. This
+    permits an isolated source checkout to reuse an existing dependency tree;
+    manifest and exact-toolset verification remain enabled.
+
 .PARAMETER Rebuild
     Clean then build (MSBuild /t:Rebuild) instead of an incremental build.
 
@@ -32,6 +37,13 @@
 
 .PARAMETER Verbosity
     MSBuild verbosity: quiet | minimal (default) | normal | detailed | diagnostic.
+
+.PARAMETER MaxParallelProjects
+    Maximum simultaneous MSBuild projects. Defaults to one to bound memory use.
+
+.PARAMETER MaxCompileProcesses
+    Maximum compiler processes per project. Defaults to two; raise it explicitly
+    on machines with enough RAM for parallel C++20 translation units.
 
 .EXAMPLE
     .\build.ps1
@@ -46,8 +58,11 @@ param(
     [ValidateSet('x64')]              [string] $Platform = 'x64',
     [string] $VisualStudioPath,
     [string] $VcpkgRoot,
+    [string] $VcpkgInstalledDir,
     [switch] $Rebuild,
     [switch] $Clean,
+    [ValidateRange(1, 64)] [int] $MaxParallelProjects = 1,
+    [ValidateRange(1, 64)] [int] $MaxCompileProcesses = 2,
     [ValidateSet('quiet', 'minimal', 'normal', 'detailed', 'diagnostic')]
     [string] $Verbosity = 'minimal'
 )
@@ -125,6 +140,7 @@ $target = if ($Clean) { 'Clean' } elseif ($Rebuild) { 'Rebuild' } else { 'Build'
 Write-Host "MSBuild : $msbuild"
 Write-Host "VS root : $selectedVisualStudio"
 Write-Host "v143    : $toolsetVersion"
+Write-Host "Parallel: $MaxParallelProjects project(s), $MaxCompileProcesses compiler process(es) per project"
 if ($resolvedVcpkgRoot) { Write-Host "vcpkg   : $resolvedVcpkgRoot" }
 Write-Host "Solution: $solution"
 Write-Host "Config  : $Configuration|$Platform  (target: $target)`n"
@@ -135,12 +151,19 @@ $arguments = @(
     "/p:Configuration=$Configuration",
     "/p:Platform=$Platform",
     "/p:VCToolsVersion=$toolsetVersion",
-    '/m',
+    "/m:$MaxParallelProjects",
+    "/p:CL_MPCount=$MaxCompileProcesses",
     '/nologo',
     "/v:$Verbosity"
 )
 if ($resolvedVcpkgRoot) {
     $arguments += "/p:VcpkgRoot=$resolvedVcpkgRoot\"
+}
+if ($VcpkgInstalledDir) {
+    $installedTree = if ([IO.Path]::IsPathRooted($VcpkgInstalledDir)) { $VcpkgInstalledDir }
+                     else { Join-Path $root $VcpkgInstalledDir }
+    $installedTree = [IO.Path]::GetFullPath($installedTree).TrimEnd([char[]]'\/')
+    $arguments += "/p:VcpkgInstalledDir=$installedTree\"
 }
 if ($PSVersionTable.PSEdition -eq 'Core') {
     $arguments += "/p:DsPowerShell=$(Join-Path $PSHOME 'pwsh.exe')"

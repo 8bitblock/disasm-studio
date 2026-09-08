@@ -17,6 +17,7 @@
 
 #include "Core/AnalysisService.h"
 #include "Core/BinaryFile.h"
+#include "Core/ArtifactWrite.h"
 #include "Core/CodeExport.h"
 #include "Core/Debugger.h"
 #include "Core/DocumentContext.h"
@@ -639,9 +640,19 @@ public:
     void pollProjectSave();
     bool saveProject();
 
-    // Open a Save dialog (Markdown / HTML) and write the chosen analysis report.
+    ArtifactWriteService artifactWrites;
+    uint64_t artifactWriteCompletionRevision = 0;
+    bool artifactWriteFailed = false;
+    std::string artifactWriteFailure;
+    std::function<void(const ArtifactWriteResult&)> artifactWriteCompletion;
+    bool queueArtifactWrite(std::function<ArtifactWriteResult()> ownedJob,
+        std::string& message,
+        std::function<void(const ArtifactWriteResult&)> completion = {});
+    void pollArtifactWrites();
+
+    // Open a Save dialog (Markdown / HTML) and queue the chosen analysis report.
     // The format is picked from the chosen file's extension. Returns true on
-    // success; `msg` receives a human-readable result. Defined in App.cpp (commdlg).
+    // admission; completion/error is reported by pollArtifactWrites on the UI thread.
     bool exportAnalysisFile(const std::string& defaultBaseName,
                              const std::string& markdown, const std::string& html,
                              std::string& msg);
@@ -651,15 +662,17 @@ public:
     bool selectCodeExportPath(const std::string& defaultName, CodeExportFormat format,
                               std::string& pathOut, std::string& err);
 
-    // Open a Save dialog and write raw bytes to the chosen file. Used by the
+    // Open a Save dialog and queue owned raw bytes for the chosen file. Used by the
     // Resources tab to dump a resource verbatim or save a reconstructed
     // .bmp/.ico. `filterSpec`/`defExt` are Win32 GetSaveFileName strings (a null
-    // filter falls back to All Files). Returns true on success; `msg` gets a
-    // human-readable result. Defined in App.cpp (commdlg).
+    // filter falls back to All Files). True means queued, never durable success.
+    // Optional companion reports are independently atomic; a report failure is
+    // a warning on a successfully saved artifact and suppresses automatic loading.
     bool saveBytesFile(const std::string& defaultName, const std::vector<uint8_t>& bytes,
                        std::string& msg,
                        const wchar_t* filterSpec = nullptr, const wchar_t* defExt = nullptr,
-                       std::string* savedPath = nullptr);
+                       std::function<void(const ArtifactWriteResult&)> completion = {},
+                       std::string reportSuffix = {}, std::string report = {});
 
 private:
     enum class PendingDocumentKind : uint8_t { Open, Activate, Close };
@@ -742,6 +755,7 @@ private:
 };
 
 class App {
+    friend struct AppExitTestAccess;
 public:
     // `startupPath` is the optional file supplied as the first command-line
     // argument (`DisasmStudio <path>`). It is loaded through the same path as
@@ -755,6 +769,9 @@ public:
     // File > Exit and the native close button share the same loss-preventing
     // project flush. A failed save leaves the window open.
     void requestExit();
+    bool exitPending() const { return exitPending_; }
+    void pollExitWithoutRendering();
+    std::string exitFailureReason();
 
     // True when the UI should keep redrawing every frame rather than sleeping until
     // the next input event: background analysis / live-scan in progress (progress
@@ -778,6 +795,7 @@ private:
     void retireActiveDocumentRequests();
     void renderMenuBar();
     void renderDebugToolbar(const DbgSnapshot& snap);
+    void pollExit();
     void resolveWorkbenchNavigation();                 // apply requests/shortcuts before drawing the strip
     void renderMainWindow(const DbgSnapshot& snap);
     void renderTabCardStrip(const DbgSnapshot& snap);  // contiguous primary workbench navigation
@@ -829,6 +847,10 @@ private:
     uint64_t                            lastDebugLifecycleCompletion_ = 0;
     DebugTargetIdentity                 suppressedLaunchNavigation_{};
     bool                                exit_      = false;
+    bool                                exitPending_ = false;
+    uint64_t                            exitArtifactRevision_ = 0;
+    uint64_t                            exitDebugRequestId_ = 0;
+    std::string                         exitFailure_;
     bool                                showDemo_  = false;
     bool                                showHelp_  = false;
     bool                                showAbout_ = false;
@@ -998,6 +1020,7 @@ private:
     };
     PassiveDumpPopupState              passiveDumpPopup_;
     PassiveDumpService                 passiveDumpService_;
+    uint64_t                           passiveResultGeneration_ = 0;
 
     enum class PendingDocumentLoadOwner : uint8_t {
         None = 0,
@@ -1023,11 +1046,12 @@ private:
 
     // Archive-entries browser state, snapshotted at open time: "Open as binary"
     // replaces the loaded binary while the popup is up, so entry extraction always
-    // re-reads sourcePath from disk instead of touching ctx_.binary.
+    // retains immutable source bytes instead of touching a replaced document.
     struct ArchiveBrowserState {
         bool        open = false;          // open-request flag, consumed by renderArchiveBrowser
         std::string sourcePath;            // file containing the archive (UTF-8, as BinaryFile::path)
         std::string sourceName;            // display base name of sourcePath
+        std::shared_ptr<const std::vector<uint8_t>> sourceBytes;
         uint64_t    zipBase = 0;           // file offset of the zip start (javaInfo.jarOffset)
         std::vector<JavaZipEntry> entries; // central-directory snapshot (capped upstream)
         char        filter[128] = {};

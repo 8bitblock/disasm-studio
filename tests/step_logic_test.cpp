@@ -10,6 +10,7 @@
 // Build & run (Linux/macOS):  g++ -std=c++20 -I../src tests/step_logic_test.cpp && ./a.out
 //
 #include "Core/StepLogic.h"
+#include "Core/DebuggerExecutionPolicy.h"
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -218,7 +219,58 @@ static void test_sim_step_out_one_level() {
     CHECK(cpu.stack.size() == 1 && cpu.stack[0] == 2);
 }
 
+static void test_checked_execution_policy() {
+    using namespace debugger_detail;
+    uint32_t flags = 0x202;
+    size_t writes = 0;
+    const auto read = [&](uint32_t& out) { out = flags; return true; };
+    const auto write = [&](uint32_t value) { flags = value; ++writes; return true; };
+    CHECK(UpdateControlBits(0x100, true, read, write) == ControlMutationResult::Applied);
+    CHECK(flags == 0x302 && writes == 1);
+    CHECK(UpdateControlBits(0x100, true, read, write) == ControlMutationResult::Applied);
+    CHECK(writes == 1); // already-correct state does not need a native write
+    CHECK(UpdateControlBits(0x100, false, read, write) == ControlMutationResult::Applied);
+    CHECK(flags == 0x202);
+    CHECK(UpdateControlBits(0x100, true, [](uint32_t&) { return false; }, write) ==
+          ControlMutationResult::ReadFailed);
+    CHECK(flags == 0x202);
+
+    writes = 0;
+    const auto partialFailure = [&](uint32_t value) {
+        flags = value; ++writes; return writes != 1;
+    };
+    CHECK(UpdateControlBits(0x100, true, read, partialFailure) == ControlMutationResult::WriteFailed);
+    CHECK(flags == 0x202 && writes == 2); // a failing API may have changed the context
+    writes = 0;
+    const auto lostWrite = [&](uint32_t value) {
+        ++writes;
+        if (writes == 1) flags ^= 0x40; // preserve an unrelated flag during rollback
+        else flags = value;
+        return true;
+    };
+    CHECK(UpdateControlBits(0x100, true, read, lostWrite) == ControlMutationResult::VerifyFailed);
+    CHECK(flags == 0x242);
+    CHECK(UpdateControlBits(0x100, true, read, [](uint32_t) { return false; }) ==
+          ControlMutationResult::RollbackFailed);
+
+    CHECK(ValidHardwareBreakpoint(0x1001, true, 8, true)); // execute normalized to one byte
+    CHECK(ValidHardwareBreakpoint(0x1000, false, 8, false));
+    CHECK(!ValidHardwareBreakpoint(0x1000, false, 8, true));
+    CHECK(!ValidHardwareBreakpoint(0x1001, false, 2, false));
+    CHECK(!ValidHardwareBreakpoint(0x1000, false, 3, false));
+    CHECK(!ValidHardwareBreakpoint(0x100000000ULL, true, 1, true));
+    CHECK(!ValidHardwareBreakpoint(UINT64_MAX, false, 8, false));
+    uint64_t continuation = 0;
+    CHECK(CheckedInstructionContinuation(0x1000, 5, true, false, continuation));
+    CHECK(continuation == 0x1005);
+    CHECK(!CheckedInstructionContinuation(0x1000, 1, false, false, continuation));
+    CHECK(!CheckedInstructionContinuation(UINT64_MAX - 2, 5, true, false, continuation));
+    CHECK(!CheckedInstructionContinuation(UINT32_MAX - 2, 5, true, true, continuation));
+    CHECK(!CheckedInstructionContinuation(0, 16, true, false, continuation));
+}
+
 int main() {
+    test_checked_execution_policy();
     test_classify();
     test_step_over();
     test_step_out();

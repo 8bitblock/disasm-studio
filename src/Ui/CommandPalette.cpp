@@ -98,6 +98,7 @@ void CommandPalette::open(std::vector<PaletteItem> actions,
     lastQuery_ = "\x01";   // force a rebuild on the first frame
     sel_       = 0;
     selMoved_  = true;
+    selectionExplicit_ = false;
     open_      = true;
     focusNext_ = true;
 }
@@ -159,6 +160,12 @@ void CommandPalette::pollInvestigationSearch() {
 // Query -> a small merged result list. Only the command list is fuzzy-matched
 // here; investigation traversal and ranking have already happened on the worker.
 void CommandPalette::rebuildResults() {
+    // Worker completion and incremental session refresh can reorder evidence.
+    // Preserve an explicitly selected local action across both paths; editing
+    // the query resets this intent before rebuilding the list.
+    const bool keepAction = selectionExplicit_ && sel_ >= 0 &&
+        sel_ < static_cast<int>(results_.size()) && results_[sel_].kind == 0;
+    const Result selectedAction = keepAction ? results_[sel_] : Result{};
     results_.clear();
     std::string q = query_;
     for (char& c : q) c = (char)std::tolower((unsigned char)c);
@@ -197,6 +204,21 @@ void CommandPalette::rebuildResults() {
                          [](const Result& a, const Result& b) { return a.score > b.score; });
     }
     if (results_.size() > kMaxShown) results_.resize(kMaxShown);
+    if (keepAction) {
+        const auto selected = std::find_if(results_.begin(), results_.end(),
+            [&](const Result& result) {
+                return result.kind == 0 && result.idx == selectedAction.idx;
+            });
+        if (selected != results_.end()) {
+            sel_ = static_cast<int>(selected - results_.begin());
+        } else {
+            // The result cap must not silently evict the user's pending action.
+            if (results_.size() >= kMaxShown) results_.pop_back();
+            results_.push_back(selectedAction);
+            sel_ = static_cast<int>(results_.size()) - 1;
+        }
+        selMoved_ = true;
+    }
     if (sel_ >= (int)results_.size()) sel_ = results_.empty() ? 0 : (int)results_.size() - 1;
     if (sel_ < 0) sel_ = 0;
 }
@@ -292,11 +314,14 @@ void CommandPalette::render(AppContext& ctx) {
     bool enter = ImGui::InputTextWithHint("##palq",
                                           "Search commands, addresses, functions, strings, imports, xrefs...",
                                           query_, sizeof(query_),
-                                          ImGuiInputTextFlags_EnterReturnsTrue);
+                                          ImGuiInputTextFlags_EnterReturnsTrue |
+                                          ImGuiInputTextFlags_CallbackHistory,
+                                          [](ImGuiInputTextCallbackData*) { return 0; });
     if (lastQuery_ != query_) {
         lastQuery_ = query_;
         sel_ = 0;
         selMoved_ = true;
+        selectionExplicit_ = false;
         submitInvestigationSearch();
         rebuildResults();
     }
@@ -311,9 +336,15 @@ void CommandPalette::render(AppContext& ctx) {
             ctx.wantContinuousRedraw = true;
     }
 
-    // Keyboard: arrows move the selection (single-line InputText ignores them).
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && sel_ + 1 < (int)results_.size()) { ++sel_; selMoved_ = true; }
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)   && sel_ > 0)                        { --sel_; selMoved_ = true; }
+    // CallbackHistory keeps Up/Down owned by the query instead of moving ImGui
+    // navigation focus to a result. The callback leaves text unchanged; these
+    // keys select a result here, so Enter still submits the retained query.
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && sel_ + 1 < (int)results_.size()) {
+        ++sel_; selMoved_ = true; selectionExplicit_ = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && sel_ > 0) {
+        --sel_; selMoved_ = true; selectionExplicit_ = true;
+    }
 
     int runIdx = -1;
     if ((enter || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) && !results_.empty())
@@ -335,21 +366,21 @@ void CommandPalette::render(AppContext& ctx) {
                                 1.0f);
         for (int i = 0; i < (int)results_.size(); ++i) {
             const Result& r = results_[i];
-            char label[320];
+            const char* label = "";
             const char* icon = nullptr;
             const char* detail = nullptr;
             char detailBuf[192];
             const InvestigationResult* investigationResult = nullptr;
             if (r.kind == 2) {
                 const InvestigationRecentQuery& recent = recentQueries_[(size_t)r.idx];
-                std::snprintf(label, sizeof(label), "%s", recent.query.c_str());
+                label = recent.query.c_str();
                 std::snprintf(detailBuf, sizeof(detailBuf), "%s recent query",
                               identityName(recent.identity));
                 icon = DS_ICON_CODE; detail = detailBuf;
             } else if (r.kind == 1 && searchPublication_ &&
                        r.idx >= 0 && (size_t)r.idx < searchPublication_->result.results.size()) {
                 investigationResult = &searchPublication_->result.results[(size_t)r.idx];
-                std::snprintf(label, sizeof(label), "%s", investigationResult->label.c_str());
+                label = investigationResult->label.c_str();
                 if (investigationResult->location.valid) {
                     std::snprintf(detailBuf, sizeof(detailBuf), "%s 0x%llX  %s",
                                   identityName(investigationResult->location.identity),
@@ -366,36 +397,46 @@ void CommandPalette::render(AppContext& ctx) {
                 icon = DS_ICON_CODE; detail = detailBuf;
             } else {
                 const PaletteItem& a = actions_[(size_t)r.idx];
-                std::snprintf(label, sizeof(label), "%s", a.label.c_str());
+                label = a.label.c_str();
                 icon = a.icon; detail = a.detail.empty() ? nullptr : a.detail.c_str();
             }
 
             ImGui::PushID(i);
-            const float rowHeight = ImGui::GetTextLineHeight() * 2.0f + 8.0f * s;
+            const float rowHeight = ImGui::GetTextLineHeight() * 2.0f +
+                3.0f * s + style.CellPadding.y * 2.0f;
             ImGui::TableNextRow(ImGuiTableRowFlags_None, rowHeight);
             ImGui::TableSetColumnIndex(0);
             const ImVec2 rowAt = ImGui::GetCursorScreenPos();
             if (i == sel_)
                 ImGui::PushStyleColor(ImGuiCol_Header,
                                       ImVec4(acc.x, acc.y, acc.z, 0.17f));
-            char row[352];
-            if (IconsLoaded() && icon) std::snprintf(row, sizeof(row), "%s  %s", icon, label);
-            else                       std::snprintf(row, sizeof(row), "%s", label);
-            if (ImGui::Selectable(row, i == sel_,
+            std::string row;
+            if (IconsLoaded() && icon) { row = icon; row += "  "; }
+            row += label;
+            // Result text is data: render it separately so ## stays literal,
+            // long names elide within the row, and tooltips retain the full text.
+            if (ImGui::Selectable("##palette_result", i == sel_,
                                   ImGuiSelectableFlags_SpanAllColumns,
                                   ImVec2(0, rowHeight - ImGui::GetStyle().CellPadding.y * 2.0f)))
                 runIdx = i;
             bool rowHovered = ImGui::IsItemHovered();
+            const float textRight = rowAt.x + ImGui::GetContentRegionAvail().x;
+            ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), rowAt,
+                ImVec2(textRight, rowAt.y + ImGui::GetTextLineHeight()), textRight, textRight,
+                row.c_str(), row.c_str() + row.size(), nullptr);
             if (i == sel_) {
                 ImGui::PopStyleColor();
                 if (selMoved_) { ImGui::SetScrollHereY(0.5f); selMoved_ = false; }
             }
 
             if (detail) {
-                ImGui::SetCursorScreenPos(ImVec2(rowAt.x,
-                    rowAt.y + ImGui::GetTextLineHeight() + 3.0f * s));
-                ImGui::TextDisabled("%s", detail);
-                rowHovered = rowHovered || ImGui::IsItemHovered();
+                const ImVec2 detailAt(rowAt.x,
+                    rowAt.y + ImGui::GetTextLineHeight() + 3.0f * s);
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+                ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), detailAt,
+                    ImVec2(textRight, detailAt.y + ImGui::GetTextLineHeight()), textRight, textRight,
+                    detail, detail + std::strlen(detail), nullptr);
+                ImGui::PopStyleColor();
             }
             if (rowHovered) {
                 ImGui::BeginTooltip();
@@ -454,6 +495,7 @@ void CommandPalette::render(AppContext& ctx) {
             lastQuery_ = query_;
             sel_ = 0;
             selMoved_ = true;
+            selectionExplicit_ = false;
             focusNext_ = true;
             submitInvestigationSearch();
             rebuildResults();
@@ -469,6 +511,7 @@ void CommandPalette::render(AppContext& ctx) {
                 lastQuery_ = query_;
                 sel_ = 0;
                 selMoved_ = true;
+                selectionExplicit_ = false;
                 focusNext_ = true;
                 submitInvestigationSearch();
                 rebuildResults();

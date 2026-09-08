@@ -323,10 +323,17 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
         if (needle.empty() || haystack.find(needle) != std::string::npos) visible.push_back(i);
     }
     if (visible.empty()) {
-        ImGui::TextDisabled(procs_.empty() ? "No processes found. Refresh to try again."
-                                          : "No processes match this name or PID.");
+        if (procs_.empty()) {
+            if (ui::EmptyState(DS_ICON_REFRESH, "No processes found",
+                              "Refresh the process list to try again.", "Refresh processes"))
+                refreshProcesses();
+        } else if (ui::EmptyState(DS_ICON_SEARCH, "No matching processes",
+                                 "Try another process name or PID.", "Clear filter")) {
+            filter_[0] = '\0';
+        }
         return;
     }
+    if (filter_[0]) ImGui::TextDisabled("%zu of %zu processes", visible.size(), procs_.size());
 
     // Fill the remaining height so the list only scrolls when truly overflowing.
     if (ImGui::BeginTable("procs", 5,
@@ -352,6 +359,7 @@ void CommunicationsTab::renderProcesses(AppContext& ctx) {
             if (ImGui::Selectable(p.name.c_str(), selProc_ == i,
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
                 selProc_ = i;
+            ui::ItemTooltip(p.name.c_str());
             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(p.is64 ? "x64" : "x86");
             ImGui::TableSetColumnIndex(3);
             ImGui::TextColored(p.canOpen ? theme::col::good() : theme::col::bad(),
@@ -502,7 +510,11 @@ void CommunicationsTab::renderConnections(AppContext& ctx) {
         return;
     }
     if (!shown) {
-        ImGui::TextWrapped("No endpoints match the current family, protocol, or text filters.");
+        if (ui::EmptyState(DS_ICON_SEARCH, "No matching endpoints",
+                          "Your family, protocol, or text filters hide the reported endpoints.", "Reset filters")) {
+            connFilter_[0] = '\0';
+            connShowV4_ = connShowV6_ = connShowTcp_ = connShowUdp_ = true;
+        }
         return;
     }
 

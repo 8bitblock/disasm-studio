@@ -234,7 +234,7 @@ bool BinaryFile::load(const std::string& path, const BinaryLoadOptions& options)
         if (options.cancelled && options.cancelled())
             return rejectLoad(BinaryLoadError::Cancelled, "binary load cancelled");
         const size_t chunk = std::min(chunkBytes, byteCount - offset);
-        if (!f.read(reinterpret_cast<char*>(data_.data() + offset),
+        if (!f.read(reinterpret_cast<char*>(data_.mutableData() + offset),
                     static_cast<std::streamsize>(chunk)))
             return rejectLoad(BinaryLoadError::ReadFailed, "could not read complete file");
         offset += chunk;
@@ -431,7 +431,7 @@ bool BinaryFile::loadRaw(const std::string& path, uint64_t base,
         if (options.cancelled && options.cancelled())
             return rejectLoad(BinaryLoadError::Cancelled, "raw binary load cancelled");
         const size_t chunk = std::min(chunkBytes, byteCount - offset);
-        if (!f.read(reinterpret_cast<char*>(data_.data() + offset),
+        if (!f.read(reinterpret_cast<char*>(data_.mutableData() + offset),
                     static_cast<std::streamsize>(chunk)))
             return rejectLoad(BinaryLoadError::ReadFailed,
                               "could not read complete raw file");
@@ -530,8 +530,8 @@ bool BinaryFile::loadFromMemory(std::vector<uint8_t> bytes, uint64_t base, const
     clear();
     if (bytes.size() < 0x40)
         return rejectLoad(BinaryLoadError::EmptyFile, "memory image is too small to map");
-    data_ = std::move(bytes);
     try {
+    data_ = std::move(bytes);
         path_ = name;
         // A live PE mapping: parse the headers but locate section data by RVA and force
         // the runtime base. Only a buffer without an MZ claim is treated as a flat blob.
@@ -638,8 +638,9 @@ size_t BinaryFile::writeImage(uint64_t va, const uint8_t* in, size_t n) {
         // Freeze the project identity before the first mutation even for a
         // caller that has not queried contentHash() yet.
         (void)contentHash();
+        uint8_t* writable = data_.mutableData();
         for (const WriteSpan& span : spans)
-            std::memcpy(data_.data() + span.fileOffset,
+            std::memcpy(writable + span.fileOffset,
                         replacement.data() + span.inputOffset, span.size);
         ++imageRevision_;
         return n;
@@ -652,11 +653,11 @@ size_t BinaryFile::writeImage(uint64_t va, const uint8_t* in, size_t n) {
 
 bool BinaryFile::commitPatchedImage(std::vector<uint8_t>&& replacement) {
     if (!loaded() || replacement.size() != data_.size()) return false;
-    // Preserve the pristine sidecar identity. std::vector::swap is noexcept for
-    // the default allocator, so after validation this commit cannot partially
-    // replace the image.
+    // Preserve the pristine sidecar identity and existing snapshot allocations.
+    // Allocate the new owner before publishing; failure leaves this image intact.
     (void)contentHash();
-    data_.swap(replacement);
+    try { data_ = std::move(replacement); }
+    catch (const std::bad_alloc&) { return false; }
     ++imageRevision_;
     return true;
 }

@@ -376,6 +376,19 @@ void PrismTab::render(AppContext& ctx) {
     }
     ImGui::Separator();
 
+    renderReportPanes(ctx, report, navigationSnapshot, sampledCreationTime,
+                      navigationOwnerExact);
+}
+
+void PrismTab::renderReportPanes(AppContext& ctx, const PrismReport& report,
+                                 const DbgSnapshot& navigationSnapshot,
+                                 uint64_t sampledCreationTime, bool canNavigate) {
+    const float scale = theme::UiScale();
+    const bool compact = ImGui::GetContentRegionAvail().x < 900.0f * scale;
+    if (compact) {
+        static const char* views[] = { "Functions", "Threads & modules", "Call paths" };
+        compactReportView_ = ui::TabStrip("##prism_report_views", views, 3, compactReportView_);
+    }
     ImVec2 available = ImGui::GetContentRegionAvail();
     available.y = std::max(220.0f * scale, available.y);
     const ImVec2 paneStart = ImGui::GetCursorPos();
@@ -383,138 +396,155 @@ void PrismTab::render(AppContext& ctx) {
     const float paneContentWidth = std::max(1.0f, available.x - splitter * 2.0f);
     const float minPane = std::min(170.0f * scale, paneContentWidth * 0.28f);
     const float minRatio = minPane / paneContentWidth;
-    firstPaneSplit_ = std::clamp(firstPaneSplit_, minRatio,
-                                 std::max(minRatio, secondPaneSplit_ - minRatio));
-    secondPaneSplit_ = std::clamp(secondPaneSplit_, firstPaneSplit_ + minRatio,
-                                  std::max(firstPaneSplit_ + minRatio, 1.0f - minRatio));
-    const float functionWidth = paneContentWidth * firstPaneSplit_;
-    const float middleWidth = paneContentWidth * (secondPaneSplit_ - firstPaneSplit_);
-    const float pathWidth = paneContentWidth - functionWidth - middleWidth;
+    if (!compact) {
+        firstPaneSplit_ = std::clamp(firstPaneSplit_, minRatio,
+                                     std::max(minRatio, secondPaneSplit_ - minRatio));
+        secondPaneSplit_ = std::clamp(secondPaneSplit_, firstPaneSplit_ + minRatio,
+                                      std::max(firstPaneSplit_ + minRatio, 1.0f - minRatio));
+    }
+    const float functionWidth = compact ? available.x : paneContentWidth * firstPaneSplit_;
+    const float middleWidth = compact ? available.x : paneContentWidth * (secondPaneSplit_ - firstPaneSplit_);
+    const float pathWidth = compact ? available.x : paneContentWidth - functionWidth - middleWidth;
     const bool haveCpuWeights = report.totalCpuCycles != 0;
-    const bool canNavigate = navigationOwnerExact;
 
-    ImGui::SetCursorPos(paneStart);
-    ImGui::BeginChild("pr_funcs", ImVec2(functionWidth, available.y), ImGuiChildFlags_None);
-    ImGui::SeparatorText(haveCpuWeights ? "CPU-weighted functions" : "Sampled leaf functions");
-    if (ImGui::BeginTable("pr_ftbl", 3,
-                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
-                                ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
-        ImGui::TableSetupColumn(haveCpuWeights ? "Incl" : "Stack",
-                                ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
-        ImGui::TableSetupColumn("Function");
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableHeadersRow();
-        for (const PrismFuncStat& function : report.functions) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            const float leafPct = haveCpuWeights ? function.cpuSelfPct : function.selfPct;
-            const float inclusivePct = haveCpuWeights ? function.cpuInclusivePct : function.inclusivePct;
-            const ImVec4 color = leafPct > 20.0f ? theme::col::bad()
-                               : leafPct > 5.0f ? theme::col::warn()
-                                                : ImGui::GetStyleColorVec4(ImGuiCol_Text);
-            ImGui::TextColored(color, "%.0f%%", leafPct);
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("%.0f%%", inclusivePct);
-            ImGui::TableSetColumnIndex(2);
-            ImGui::PushID(reinterpret_cast<void*>(static_cast<uintptr_t>(function.address)));
-            ImGui::BeginDisabled(!canNavigate || !function.address);
-            if (ImGui::Selectable(function.symbol.c_str(), false,
-                                  ImGuiSelectableFlags_SpanAllColumns) && function.address)
-                navigateAddress(ctx, sampler_.pid(), sampledCreationTime,
-                                function.address, navigationSnapshot,
-                                ImGui::GetIO().KeyShift);
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !canNavigate)
-                ImGui::SetTooltip(
-                    "Attach the Win32 debugger to the exact sampled process (PID %u) to navigate.",
-                    sampler_.pid());
-            ImGui::PopID();
+    if (!compact || compactReportView_ == 0) {
+        ImGui::SetCursorPos(paneStart);
+        ImGui::BeginChild("pr_funcs", ImVec2(functionWidth, available.y), ImGuiChildFlags_None);
+        ImGui::SeparatorText(haveCpuWeights ? "CPU-weighted functions" : "Sampled leaf functions");
+        if (ImGui::BeginTable("pr_ftbl", 3,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
+                                    ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
+            ImGui::TableSetupColumn(haveCpuWeights ? "Incl" : "Stack",
+                                    ImGuiTableColumnFlags_WidthFixed, 48.0f * scale);
+            ImGui::TableSetupColumn("Function");
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            for (const PrismFuncStat& function : report.functions) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                const float leafPct = haveCpuWeights ? function.cpuSelfPct : function.selfPct;
+                const float inclusivePct = haveCpuWeights ? function.cpuInclusivePct : function.inclusivePct;
+                const ImVec4 color = leafPct > 20.0f ? theme::col::bad()
+                                   : leafPct > 5.0f ? theme::col::warn()
+                                                    : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                ImGui::TextColored(color, "%.0f%%", leafPct);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextDisabled("%.0f%%", inclusivePct);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::PushID(reinterpret_cast<void*>(static_cast<uintptr_t>(function.address)));
+                ImGui::BeginDisabled(!canNavigate || !function.address);
+                if (ImGui::Selectable(function.symbol.c_str(), false,
+                                      ImGuiSelectableFlags_SpanAllColumns) && function.address)
+                    navigateAddress(ctx, sampler_.pid(), sampledCreationTime,
+                                    function.address, navigationSnapshot,
+                                    ImGui::GetIO().KeyShift);
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (!canNavigate)
+                        ImGui::SetTooltip("%s\nAttach the Win32 debugger to the exact sampled process (PID %u) to navigate.",
+                                          function.symbol.c_str(), sampler_.pid());
+                    else
+                        ImGui::SetTooltip("%s\n0x%llX\nClick: open code. Shift-click: open live code.",
+                                          function.symbol.c_str(), static_cast<unsigned long long>(function.address));
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
         }
-        ImGui::EndTable();
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
 
-    drawVerticalSplitter("##prism_split_functions",
-                         ImVec2(paneStart.x + functionWidth, paneStart.y),
-                         available.y, splitter, paneContentWidth, firstPaneSplit_,
-                         minRatio, std::max(minRatio, secondPaneSplit_ - minRatio));
-    ImGui::SetCursorPos(ImVec2(paneStart.x + functionWidth + splitter, paneStart.y));
-    ImGui::BeginChild("pr_mid", ImVec2(middleWidth, available.y), ImGuiChildFlags_None);
-    float halfHeight = ImGui::GetContentRegionAvail().y * 0.5f - 24.0f * scale;
-    halfHeight = std::max(60.0f * scale, halfHeight);
-    ImGui::SeparatorText("Threads");
-    if (ImGui::BeginTable("pr_thr", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                                     ImGuiTableFlags_Resizable,
-                          ImVec2(0, halfHeight))) {
-        ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
-        ImGui::TableSetupColumn("State");
-        ImGui::TableSetupColumn("Obs", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
-        ImGui::TableSetupColumn("CPU", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableHeadersRow();
-        for (const PrismThreadStat& thread : report.threads) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Text("%u", thread.threadId);
-            if (ImGui::IsItemHovered() && !thread.topSymbol.empty())
-                ImGui::SetTooltip("hottest: %s", thread.topSymbol.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(stateColor(thread.dominant), "%s", ThreadStateName(thread.dominant));
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextDisabled("%.0f", thread.dominantPct);
-            ImGui::TableSetColumnIndex(3);
-            if (haveCpuWeights) ImGui::TextDisabled("%.0f", thread.cpuPct);
-            else ImGui::TextDisabled("--");
+    if (!compact) {
+        drawVerticalSplitter("##prism_split_functions",
+                             ImVec2(paneStart.x + functionWidth, paneStart.y),
+                             available.y, splitter, paneContentWidth, firstPaneSplit_,
+                             minRatio, std::max(minRatio, secondPaneSplit_ - minRatio));
+        ImGui::SetCursorPos(ImVec2(paneStart.x + functionWidth + splitter, paneStart.y));
+    } else if (compactReportView_ == 1) ImGui::SetCursorPos(paneStart);
+    if (!compact || compactReportView_ == 1) {
+        ImGui::BeginChild("pr_mid", ImVec2(middleWidth, available.y), ImGuiChildFlags_None);
+        float halfHeight = ImGui::GetContentRegionAvail().y * 0.5f - 24.0f * scale;
+        halfHeight = std::max(60.0f * scale, halfHeight);
+        ImGui::SeparatorText("Threads");
+        if (ImGui::BeginTable("pr_thr", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                         ImGuiTableFlags_Resizable,
+                              ImVec2(0, halfHeight))) {
+            ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
+            ImGui::TableSetupColumn("State");
+            ImGui::TableSetupColumn("Obs", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
+            ImGui::TableSetupColumn("CPU", ImGuiTableColumnFlags_WidthFixed, 36.0f * scale);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            for (const PrismThreadStat& thread : report.threads) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%u", thread.threadId);
+                if (ImGui::IsItemHovered() && !thread.topSymbol.empty())
+                    ImGui::SetTooltip("hottest: %s", thread.topSymbol.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextColored(stateColor(thread.dominant), "%s", ThreadStateName(thread.dominant));
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextDisabled("%.0f", thread.dominantPct);
+                ImGui::TableSetColumnIndex(3);
+                if (haveCpuWeights) ImGui::TextDisabled("%.0f", thread.cpuPct);
+                else ImGui::TextDisabled("--");
+            }
+            ImGui::EndTable();
         }
-        ImGui::EndTable();
-    }
-    ImGui::Spacing();
-    ImGui::SeparatorText("Modules");
-    if (ImGui::BeginTable("pr_mod", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-                                     ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Module");
-        ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
-                                ImGuiTableColumnFlags_WidthFixed, 46.0f * scale);
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableHeadersRow();
-        int shown = 0;
-        for (const PrismModuleStat& module : report.modules) {
-            if (shown++ >= 20) break;
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(module.module.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextDisabled("%.0f%%", haveCpuWeights ? module.cpuPct : module.selfPct);
+        ImGui::Spacing();
+        ImGui::SeparatorText("Modules");
+        if (ImGui::BeginTable("pr_mod", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                         ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Module");
+            ImGui::TableSetupColumn(haveCpuWeights ? "CPU" : "Leaf",
+                                    ImGuiTableColumnFlags_WidthFixed, 46.0f * scale);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            int shown = 0;
+            for (const PrismModuleStat& module : report.modules) {
+                if (shown++ >= 20) break;
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(module.module.c_str());
+                ui::ItemTooltip(module.module.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextDisabled("%.0f%%", haveCpuWeights ? module.cpuPct : module.selfPct);
+            }
+            ImGui::EndTable();
         }
-        ImGui::EndTable();
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
 
-    drawVerticalSplitter("##prism_split_details",
-                         ImVec2(paneStart.x + functionWidth + splitter + middleWidth,
-                                paneStart.y),
-                         available.y, splitter, paneContentWidth, secondPaneSplit_,
-                         firstPaneSplit_ + minRatio,
-                         std::max(firstPaneSplit_ + minRatio, 1.0f - minRatio));
-    ImGui::SetCursorPos(ImVec2(paneStart.x + functionWidth + splitter + middleWidth + splitter,
-                               paneStart.y));
-    ImGui::BeginChild("pr_paths", ImVec2(pathWidth, available.y), ImGuiChildFlags_None);
-    ImGui::SeparatorText("Hot call paths");
-    for (size_t i = 0; i < report.hotPaths.size(); ++i) {
-        const PrismHotPath& path = report.hotPaths[i];
-        char header[72];
-        std::snprintf(header, sizeof(header), "%.0f%%  (%d samples)###hp%zu",
-                      path.pct, path.samples, i);
-        if (ImGui::TreeNodeEx(header, i == 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
-            ui::PushMono();
-            for (size_t frame = 0; frame < path.frames.size(); ++frame)
-                ImGui::Text("%*s%s", static_cast<int>(frame * 2), "", path.frames[frame].c_str());
-            ui::PopMono();
-            ImGui::TreePop();
+    if (!compact) {
+        drawVerticalSplitter("##prism_split_details",
+                             ImVec2(paneStart.x + functionWidth + splitter + middleWidth,
+                                    paneStart.y),
+                             available.y, splitter, paneContentWidth, secondPaneSplit_,
+                             firstPaneSplit_ + minRatio,
+                             std::max(firstPaneSplit_ + minRatio, 1.0f - minRatio));
+        ImGui::SetCursorPos(ImVec2(paneStart.x + functionWidth + splitter + middleWidth + splitter,
+                                   paneStart.y));
+    } else if (compactReportView_ == 2) ImGui::SetCursorPos(paneStart);
+    if (!compact || compactReportView_ == 2) {
+        ImGui::BeginChild("pr_paths", ImVec2(pathWidth, available.y), ImGuiChildFlags_None,
+                           ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::SeparatorText("Hot call paths");
+        for (size_t i = 0; i < report.hotPaths.size(); ++i) {
+            const PrismHotPath& path = report.hotPaths[i];
+            char header[72];
+            std::snprintf(header, sizeof(header), "%.0f%%  (%d samples)###hp%zu",
+                          path.pct, path.samples, i);
+            if (ImGui::TreeNodeEx(header, i == 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+                ui::PushMono();
+                for (size_t frame = 0; frame < path.frames.size(); ++frame)
+                    ImGui::Text("%*s%s", static_cast<int>(frame * 2), "", path.frames[frame].c_str());
+                ui::PopMono();
+                ImGui::TreePop();
+            }
         }
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
 }
 
 } // namespace ds

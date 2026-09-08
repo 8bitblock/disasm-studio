@@ -43,6 +43,11 @@
     <ClCompile Include="src\Core\JumpTableResolver.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\FunctionNamer.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\Debugger.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\DebuggerBreakpointMemory.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\DebuggerBreakpoints.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\DebuggerExecution.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\DebuggerObservers.cpp"><Filter>Source\Core</Filter></ClCompile>
+    <ClCompile Include="src\Core\ArtifactWrite.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\CFG.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\Cond.cpp"><Filter>Source\Core</Filter></ClCompile>
     <ClCompile Include="src\Core\ConnectionSchema.cpp"><Filter>Source\Core</Filter></ClCompile>
@@ -130,6 +135,8 @@
     <ClInclude Include="src\Core\AddressSpan.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\AttachImagePolicy.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\AddressInspector.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\MemoryValueHint.h"><Filter>Headers\Core</Filter></ClInclude>
+    <ClInclude Include="src\Core\InstructionBytePattern.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\BinaryFile.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\GameMakerArchive.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\GmlInstructionText.h"><Filter>Headers\Core</Filter></ClInclude>
@@ -172,6 +179,12 @@
       <ClInclude Include="src\Core\TypeSystem.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\InstructionSemantics.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\PatchedImage.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\DebuggerInternal.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\DebuggerMemoryMutation.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\DebuggerExecutionPolicy.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\ArtifactWrite.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\OwnedImage.h"><Filter>Headers\Core</Filter></ClInclude>
+      <ClInclude Include="src\Core\PatchRecovery.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\PatchRefresh.h"><Filter>Headers\Core</Filter></ClInclude>
       <ClInclude Include="src\Core\LivePatchOriginal.h"><Filter>Headers\Core</Filter></ClInclude>
     <ClInclude Include="src\Core\Decompiler.h"><Filter>Headers\Core</Filter></ClInclude>

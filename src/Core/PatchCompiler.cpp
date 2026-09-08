@@ -35,7 +35,7 @@ bool PatchLanguageAvailable(PatchLang lang) {
 
 static CompileResult CompileAsm(const std::string& src, const PatchCtx& ctx) {
     CompileResult r;
-    AsmResult a = Assemble(ctx.arch, src, ctx.siteVA);
+    AsmResult a = Assemble(ctx.machine, src, ctx.siteVA);
     r.ok = a.ok;
     r.bytes = std::move(a.bytes);
     if (!a.ok) r.diagnostics = a.error;
@@ -79,12 +79,22 @@ static CompileResult CompileC(const std::string& src, const PatchCtx&) {
     return r;
 }
 
-CompileResult CompilePatch(PatchLang lang, const std::string& source, const PatchCtx& ctx) {
+CompileResult CompilePatch(PatchLang lang, const std::string& source, const PatchCtx& ctx) try {
     switch (lang) {
         case PatchLang::Asm:    return CompileAsm(source, ctx);
-        case PatchLang::C:      return CompileC(source, ctx);
+        case PatchLang::C:
+            if (!PatchEncodingConfigurationValid(ctx.machine) || ctx.machine.arch != Arch::X64) {
+                CompileResult r;
+                r.diagnostics = "inline C supports only the build's x64 little-endian target";
+                return r;
+            }
+            return CompileC(source, ctx);
     }
     CompileResult r; r.diagnostics = "unknown patch language"; return r;
+} catch (const std::bad_alloc&) {
+    CompileResult r; r.diagnostics = "not enough memory to compile the patch"; return r;
+} catch (const std::length_error&) {
+    CompileResult r; r.diagnostics = "compiled patch exceeds the container limit"; return r;
 }
 
 } // namespace ds

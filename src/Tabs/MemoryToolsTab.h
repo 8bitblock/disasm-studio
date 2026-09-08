@@ -195,6 +195,9 @@ private:
     void refreshViewer(AppContext& ctx, const TargetToken& target, bool force);
     void navigateViewer(uint64_t address, bool recordHistory = true,
                         uint32_t selectionBytes = 1);
+    bool viewerRangeReadable(int offset, size_t size) const;
+    void selectViewerByte(int offset, bool extend);
+    std::string viewerSelectionText(bool pattern, bool ascii = false) const;
     void consumeMemoryRequest(AppContext& ctx, const TargetToken& target);
     void startPointerScan(AppContext& ctx, const TargetToken& target);
     void cancelPointerScan();
@@ -297,6 +300,9 @@ private:
     TargetToken viewOwner_;
     std::array<uint8_t, 256> viewBytes_{};
     std::array<uint8_t, 256> viewPrevious_{};
+    std::array<uint8_t, 256> viewValid_{};
+    std::array<uint8_t, 256> viewPreviousValid_{};
+    std::array<uint8_t, 256> viewWildcard_{};
     size_t viewBytesRead_ = 0;
     bool viewHavePrevious_ = false;
     bool viewAutoRefresh_ = true;
@@ -304,8 +310,16 @@ private:
     double viewLastRefresh_ = 0.0;
     int viewSelectionBegin_ = -1;
     int viewSelectionEnd_ = -1;
+    int viewValueType_ = static_cast<int>(MemoryValueType::Int32);
+    bool viewScrollSelection_ = false;
+    bool viewFocusAddress_ = false;
+    std::string viewStatus_;
     char viewEdit_[1024]{};
-    std::vector<uint64_t> viewHistory_;
+    struct ViewerLocation {
+        uint64_t address = 0;
+        uint32_t selectionBytes = 1;
+    };
+    std::vector<ViewerLocation> viewHistory_;
     size_t viewHistoryIndex_ = 0;
 
     // Pointer scan state.

@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $false)]
-    [string]$ManifestPath
+    [string]$ManifestPath,
+    [switch]$PassThru
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +53,7 @@ foreach ($line in [IO.File]::ReadLines($manifest)) {
         Kind = $kind
         Name = $name
         Line = $lineNumber
+        Dependencies = $dependencies
     })
 }
 
@@ -83,3 +85,4 @@ $liveCount = @($records | Where-Object Kind -eq 'LIVE_TEST').Count
 $integrationCount = @($records | Where-Object Kind -eq 'INTEGRATION_TEST').Count
 $eligibleCount = $records.Count - $liveCount - $integrationCount
 Write-Host "Test manifest OK: $($records.Count) declared ($eligibleCount eligible, $liveCount live/environment-dependent, $integrationCount app-object integration)."
+if ($PassThru) { $records.ToArray() }

@@ -1,4 +1,5 @@
 #include "Debugger.h"
+#include "DebuggerInternal.h"
 #include "NetworkApiCatalog.h"
 #include "Cond.h"
 #include "DbgHelpLock.h"      // serialize DbgHelp against the UI thread's SymbolResolver
@@ -6,6 +7,7 @@
 #include "JvmAware.h"         // JVM module detection / JNI_CreateJavaVM resolution
 #include "RegisterEdit.h"     // text-pointer register edit policy / byte cap
 #include "StepLogic.h"
+#include "DebuggerExecutionPolicy.h"
 #include "../Disasm/IDisassembler.h"
 #include "../Disasm/ZydisDisassembler.h"
 
@@ -43,10 +45,6 @@ static constexpr size_t   kMaxPendingMemoryWriteBytes = 32u * 1024u * 1024u;
 static constexpr size_t   kMaxPendingMemoryWrites = 64;
 static constexpr size_t   kMaxRemoteRegisterBuffers = 256;
 
-static bool readByteRPM(HANDLE h, uint64_t va, uint8_t& b);
-static bool writeByteRPM(HANDLE h, uint64_t va, uint8_t b);
-static bool replaceByteIfEqual(HANDLE h, uint64_t va, uint8_t expected, uint8_t replacement);
-static bool readRemoteExact(HANDLE h, uint64_t va, void* out, size_t size);
 
 static AttachedFileIdentity attachedFileIdentity(HANDLE file) {
     AttachedFileIdentity identity;
@@ -65,11 +63,11 @@ static AttachedFileIdentity attachedFileIdentity(HANDLE file) {
     return identity;
 }
 
-static std::wstring widenUtf8(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+std::wstring widenUtf8(const std::string& s) {
+    if (s.empty() || s.size() > 32767 || s.find('\0') != std::string::npos) return {};
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), nullptr, 0);
     std::wstring w(n > 0 ? n : 0, L'\0');
-    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
+    if (n > 0) MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), w.data(), n);
     return w;
 }
 
@@ -189,35 +187,6 @@ static SyntheticClockConfig productionSyntheticClockConfig() {
     return config;
 }
 
-static void writePrintablePayload(std::FILE* f, const std::vector<uint8_t>& bytes) {
-    for (uint8_t b : bytes) {
-        if (b == '\r' || b == '\n' || b == '\t') std::fputc((int)b, f);
-        else if (b >= 0x20 && b < 0x7F)          std::fputc((int)b, f);
-        else                                     std::fputc('.', f);
-    }
-    if (bytes.empty() || bytes.back() != '\n') std::fputc('\n', f);
-}
-
-static void writeHexPayload(std::FILE* f, const std::vector<uint8_t>& bytes) {
-    for (size_t off = 0; off < bytes.size(); off += 16) {
-        std::fprintf(f, "%08zX  ", off);
-        char ascii[17] = {};
-        for (size_t i = 0; i < 16; ++i) {
-            if (off + i < bytes.size()) {
-                uint8_t b = bytes[off + i];
-                std::fprintf(f, "%02X ", b);
-                ascii[i] = (b >= 0x20 && b < 0x7F) ? (char)b : '.';
-            } else {
-                std::fputs("   ", f);
-                ascii[i] = ' ';
-            }
-            if (i == 7) std::fputc(' ', f);
-        }
-        ascii[16] = '\0';
-        std::fprintf(f, " %s\n", ascii);
-    }
-}
-
 // In a 32-bit (WOW64) target, int3 / single-step in the 32-bit code are reported as
 // these WX86 status codes, not the usual EXCEPTION_BREAKPOINT / EXCEPTION_SINGLE_STEP.
 static constexpr uint32_t kStatusWx86Breakpoint = 0x4000001FUL;
@@ -250,7 +219,11 @@ Debugger::~Debugger() {
     lifecycleCv_.notify_all();
     cmdCv_.notify_all();
     if (lifecycleThread_.joinable()) lifecycleThread_.join();
-    detach();
+    { std::lock_guard lock(mtx_); destroying_ = true; }
+    (void)detach();
+    // Forced destruction has no UI left to approve abandoning repair. Keep the
+    // owning thread alive until its retained cleanup succeeds or the target exits.
+    if (thread_.joinable()) { cmdCv_.notify_all(); thread_.join(); }
     { std::lock_guard lock(netLogMtx_); netLogShutdown_ = true; }
     netLogCv_.notify_one();
     if (netLogThread_.joinable()) netLogThread_.join();
@@ -411,6 +384,7 @@ void Debugger::lifecycleWorkerLoop() {
             lifecycleQueued_ = false;
         }
         bool succeeded = false;
+        bool cancellationCleanupFailed = false;
         std::string error;
         DebugTargetIdentity target;
         std::lock_guard ownerLock(lifecycleOwnerMtx_);
@@ -435,9 +409,12 @@ void Debugger::lifecycleWorkerLoop() {
                 if (lifecycleCancel_.load()) {
                     // A queued request cancelled before it acquires ownership
                     // never tears down an existing unrelated attachment.
-                    if (attemptedAttach) detach();
+                    cancellationCleanupFailed = attemptedAttach && !detach();
                     succeeded = false;
-                    error = "debugger startup cancelled";
+                    if (cancellationCleanupFailed) {
+                        std::lock_guard sessionLock(mtx_);
+                        error = lastEvent_; target = {pid_, sessionGeneration_};
+                    } else error = "debugger startup cancelled";
                 }
                 if (succeeded) {
                     std::lock_guard sessionLock(mtx_);
@@ -445,8 +422,11 @@ void Debugger::lifecycleWorkerLoop() {
                 }
                 lifecycleAttaching_.store(false);
             } else {
-                succeeded = expected.valid() ? detachForSession(expected) : (detach(), true);
-                if (!succeeded) error = "the debugger session changed before detach";
+                succeeded = expected.valid() ? detachForSession(expected) : detach();
+                if (!succeeded) {
+                    std::lock_guard sessionLock(mtx_);
+                    error = cleanupOnly_ ? lastEvent_ : "the debugger session changed before detach";
+                }
             }
         } catch (const std::exception& e) {
             error = std::string("debugger lifecycle failed: ") + e.what();
@@ -461,16 +441,18 @@ void Debugger::lifecycleWorkerLoop() {
             // Commit and cancellation share this lock. Keep the operation busy
             // while cleanup runs, but release it so UI polling never waits on IO.
             lock.unlock();
-            detach();
+            cancellationCleanupFailed = !detach();
             succeeded = false;
-            target = {};
-            error = "debugger startup cancelled";
+            if (cancellationCleanupFailed) {
+                std::lock_guard sessionLock(mtx_);
+                error = lastEvent_; target = {pid_, sessionGeneration_};
+            } else { target = {}; error = "debugger startup cancelled"; }
             lock.lock();
         }
         lifecycle_.busy = false;
         lifecycle_.completed = true;
         lifecycle_.succeeded = succeeded;
-        lifecycle_.cancelled = lifecycleCancel_.load() &&
+        lifecycle_.cancelled = !cancellationCleanupFailed && lifecycleCancel_.load() &&
             request.command != DbgLifecycleCommand::Detach;
         lifecycle_.error = std::move(error);
         lifecycle_.target = target;
@@ -540,6 +522,9 @@ uint64_t Debugger::beginSessionControl() {
     pendingBpEveryN_.clear();
     pendingHwAdds_.clear();
     pendingHwRems_.clear();
+    pendingNetworkSync_ = false;
+    pendingInstructionRewinds_.clear();
+    pendingControlFlagRepairs_.clear();
     pausedUserBpAddr_.reset();
     runtimeTempBpAddr_.reset();
     startupErr_.clear();
@@ -547,6 +532,8 @@ uint64_t Debugger::beginSessionControl() {
     startupOk_ = false;
     startupDone_ = false;
     initialProcessEventReady_ = false;
+    ownerFinished_ = false;
+    cleanupOnly_ = false;
     breakRequested_ = false;
     traceSyncBreakRequested_ = false;
     return controlEpoch_;
@@ -590,7 +577,10 @@ bool Debugger::waitForStartup(std::string& err) {
         CancelSynchronousIo(thread_.native_handle());
         requestTraceSyncBreak();
     }
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable() && !detach()) {
+        std::lock_guard lock(mtx_);
+        err += "; " + lastEvent_;
+    }
     return false;
 }
 
@@ -604,7 +594,7 @@ bool Debugger::attach(uint32_t pid, std::string& err) {
             return false;
         }
     }
-    detach();
+    if (!detach()) { err = "previous debugger cleanup is incomplete; Retry Detach before replacing the target"; return false; }
     const uint64_t controlEpoch = beginSessionControl();
     try {
         thread_ = std::thread([this, pid, controlEpoch] {
@@ -660,7 +650,7 @@ bool Debugger::launchAndAttach(const std::string& exePath, std::string& err,
     // Invalid authorization evidence must not tear down an unrelated live
     // debugger session. Once every launch input is complete, establish the new
     // session and retain the plan before the worker can receive CREATE_PROCESS.
-    detach();
+    if (!detach()) { err = "previous debugger cleanup is incomplete; Retry Detach before replacing the target"; return false; }
     const uint64_t controlEpoch = beginSessionControl();
     if (authorizationPlan) {
         authorizationWatch_.prepare(*authorizationPlan, authorizationOptions);
@@ -707,7 +697,9 @@ bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& e
             err = "debugger lifecycle is busy"; return false;
         }
     }
-    if (!plan.valid) {
+    if (!plan.valid || plan.executable.find('\0') != std::string::npos ||
+        plan.commandLine.find('\0') != std::string::npos ||
+        plan.executable.size() > 32767 || plan.commandLine.size() > 32767) {
         err = plan.errors.empty() ? "invalid DLL debug launch plan" : plan.errors.front();
         return false;
     }
@@ -718,7 +710,7 @@ bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& e
         return false;
     }
 
-    detach();
+    if (!detach()) { err = "previous debugger cleanup is incomplete; Retry Detach before replacing the target"; return false; }
     const uint64_t controlEpoch = beginSessionControl();
     try {
         thread_ = std::thread([this, applicationPath, commandLine, plan, controlEpoch] {
@@ -733,7 +725,7 @@ bool Debugger::launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& e
     return waitForStartup(err);
 }
 
-void Debugger::detach() {
+bool Debugger::detach() {
     std::lock_guard ownerLock(lifecycleOwnerMtx_);
     // Observation is session-scoped. Never carry an old opt-in into a later
     // attach, even when detach is called while no worker is running.
@@ -753,8 +745,19 @@ void Debugger::detach() {
         // threadMain keeps that event outstanding while it restores debugger-owned
         // bytes and DR state, so cleanup never races executing target threads.
         requestTraceSyncBreak();
-        quit_ = true;
-        postCommand(Cmd::Detach);
+        uint64_t attempt = 0;
+        {
+            std::lock_guard lock(mtx_);
+            attempt = ++detachAttempt_;
+            quit_ = true;
+            pendingCommand_ = {Cmd::Detach, 0, controlEpoch_};
+        }
+        cmdCv_.notify_all();
+        {
+            std::unique_lock lock(mtx_);
+            cmdCv_.wait(lock, [&] { return ownerFinished_ || detachCompletedAttempt_ >= attempt; });
+            if (!ownerFinished_) return false;
+        }
         thread_.join();
         closeNetCaptureLogFile();
     }
@@ -774,6 +777,8 @@ void Debugger::detach() {
     pendingBpEveryN_.clear();
     pendingHwAdds_.clear();
     pendingHwRems_.clear();
+    pendingNetworkSync_ = false;
+    pendingInstructionRewinds_.clear();
     pausedUserBpAddr_.reset();
     runtimeTempBpAddr_.reset();
     traceBps_.clear();
@@ -824,6 +829,8 @@ void Debugger::detach() {
     activeTid_ = 0;
     containedJob_ = false;
     isWow64_.store(false);
+    cleanupOnly_ = false;
+    return true;
 }
 
 bool Debugger::detachForSession(DebugTargetIdentity expected) {
@@ -838,14 +845,13 @@ bool Debugger::detachForSession(DebugTargetIdentity expected) {
     }
     // UI lifecycle calls are serialized. The identity check prevents a retained
     // control (for example Ctrl+K) from detaching a later session.
-    detach();
-    return true;
+    return detach();
 }
 
 void Debugger::postCommand(Cmd c, uint64_t argument) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (c != Cmd::Detach && state_ != DbgState::Paused) return;
+        if (c != Cmd::Detach && (state_ != DbgState::Paused || cleanupOnly_)) return;
         if (pendingCommand_.checkedRunToToken)
             cancelCheckedRunToLocked(
                 "another execution command replaced the pending checked RunTo request");
@@ -859,7 +865,7 @@ bool Debugger::postCommandForSession(Cmd c, uint64_t argument,
     if (!expected.valid()) return false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ != DbgState::Paused ||
+        if (state_ != DbgState::Paused || cleanupOnly_ ||
             !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
             return false;
         if (pendingCommand_.checkedRunToToken)
@@ -915,7 +921,7 @@ bool Debugger::runToCursorForSession(DebugTargetIdentity expected,
     std::unique_lock<std::mutex> stateLock(mtx_);
     if (!DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return fail("the debugger target or session changed");
-    if (state_ != DbgState::Paused)
+    if (cleanupOnly_ || state_ != DbgState::Paused)
         return fail("the debugger is no longer paused");
     if (activeTid_ != expectedTid)
         return fail("the active debugger thread changed");
@@ -1009,6 +1015,7 @@ std::vector<Registers> Debugger::sampleExecutionContexts(size_t maxThreads) {
     DbgState state = DbgState::Detached;
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (cleanupOnly_) return {};
         state = state_;
         if (state == DbgState::Paused) {
             result.push_back(regs_);
@@ -1052,6 +1059,7 @@ void Debugger::requestTraceSyncBreak(DebugTargetIdentity expected) {
         if (expected.valid() && !DebugTargetIdentityMatches(
                 { pid_, sessionGeneration_ }, expected))
             return;
+        if (cleanupOnly_) return;
         state = state_;
     }
     if (state == DbgState::Paused) {
@@ -1074,7 +1082,7 @@ void Debugger::startTraceCoverage(const std::vector<uint64_t>& basicBlockStarts,
                                   size_t maxSites) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ != DbgState::Running && state_ != DbgState::Paused) return;
+        if (cleanupOnly_ || (state_ != DbgState::Running && state_ != DbgState::Paused)) return;
         traceCoverage_.begin(basicBlockStarts, maxSites);
         pendingTraceStop_ = false;
         pendingTraceStart_ = true;
@@ -1089,7 +1097,7 @@ bool Debugger::startTraceCoverageForSession(
     if (!expected.valid()) return false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
+        if (cleanupOnly_ || (state_ != DbgState::Running && state_ != DbgState::Paused) ||
             !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
             return false;
         traceCoverage_.begin(basicBlockStarts, maxSites);
@@ -1103,6 +1111,7 @@ bool Debugger::startTraceCoverageForSession(
 void Debugger::stopTraceCoverage() {
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (cleanupOnly_) return;
         traceCoverage_.stop();
         pendingTraceStart_ = false;
         pendingTraceStop_ = true;
@@ -1114,7 +1123,7 @@ bool Debugger::stopTraceCoverageForSession(DebugTargetIdentity expected) {
     if (!expected.valid()) return false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
+        if (cleanupOnly_ || (state_ != DbgState::Running && state_ != DbgState::Paused) ||
             !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
             return false;
         traceCoverage_.stop();
@@ -1136,6 +1145,13 @@ void* Debugger::duplicateProcessHandleForSession(DebugTargetIdentity expected) {
     return duplicate;
 }
 
+bool Debugger::memorySessionMatches(DebugTargetIdentity expected) {
+    if (!expected.valid()) return false;
+    std::lock_guard<std::mutex> lk(hProcMtx_);
+    return hProcessShared_.load() != nullptr &&
+           DebugTargetIdentityMatches(hProcessIdentity_, expected);
+}
+
 uint64_t Debugger::processCreationTimeForSession(DebugTargetIdentity expected) {
     if (!expected.valid()) return 0;
     std::lock_guard<std::mutex> lk(hProcMtx_);
@@ -1151,7 +1167,7 @@ void Debugger::clearTraceCoverage() { traceCoverage_.clearHits(); }
 bool Debugger::clearTraceCoverageForSession(DebugTargetIdentity expected) {
     if (!expected.valid()) return false;
     std::lock_guard<std::mutex> lk(mtx_);
-    if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
+    if (cleanupOnly_ || (state_ != DbgState::Running && state_ != DbgState::Paused) ||
         !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return false;
     traceCoverage_.clearHits();
@@ -1186,7 +1202,7 @@ bool Debugger::startAuthorizationWatch(
     {
         std::lock_guard<std::mutex> lk(mtx_);
         const DebugTargetIdentity current{ pid_, sessionGeneration_ };
-        if (!DebugTargetIdentityMatches(current, expected) ||
+        if (cleanupOnly_ || !DebugTargetIdentityMatches(current, expected) ||
             (state_ != DbgState::Running && state_ != DbgState::Paused)) {
             if (error) *error = "debug target changed before Authorization Watch could start";
             return false;
@@ -1221,7 +1237,7 @@ bool Debugger::startAuthorizationWatch(
     {
         std::lock_guard<std::mutex> lk(mtx_);
         const DebugTargetIdentity current{ pid_, sessionGeneration_ };
-        if (!DebugTargetIdentityMatches(current, expected) ||
+        if (cleanupOnly_ || !DebugTargetIdentityMatches(current, expected) ||
             (state_ != DbgState::Running && state_ != DbgState::Paused)) {
             authorizationWatch_.reset();
             if (error) *error = "debug target changed while Authorization Watch was starting";
@@ -1235,9 +1251,10 @@ bool Debugger::startAuthorizationWatch(
 }
 
 void Debugger::stopAuthorizationWatch() {
-    authorizationWatch_.stop();
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (cleanupOnly_) return;
+        authorizationWatch_.stop();
         pendingAuthorizationStart_ = false;
         pendingAuthorizationStop_ = true;
     }
@@ -1263,7 +1280,7 @@ AuthorizationWatchSnapshot Debugger::authorizationWatchSnapshot() {
 
 void Debugger::setActiveThread(uint32_t tid) {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (state_ != DbgState::Paused) return;            // thread contexts are only stable at a stop
+    if (cleanupOnly_ || state_ != DbgState::Paused) return;            // thread contexts are only stable at a stop
     void* h = nullptr;
     for (auto& kv : threadHandles_) if (kv.first == tid) { h = kv.second; break; }
     if (!h) return;
@@ -1282,7 +1299,7 @@ void Debugger::setActiveThread(uint32_t tid) {
 bool Debugger::setActiveThreadForSession(DebugTargetIdentity expected, uint32_t tid) {
     if (!expected.valid()) return false;
     std::lock_guard<std::mutex> lk(mtx_);
-    if (state_ != DbgState::Paused ||
+    if (state_ != DbgState::Paused || cleanupOnly_ ||
         !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return false;
     void* h = nullptr;
@@ -1298,11 +1315,12 @@ bool Debugger::setActiveThreadForSession(DebugTargetIdentity expected, uint32_t 
 
 bool Debugger::setRegisters(const Registers& r) {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (state_ != DbgState::Paused || gmlSnapshot_.stop) return false;
+    if (state_ != DbgState::Paused || cleanupOnly_ || gmlSnapshot_.stop) return false;
     void* h = nullptr;
     for (auto& kv : threadHandles_) if (kv.first == activeTid_) { h = kv.second; break; }
     if (!h) return false;
     if (!ctxWriteFull(h, r)) return false;             // get-modify-set (preserves seg/FP/debug)
+    pendingInstructionRewinds_.erase(activeTid_); // explicit full-context edit supersedes pending rewind
     regs_ = r;                                          // reflect immediately in the next snapshot
     return true;
 }
@@ -1336,7 +1354,7 @@ bool Debugger::setRegisterForSession(uint32_t expectedPid,
     const DebugTargetIdentity expected{ expectedPid, expectedSessionGeneration };
     std::lock_guard<std::mutex> lk(mtx_);
     const DebugTargetIdentity current{ pid_, sessionGeneration_ };
-    if (!DebugTargetIdentityMatches(current, expected) || state_ != DbgState::Paused || gmlSnapshot_.stop)
+    if (!DebugTargetIdentityMatches(current, expected) || state_ != DbgState::Paused || cleanupOnly_ || gmlSnapshot_.stop)
         return false;
     if (expectedTid && activeTid_ != expectedTid) return false;
     const bool wow64 = isWow64_.load();
@@ -1356,6 +1374,7 @@ bool Debugger::setRegisterForSession(uint32_t expectedPid,
     if (expectedRip && r.rip != *expectedRip) return false;
     r.*f = value;
     if (!ctxWriteFull(h, r)) return false;
+    if (name == "rip") pendingInstructionRewinds_.erase(activeTid_);
     // Publish what the target actually received.  In particular, a WOW64
     // context contains zero-extended DWORDs and must never expose a stale high
     // half in the UI snapshot.
@@ -1396,7 +1415,7 @@ bool Debugger::readPausedRegistersForSession(DebugTargetIdentity expected,
         return fail("native register experiments are unavailable inside a GML helper stop");
     if (!DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return fail("the debugger target or session changed");
-    if (state_ != DbgState::Paused)
+    if (cleanupOnly_ || state_ != DbgState::Paused)
         return fail("the debugger is no longer paused");
     if (activeTid_ != expectedTid)
         return fail("the active debugger thread changed");
@@ -1441,7 +1460,7 @@ bool Debugger::setAccumulatorForSessionVerified(
     std::lock_guard<std::mutex> stateLock(mtx_);
     if (!DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return fail("the debugger target or session changed");
-    if (state_ != DbgState::Paused)
+    if (cleanupOnly_ || state_ != DbgState::Paused)
         return fail("the debugger is no longer paused");
     if (activeTid_ != expectedTid)
         return fail("the active debugger thread changed");
@@ -1558,7 +1577,7 @@ bool Debugger::setRegisterToBufferForSession(
     if (gmlSnapshot_.stop)
         return fail("native register text editing is unavailable inside a GML helper stop");
     if (!DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected) ||
-        state_ != DbgState::Paused || activeTid_ != expectedTid)
+        cleanupOnly_ || state_ != DbgState::Paused || activeTid_ != expectedTid)
         return fail("debugger target, session, or active thread changed");
     const bool wow64 = isWow64_.load();
     if (!RegisterCanHoldTextPointer(name, wow64))
@@ -1679,6 +1698,7 @@ bool Debugger::setRegisterToBufferForSession(
 
 void Debugger::suspendThread(uint32_t tid) {
     std::lock_guard<std::mutex> lk(mtx_);
+    if (cleanupOnly_) return;
     if (suspended_.count(tid)) return;                 // keep our suspend count at exactly +1
     void* h = nullptr;
     for (auto& kv : threadHandles_) if (kv.first == tid) { h = kv.second; break; }
@@ -1689,7 +1709,7 @@ void Debugger::suspendThread(uint32_t tid) {
 bool Debugger::suspendThreadForSession(DebugTargetIdentity expected, uint32_t tid) {
     if (!expected.valid()) return false;
     std::lock_guard<std::mutex> lk(mtx_);
-    if ((state_ == DbgState::Detached || state_ == DbgState::Terminated) ||
+    if (cleanupOnly_ || (state_ == DbgState::Detached || state_ == DbgState::Terminated) ||
         !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return false;
     if (suspended_.count(tid)) return true;
@@ -1703,6 +1723,7 @@ bool Debugger::suspendThreadForSession(DebugTargetIdentity expected, uint32_t ti
 
 void Debugger::resumeThread(uint32_t tid) {
     std::lock_guard<std::mutex> lk(mtx_);
+    if (cleanupOnly_) return;
     if (!suspended_.count(tid)) return;
     void* h = nullptr;
     for (auto& kv : threadHandles_) if (kv.first == tid) { h = kv.second; break; }
@@ -1715,7 +1736,7 @@ void Debugger::resumeThread(uint32_t tid) {
 bool Debugger::resumeThreadForSession(DebugTargetIdentity expected, uint32_t tid) {
     if (!expected.valid()) return false;
     std::lock_guard<std::mutex> lk(mtx_);
-    if ((state_ == DbgState::Detached || state_ == DbgState::Terminated) ||
+    if (cleanupOnly_ || (state_ == DbgState::Detached || state_ == DbgState::Terminated) ||
         !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
         return false;
     if (!suspended_.count(tid)) return true;
@@ -1764,135 +1785,6 @@ bool Debugger::pauseForSession(DebugTargetIdentity expected) {
     return true;
 }
 
-bool Debugger::addBreakpoint(uint64_t va, const std::string& condition) {
-    if (!ValidateBreakpointCondition(condition)) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return false;
-        if (gameMakerOwnsRangeLocked(va,1)) return false;
-        // The debug thread drains command kinds separately. Coalesce this
-        // address while still queued so remove/re-add preserves the last intent.
-        // Keep adds/removals sorted: large ascending listing selections append
-        // after logarithmic lookup instead of scanning every prior request.
-        const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
-        if (removal != pendingBpRems_.end() && *removal == va) pendingBpRems_.erase(removal);
-        std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
-        const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
-            [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
-        if (addition != pendingBpAdds_.end() && addition->va == va) addition->cond = condition;
-        else pendingBpAdds_.insert(addition, { va, condition });
-        clearBreakpointInstallFailureLocked(va); // a fresh request is queued, not the old failure
-    }
-    requestTraceSyncBreak();
-    return true;
-}
-bool Debugger::addBreakpointForSession(DebugTargetIdentity expected, uint64_t va,
-                                       const std::string& condition) {
-    if (!expected.valid() || !ValidateBreakpointCondition(condition)) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
-            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
-            return false;
-        if (gameMakerOwnsRangeLocked(va,1)) return false;
-        const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
-        if (removal != pendingBpRems_.end() && *removal == va) pendingBpRems_.erase(removal);
-        std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
-        const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
-            [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
-        if (addition != pendingBpAdds_.end() && addition->va == va) addition->cond = condition;
-        else pendingBpAdds_.insert(addition, { va, condition });
-        clearBreakpointInstallFailureLocked(va);
-    }
-    requestTraceSyncBreak(expected);
-    return true;
-}
-bool Debugger::removeBreakpoint(uint64_t va) {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return false;
-        const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
-            [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
-        if (addition != pendingBpAdds_.end() && addition->va == va) pendingBpAdds_.erase(addition);
-        std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
-        std::erase_if(pendingBpEveryN_, [va](const auto& pending) { return pending.first == va; });
-        const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
-        if (removal == pendingBpRems_.end() || *removal != va) pendingBpRems_.insert(removal, va);
-    }
-    requestTraceSyncBreak();
-    return true;
-}
-bool Debugger::removeBreakpointForSession(DebugTargetIdentity expected, uint64_t va) {
-    if (!expected.valid()) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
-            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
-            return false;
-        const auto addition = std::lower_bound(pendingBpAdds_.begin(), pendingBpAdds_.end(), va,
-            [](const PendingBp& pending, uint64_t address) { return pending.va < address; });
-        if (addition != pendingBpAdds_.end() && addition->va == va) pendingBpAdds_.erase(addition);
-        std::erase_if(pendingBpConds_, [va](const PendingBp& pending) { return pending.va == va; });
-        std::erase_if(pendingBpEveryN_, [va](const auto& pending) { return pending.first == va; });
-        const auto removal = std::lower_bound(pendingBpRems_.begin(), pendingBpRems_.end(), va);
-        if (removal == pendingBpRems_.end() || *removal != va) pendingBpRems_.insert(removal, va);
-    }
-    requestTraceSyncBreak(expected);
-    return true;
-}
-bool Debugger::hasBreakpoint(uint64_t va) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return bps_.count(va) != 0;
-}
-bool Debugger::setBreakpointCondition(uint64_t va, const std::string& condition) {
-    if (!ValidateBreakpointCondition(condition)) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return false;
-        pendingBpConds_.push_back({ va, condition });
-    }
-    requestTraceSyncBreak();
-    return true;
-}
-
-bool Debugger::setBreakpointConditionForSession(DebugTargetIdentity expected,
-                                                uint64_t va,
-                                                const std::string& condition) {
-    if (!expected.valid() || !ValidateBreakpointCondition(condition)) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
-            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
-            return false;
-        pendingBpConds_.push_back({ va, condition });
-    }
-    requestTraceSyncBreak(expected);
-    return true;
-}
-
-void Debugger::setBreakpointEveryN(uint64_t va, uint32_t n) {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return;
-        pendingBpEveryN_.push_back({ va, n });
-    }
-    requestTraceSyncBreak();
-}
-
-bool Debugger::setBreakpointEveryNForSession(DebugTargetIdentity expected,
-                                             uint64_t va, uint32_t n) {
-    if (!expected.valid()) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
-            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
-            return false;
-        pendingBpEveryN_.push_back({ va, n });
-    }
-    requestTraceSyncBreak(expected);
-    return true;
-}
-
 void Debugger::addFirstChanceCode(uint32_t code) {
     std::lock_guard<std::mutex> lk(mtx_);
     fcWhitelist_.insert(code);
@@ -1913,2010 +1805,6 @@ void Debugger::clearDebugOutput() {
 
 // Defined further down (the RPM byte helpers); forward-declared so the net-tap
 // methods above their definitions can use them.
-static bool readByteRPM(HANDLE h, uint64_t va, uint8_t& b);
-static bool writeByteRPM(HANDLE h, uint64_t va, uint8_t b);
-
-// ---- guided network observation (public shell + debug-thread probes) ---------
-void Debugger::startNetworkObservation() {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        // A terminated snapshot deliberately retains modules/register history,
-        // but it has no live debuggee in which probes can be installed. Keep
-        // this Core boundary authoritative even if a UI caller has stale state.
-        if (state_ != DbgState::Running && state_ != DbgState::Paused) {
-            networkObservationWant_.store(false);
-            networkCoverage_.requested = false;
-            return;
-        }
-        networkObservationWant_.store(true);
-        networkCoverage_.requested = true;
-    }
-    requestTraceSyncBreak();
-}
-
-void Debugger::stopNetworkObservation() {
-    networkObservationWant_.store(false);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        networkCoverage_.requested = false;
-    }
-    requestTraceSyncBreak();
-}
-
-void Debugger::enableNetTap(bool on) {
-    if (on) startNetworkObservation();
-    else stopNetworkObservation();
-}
-
-NetworkObservation Debugger::networkObservationSnapshot() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    NetworkObservation snapshot;
-    snapshot.coverage = networkCoverage_;
-    snapshot.events.assign(networkEvents_.begin(), networkEvents_.end());
-    return snapshot;
-}
-
-NetworkProbeCoverage Debugger::networkProbeCoverage() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return networkCoverage_;
-}
-
-void Debugger::clearNetworkObservation() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    networkEvents_.clear();
-    networkCoverage_.retainedPayloadBytes = 0;
-    networkCoverage_.payloadBytesDropped = 0;
-    networkCoverage_.eventsDropped = 0;
-}
-
-bool Debugger::setNetCaptureLogFile(const std::string& utf8Path, bool append, std::string* err) {
-    if (err) err->clear();
-    if (utf8Path.empty() || utf8Path.size() > 32768 || utf8Path.find('\0') != std::string::npos) {
-        if (err) *err = "invalid log path";
-        return false;
-    }
-    std::lock_guard lock(netLogMtx_);
-    // Reserve an extra control slot for Close, which must always be accepted.
-    if (netLogShutdown_ || netLogQueuedControls_ >= kNetLogQueueControls) {
-        if (err) *err = "log writer is busy; wait for queued file changes to finish";
-        return false;
-    }
-    NetLogWork work;
-    work.kind = NetLogWork::Kind::Open;
-    work.path = utf8Path;
-    work.append = append;
-    work.generation = ++netLogGeneration_;
-    netLogQueue_.push_back(std::move(work));
-    ++netLogQueuedControls_;
-    netLogPath_ = utf8Path;
-    netLogStatus_.enabled = true;
-    netLogStatus_.opening = true;
-    netLogStatus_.draining = false;
-    netLogStatus_.error.clear();
-    netLogCv_.notify_one();
-    return true;
-}
-
-void Debugger::closeNetCaptureLogFile() {
-    std::lock_guard lock(netLogMtx_);
-    if (!netLogStatus_.enabled && !netLogStatus_.opening) return;
-    NetLogWork work;
-    work.kind = NetLogWork::Kind::Close;
-    work.generation = ++netLogGeneration_;
-    netLogQueue_.push_back(std::move(work));
-    ++netLogQueuedControls_;
-    netLogStatus_.enabled = false;
-    netLogStatus_.opening = false;
-    netLogStatus_.draining = true;
-    netLogCv_.notify_one();
-}
-
-NetCaptureLogStatus Debugger::netCaptureLogStatus() {
-    std::lock_guard lock(netLogMtx_);
-    return netLogStatus_;
-}
-
-bool Debugger::netCaptureLogEnabled() {
-    std::lock_guard lock(netLogMtx_);
-    return netLogStatus_.enabled;
-}
-
-std::string Debugger::netCaptureLogPath() {
-    std::lock_guard lock(netLogMtx_);
-    return netLogPath_;
-}
-
-static const char* networkApiName(NetworkProbeApi api) {
-    const NetworkProbeDescriptor* descriptor = NetworkProbeDescriptorFor(api);
-    return descriptor ? descriptor->symbol : "network";
-}
-
-static const char* networkStageName(NetworkObservationStage stage) {
-    switch (stage) {
-        case NetworkObservationStage::NameResolution: return "resolve";
-        case NetworkObservationStage::Connect: return "connect";
-        case NetworkObservationStage::Request: return "request";
-        case NetworkObservationStage::Response: return "response";
-        case NetworkObservationStage::Send: return "send";
-        case NetworkObservationStage::Receive: return "receive";
-        case NetworkObservationStage::HandleClosed: return "close";
-        case NetworkObservationStage::Limitation: return "limitation";
-        case NetworkObservationStage::ProbeStatus: return "status";
-    }
-    return "status";
-}
-
-static const char* networkDirectionName(NetworkDirection direction) {
-    switch (direction) {
-        case NetworkDirection::Outbound: return "outbound";
-        case NetworkDirection::Inbound: return "inbound";
-        case NetworkDirection::None: return "none";
-    }
-    return "none";
-}
-
-void Debugger::pushNetworkEvent(NetworkObservationEvent&& event) {
-    event.hostname = BoundNetworkText(std::move(event.hostname));
-    event.ip = BoundNetworkText(std::move(event.ip));
-    event.endpoint = BoundNetworkText(std::move(event.endpoint));
-    event.method = BoundNetworkText(std::move(event.method));
-    event.path = BoundNetworkText(std::move(event.path));
-    event.object = BoundNetworkText(std::move(event.object));
-    event.detail = BoundNetworkText(std::move(event.detail));
-    event.runtimeModule = BoundNetworkText(std::move(event.runtimeModule));
-    event.mappingEvidence = BoundNetworkText(std::move(event.mappingEvidence));
-    if (event.payload.size() > kNetworkObservationPayloadCap) {
-        event.payload.resize(kNetworkObservationPayloadCap);
-        event.truncated = true;
-    }
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (!event.sessionGeneration) event.sessionGeneration = sessionGeneration_;
-    if (!event.pid) event.pid = pid_;
-    event.sequence = ++networkEventSequence_;
-    auto payloadWouldExceed = [&]() {
-        const uint64_t retained = networkPendingPayloadBytes_ +
-                                  networkCoverage_.retainedPayloadBytes;
-        return retained >= kNetworkObservationRetainedPayloadCap
-             ? !event.payload.empty()
-             : event.payload.size() > kNetworkObservationRetainedPayloadCap - retained;
-    };
-    while (!networkEvents_.empty() && payloadWouldExceed()) {
-        networkCoverage_.payloadBytesDropped += networkEvents_.front().payload.size();
-        networkCoverage_.retainedPayloadBytes -= networkEvents_.front().payload.size();
-        networkEvents_.pop_front();
-        ++networkCoverage_.eventsDropped;
-    }
-    if (payloadWouldExceed()) {
-        const uint64_t retained = (std::min<uint64_t>)(
-            kNetworkObservationRetainedPayloadCap,
-            networkPendingPayloadBytes_ + networkCoverage_.retainedPayloadBytes);
-        const size_t available = static_cast<size_t>(
-            kNetworkObservationRetainedPayloadCap - retained);
-        networkCoverage_.payloadBytesDropped += event.payload.size() - available;
-        event.payload.resize(available);
-        event.truncated = true;
-    }
-    while (networkEvents_.size() >= kNetworkObservationEventCap) {
-        networkCoverage_.retainedPayloadBytes -= networkEvents_.front().payload.size();
-        networkCoverage_.payloadBytesDropped += networkEvents_.front().payload.size();
-        networkEvents_.pop_front();
-        ++networkCoverage_.eventsDropped;
-    }
-    networkCoverage_.retainedPayloadBytes += event.payload.size();
-    networkEvents_.push_back(std::move(event));
-}
-static void writeNetworkLogRecord(std::FILE* file, const NetworkObservationEvent& event,
-                                  uint64_t timestamp) {
-    FILETIME utc{static_cast<DWORD>(timestamp), static_cast<DWORD>(timestamp >> 32)}, local{};
-    SYSTEMTIME st{};
-    FileTimeToLocalFileTime(&utc, &local);
-    FileTimeToSystemTime(&local, &st);
-    const std::string port = event.portValid ? std::to_string(event.port) : "-";
-    const uint32_t eventPid = event.pid;
-    std::fprintf(file,
-                 "=== %04u-%02u-%02u %02u:%02u:%02u.%03u stage=%s direction=%s api=%s pid=%u tid=%u handle=0x%llX host=%s ip=%s port=%s method=%s path=%s object=%s endpoint=%s detail=%s result=%lld raw_result=0x%llX result_valid=%u pointer_bits=%u requested=%llu requested_valid=%u transferred=%u transferred_valid=%u captured=%zu%s%s%s ===\n",
-                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                 networkStageName(event.stage), networkDirectionName(event.direction),
-                 networkApiName(event.api), eventPid, event.tid,
-                 (unsigned long long)event.handle, event.hostname.c_str(), event.ip.c_str(),
-                 port.c_str(), event.method.c_str(), event.path.c_str(), event.object.c_str(),
-                 event.endpoint.c_str(), event.detail.c_str(), (long long)event.result,
-                 (unsigned long long)event.rawResult, event.resultValid ? 1u : 0u,
-                 static_cast<unsigned>(event.pointerWidthBits),
-                 (unsigned long long)event.requestedBytes,
-                 event.requestedBytesValid ? 1u : 0u, event.transferred,
-                 event.transferredValid ? 1u : 0u,
-                 event.payload.size(), event.truncated ? " truncated" : "",
-                 event.asyncPartial ? " async-partial" : "",
-                 event.payloadOpaque ? " opaque" : "");
-    if (!event.payload.empty()) {
-        std::fputs("TEXT:\n", file);
-        writePrintablePayload(file, event.payload);
-        std::fputs("HEX:\n", file);
-        writeHexPayload(file, event.payload);
-    }
-    std::fputc('\n', file);
-}
-
-void Debugger::writeNetworkObservationLog(const NetworkObservationEvent& event) {
-    std::lock_guard lock(netLogMtx_);
-    if (!netLogStatus_.enabled || netLogShutdown_) return;
-    if (event.payload.size() > kNetLogQueueBytes - sizeof(NetworkObservationEvent)) {
-        ++netLogStatus_.droppedRecords;
-        return;
-    }
-    size_t bytes = sizeof(NetworkObservationEvent) + event.payload.size();
-    for (const auto* text : {&event.hostname, &event.ip, &event.endpoint, &event.method,
-            &event.path, &event.object, &event.detail, &event.runtimeModule, &event.mappingEvidence}) {
-        if (text->size() > kNetLogQueueBytes || bytes > kNetLogQueueBytes - text->size()) {
-            ++netLogStatus_.droppedRecords;
-            return;
-        }
-        bytes += text->size();
-    }
-    if (netLogStatus_.queuedRecords >= kNetLogQueueRecords ||
-        bytes > kNetLogQueueBytes - netLogStatus_.queuedBytes) {
-        ++netLogStatus_.droppedRecords;
-        return;
-    }
-    NetLogWork work;
-    work.event = event;
-    work.event.pid = event.pid ? event.pid : pid_; // called only by the debug-event owner
-    work.bytes = bytes;
-    work.generation = netLogGeneration_;
-    FILETIME now{};
-    GetSystemTimeAsFileTime(&now);
-    work.timestamp = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
-    netLogQueue_.push_back(std::move(work));
-    ++netLogStatus_.queuedRecords;
-    netLogStatus_.queuedBytes += bytes;
-    netLogCv_.notify_one();
-}
-
-void Debugger::networkLogWorkerLoop() {
-    std::FILE* file = nullptr; // accessed/closed exclusively by this worker
-    uint64_t openGeneration = 0;
-    auto closeFile = [&] {
-        if (!file) return;
-        SYSTEMTIME st{};
-        GetLocalTime(&st);
-        std::fprintf(file, "\n# stopped %04u-%02u-%02u %02u:%02u:%02u.%03u local\n",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        const bool failed = std::ferror(file) != 0;
-        const int closed = std::fclose(file);
-        file = nullptr;
-        if (failed || closed != 0) {
-            std::lock_guard lock(netLogMtx_);
-            netLogStatus_.error = "network log could not be completely written to storage";
-        }
-    };
-    for (;;) {
-        NetLogWork work;
-        {
-            std::unique_lock lock(netLogMtx_);
-            netLogCv_.wait(lock, [this] { return netLogShutdown_ || !netLogQueue_.empty(); });
-            if (netLogQueue_.empty() && netLogShutdown_) break;
-            work = std::move(netLogQueue_.front());
-            netLogQueue_.pop_front();
-            if (work.kind == NetLogWork::Kind::Record) {
-                --netLogStatus_.queuedRecords;
-                netLogStatus_.queuedBytes -= work.bytes;
-            } else --netLogQueuedControls_;
-        }
-        if (work.kind == NetLogWork::Kind::Close) {
-            closeFile();
-            std::lock_guard lock(netLogMtx_);
-            if (work.generation == netLogGeneration_) netLogStatus_.draining = false;
-        } else if (work.kind == NetLogWork::Kind::Open) {
-            closeFile();
-            const auto path = widenUtf8(work.path);
-            const bool opened = !path.empty() &&
-                _wfopen_s(&file, path.c_str(), work.append ? L"ab" : L"wb") == 0 && file;
-            if (opened) {
-                openGeneration = work.generation;
-                SYSTEMTIME st{};
-                GetLocalTime(&st);
-                std::fprintf(file,
-                    "# DisasmStudio typed network observation log\n"
-                    "# started %04u-%02u-%02u %02u:%02u:%02u.%03u local\n"
-                    "# bounded asynchronous writer; queue drops are reported in Server Watch\n\n",
-                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-            }
-            std::lock_guard lock(netLogMtx_);
-            if (work.generation == netLogGeneration_) {
-                netLogStatus_.opening = false;
-                netLogStatus_.enabled = opened;
-                if (!opened) netLogStatus_.error = "could not open network log file: " + work.path;
-            }
-        } else if (file && work.generation == openGeneration) {
-            writeNetworkLogRecord(file, work.event, work.timestamp);
-            // Flushing is exclusively writer-owned. Even a stalled filesystem
-            // cannot hold a debug-event/UI mutex or grow the bounded queue.
-            if (std::fflush(file) != 0 || std::ferror(file)) {
-                closeFile();
-                std::lock_guard lock(netLogMtx_);
-                if (work.generation == netLogGeneration_) {
-                    netLogStatus_.enabled = false;
-                    netLogStatus_.error = "network log write failed; logging stopped";
-                }
-                ++netLogStatus_.droppedRecords;
-            }
-        } else {
-            std::lock_guard lock(netLogMtx_);
-            ++netLogStatus_.droppedRecords;
-        }
-    }
-    closeFile();
-}
-
-// Resolve exports from the debuggee's exact mapped modules. Probe metadata lives
-// outside bps_, so it never appears in the analyst breakpoint list. A user bp can
-// share the physical int3 and remains the owner/visible stop.
-void Debugger::armNetTap() {
-    if (!hProcess_) return;
-    std::vector<DbgModule> modules;
-    { std::lock_guard<std::mutex> lk(mtx_); modules = dbgModules_; }
-    std::unordered_set<std::string> catalogBackedSpecs;
-    std::vector<std::string> rejectedSpecs;
-    for (const NetworkProbeDescriptor& spec : kNetworkProbeDescriptors) {
-        if (!NetworkProbeDescriptorFor(spec.api)) continue;
-        const auto catalog = LookupNetworkApi(spec.dll, spec.symbol);
-        if (!catalog) {
-            rejectedSpecs.push_back(std::string(spec.dll) + "!" + spec.symbol);
-            continue;
-        }
-        catalogBackedSpecs.insert(catalog->dll + "!" + catalog->normalizedName);
-    }
-    auto targetExecutableImageAddress = [&](const DbgModule& module, uint64_t va) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (::VirtualQueryEx((HANDLE)hProcess_, reinterpret_cast<LPCVOID>(va), &mbi,
-                             sizeof(mbi)) != sizeof(mbi) ||
-            mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE ||
-            reinterpret_cast<uint64_t>(mbi.AllocationBase) != module.base ||
-            va < module.base || (module.size && va - module.base >= module.size) ||
-            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
-            return false;
-        switch (mbi.Protect & 0xFFu) {
-            case PAGE_EXECUTE:
-            case PAGE_EXECUTE_READ:
-            case PAGE_EXECUTE_READWRITE:
-            case PAGE_EXECUTE_WRITECOPY: return true;
-            default: return false;
-        }
-    };
-    uint32_t available = 0, skipped = 0;
-    for (const NetworkProbeDescriptor& spec : kNetworkProbeDescriptors) {
-        if (!NetworkProbeDescriptorFor(spec.api)) continue;
-        // Registration is fail-closed: a typo, wrong DLL, or future ad-hoc row
-        // cannot become a live target mutation until it is cataloged exactly.
-        if (!LookupNetworkApi(spec.dll, spec.symbol)) continue;
-        auto module = std::find_if(modules.begin(), modules.end(), [&](const DbgModule& m) {
-            return jvmdetail::baseNameLower(m.name) == spec.dll ||
-                   jvmdetail::baseNameLower(m.path) == spec.dll;
-        });
-        if (module == modules.end() || !module->base || !module->size) continue;
-        const uint64_t addr = resolveMappedExport(module->base, module->size, spec.symbol);
-        if (!addr || !targetExecutableImageAddress(*module, addr)) continue;
-        ++available;
-        { std::lock_guard<std::mutex> lk(mtx_);
-          if (networkProbeBps_.count(addr)) continue; }
-
-        NetworkProbeBp probe;
-        probe.api = spec.api;
-        probe.moduleBase = module->base;
-        bool conflict = false;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (auto user = bps_.find(addr); user != bps_.end() && user->second.armed) {
-                probe.orig = user->second.orig;
-                probe.ownsByte = false;
-            } else if (bps_.count(addr)) {
-                conflict = true;
-            } else if (traceBps_.count(addr) || dllTargetBps_.count(addr) ||
-                       antiTraps_.count(addr) || networkReturnBps_.count(addr) ||
-                       authorizationBps_.count(addr) ||
-                       authorizationReturnBps_.count(addr) ||
-                       (runtimeTempBpAddr_ && *runtimeTempBpAddr_ == addr)) {
-                conflict = true;
-            }
-        }
-        if (conflict) { ++skipped; continue; }
-        if (probe.ownsByte) {
-            if (!readByteRPM((HANDLE)hProcess_, addr, probe.orig) || probe.orig == 0xCC ||
-                !replaceByteIfEqual((HANDLE)hProcess_, addr, probe.orig, 0xCC)) {
-                ++skipped;
-                continue;
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            networkProbeBps_[addr] = probe;
-            auto at = std::lower_bound(networkProbeBpAddrs_.begin(), networkProbeBpAddrs_.end(), addr);
-            networkProbeBpAddrs_.insert(at, addr);
-        }
-    }
-    std::string unsupportedCatalog =
-        "Cataloged APIs without a live ABI decoder (not silently observed): ";
-    bool hasUnsupportedCatalog = false;
-    for (const NetworkApiMatch& api : EnumerateNetworkApis()) {
-        if (catalogBackedSpecs.count(api.dll + "!" + api.normalizedName)) continue;
-        if (hasUnsupportedCatalog) unsupportedCatalog += ", ";
-        unsupportedCatalog += api.dll + "!" + api.canonicalName;
-        hasUnsupportedCatalog = true;
-    }
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        networkCoverage_.sessionGeneration = sessionGeneration_;
-        networkCoverage_.pid = pid_;
-        networkCoverage_.requested = networkObservationWant_.load();
-        networkCoverage_.active = !networkProbeBps_.empty();
-        networkCoverage_.wow64 = isWow64_.load();
-        networkCoverage_.probesAvailable = available;
-        networkCoverage_.probesArmed = static_cast<uint32_t>(networkProbeBps_.size());
-        networkCoverage_.probesSkipped = skipped + static_cast<uint32_t>(rejectedSpecs.size());
-        networkCoverage_.probesSharedWithUserBreakpoints = 0;
-        networkCoverage_.winsock = networkCoverage_.nameResolution = false;
-        networkCoverage_.winHttp = networkCoverage_.winInet = networkCoverage_.urlMon = false;
-        for (const auto& [ignored, probe] : networkProbeBps_) {
-            (void)ignored;
-            if (!probe.ownsByte) ++networkCoverage_.probesSharedWithUserBreakpoints;
-            if (probe.api >= NetworkProbeApi::ResolveAddrInfoA &&
-                probe.api <= NetworkProbeApi::DnsQueryUtf8)
-                networkCoverage_.nameResolution = true;
-            if ((probe.api >= NetworkProbeApi::ResolveAddrInfoA &&
-                 probe.api <= NetworkProbeApi::GetNameInfoW) ||
-                (probe.api >= NetworkProbeApi::Connect &&
-                 probe.api <= NetworkProbeApi::CloseSocket))
-                networkCoverage_.winsock = true;
-            if (probe.api >= NetworkProbeApi::WinHttpOpen && probe.api <= NetworkProbeApi::WinHttpCloseHandle)
-                networkCoverage_.winHttp = true;
-            if (probe.api >= NetworkProbeApi::InternetOpenA && probe.api <= NetworkProbeApi::InternetCloseHandle)
-                networkCoverage_.winInet = true;
-            if (probe.api >= NetworkProbeApi::UrlDownloadToFileA &&
-                probe.api <= NetworkProbeApi::UrlOpenBlockingStreamW)
-                networkCoverage_.urlMon = true;
-        }
-        networkCoverage_.payloads = networkCoverage_.winsock || networkCoverage_.winHttp || networkCoverage_.winInet;
-        networkCoverage_.limitations = {
-            "Custom TLS stacks and raw Winsock TLS payloads remain opaque encrypted bytes.",
-            "Overlapped/asynchronous receive completion can outlive the API return and is reported as partial.",
-            "Direct syscalls, custom/inlined network stacks, kernel traffic, and child processes are not observed.",
-            "API entry probes briefly restore one instruction under debugger-controlled peer suspension.",
-        };
-        if (hasUnsupportedCatalog)
-            networkCoverage_.limitations.push_back(std::move(unsupportedCatalog));
-        if (networkCoverage_.handleStatesDropped)
-            networkCoverage_.limitations.push_back(
-                "HTTP/socket handle-lineage state exceeded the 4,096-record cap; some descendant metadata is unavailable.");
-        if (!rejectedSpecs.empty()) {
-            std::string rejected = "Live probe specs rejected by exact network catalog guard: ";
-            for (size_t i = 0; i < rejectedSpecs.size(); ++i) {
-                if (i) rejected += ", ";
-                rejected += rejectedSpecs[i];
-            }
-            networkCoverage_.limitations.push_back(std::move(rejected));
-        }
-        netTapArmed_ = !networkProbeBps_.empty();
-    }
-}
-
-void Debugger::disarmNetTap() {
-    if (hProcess_) {
-        std::vector<std::pair<uint64_t, NetworkProbeBp>> probes;
-        std::vector<std::pair<uint64_t, NetworkReturnBp>> returns;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            probes.assign(networkProbeBps_.begin(), networkProbeBps_.end());
-            returns.assign(networkReturnBps_.begin(), networkReturnBps_.end());
-            networkProbeBps_.clear(); networkProbeBpAddrs_.clear();
-            networkReturnBps_.clear(); networkReturnBpAddrs_.clear();
-            networkCoverage_.active = false;
-            networkCoverage_.probesArmed = 0;
-        }
-        for (const auto& [addr, probe] : probes)
-            if (probe.ownsByte) (void)replaceByteIfEqual((HANDLE)hProcess_, addr, 0xCC, probe.orig);
-        for (const auto& [addr, site] : returns)
-            if (site.ownsByte) (void)replaceByteIfEqual((HANDLE)hProcess_, addr, 0xCC, site.orig);
-    }
-    networkPendingReturns_.clear();
-    { std::lock_guard<std::mutex> lk(mtx_); networkPendingPayloadBytes_ = 0; }
-    networkHandleLineage_.clear();
-    netTapArmed_ = false;
-}
-
-void Debugger::retireNetworkModule(uint64_t base, uint64_t size) {
-    if (!base) return;
-    std::lock_guard<std::mutex> lk(mtx_);
-    for (auto it = networkProbeBps_.begin(); it != networkProbeBps_.end(); ) {
-        if (it->second.moduleBase == base) it = networkProbeBps_.erase(it);
-        else ++it;
-    }
-    networkProbeBpAddrs_.clear();
-    for (const auto& [addr, ignored] : networkProbeBps_) {
-        (void)ignored; networkProbeBpAddrs_.push_back(addr);
-    }
-    std::sort(networkProbeBpAddrs_.begin(), networkProbeBpAddrs_.end());
-    if (!size) {
-        // With no image extent, address-range retirement would risk deleting
-        // unrelated higher mappings. Drop all in-flight returns without writing
-        // any possibly reused VA; loaded entry probes will be re-evaluated below.
-        networkPendingReturns_.clear();
-        networkPendingPayloadBytes_ = 0;
-        networkReturnBps_.clear();
-    }
-    for (auto it = networkReturnBps_.begin(); it != networkReturnBps_.end(); ) {
-        if (size && it->first >= base && it->first - base < size) {
-            (void)networkPendingReturns_.eraseAddress(it->first,
-                [&](const NetworkPendingFrame& frame) {
-                    networkPendingPayloadBytes_ -= (std::min<uint64_t>)(
-                        networkPendingPayloadBytes_, frame.payload.size());
-                });
-            it = networkReturnBps_.erase(it);
-        } else ++it;
-    }
-    networkReturnBpAddrs_.clear();
-    for (const auto& [addr, ignored] : networkReturnBps_) {
-        (void)ignored; networkReturnBpAddrs_.push_back(addr);
-    }
-    std::sort(networkReturnBpAddrs_.begin(), networkReturnBpAddrs_.end());
-    networkCoverage_.probesArmed = static_cast<uint32_t>(networkProbeBps_.size());
-    networkCoverage_.active = !networkProbeBps_.empty();
-    netTapArmed_ = !networkProbeBps_.empty();
-}
-
-bool Debugger::disarmNetworkProbe(uint64_t addr) {
-    NetworkProbeBp probe;
-    { std::lock_guard<std::mutex> lk(mtx_);
-      auto it = networkProbeBps_.find(addr); if (it == networkProbeBps_.end()) return false;
-      probe = it->second; it->second.armed = false; }
-    return !probe.ownsByte || replaceByteIfEqual((HANDLE)hProcess_, addr, 0xCC, probe.orig);
-}
-
-bool Debugger::rearmNetworkProbe(uint64_t addr) {
-    NetworkProbeBp probe;
-    { std::lock_guard<std::mutex> lk(mtx_);
-      auto it = networkProbeBps_.find(addr); if (it == networkProbeBps_.end()) return false;
-      probe = it->second; }
-    const bool ok = !probe.ownsByte || replaceByteIfEqual((HANDLE)hProcess_, addr, probe.orig, 0xCC);
-    if (ok) { std::lock_guard<std::mutex> lk(mtx_); if (auto it = networkProbeBps_.find(addr); it != networkProbeBps_.end()) it->second.armed = true; }
-    return ok;
-}
-
-bool Debugger::rearmNetworkReturn(uint64_t addr) {
-    NetworkReturnBp site;
-    { std::lock_guard<std::mutex> lk(mtx_);
-      auto it = networkReturnBps_.find(addr); if (it == networkReturnBps_.end()) return false;
-      site = it->second; }
-    const bool ok = !site.ownsByte || replaceByteIfEqual((HANDLE)hProcess_, addr, site.orig, 0xCC);
-    if (ok) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (auto it = networkReturnBps_.find(addr); it != networkReturnBps_.end())
-            it->second.armed = true;
-    }
-    return ok;
-}
-
-static std::string readNetworkAnsi(HANDLE process, uint64_t address,
-                                   size_t maxChars = kNetworkObservationTextCap,
-                                   bool* hitLimit = nullptr) {
-    std::string value;
-    if (hitLimit) *hitLimit = false;
-    if (!address) return value;
-    value.reserve(128);
-    maxChars = (std::min)(maxChars, kNetworkObservationTextCap);
-    bool terminated = false;
-    for (size_t i = 0; i < maxChars; ++i) {
-        char ch = 0;
-        if (!readRemoteExact(process, address + i, &ch, sizeof(ch))) break;
-        if (!ch) { terminated = true; break; }
-        value.push_back(ch);
-    }
-    if (hitLimit) *hitLimit = maxChars != 0 && value.size() == maxChars && !terminated;
-    return value;
-}
-
-static std::string readNetworkWide(HANDLE process, uint64_t address,
-                                   size_t maxChars = kNetworkObservationTextCap,
-                                   bool* hitLimit = nullptr) {
-    std::vector<wchar_t> wide;
-    if (hitLimit) *hitLimit = false;
-    if (!address) return {};
-    wide.reserve(128);
-    maxChars = (std::min)(maxChars, kNetworkObservationTextCap);
-    bool terminated = false;
-    for (size_t i = 0; i < maxChars; ++i) {
-        uint16_t unit = 0;
-        if (!readRemoteExact(process, address + i * 2u, &unit, sizeof(unit))) break;
-        if (!unit) { terminated = true; break; }
-        wide.push_back(static_cast<wchar_t>(unit));
-    }
-    if (hitLimit) *hitLimit = maxChars != 0 && wide.size() == maxChars && !terminated;
-    if (wide.empty()) return {};
-    const int count = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-                                          nullptr, 0, nullptr, nullptr);
-    if (count <= 0) return {};
-    std::string value(static_cast<size_t>(count), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-                        value.data(), count, nullptr, nullptr);
-    return BoundNetworkText(std::move(value));
-}
-
-static std::vector<uint8_t> readNetworkPayload(HANDLE process, uint64_t address,
-                                                uint64_t length) {
-    std::vector<uint8_t> payload;
-    const size_t take = static_cast<size_t>((std::min<uint64_t>)(
-        length, kNetworkObservationPayloadCap));
-    if (!address || !take) return payload;
-    payload.resize(take);
-    SIZE_T got = 0;
-    if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), payload.data(), take, &got) || !got) {
-        payload.clear();
-        return payload;
-    }
-    payload.resize(static_cast<size_t>(got));
-    return payload;
-}
-
-static std::vector<uint8_t> readNetworkWsabufs(HANDLE process, bool wow64,
-                                               uint64_t buffers, uint64_t count,
-                                               uint64_t byteLimit = UINT64_MAX,
-                                               uint64_t* describedBytes = nullptr,
-                                               bool* truncated = nullptr,
-                                               bool* describedBytesValid = nullptr) {
-    std::vector<uint8_t> payload;
-    const size_t stride = wow64 ? 8u : 16u;
-    const uint64_t originalCount = count;
-    count = (std::min<uint64_t>)(count, 16u);
-    uint64_t described = 0;
-    uint64_t processed = 0;
-    bool wasTruncated = originalCount > count;
-    for (uint64_t i = 0; i < count; ++i) {
-        uint8_t descriptor[16]{};
-        if (!readRemoteExact(process, buffers + i * stride, descriptor, stride)) {
-            wasTruncated = true;
-            break;
-        }
-        uint32_t length = 0;
-        std::memcpy(&length, descriptor, sizeof(length));
-        ++processed;
-        described = UINT64_MAX - described < length ? UINT64_MAX : described + length;
-        uint64_t pointer = 0;
-        if (wow64) {
-            uint32_t narrow = 0;
-            std::memcpy(&narrow, descriptor + 4, sizeof(narrow));
-            pointer = narrow;
-        } else {
-            std::memcpy(&pointer, descriptor + 8, sizeof(pointer));
-        }
-        const uint64_t available = kNetworkObservationPayloadCap - payload.size();
-        const uint64_t take = (std::min<uint64_t>)((std::min<uint64_t>)(length, available), byteLimit);
-        if (!take) {
-            if (length) wasTruncated = true;
-            continue;
-        }
-        std::vector<uint8_t> part = readNetworkPayload(process, pointer, take);
-        payload.insert(payload.end(), part.begin(), part.end());
-        if (part.size() < take) { wasTruncated = true; break; }
-        if (take < length) wasTruncated = true;
-        byteLimit -= take;
-    }
-    if (processed < count) wasTruncated = true;
-    if (payload.size() == kNetworkObservationPayloadCap && described > payload.size())
-        wasTruncated = true;
-    if (describedBytes) *describedBytes = described;
-    if (truncated) *truncated = wasTruncated;
-    if (describedBytesValid)
-        *describedBytesValid = originalCount <= 16u && processed == originalCount &&
-                               described != UINT64_MAX;
-    return payload;
-}
-
-static bool readInternetBuffer(HANDLE process, bool wow64, uint64_t descriptor,
-                               uint64_t& buffer, uint32_t& length,
-                               uint64_t* headers = nullptr,
-                               uint32_t* headersLength = nullptr) {
-    buffer = 0;
-    length = 0;
-    if (headers) *headers = 0;
-    if (headersLength) *headersLength = 0;
-    const size_t size = wow64 ? 40u : 56u;
-    std::array<uint8_t, 56> bytes{};
-    if (!descriptor || !readRemoteExact(process, descriptor, bytes.data(), size)) return false;
-    uint32_t structureSize = 0;
-    std::memcpy(&structureSize, bytes.data(), sizeof(structureSize));
-    if (structureSize < size) return false;
-    if (wow64) {
-        uint32_t pointer = 0;
-        std::memcpy(&pointer, bytes.data() + 20, sizeof(pointer));
-        buffer = pointer;
-        std::memcpy(&length, bytes.data() + 24, sizeof(length));
-        if (headers) {
-            std::memcpy(&pointer, bytes.data() + 8, sizeof(pointer));
-            *headers = pointer;
-        }
-        if (headersLength)
-            std::memcpy(headersLength, bytes.data() + 12, sizeof(*headersLength));
-    } else {
-        std::memcpy(&buffer, bytes.data() + 32, sizeof(buffer));
-        std::memcpy(&length, bytes.data() + 40, sizeof(length));
-        if (headers) std::memcpy(headers, bytes.data() + 16, sizeof(*headers));
-        if (headersLength)
-            std::memcpy(headersLength, bytes.data() + 24, sizeof(*headersLength));
-    }
-    return true;
-}
-
-static std::string readNetworkHostent(HANDLE process, bool wow64, uint64_t address,
-                                      std::string* firstIp = nullptr) {
-    if (firstIp) firstIp->clear();
-    if (!address) return {};
-    const uint64_t typeAt = address + (wow64 ? 8u : 16u);
-    const uint64_t lengthAt = typeAt + 2u;
-    const uint64_t listAt = address + (wow64 ? 12u : 24u);
-    uint16_t family = 0, addressLength = 0;
-    if (!readRemoteExact(process, typeAt, &family, sizeof(family)) ||
-        !readRemoteExact(process, lengthAt, &addressLength, sizeof(addressLength))) return {};
-    const NetworkCallContext pointerContext{wow64, 0, {}};
-    const NetworkMemoryReader read = [process](uint64_t at, void* out, size_t size) {
-        return readRemoteExact(process, at, out, size);
-    };
-    uint64_t list = 0;
-    if (!ReadNetworkPointer(pointerContext, read, listAt, list)) return {};
-    std::string endpoints;
-    const uint64_t pointerSize = wow64 ? 4u : 8u;
-    for (size_t i = 0; list && i < 8; ++i) {
-        uint64_t item = 0;
-        if (!ReadNetworkPointer(pointerContext, read, list + i * pointerSize, item) || !item) break;
-        std::string one;
-        if (family == 2 && addressLength >= 4) {
-            uint8_t bytes[4]{};
-            if (readRemoteExact(process, item, bytes, sizeof(bytes))) one = FormatIpv4Address(bytes);
-        } else if (family == 23 && addressLength >= 16) {
-            uint8_t bytes[16]{};
-            if (readRemoteExact(process, item, bytes, sizeof(bytes))) one = FormatIpv6Address(bytes);
-        }
-        if (!one.empty()) {
-            if (firstIp && firstIp->empty()) *firstIp = one;
-            if (!endpoints.empty()) endpoints += ", ";
-            endpoints += one;
-        }
-    }
-    return BoundNetworkText(std::move(endpoints));
-}
-
-static std::string readNetworkSockaddr(HANDLE process, uint64_t address, uint64_t length,
-                                       std::string* ip = nullptr, uint16_t* port = nullptr,
-                                       bool* portValid = nullptr) {
-    if (ip) ip->clear();
-    if (port) *port = 0;
-    if (portValid) *portValid = false;
-    const size_t take = static_cast<size_t>((std::min<uint64_t>)(length, 128u));
-    if (!address || take < 2) return {};
-    std::array<uint8_t, 128> bytes{};
-    if (!readRemoteExact(process, address, bytes.data(), take)) return {};
-    NetworkEndpointParts parts;
-    if (!DecodeNetworkSockaddr(bytes.data(), take, parts)) return {};
-    if (ip) *ip = parts.ip;
-    if (port) *port = parts.port;
-    if (portValid) *portValid = parts.portValid;
-    return parts.endpoint;
-}
-
-static std::string formatNetworkHostPort(const std::string& host, uint16_t port,
-                                         bool portValid) {
-    if (host.empty()) return {};
-    if (!portValid) return host;
-    if (host.find(':') != std::string::npos && host.front() != '[')
-        return "[" + host + "]:" + std::to_string(port);
-    return host + ":" + std::to_string(port);
-}
-
-void Debugger::decorateNetworkEvent(NetworkObservationEvent& event) {
-    if (!event.caller || !hProcess_) return;
-    DbgModule module;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = std::find_if(dbgModules_.begin(), dbgModules_.end(), [&](const DbgModule& candidate) {
-            return candidate.base && candidate.size && event.caller >= candidate.base &&
-                   event.caller - candidate.base < candidate.size;
-        });
-        if (it == dbgModules_.end()) return;
-        module = *it;
-    }
-    event.runtimeModule = module.name.empty() ? module.path : module.name;
-    event.runtimeModuleBase = module.base;
-    event.runtimeModuleLoadGeneration = module.loadGeneration;
-
-    IMAGE_DOS_HEADER dos{};
-    DWORD signature = 0;
-    IMAGE_FILE_HEADER file{};
-    uint32_t sizeOfHeaders = 0;
-    if (!readRemoteExact((HANDLE)hProcess_, module.base, &dos, sizeof(dos)) ||
-        dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000 ||
-        !readRemoteExact((HANDLE)hProcess_, module.base + dos.e_lfanew, &signature, sizeof(signature)) ||
-        signature != IMAGE_NT_SIGNATURE ||
-        !readRemoteExact((HANDLE)hProcess_, module.base + dos.e_lfanew + 4, &file, sizeof(file)) ||
-        !file.NumberOfSections || file.NumberOfSections > 96 || file.SizeOfOptionalHeader < 64 ||
-        !readRemoteExact((HANDLE)hProcess_, module.base + dos.e_lfanew + 24 + 60,
-                         &sizeOfHeaders, sizeof(sizeOfHeaders)))
-        return;
-
-    const uint64_t rva = event.caller - module.base;
-    if (rva < sizeOfHeaders) {
-        event.fileOffset = rva;
-        event.fileOffsetValid = true;
-        event.mappingEvidence =
-            "observed live PE header projection (backing-file identity/extent not proven)";
-        event.evidenceQuality = NetworkEvidenceQuality::Observed;
-        return;
-    }
-    const uint64_t sectionsAt = module.base + dos.e_lfanew + 24 + file.SizeOfOptionalHeader;
-    std::vector<IMAGE_SECTION_HEADER> sections(file.NumberOfSections);
-    if (!readRemoteExact((HANDLE)hProcess_, sectionsAt, sections.data(),
-                         sections.size() * sizeof(IMAGE_SECTION_HEADER)))
-        return;
-    for (const IMAGE_SECTION_HEADER& section : sections) {
-        const uint64_t start = section.VirtualAddress;
-        const uint64_t rawSize = section.SizeOfRawData;
-        if (!rawSize || rva < start || rva - start >= rawSize) continue;
-        const uint64_t delta = rva - start;
-        if (section.PointerToRawData > UINT64_MAX - delta) return;
-        event.fileOffset = section.PointerToRawData + delta;
-        event.fileOffsetValid = true;
-        event.mappingEvidence =
-            "observed live PE section projection (backing-file identity/extent not proven)";
-        event.evidenceQuality = NetworkEvidenceQuality::Observed;
-        return;
-    }
-    event.mappingEvidence = "caller is in a live image range without file-backed raw bytes";
-}
-
-// Decode the stopped call in the target ABI, retain nested return state per thread,
-// and plant a shared physical return site only when the result/buffer is needed.
-void Debugger::netTapCapture(uint64_t /*addr*/, uint32_t tid, NetworkProbeApi api) {
-    auto th = threads_.find(tid);
-    if (th == threads_.end()) return;
-    Registers r;
-    if (!ctxReadFull(th->second, r)) return;
-    HANDLE hp = (HANDLE)hProcess_;
-    const bool wow64 = isWow64_.load();
-    const NetworkCallContext context{ wow64, r.rsp, { r.rcx, r.rdx, r.r8, r.r9 } };
-    const NetworkMemoryReader read = [hp](uint64_t address, void* out, size_t size) {
-        return readRemoteExact(hp, address, out, size);
-    };
-    NetworkPendingFrame frame;
-    frame.api = api;
-    frame.wide = api == NetworkProbeApi::ResolveAddrInfoW ||
-                 api == NetworkProbeApi::GetAddrInfoExW ||
-                 api == NetworkProbeApi::GetNameInfoW ||
-                 api == NetworkProbeApi::DnsQueryW ||
-                 api == NetworkProbeApi::InternetOpenW ||
-                 api == NetworkProbeApi::InternetConnectW ||
-                 api == NetworkProbeApi::HttpOpenRequestW ||
-                 api == NetworkProbeApi::HttpAddRequestHeadersW ||
-                 api == NetworkProbeApi::HttpSendRequestW ||
-                 api == NetworkProbeApi::HttpSendRequestExW ||
-                 api == NetworkProbeApi::HttpEndRequestW ||
-                 api == NetworkProbeApi::InternetOpenUrlW ||
-                 api == NetworkProbeApi::InternetReadFileExW ||
-                 api == NetworkProbeApi::HttpQueryInfoW ||
-                 api == NetworkProbeApi::UrlDownloadToFileW ||
-                 api == NetworkProbeApi::UrlDownloadToCacheFileW ||
-                 api == NetworkProbeApi::UrlOpenStreamW ||
-                 api == NetworkProbeApi::UrlOpenBlockingStreamW;
-    (void)ReadNetworkReturnAddress(context, read, frame.returnAddress);
-    frame.caller = frame.returnAddress;
-    for (size_t i = 0; i < frame.args.size(); ++i)
-        (void)ReadNetworkArgument(context, i, read, frame.args[i]);
-    // Win64 stack home slots are 64-bit, but the high half is unspecified for
-    // DWORD/ULONG/int arguments. Normalize scalar ABI values before any bounds
-    // decision; handles, pointers, and callback/context values stay full-width.
-    const auto argU32 = [&](size_t index) {
-        return static_cast<uint32_t>(frame.args[index]);
-    };
-    const auto argI32 = [&](size_t index) {
-        return static_cast<int32_t>(argU32(index));
-    };
-    const auto positiveI32Length = [&](size_t index) -> uint32_t {
-        const int32_t value = argI32(index);
-        return value > 0 ? static_cast<uint32_t>(value) : 0u;
-    };
-    frame.handle = frame.args[0];
-    // Session async mode is inherited by connection/request handles. Capture it
-    // at entry so async read/write returns never inspect completion-owned output.
-    frame.async = networkHandleLineage_.resolve(frame.handle).async;
-
-    auto queueReturn = [&](NetworkPendingFrame pending) {
-        if (!pending.returnAddress) return false;
-        const uint64_t returnAddress = pending.returnAddress;
-        const bool first = networkPendingReturns_.references(returnAddress) == 0;
-        if (first) {
-            NetworkReturnBp site;
-            bool conflict = false;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                if (auto user = bps_.find(returnAddress);
-                    user != bps_.end() && user->second.armed) {
-                    site.orig = user->second.orig;
-                    site.ownsByte = false;
-                } else if (bps_.count(returnAddress)) {
-                    conflict = true;
-                } else if (networkProbeBps_.count(returnAddress) || traceBps_.count(returnAddress) ||
-                           dllTargetBps_.count(returnAddress) || antiTraps_.count(returnAddress) ||
-                           authorizationBps_.count(returnAddress) ||
-                           authorizationReturnBps_.count(returnAddress) ||
-                           (runtimeTempBpAddr_ && *runtimeTempBpAddr_ == returnAddress)) {
-                    conflict = true;
-                }
-            }
-            if (conflict || (site.ownsByte &&
-                (!readByteRPM(hp, returnAddress, site.orig) || site.orig == 0xCC ||
-                 !replaceByteIfEqual(hp, returnAddress, site.orig, 0xCC)))) {
-                std::lock_guard<std::mutex> lk(mtx_);
-                ++networkCoverage_.pendingReturnsDropped;
-                return false;
-            }
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                networkReturnBps_[returnAddress] = site;
-                auto at = std::lower_bound(networkReturnBpAddrs_.begin(), networkReturnBpAddrs_.end(),
-                                           returnAddress);
-                networkReturnBpAddrs_.insert(at, returnAddress);
-            }
-        }
-        const size_t pendingPayload = pending.payload.size();
-        if (pendingPayload) {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto wouldExceed = [&]() {
-                const uint64_t retained = networkPendingPayloadBytes_ +
-                                          networkCoverage_.retainedPayloadBytes;
-                return retained >= kNetworkObservationRetainedPayloadCap ||
-                       pending.payload.size() >
-                           kNetworkObservationRetainedPayloadCap - retained;
-            };
-            while (!networkEvents_.empty() && wouldExceed()) {
-                networkCoverage_.payloadBytesDropped += networkEvents_.front().payload.size();
-                networkCoverage_.retainedPayloadBytes -= networkEvents_.front().payload.size();
-                networkEvents_.pop_front();
-                ++networkCoverage_.eventsDropped;
-            }
-            const uint64_t retained = (std::min<uint64_t>)(
-                kNetworkObservationRetainedPayloadCap,
-                networkPendingPayloadBytes_ + networkCoverage_.retainedPayloadBytes);
-            const size_t available = static_cast<size_t>(
-                kNetworkObservationRetainedPayloadCap - retained);
-            if (pending.payload.size() > available) {
-                networkCoverage_.payloadBytesDropped += pending.payload.size() - available;
-                pending.payload.resize(available);
-                pending.payloadTruncated = true;
-            }
-        }
-        const size_t admittedPayload = pending.payload.size();
-        if (networkPendingReturns_.push(tid, returnAddress, std::move(pending))) {
-            if (admittedPayload) {
-                std::lock_guard<std::mutex> lk(mtx_);
-                networkPendingPayloadBytes_ += admittedPayload;
-            }
-            return true;
-        }
-        if (first) {
-            NetworkReturnBp site;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                auto it = networkReturnBps_.find(returnAddress);
-                if (it != networkReturnBps_.end()) { site = it->second; networkReturnBps_.erase(it); }
-                auto at = std::lower_bound(networkReturnBpAddrs_.begin(), networkReturnBpAddrs_.end(),
-                                           returnAddress);
-                if (at != networkReturnBpAddrs_.end() && *at == returnAddress)
-                    networkReturnBpAddrs_.erase(at);
-                ++networkCoverage_.pendingReturnsDropped;
-            }
-            if (site.ownsByte) (void)replaceByteIfEqual(hp, returnAddress, 0xCC, site.orig);
-        } else {
-            std::lock_guard<std::mutex> lk(mtx_);
-            ++networkCoverage_.pendingReturnsDropped;
-        }
-        return false;
-    };
-
-    switch (api) {
-        case NetworkProbeApi::ResolveAddrInfoA:
-        case NetworkProbeApi::ResolveAddrInfoW:
-            frame.hostname = frame.wide ? readNetworkWide(hp, frame.args[0])
-                                        : readNetworkAnsi(hp, frame.args[0]);
-            frame.detail = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            frame.buffer = frame.args[3]; // addrinfo**
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::GetAddrInfoExA:
-        case NetworkProbeApi::GetAddrInfoExW:
-            frame.hostname = frame.wide ? readNetworkWide(hp, frame.args[0])
-                                        : readNetworkAnsi(hp, frame.args[0]);
-            frame.detail = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            frame.buffer = frame.args[5]; // ADDRINFOEX**
-            frame.async = frame.args[7] != 0 || frame.args[8] != 0;
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::GetHostByName:
-            frame.hostname = readNetworkAnsi(hp, frame.args[0]);
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::GetNameInfoA:
-        case NetworkProbeApi::GetNameInfoW: {
-            frame.endpoint = readNetworkSockaddr(hp, frame.args[0], positiveI32Length(1),
-                                                 &frame.ip, &frame.port,
-                                                 &frame.portValid);
-            frame.buffer = frame.args[2];
-            frame.countOrLength = argU32(3);
-            frame.transferredPtr = frame.args[4]; // service-name buffer
-            frame.addressLengthPtr = argU32(5); // service-name character capacity
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::DnsQueryA:
-        case NetworkProbeApi::DnsQueryW:
-        case NetworkProbeApi::DnsQueryUtf8:
-            frame.hostname = frame.wide ? readNetworkWide(hp, frame.args[0])
-                                        : readNetworkAnsi(hp, frame.args[0]);
-            frame.countOrLength = static_cast<uint16_t>(frame.args[1]); // DNS record type
-            frame.buffer = frame.args[4];        // DNS_RECORD**
-            frame.detail = "DNS record type " +
-                           std::to_string(static_cast<uint16_t>(frame.countOrLength));
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::Connect:
-        case NetworkProbeApi::WSAConnect:
-            frame.endpoint = readNetworkSockaddr(hp, frame.args[1], positiveI32Length(2),
-                                                 &frame.ip, &frame.port,
-                                                 &frame.portValid);
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::CloseSocket:
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::Send:
-        case NetworkProbeApi::SendTo: {
-            const int32_t requested = argI32(2);
-            frame.requestedLengthValid = requested >= 0;
-            frame.requestedLength = requested >= 0 ? static_cast<uint32_t>(requested) : 0u;
-            frame.payload = readNetworkPayload(hp, frame.args[1], frame.requestedLength);
-            frame.payloadTruncated = frame.payload.size() < frame.requestedLength;
-            if (api == NetworkProbeApi::SendTo)
-                frame.endpoint = readNetworkSockaddr(hp, frame.args[4], positiveI32Length(5),
-                                                     &frame.ip, &frame.port,
-                                                     &frame.portValid);
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::WSASend:
-        case NetworkProbeApi::WSASendTo:
-            frame.buffers = frame.args[1];
-            frame.countOrLength = argU32(2);
-            frame.transferredPtr = frame.args[3];
-            frame.payload = readNetworkWsabufs(hp, wow64, frame.buffers,
-                                               frame.countOrLength, UINT64_MAX,
-                                               &frame.requestedLength,
-                                               &frame.payloadTruncated,
-                                               &frame.requestedLengthValid);
-            if (api == NetworkProbeApi::WSASendTo)
-                frame.endpoint = readNetworkSockaddr(hp, frame.args[5], positiveI32Length(6),
-                                                     &frame.ip, &frame.port,
-                                                     &frame.portValid);
-            frame.async = frame.args[NetworkOverlappedArgumentIndex(api)] != 0;
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::Recv:
-        case NetworkProbeApi::RecvFrom: {
-            frame.buffer = frame.args[1];
-            const int32_t requested = argI32(2);
-            frame.requestedLengthValid = requested >= 0;
-            frame.countOrLength = requested >= 0 ? static_cast<uint32_t>(requested) : 0u;
-            frame.requestedLength = frame.countOrLength;
-            if (api == NetworkProbeApi::RecvFrom) {
-                frame.addressPtr = frame.args[4];
-                frame.addressLengthPtr = frame.args[5];
-            }
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::WSARecv:
-        case NetworkProbeApi::WSARecvFrom:
-            frame.buffers = frame.args[1];
-            frame.countOrLength = argU32(2);
-            frame.transferredPtr = frame.args[3];
-            (void)readNetworkWsabufs(hp, wow64, frame.buffers,
-                                     frame.countOrLength, 0,
-                                     &frame.requestedLength, nullptr,
-                                     &frame.requestedLengthValid);
-            if (api == NetworkProbeApi::WSARecvFrom) {
-                frame.addressPtr = frame.args[5];
-                frame.addressLengthPtr = frame.args[6];
-            }
-            frame.async = frame.args[NetworkOverlappedArgumentIndex(api)] != 0;
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpOpen:
-            frame.handle = 0;
-            frame.detail = readNetworkWide(hp, frame.args[0]);
-            frame.async = NetworkHttpSessionIsAsync(argU32(4));
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::InternetOpenA:
-        case NetworkProbeApi::InternetOpenW:
-            frame.handle = 0;
-            frame.detail = frame.wide ? readNetworkWide(hp, frame.args[0])
-                                      : readNetworkAnsi(hp, frame.args[0]);
-            frame.async = NetworkHttpSessionIsAsync(argU32(4));
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpConnect:
-            frame.hostname = readNetworkWide(hp, frame.args[1]);
-            frame.port = static_cast<uint16_t>(frame.args[2]);
-            frame.portValid = true; // INTERNET_PORT is a 16-bit value, including valid zero.
-            if (NetworkLooksLikeIp(frame.hostname)) frame.ip = frame.hostname;
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::InternetConnectA:
-        case NetworkProbeApi::InternetConnectW:
-            frame.hostname = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                        : readNetworkAnsi(hp, frame.args[1]);
-            frame.port = static_cast<uint16_t>(frame.args[2]);
-            frame.portValid = true; // INTERNET_PORT is a 16-bit value, including valid zero.
-            if (NetworkLooksLikeIp(frame.hostname)) frame.ip = frame.hostname;
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpOpenRequest:
-        case NetworkProbeApi::HttpOpenRequestA:
-        case NetworkProbeApi::HttpOpenRequestW:
-            frame.parent = frame.args[0];
-            frame.method = api == NetworkProbeApi::WinHttpOpenRequest || frame.wide
-                         ? readNetworkWide(hp, frame.args[1]) : readNetworkAnsi(hp, frame.args[1]);
-            frame.object = api == NetworkProbeApi::WinHttpOpenRequest || frame.wide
-                         ? readNetworkWide(hp, frame.args[2]) : readNetworkAnsi(hp, frame.args[2]);
-            frame.path = frame.object;
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpAddRequestHeaders:
-        case NetworkProbeApi::HttpAddRequestHeadersA:
-        case NetworkProbeApi::HttpAddRequestHeadersW: {
-            const uint32_t headerChars = static_cast<uint32_t>(frame.args[2]);
-            const size_t headerLimit = headerChars == UINT32_MAX
-                                     ? kNetworkObservationTextCap : headerChars;
-            bool headerHitLimit = false;
-            frame.detail = api == NetworkProbeApi::WinHttpAddRequestHeaders || frame.wide
-                         ? readNetworkWide(hp, frame.args[1], headerLimit, &headerHitLimit)
-                         : readNetworkAnsi(hp, frame.args[1], headerLimit, &headerHitLimit);
-            frame.payloadTruncated = (headerChars != UINT32_MAX &&
-                                      headerChars > kNetworkObservationTextCap) ||
-                                     (headerChars == UINT32_MAX && headerHitLimit);
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::InternetOpenUrlA:
-        case NetworkProbeApi::InternetOpenUrlW:
-            frame.parent = frame.args[0];
-            frame.object = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            {
-                NetworkUrlParts url;
-                if (ParseNetworkUrl(frame.object, url)) {
-                    frame.hostname = std::move(url.hostname);
-                    frame.ip = std::move(url.ip);
-                    frame.port = url.port;
-                    frame.portValid = url.portValid;
-                    frame.path = std::move(url.path);
-                }
-            }
-            {
-                const uint32_t headerChars = static_cast<uint32_t>(frame.args[3]);
-                const size_t headerLimit = headerChars == UINT32_MAX
-                                         ? kNetworkObservationTextCap : headerChars;
-                bool headerHitLimit = false;
-                frame.detail = frame.wide
-                             ? readNetworkWide(hp, frame.args[2], headerLimit, &headerHitLimit)
-                             : readNetworkAnsi(hp, frame.args[2], headerLimit, &headerHitLimit);
-                frame.payloadTruncated = (headerChars != UINT32_MAX &&
-                                          headerChars > kNetworkObservationTextCap) ||
-                                         (headerChars == UINT32_MAX && headerHitLimit);
-            }
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpSendRequest:
-        case NetworkProbeApi::HttpSendRequestA:
-        case NetworkProbeApi::HttpSendRequestW: {
-            const uint32_t headerChars = static_cast<uint32_t>(frame.args[2]);
-            const size_t headerLimit = headerChars == UINT32_MAX
-                                     ? kNetworkObservationTextCap : headerChars;
-            bool headerHitLimit = false;
-            frame.detail = api == NetworkProbeApi::WinHttpSendRequest || frame.wide
-                         ? readNetworkWide(hp, frame.args[1], headerLimit, &headerHitLimit)
-                         : readNetworkAnsi(hp, frame.args[1], headerLimit, &headerHitLimit);
-            // DWORD stack arguments only guarantee their low 32 bits on Win64;
-            // do not treat stale upper home-slot bytes as part of the length.
-            frame.requestedLength = static_cast<uint32_t>(frame.args[4]);
-            frame.requestedLengthValid = true;
-            frame.payload = readNetworkPayload(hp, frame.args[3], frame.requestedLength);
-            frame.payloadTruncated = frame.payload.size() < frame.requestedLength ||
-                                     (headerChars != UINT32_MAX &&
-                                      headerChars > kNetworkObservationTextCap) ||
-                                     (headerChars == UINT32_MAX && headerHitLimit);
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::HttpSendRequestExA:
-        case NetworkProbeApi::HttpSendRequestExW: {
-            frame.buffers = frame.args[1];
-            uint64_t body = 0, headers = 0;
-            uint32_t bodyLength = 0, headersLength = 0;
-            if (readInternetBuffer(hp, wow64, frame.buffers, body, bodyLength,
-                                   &headers, &headersLength)) {
-                frame.payload = readNetworkPayload(hp, body, bodyLength);
-                frame.requestedLength = bodyLength;
-                frame.requestedLengthValid = true;
-                frame.payloadTruncated = frame.payload.size() < bodyLength ||
-                                         headersLength > kNetworkObservationTextCap;
-                frame.detail = frame.wide
-                             ? readNetworkWide(hp, headers, headersLength)
-                             : readNetworkAnsi(hp, headers, headersLength);
-            }
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::HttpEndRequestA:
-        case NetworkProbeApi::HttpEndRequestW:
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpWriteData:
-        case NetworkProbeApi::InternetWriteFile:
-            frame.requestedLength = argU32(2);
-            frame.requestedLengthValid = true;
-            frame.payload = readNetworkPayload(hp, frame.args[1], frame.requestedLength);
-            frame.payloadTruncated = frame.payload.size() < frame.requestedLength;
-            frame.transferredPtr = frame.args[3];
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpReceiveResponse:
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpReadData:
-        case NetworkProbeApi::InternetReadFile:
-            frame.buffer = frame.args[1];
-            frame.countOrLength = argU32(2);
-            frame.requestedLength = frame.countOrLength;
-            frame.requestedLengthValid = true;
-            frame.transferredPtr = frame.args[3];
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::InternetReadFileExA:
-        case NetworkProbeApi::InternetReadFileExW: {
-            frame.buffers = frame.args[1];
-            frame.async = frame.async || (argU32(2) & 0x1u) != 0; // IRF_ASYNC
-            uint64_t requestedBuffer = 0;
-            uint32_t requestedLength = 0;
-            if (readInternetBuffer(hp, wow64, frame.buffers,
-                                   requestedBuffer, requestedLength)) {
-                frame.requestedLength = requestedLength;
-                frame.requestedLengthValid = true;
-            }
-            (void)queueReturn(std::move(frame));
-            return;
-        }
-        case NetworkProbeApi::WinHttpQueryHeaders:
-            frame.buffer = frame.args[3];
-            frame.transferredPtr = frame.args[4];
-            if (frame.transferredPtr) {
-                uint32_t capacity = 0;
-                if (readRemoteExact(hp, frame.transferredPtr, &capacity, sizeof(capacity))) {
-                    frame.countOrLength = capacity;
-                    frame.requestedLength = capacity;
-                    frame.requestedLengthValid = true;
-                }
-            }
-            frame.detail = "query level " + std::to_string(static_cast<uint32_t>(frame.args[1]));
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::HttpQueryInfoA:
-        case NetworkProbeApi::HttpQueryInfoW:
-            frame.buffer = frame.args[2];
-            frame.transferredPtr = frame.args[3];
-            if (frame.transferredPtr) {
-                uint32_t capacity = 0;
-                if (readRemoteExact(hp, frame.transferredPtr, &capacity, sizeof(capacity))) {
-                    frame.countOrLength = capacity;
-                    frame.requestedLength = capacity;
-                    frame.requestedLengthValid = true;
-                }
-            }
-            frame.detail = "query level " + std::to_string(static_cast<uint32_t>(frame.args[1]));
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::WinHttpCloseHandle:
-        case NetworkProbeApi::InternetCloseHandle:
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::UrlDownloadToFileA:
-        case NetworkProbeApi::UrlDownloadToFileW:
-            frame.object = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            {
-                NetworkUrlParts url;
-                if (ParseNetworkUrl(frame.object, url)) {
-                    frame.hostname = std::move(url.hostname); frame.ip = std::move(url.ip);
-                    frame.port = url.port; frame.portValid = url.portValid;
-                    frame.path = std::move(url.path);
-                }
-            }
-            frame.detail = frame.wide ? readNetworkWide(hp, frame.args[2])
-                                      : readNetworkAnsi(hp, frame.args[2]);
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::UrlDownloadToCacheFileA:
-        case NetworkProbeApi::UrlDownloadToCacheFileW:
-            frame.object = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            {
-                NetworkUrlParts url;
-                if (ParseNetworkUrl(frame.object, url)) {
-                    frame.hostname = std::move(url.hostname); frame.ip = std::move(url.ip);
-                    frame.port = url.port; frame.portValid = url.portValid;
-                    frame.path = std::move(url.path);
-                }
-            }
-            frame.buffer = frame.args[2];
-            frame.countOrLength = argU32(3);
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::UrlOpenStreamA:
-        case NetworkProbeApi::UrlOpenStreamW:
-            frame.object = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            {
-                NetworkUrlParts url;
-                if (ParseNetworkUrl(frame.object, url)) {
-                    frame.hostname = std::move(url.hostname); frame.ip = std::move(url.ip);
-                    frame.port = url.port; frame.portValid = url.portValid;
-                    frame.path = std::move(url.path);
-                }
-            }
-            (void)queueReturn(std::move(frame));
-            return;
-        case NetworkProbeApi::UrlOpenBlockingStreamA:
-        case NetworkProbeApi::UrlOpenBlockingStreamW:
-            frame.object = frame.wide ? readNetworkWide(hp, frame.args[1])
-                                      : readNetworkAnsi(hp, frame.args[1]);
-            {
-                NetworkUrlParts url;
-                if (ParseNetworkUrl(frame.object, url)) {
-                    frame.hostname = std::move(url.hostname); frame.ip = std::move(url.ip);
-                    frame.port = url.port; frame.portValid = url.portValid;
-                    frame.path = std::move(url.path);
-                }
-            }
-            frame.buffer = frame.args[2]; // IStream**
-            (void)queueReturn(std::move(frame));
-            return;
-        default:
-            return;
-    }
-}
-
-// Restore one shared return instruction, pop exactly the calling thread's top
-// frame, publish its typed result, and tell the event loop whether peers still
-// reference this site and therefore require it to be re-armed after one TF step.
-bool Debugger::netTapOnReturn(uint64_t addr, uint32_t tid, bool* transitionFailed) {
-    if (transitionFailed) *transitionFailed = false;
-    HANDLE hp = (HANDLE)hProcess_;
-    NetworkReturnBp site;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = networkReturnBps_.find(addr);
-        if (it == networkReturnBps_.end()) return false;
-        site = it->second;
-        it->second.armed = false;
-    }
-    auto th = threads_.find(tid);
-    if (site.ownsByte && !replaceByteIfEqual(hp, addr, 0xCC, site.orig)) {
-        if (transitionFailed) *transitionFailed = true;
-        return false;
-    }
-    if (th == threads_.end()) return true;
-    ctxSetRip(th->second, addr);
-    auto finishSite = [&]() {
-        const bool shared = networkPendingReturns_.references(addr) != 0;
-        if (!shared) {
-            std::lock_guard<std::mutex> lk(mtx_);
-            networkReturnBps_.erase(addr);
-            auto at = std::lower_bound(networkReturnBpAddrs_.begin(),
-                                       networkReturnBpAddrs_.end(), addr);
-            if (at != networkReturnBpAddrs_.end() && *at == addr)
-                networkReturnBpAddrs_.erase(at);
-        }
-        return shared;
-    };
-    NetworkPendingFrame frame;
-    if (!networkPendingReturns_.pop(tid, addr, frame)) return finishSite();
-    if (!frame.payload.empty()) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        networkPendingPayloadBytes_ -= (std::min<uint64_t>)(
-            networkPendingPayloadBytes_, frame.payload.size());
-    }
-    Registers r;
-    if (!ctxReadFull(th->second, r)) return finishSite();
-    const bool wow64 = isWow64_.load();
-    const int32_t result32 = static_cast<int32_t>(static_cast<uint32_t>(r.rax));
-    const uint64_t rawResult = wow64 ? static_cast<uint32_t>(r.rax) : r.rax;
-    NetworkObservationEvent event;
-    event.tickMs = GetTickCount(); event.tid = tid; event.api = frame.api;
-    event.caller = frame.caller; event.handle = frame.handle;
-    event.result = result32;
-    SetNetworkObservedRawResult(event, r.rax, wow64);
-    event.hostname = frame.hostname; event.ip = frame.ip;
-    event.port = frame.port; event.portValid = frame.portValid;
-    event.endpoint = frame.endpoint; event.method = frame.method;
-    event.path = frame.path; event.object = frame.object; event.detail = frame.detail;
-    event.requestedBytes = frame.requestedLength;
-    event.requestedBytesValid = frame.requestedLengthValid;
-    event.asyncPartial = frame.async;
-    event.truncated = frame.payloadTruncated;
-
-    auto applyLineage = [&]() {
-        const NetworkHandleRecord lineage = networkHandleLineage_.resolve(frame.handle);
-        if (event.hostname.empty()) event.hostname = lineage.hostname;
-        if (event.ip.empty()) event.ip = lineage.ip;
-        if (!event.portValid && lineage.portValid) {
-            event.port = lineage.port;
-            event.portValid = true;
-        }
-        if (event.method.empty()) event.method = lineage.method;
-        if (event.path.empty()) event.path = lineage.path;
-        if (event.object.empty()) event.object = lineage.object;
-        if (event.endpoint.empty()) event.endpoint = lineage.endpoint;
-        if (event.endpoint.empty()) {
-            const std::string& host = !event.ip.empty() ? event.ip : event.hostname;
-            event.endpoint = formatNetworkHostPort(host, event.port, event.portValid);
-        }
-        event.asyncPartial = event.asyncPartial || lineage.async;
-    };
-    auto readTransferred = [&](uint32_t& transferred) {
-        transferred = 0;
-        return frame.transferredPtr &&
-               readRemoteExact(hp, frame.transferredPtr, &transferred,
-                               sizeof(transferred));
-    };
-    auto captureTransferred = [&]() {
-        uint32_t transferred = 0;
-        if (!readTransferred(transferred)) return false;
-        event.transferred = transferred;
-        event.transferredValid = true;
-        return true;
-    };
-    auto putHandleState = [&](uint64_t handle, NetworkHandleRecord record) {
-        if (networkHandleLineage_.put(handle, std::move(record))) return true;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            networkCoverage_.handleStatesDropped =
-                NetworkHandleStatesDropped(networkHandleLineage_);
-            if (networkCoverage_.handleStatesDropped == 1)
-                networkCoverage_.limitations.push_back(
-                    "HTTP/socket handle-lineage state exceeded the 4,096-record cap; some descendant metadata is unavailable.");
-        }
-        if (!event.detail.empty()) event.detail += "; ";
-        event.detail += "handle-lineage state dropped at bounded capacity";
-        return false;
-    };
-    switch (frame.api) {
-        case NetworkProbeApi::ResolveAddrInfoA:
-        case NetworkProbeApi::ResolveAddrInfoW: {
-            event.stage = NetworkObservationStage::NameResolution;
-            event.result = result32;
-            if (result32 == 0 && frame.buffer) {
-                const NetworkCallContext pointerContext{ isWow64_.load(), 0, {} };
-                const NetworkMemoryReader read = [hp](uint64_t address, void* out, size_t size) {
-                    return readRemoteExact(hp, address, out, size);
-                };
-                uint64_t cursor = 0;
-                if (ReadNetworkPointer(pointerContext, read, frame.buffer, cursor)) {
-                    std::string endpoints;
-                    for (size_t i = 0; cursor && i < 8; ++i) {
-                        uint32_t addrLen = 0;
-                        uint64_t addrPtr = 0, next = 0;
-                        const uint64_t addrLenAt = cursor + 16;
-                        (void)readRemoteExact(hp, addrLenAt, &addrLen, sizeof(addrLen));
-                        const uint64_t addrPtrAt = cursor + (isWow64_.load() ? 24u : 32u);
-                        const uint64_t nextAt = cursor + (isWow64_.load() ? 28u : 40u);
-                        if (ReadNetworkPointer(pointerContext, read, addrPtrAt, addrPtr)) {
-                            std::string oneIp;
-                            uint16_t onePort = 0;
-                            bool onePortValid = false;
-                            const std::string one = readNetworkSockaddr(
-                                hp, addrPtr, addrLen, &oneIp, &onePort, &onePortValid);
-                            if (!one.empty()) {
-                                if (event.ip.empty()) {
-                                    event.ip = std::move(oneIp);
-                                    event.port = onePort;
-                                    event.portValid = onePortValid;
-                                }
-                                if (!endpoints.empty()) endpoints += ", ";
-                                endpoints += one;
-                            }
-                        }
-                        if (!ReadNetworkPointer(pointerContext, read, nextAt, next) || next == cursor) break;
-                        cursor = next;
-                    }
-                    event.endpoint = BoundNetworkText(std::move(endpoints));
-                }
-            }
-            break;
-        }
-        case NetworkProbeApi::GetAddrInfoExA:
-        case NetworkProbeApi::GetAddrInfoExW: {
-            event.stage = NetworkObservationStage::NameResolution;
-            event.asyncPartial = frame.async;
-            if (result32 == 0 && frame.buffer && !frame.async) {
-                const bool narrow = isWow64_.load();
-                const NetworkCallContext pointerContext{narrow, 0, {}};
-                const NetworkMemoryReader read = [hp](uint64_t address, void* out, size_t size) {
-                    return readRemoteExact(hp, address, out, size);
-                };
-                uint64_t cursor = 0;
-                if (ReadNetworkPointer(pointerContext, read, frame.buffer, cursor)) {
-                    std::string endpoints;
-                    for (size_t i = 0; cursor && i < 8; ++i) {
-                        uint32_t addrLen = 0;
-                        uint64_t addrPtr = 0, next = 0;
-                        (void)readRemoteExact(hp, cursor + 16, &addrLen, sizeof(addrLen));
-                        const uint64_t addrAt = cursor + (narrow ? 24u : 32u);
-                        const uint64_t nextAt = cursor + (narrow ? 40u : 64u);
-                        if (ReadNetworkPointer(pointerContext, read, addrAt, addrPtr)) {
-                            std::string oneIp;
-                            uint16_t onePort = 0;
-                            bool onePortValid = false;
-                            const std::string one = readNetworkSockaddr(
-                                hp, addrPtr, addrLen, &oneIp, &onePort, &onePortValid);
-                            if (!one.empty()) {
-                                if (event.ip.empty()) {
-                                    event.ip = std::move(oneIp);
-                                    event.port = onePort;
-                                    event.portValid = onePortValid;
-                                }
-                                if (!endpoints.empty()) endpoints += ", ";
-                                endpoints += one;
-                            }
-                        }
-                        if (!ReadNetworkPointer(pointerContext, read, nextAt, next) || next == cursor)
-                            break;
-                        cursor = next;
-                    }
-                    event.endpoint = BoundNetworkText(std::move(endpoints));
-                }
-            }
-            break;
-        }
-        case NetworkProbeApi::GetHostByName:
-            event.stage = NetworkObservationStage::NameResolution;
-            event.result = static_cast<int64_t>(rawResult);
-            if (rawResult)
-                event.endpoint = readNetworkHostent(hp, isWow64_.load(), rawResult,
-                                                    &event.ip);
-            break;
-        case NetworkProbeApi::GetNameInfoA:
-        case NetworkProbeApi::GetNameInfoW:
-            event.stage = NetworkObservationStage::NameResolution;
-            if (result32 == 0) {
-                bool hostHitLimit = false, serviceHitLimit = false;
-                event.hostname = frame.wide
-                    ? readNetworkWide(hp, frame.buffer,
-                                      static_cast<size_t>((std::min<uint64_t>)(
-                                          frame.countOrLength, kNetworkObservationTextCap)),
-                                      &hostHitLimit)
-                    : readNetworkAnsi(hp, frame.buffer,
-                                      static_cast<size_t>((std::min<uint64_t>)(
-                                          frame.countOrLength, kNetworkObservationTextCap)),
-                                      &hostHitLimit);
-                const std::string service = frame.wide
-                    ? readNetworkWide(hp, frame.transferredPtr,
-                                      static_cast<size_t>((std::min<uint64_t>)(
-                                          frame.addressLengthPtr, kNetworkObservationTextCap)),
-                                      &serviceHitLimit)
-                    : readNetworkAnsi(hp, frame.transferredPtr,
-                                      static_cast<size_t>((std::min<uint64_t>)(
-                                          frame.addressLengthPtr, kNetworkObservationTextCap)),
-                                      &serviceHitLimit);
-                event.truncated = event.truncated || hostHitLimit || serviceHitLimit;
-                if (!service.empty()) event.detail = "service " + service;
-            }
-            break;
-        case NetworkProbeApi::DnsQueryA:
-        case NetworkProbeApi::DnsQueryW:
-        case NetworkProbeApi::DnsQueryUtf8:
-            event.stage = NetworkObservationStage::NameResolution;
-            break;
-        case NetworkProbeApi::Connect:
-        case NetworkProbeApi::WSAConnect:
-            event.stage = NetworkObservationStage::Connect;
-            event.direction = NetworkDirection::Outbound;
-            event.result = result32;
-            if (result32 == 0 && frame.handle) {
-                NetworkHandleRecord socket;
-                socket.kind = NetworkHandleKind::Socket;
-                socket.endpoint = frame.endpoint; socket.ip = frame.ip;
-                socket.port = frame.port; socket.portValid = frame.portValid;
-                (void)putHandleState(frame.handle, std::move(socket));
-            }
-            break;
-        case NetworkProbeApi::Send:
-        case NetworkProbeApi::SendTo:
-            event.stage = NetworkObservationStage::Send;
-            event.direction = NetworkDirection::Outbound;
-            if (result32 >= 0) {
-                event.transferred = static_cast<uint32_t>(result32);
-                event.transferredValid = true;
-            }
-            if (result32 > 0) {
-                if (event.transferred < frame.payload.size()) frame.payload.resize(event.transferred);
-            }
-            event.payload = std::move(frame.payload);
-            event.truncated = event.truncated || event.transferred > event.payload.size();
-            event.payloadOpaque = true; // raw Winsock may contain TLS ciphertext; bytes remain exact
-            applyLineage();
-            break;
-        case NetworkProbeApi::WSASend:
-        case NetworkProbeApi::WSASendTo:
-            event.stage = NetworkObservationStage::Send;
-            event.direction = NetworkDirection::Outbound;
-            if (result32 == 0) (void)captureTransferred();
-            event.payload = std::move(frame.payload);
-            if (event.transferred && event.transferred < event.payload.size()) event.payload.resize(event.transferred);
-            event.truncated = event.truncated || event.transferred > event.payload.size();
-            event.payloadOpaque = true;
-            applyLineage();
-            break;
-        case NetworkProbeApi::Recv:
-        case NetworkProbeApi::RecvFrom:
-            event.stage = NetworkObservationStage::Receive;
-            event.direction = NetworkDirection::Inbound;
-            if (result32 >= 0) {
-                event.transferred = static_cast<uint32_t>(result32);
-                event.transferredValid = true;
-            }
-            if (result32 > 0) {
-                event.payload = readNetworkPayload(hp, frame.buffer,
-                    (std::min<uint64_t>)(event.transferred, frame.countOrLength));
-            }
-            if (result32 > 0 && frame.addressPtr && frame.addressLengthPtr) {
-                int32_t length = 0;
-                if (readRemoteExact(hp, frame.addressLengthPtr, &length, sizeof(length)) && length > 0)
-                    event.endpoint = readNetworkSockaddr(
-                        hp, frame.addressPtr, static_cast<uint32_t>(length),
-                        &event.ip, &event.port, &event.portValid);
-            }
-            event.truncated = event.truncated || event.transferred > event.payload.size();
-            event.payloadOpaque = true;
-            applyLineage();
-            break;
-        case NetworkProbeApi::WSARecv:
-        case NetworkProbeApi::WSARecvFrom:
-            event.stage = NetworkObservationStage::Receive;
-            event.direction = NetworkDirection::Inbound;
-            if (result32 == 0) {
-                (void)captureTransferred();
-                event.payload = readNetworkWsabufs(hp, isWow64_.load(), frame.buffers,
-                                                   frame.countOrLength, event.transferred);
-            }
-            if (result32 == 0 && frame.addressPtr && frame.addressLengthPtr) {
-                int32_t length = 0;
-                if (readRemoteExact(hp, frame.addressLengthPtr, &length, sizeof(length)) && length > 0)
-                    event.endpoint = readNetworkSockaddr(
-                        hp, frame.addressPtr, static_cast<uint32_t>(length),
-                        &event.ip, &event.port, &event.portValid);
-            }
-            event.truncated = event.truncated || event.transferred > event.payload.size();
-            event.payloadOpaque = true;
-            applyLineage();
-            break;
-        case NetworkProbeApi::CloseSocket:
-            event.stage = NetworkObservationStage::HandleClosed;
-            applyLineage();
-            if (result32 == 0) networkHandleLineage_.erase(frame.handle);
-            break;
-        case NetworkProbeApi::WinHttpOpen:
-        case NetworkProbeApi::InternetOpenA:
-        case NetworkProbeApi::InternetOpenW:
-            event.stage = NetworkObservationStage::ProbeStatus;
-            event.result = static_cast<int64_t>(rawResult);
-            event.handle = rawResult;
-            event.detail = rawResult ? "HTTP session opened" : "HTTP session open failed";
-            event.asyncPartial = frame.async;
-            if (rawResult) {
-                NetworkHandleRecord record;
-                record.kind = NetworkHandleKind::Session;
-                record.async = frame.async;
-                (void)putHandleState(rawResult, std::move(record));
-            }
-            break;
-        case NetworkProbeApi::WinHttpConnect:
-        case NetworkProbeApi::InternetConnectA:
-        case NetworkProbeApi::InternetConnectW:
-            event.stage = NetworkObservationStage::Connect;
-            event.result = static_cast<int64_t>(rawResult);
-            event.handle = rawResult;
-            event.asyncPartial = networkHandleLineage_.resolve(frame.handle).async;
-            if (rawResult) {
-                NetworkHandleRecord record;
-                record.kind = NetworkHandleKind::Connection; record.parent = frame.handle;
-                record.hostname = frame.hostname; record.ip = frame.ip;
-                record.port = frame.port; record.portValid = frame.portValid;
-                (void)putHandleState(rawResult, std::move(record));
-                event.endpoint = formatNetworkHostPort(
-                    !event.ip.empty() ? event.ip : event.hostname,
-                    event.port, event.portValid);
-            }
-            break;
-        case NetworkProbeApi::WinHttpOpenRequest:
-        case NetworkProbeApi::HttpOpenRequestA:
-        case NetworkProbeApi::HttpOpenRequestW:
-        case NetworkProbeApi::InternetOpenUrlA:
-        case NetworkProbeApi::InternetOpenUrlW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.result = static_cast<int64_t>(rawResult);
-            event.handle = rawResult;
-            if (rawResult) {
-                NetworkHandleRecord record;
-                record.kind = NetworkHandleKind::Request;
-                record.parent = frame.parent ? frame.parent : frame.handle;
-                record.hostname = frame.hostname; record.ip = frame.ip;
-                record.port = frame.port; record.portValid = frame.portValid;
-                record.method = frame.method; record.path = frame.path;
-                record.object = frame.object;
-                (void)putHandleState(rawResult, std::move(record));
-            }
-            applyLineage();
-            break;
-        case NetworkProbeApi::WinHttpAddRequestHeaders:
-        case NetworkProbeApi::HttpAddRequestHeadersA:
-        case NetworkProbeApi::HttpAddRequestHeadersW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            applyLineage();
-            break;
-        case NetworkProbeApi::WinHttpSendRequest:
-        case NetworkProbeApi::HttpSendRequestA:
-        case NetworkProbeApi::HttpSendRequestW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.payload = std::move(frame.payload);
-            applyLineage();
-            break;
-        case NetworkProbeApi::HttpSendRequestExA:
-        case NetworkProbeApi::HttpSendRequestExW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.payload = std::move(frame.payload);
-            applyLineage();
-            break;
-        case NetworkProbeApi::HttpEndRequestA:
-        case NetworkProbeApi::HttpEndRequestW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.detail = "extended request body ended";
-            applyLineage();
-            break;
-        case NetworkProbeApi::WinHttpWriteData:
-        case NetworkProbeApi::InternetWriteFile:
-            event.stage = NetworkObservationStage::Send;
-            event.direction = NetworkDirection::Outbound;
-            applyLineage();
-            if (result32 != 0 && !event.asyncPartial)
-                (void)captureTransferred();
-            event.payload = std::move(frame.payload);
-            if (result32 != 0 && event.transferred && event.transferred < event.payload.size())
-                event.payload.resize(event.transferred);
-            event.truncated = event.truncated || event.transferred > event.payload.size();
-            break;
-        case NetworkProbeApi::WinHttpReceiveResponse:
-            event.stage = NetworkObservationStage::Response;
-            event.direction = NetworkDirection::Inbound;
-            applyLineage();
-            break;
-        case NetworkProbeApi::WinHttpReadData:
-        case NetworkProbeApi::InternetReadFile:
-            event.stage = NetworkObservationStage::Receive;
-            event.direction = NetworkDirection::Inbound;
-            applyLineage();
-            if (result32 != 0 && !event.asyncPartial) {
-                (void)captureTransferred();
-                event.payload = readNetworkPayload(hp, frame.buffer,
-                    (std::min<uint64_t>)(event.transferred, frame.countOrLength));
-            }
-            event.truncated = event.truncated || event.transferred > event.payload.size();
-            break;
-        case NetworkProbeApi::InternetReadFileExA:
-        case NetworkProbeApi::InternetReadFileExW: {
-            event.stage = NetworkObservationStage::Receive;
-            event.direction = NetworkDirection::Inbound;
-            applyLineage();
-            uint64_t body = 0;
-            uint32_t bodyLength = 0;
-            if (result32 != 0 && !event.asyncPartial &&
-                readInternetBuffer(hp, isWow64_.load(), frame.buffers, body, bodyLength)) {
-                event.transferred = bodyLength;
-                event.transferredValid = true;
-                event.payload = readNetworkPayload(hp, body, bodyLength);
-                event.truncated = event.truncated || bodyLength > event.payload.size();
-            }
-            break;
-        }
-        case NetworkProbeApi::WinHttpQueryHeaders:
-        case NetworkProbeApi::HttpQueryInfoA:
-        case NetworkProbeApi::HttpQueryInfoW:
-            event.stage = NetworkObservationStage::Response;
-            event.direction = NetworkDirection::Inbound;
-            // On failure the size pointer is an updated required length, not a
-            // claim that the caller supplied that capacity. Never read beyond
-            // the entry-time buffer size (especially ERROR_INSUFFICIENT_BUFFER).
-            if (result32 != 0) {
-                (void)captureTransferred();
-                const uint64_t readable = (std::min<uint64_t>)(
-                    event.transferred, frame.countOrLength);
-                event.payload = readNetworkPayload(hp, frame.buffer, readable);
-                event.truncated = event.transferred > event.payload.size();
-            }
-            applyLineage();
-            break;
-        case NetworkProbeApi::UrlDownloadToFileA:
-        case NetworkProbeApi::UrlDownloadToFileW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.object = frame.object;
-            event.detail = "destination: " + frame.detail;
-            break;
-        case NetworkProbeApi::UrlDownloadToCacheFileA:
-        case NetworkProbeApi::UrlDownloadToCacheFileW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.object = frame.object;
-            if (result32 == 0)
-                event.detail = "cache destination: " +
-                    (frame.wide ? readNetworkWide(hp, frame.buffer)
-                                : readNetworkAnsi(hp, frame.buffer));
-            break;
-        case NetworkProbeApi::UrlOpenStreamA:
-        case NetworkProbeApi::UrlOpenStreamW:
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.object = frame.object;
-            event.asyncPartial = true; // callback completion is outside this API return
-            break;
-        case NetworkProbeApi::UrlOpenBlockingStreamA:
-        case NetworkProbeApi::UrlOpenBlockingStreamW: {
-            event.stage = NetworkObservationStage::Request;
-            event.direction = NetworkDirection::Outbound;
-            event.object = frame.object;
-            const NetworkCallContext pointerContext{isWow64_.load(), 0, {}};
-            const NetworkMemoryReader read = [hp](uint64_t at, void* out, size_t size) {
-                return readRemoteExact(hp, at, out, size);
-            };
-            uint64_t stream = 0;
-            if (result32 == 0 && ReadNetworkPointer(pointerContext, read, frame.buffer, stream))
-                event.handle = stream;
-            break;
-        }
-        case NetworkProbeApi::WinHttpCloseHandle:
-        case NetworkProbeApi::InternetCloseHandle:
-            event.stage = NetworkObservationStage::HandleClosed;
-            applyLineage();
-            if (result32 != 0) networkHandleLineage_.erase(frame.handle);
-            break;
-        default:
-            event.stage = NetworkObservationStage::ProbeStatus;
-            break;
-    }
-
-    decorateNetworkEvent(event);
-    writeNetworkObservationLog(event);
-    pushNetworkEvent(std::move(event));
-
-    return finishSite();
-}
-
-bool Debugger::addHardwareBreakpoint(uint64_t va, HwKind kind, uint8_t size) {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return false;
-        if (gameMakerOwnsRangeLocked(va,kind==HwKind::Execute ? 1 : size)) return false;
-        // A remove followed by an add at the same address is a type/size
-        // replacement. The debug thread applies removals before additions, so do
-        // not mistake the soon-to-be-freed slot for an already-satisfied add.
-        const bool replacing = std::find(pendingHwRems_.begin(), pendingHwRems_.end(), va) !=
-                               pendingHwRems_.end();
-        for (auto& pending : pendingHwAdds_) {
-            if (pending.addr != va) continue;
-            pending.kind = kind;
-            pending.size = size;
-            return true;
-        }
-        int inUse = 0;
-        for (auto& s : hwSlots_) {
-            if (!s.used) continue;
-            if (s.addr == va) {
-                if (!replacing) return true;
-                continue;
-            }
-            ++inUse;
-        }
-        inUse += (int)pendingHwAdds_.size();
-        if (inUse >= 4) return false;
-        HwSlot s; s.used = true; s.addr = va; s.kind = kind; s.size = size;
-        pendingHwAdds_.push_back(s);
-    }
-    requestTraceSyncBreak();
-    return true;
-}
-bool Debugger::addHardwareBreakpointForSession(DebugTargetIdentity expected,
-                                               uint64_t va, HwKind kind,
-                                               uint8_t size) {
-    if (!expected.valid()) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
-            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
-            return false;
-        if (gameMakerOwnsRangeLocked(va,kind==HwKind::Execute ? 1 : size)) return false;
-        const bool replacing = std::find(pendingHwRems_.begin(), pendingHwRems_.end(), va) !=
-                               pendingHwRems_.end();
-        for (auto& pending : pendingHwAdds_) {
-            if (pending.addr != va) continue;
-            pending.kind = kind;
-            pending.size = size;
-            return true;
-        }
-        int inUse = 0;
-        for (auto& s : hwSlots_) {
-            if (!s.used) continue;
-            if (s.addr == va) {
-                if (!replacing) return true;
-                continue;
-            }
-            ++inUse;
-        }
-        inUse += (int)pendingHwAdds_.size();
-        if (inUse >= 4) return false;
-        HwSlot s; s.used = true; s.addr = va; s.kind = kind; s.size = size;
-        pendingHwAdds_.push_back(s);
-    }
-    requestTraceSyncBreak(expected);
-    return true;
-}
-bool Debugger::removeHardwareBreakpoint(uint64_t va) {
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (state_ == DbgState::Detached || state_ == DbgState::Terminated) return false;
-        pendingHwRems_.push_back(va);
-    }
-    requestTraceSyncBreak();
-    return true;
-}
-bool Debugger::removeHardwareBreakpointForSession(DebugTargetIdentity expected,
-                                                  uint64_t va) {
-    if (!expected.valid()) return false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if ((state_ != DbgState::Running && state_ != DbgState::Paused) ||
-            !DebugTargetIdentityMatches({ pid_, sessionGeneration_ }, expected))
-            return false;
-        pendingHwRems_.push_back(va);
-    }
-    requestTraceSyncBreak(expected);
-    return true;
-}
-bool Debugger::hasHardwareBreakpoint(uint64_t va) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    for (auto& s : hwSlots_) if (s.used && s.addr == va) return true;
-    return false;
-}
 
 bool Debugger::setAntiDebugPolicy(const AntiDebugPolicy& policy, std::string* error) {
     std::unique_lock ownerLock(lifecycleOwnerMtx_, std::try_to_lock);
@@ -4200,7 +2088,7 @@ size_t Debugger::writeMemoryOwned(std::optional<DebugTargetIdentity> expected,
     bool wakeRunningTarget = false;
     {
         std::lock_guard<std::mutex> stateLock(mtx_);
-        if (state_ != DbgState::Paused && state_ != DbgState::Running) return 0;
+        if (cleanupOnly_ || (state_ != DbgState::Paused && state_ != DbgState::Running)) return 0;
         const DebugTargetIdentity current{ pid_, sessionGeneration_ };
         if (!current.valid() || (expected && !DebugTargetIdentityMatches(current, *expected)))
             return 0;
@@ -4596,7 +2484,7 @@ std::vector<size_t> Debugger::writeMemoryBatchForSession(
     bool wakeRunningTarget = false;
     {
         std::lock_guard<std::mutex> stateLock(mtx_);
-        if (state_ != DbgState::Paused && state_ != DbgState::Running) return results;
+        if (cleanupOnly_ || (state_ != DbgState::Paused && state_ != DbgState::Running)) return results;
         const DebugTargetIdentity expected{
             expectedPid, expectedSessionGeneration
         };
@@ -4796,7 +2684,7 @@ std::vector<DbgModule> Debugger::modulesForSession(
 
 uint64_t Debugger::allocRemote(size_t n) {
     std::unique_lock<std::mutex> stateLock(mtx_);
-    if (state_ != DbgState::Paused) return 0;
+    if (cleanupOnly_ || state_ != DbgState::Paused) return 0;
     std::lock_guard<std::mutex> lk(hProcMtx_);
     void* h = hProcessShared_.load();
     if (!h || n == 0) return 0;
@@ -4808,7 +2696,7 @@ uint64_t Debugger::allocRemote(size_t n) {
 
 void Debugger::freeRemote(uint64_t addr) {
     std::unique_lock<std::mutex> stateLock(mtx_);
-    if (state_ != DbgState::Paused) return;
+    if (cleanupOnly_ || state_ != DbgState::Paused) return;
     std::lock_guard<std::mutex> lk(hProcMtx_);
     void* h = hProcessShared_.load();
     auto tracked = std::find(remoteAllocs_.begin(), remoteAllocs_.end(), addr);
@@ -4821,7 +2709,7 @@ void Debugger::freeRemote(uint64_t addr) {
 
 void Debugger::freeAllRemote() {
     std::unique_lock<std::mutex> stateLock(mtx_);
-    if (state_ != DbgState::Paused) return;
+    if (cleanupOnly_ || state_ != DbgState::Paused) return;
     std::lock_guard<std::mutex> lk(hProcMtx_);
     void* h = hProcessShared_.load();
     if (!h) return;
@@ -4863,10 +2751,13 @@ DbgSnapshot Debugger::snapshot() {
     std::lock_guard<std::mutex> lk(mtx_);
     DbgSnapshot s;
     s.state = state_;
+    s.cleanupOnly = cleanupOnly_;
     s.pid = pid_; s.tid = tid_;
     s.sessionGeneration = sessionGeneration_;
     s.regs = regs_;
     s.lastEvent = lastEvent_;
+    s.mutationError = mutationError_;
+    s.mutationErrorRevision = mutationErrorRevision_;
     s.traceOwnedSites = traceBps_.size();
     s.breakpoints.reserve(bps_.size() + failedBpInstalls_.size());
     for (auto& kv : bps_)
@@ -4909,7 +2800,9 @@ Debugger::CommandEnvelope Debugger::waitForCommand(uint64_t controlEpoch) {
         return controlEpoch_ == controlEpoch &&
             (!pendingBpAdds_.empty() || !pendingBpRems_.empty() ||
              !pendingBpConds_.empty() || !pendingBpEveryN_.empty() ||
-             pendingTraceStart_ || pendingTraceStop_);
+             !pendingHwAdds_.empty() || !pendingHwRems_.empty() ||
+             pendingTraceStart_ || pendingTraceStop_ ||
+             pendingAuthorizationStart_ || pendingAuthorizationStop_ || pendingNetworkSync_);
     };
     const auto ready = [this, controlEpoch, &hasBreakpointEdits] {
         return quit_ || (pendingCommand_.command != Cmd::None &&
@@ -4945,72 +2838,6 @@ Debugger::CommandEnvelope Debugger::waitForCommand(uint64_t controlEpoch) {
 }
 
 // ---- debug-thread helpers ---------------------------------------------------
-
-static bool readByteRPM(HANDLE h, uint64_t va, uint8_t& b) {
-    SIZE_T got = 0; return ReadProcessMemory(h, (LPCVOID)va, &b, 1, &got) && got == 1;
-}
-static bool writeByteRPM(HANDLE h, uint64_t va, uint8_t b) {
-    SIZE_T put = 0;
-    DWORD oldProt = 0;
-    BOOL prot = VirtualProtectEx(h, (LPVOID)va, 1, PAGE_EXECUTE_READWRITE, &oldProt);
-    bool ok = WriteProcessMemory(h, (LPVOID)va, &b, 1, &put) && put == 1;
-    if (prot) VirtualProtectEx(h, (LPVOID)va, 1, oldProt, &oldProt);
-    FlushInstructionCache(h, (LPCVOID)va, 1);
-    return ok;
-}
-
-// A debugger-owned byte transition is valid only while the byte still has the
-// value whose ownership we proved. The target is stopped whenever this helper is
-// used for breakpoint state, so the compare/write/readback sequence is atomic
-// with respect to execution and protects patches/self-modifying code from stale
-// cleanup restores.
-static bool replaceByteIfEqual(HANDLE h, uint64_t va, uint8_t expected, uint8_t replacement) {
-    uint8_t current = 0;
-    if (!readByteRPM(h, va, current) || current != expected) return false;
-    if (expected == replacement) return true;
-    if (!writeByteRPM(h, va, replacement)) return false;
-    uint8_t verify = 0;
-    if (readByteRPM(h, va, verify) && verify == replacement) return true;
-    // Best-effort rollback. Never claim ownership after a failed readback.
-    writeByteRPM(h, va, expected);
-    return false;
-}
-
-static bool restoreDebuggerOwnedByte(HANDLE h, uint64_t va, uint8_t original) {
-    uint8_t current = 0;
-    if (!readByteRPM(h, va, current)) return false;
-    if (current == original) return true; // already exposed/removed
-    if (current != 0xCC) return true;     // patch/self-modification superseded us
-    return replaceByteIfEqual(h, va, 0xCC, original);
-}
-
-debugger_detail::TempBreakpointCleanupDisposition
-debugger_detail::ClassifyTempBreakpointCleanup(
-    bool persistentOwner,
-    bool transitionSucceeded,
-    TempBreakpointByteState byteState) noexcept {
-    if (transitionSucceeded || persistentOwner ||
-        byteState == TempBreakpointByteState::Other ||
-        byteState == TempBreakpointByteState::Unmapped)
-        return TempBreakpointCleanupDisposition::Release;
-    return TempBreakpointCleanupDisposition::Retain;
-}
-
-static bool readRemoteExact(HANDLE h, uint64_t va, void* out, size_t size) {
-    SIZE_T got = 0;
-    return size && ReadProcessMemory(h, (LPCVOID)va, out, size, &got) && got == size;
-}
-
-static bool writeRemoteExact(HANDLE h, uint64_t va, const void* in, size_t size) {
-    if (!size) return false;
-    DWORD oldProt = 0;
-    const BOOL changed = VirtualProtectEx(h, (LPVOID)va, size, PAGE_EXECUTE_READWRITE, &oldProt);
-    SIZE_T put = 0;
-    const bool ok = WriteProcessMemory(h, (LPVOID)va, in, size, &put) && put == size;
-    if (changed) VirtualProtectEx(h, (LPVOID)va, size, oldProt, &oldProt);
-    FlushInstructionCache(h, (LPCVOID)va, size);
-    return ok;
-}
 
 void Debugger::rebuildAntiTrapAddrs_() noexcept {
     try {
@@ -6129,204 +3956,6 @@ void Debugger::retireAntiDebugImage(uint64_t imageBase) {
     rebuildAntiTrapAddrs_();
 }
 
-// ---- arch-aware thread-context access ---------------------------------------
-// A 32-bit (WOW64) target's registers live in a WOW64_CONTEXT reached via
-// Wow64Get/SetThreadContext; a native 64-bit target uses the normal CONTEXT.
-// 32-bit values are zero-extended into the 64-bit Registers fields so the rest of
-// the engine (stepping, conditions, UI) is arch-agnostic.
-
-bool Debugger::ctxReadFull(void* hThread, Registers& out) {
-    out = Registers{};
-    if (isWow64_.load()) {
-        WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_FULL;
-        if (!Wow64GetThreadContext((HANDLE)hThread, &c)) return false;
-        out.rip = c.Eip; out.rsp = c.Esp; out.rbp = c.Ebp; out.rflags = c.EFlags;
-        out.rax = c.Eax; out.rbx = c.Ebx; out.rcx = c.Ecx; out.rdx = c.Edx;
-        out.rsi = c.Esi; out.rdi = c.Edi;   // r8-r15 don't exist in 32-bit mode
-        return true;
-    }
-    CONTEXT c{}; c.ContextFlags = CONTEXT_FULL;
-    if (!GetThreadContext((HANDLE)hThread, &c)) return false;
-    out.rip = c.Rip; out.rsp = c.Rsp; out.rbp = c.Rbp; out.rflags = c.EFlags;
-    out.rax = c.Rax; out.rbx = c.Rbx; out.rcx = c.Rcx; out.rdx = c.Rdx;
-    out.rsi = c.Rsi; out.rdi = c.Rdi;
-    out.r8  = c.R8;  out.r9  = c.R9;  out.r10 = c.R10; out.r11 = c.R11;
-    out.r12 = c.R12; out.r13 = c.R13; out.r14 = c.R14; out.r15 = c.R15;
-    return true;
-}
-
-bool Debugger::ctxWriteFull(void* hThread, const Registers& r) {
-    if (isWow64_.load()) {
-        WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_FULL;
-        if (!Wow64GetThreadContext((HANDLE)hThread, &c)) return false;   // preserve seg/FP/debug
-        c.Eip = (DWORD)r.rip; c.Esp = (DWORD)r.rsp; c.Ebp = (DWORD)r.rbp; c.EFlags = (DWORD)r.rflags;
-        c.Eax = (DWORD)r.rax; c.Ebx = (DWORD)r.rbx; c.Ecx = (DWORD)r.rcx; c.Edx = (DWORD)r.rdx;
-        c.Esi = (DWORD)r.rsi; c.Edi = (DWORD)r.rdi;
-        c.ContextFlags = WOW64_CONTEXT_FULL;
-        return Wow64SetThreadContext((HANDLE)hThread, &c) != 0;
-    }
-    CONTEXT c{}; c.ContextFlags = CONTEXT_FULL;
-    if (!GetThreadContext((HANDLE)hThread, &c)) return false;
-    c.Rip = r.rip; c.Rsp = r.rsp; c.Rbp = r.rbp; c.EFlags = (DWORD)r.rflags;
-    c.Rax = r.rax; c.Rbx = r.rbx; c.Rcx = r.rcx; c.Rdx = r.rdx; c.Rsi = r.rsi; c.Rdi = r.rdi;
-    c.R8  = r.r8;  c.R9  = r.r9;  c.R10 = r.r10; c.R11 = r.r11;
-    c.R12 = r.r12; c.R13 = r.r13; c.R14 = r.r14; c.R15 = r.r15;
-    c.ContextFlags = CONTEXT_FULL;
-    return SetThreadContext((HANDLE)hThread, &c) != 0;
-}
-
-uint64_t Debugger::ctxReadRip(void* hThread) {
-    if (isWow64_.load()) {
-        WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_CONTROL;
-        return Wow64GetThreadContext((HANDLE)hThread, &c) ? (uint64_t)c.Eip : 0;
-    }
-    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
-    return GetThreadContext((HANDLE)hThread, &c) ? (uint64_t)c.Rip : 0;
-}
-
-bool Debugger::ctxSetRip(void* hThread, uint64_t rip) {
-    if (isWow64_.load()) {
-        if (rip > UINT32_MAX) return false;
-        WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_CONTROL;
-        if (Wow64GetThreadContext((HANDLE)hThread, &c)) {
-            c.Eip = (DWORD)rip; c.ContextFlags = WOW64_CONTEXT_CONTROL;
-            return Wow64SetThreadContext((HANDLE)hThread, &c) != FALSE;
-        }
-        return false;
-    }
-    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
-    if (!GetThreadContext((HANDLE)hThread, &c)) return false;
-    c.Rip = rip;
-    return SetThreadContext((HANDLE)hThread, &c) != FALSE;
-}
-
-void Debugger::clearBreakpointInstallFailureLocked(uint64_t va) {
-    std::erase_if(failedBpInstalls_, [va](const SwBreakpointInfo& failed) {
-        return failed.address == va;
-    });
-}
-
-bool Debugger::armBreakpoint(uint64_t va) {
-    uint8_t orig = 0;
-    bool ownsByte = false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (gameMakerOwnsRangeLocked(va,1)) return false;
-        auto it = bps_.find(va);
-        if (it == bps_.end()) return false;
-        orig = it->second.orig;
-        ownsByte = it->second.ownsByte;
-        if (!ownsByte) {
-            it->second.armed = true;
-            it->second.error.clear();
-            return true;
-        }
-    }
-    const bool ok = orig != 0xCC &&
-        replaceByteIfEqual((HANDLE)hProcess_, va, orig, 0xCC);
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (auto it = bps_.find(va); it != bps_.end()) {
-            it->second.armed = ok;
-            it->second.error = ok ? std::string{} : "could not re-arm owned breakpoint byte";
-        }
-    }
-    return ok;
-}
-bool Debugger::disarmBreakpoint(uint64_t va) {
-    uint8_t orig = 0;
-    bool ownsByte = false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = bps_.find(va);
-        if (it == bps_.end()) return false;
-        orig = it->second.orig;
-        ownsByte = it->second.ownsByte;
-        if (!ownsByte) return true; // the shared anti-debug hook mediates the byte
-    }
-    uint8_t current = 0;
-    const bool ok = readByteRPM((HANDLE)hProcess_, va, current) &&
-        (current == orig || replaceByteIfEqual((HANDLE)hProcess_, va, 0xCC, orig));
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (auto it = bps_.find(va); it != bps_.end()) {
-            it->second.armed = false;
-            it->second.error = ok ? std::string{} : "could not restore owned breakpoint byte";
-        }
-    }
-    return ok;
-}
-
-bool Debugger::disarmAuthorizationBreakpoint(uint64_t va) {
-    AuthorizationBp site;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = authorizationBps_.find(va);
-        if (it == authorizationBps_.end()) return false;
-        site = it->second;
-        it->second.armed = false;
-        if (auto completion = authorizationReturnBps_.find(va);
-            completion != authorizationReturnBps_.end())
-            completion->second.armed = false;
-    }
-    return !site.ownsByte ||
-           replaceByteIfEqual((HANDLE)hProcess_, va, 0xCC, site.orig);
-}
-
-bool Debugger::rearmAuthorizationBreakpoint(uint64_t va) {
-    AuthorizationBp site;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = authorizationBps_.find(va);
-        if (it == authorizationBps_.end()) return false;
-        site = it->second;
-    }
-    const bool ok = !site.ownsByte ||
-                    replaceByteIfEqual((HANDLE)hProcess_, va, site.orig, 0xCC);
-    if (ok) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (auto it = authorizationBps_.find(va); it != authorizationBps_.end())
-            it->second.armed = true;
-        if (auto it = authorizationReturnBps_.find(va);
-            it != authorizationReturnBps_.end())
-            it->second.armed = true;
-    }
-    return ok;
-}
-
-bool Debugger::disarmAuthorizationReturn(uint64_t va) {
-    AuthorizationReturnBp site;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = authorizationReturnBps_.find(va);
-        if (it == authorizationReturnBps_.end()) return false;
-        site = it->second;
-        it->second.armed = false;
-    }
-    return !site.ownsByte ||
-           replaceByteIfEqual((HANDLE)hProcess_, va, 0xCC, site.orig);
-}
-
-bool Debugger::rearmAuthorizationReturn(uint64_t va) {
-    AuthorizationReturnBp site;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = authorizationReturnBps_.find(va);
-        if (it == authorizationReturnBps_.end()) return false;
-        site = it->second;
-    }
-    const bool ok = !site.ownsByte ||
-                    replaceByteIfEqual((HANDLE)hProcess_, va, site.orig, 0xCC);
-    if (ok) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (auto it = authorizationReturnBps_.find(va);
-            it != authorizationReturnBps_.end())
-            it->second.armed = true;
-    }
-    return ok;
-}
-
-// Rebuild the UI-visible thread list (debug thread; debuggee is stopped here).
 void Debugger::refreshThreadList() {
     std::vector<ThreadInfo> list;
     std::vector<std::pair<uint32_t, void*>> handles;
@@ -6454,172 +4083,6 @@ void Debugger::unwindStack(uint32_t tid) {
 }
 
 // Evaluate a breakpoint's condition for the stopped thread (debug thread).
-bool Debugger::evalConditionFor(uint64_t addr, uint32_t tid) {
-    // Use the condition compiled once when the breakpoint was set/changed, instead
-    // of re-parsing the string on every hit. An empty (unconditional) program is
-    // {valid,empty} -> always true.
-    CondProgram prog;
-    { std::lock_guard<std::mutex> lk(mtx_);
-      auto it = bps_.find(addr); if (it != bps_.end()) prog = it->second.prog; }
-    // Invalid programs are never supposed to enter bps_ (the public command
-    // boundary rejects them). Fail closed here as defense in depth: malformed
-    // legacy/corrupt state must not become an unconditional breakpoint.
-    if (!prog.valid) return false;
-    if (prog.empty) return true;
-
-    auto th = threads_.find(tid);
-    if (th == threads_.end()) return true;
-    Registers rg;
-    if (!ctxReadFull(th->second, rg)) return true;   // 32-bit values map into the low halves
-
-    CondContext cc;
-    cc.reg = [&rg](const std::string& n, uint64_t& out) -> bool {
-        // Accept both 64-bit and 32-bit register names (eax/eip/esp/... alias rax/rip/rsp).
-        if      (n == "rax" || n == "eax") out = rg.rax; else if (n == "rbx" || n == "ebx") out = rg.rbx;
-        else if (n == "rcx" || n == "ecx") out = rg.rcx; else if (n == "rdx" || n == "edx") out = rg.rdx;
-        else if (n == "rsi" || n == "esi") out = rg.rsi; else if (n == "rdi" || n == "edi") out = rg.rdi;
-        else if (n == "rbp" || n == "ebp") out = rg.rbp; else if (n == "rsp" || n == "esp") out = rg.rsp;
-        else if (n == "rip" || n == "eip") out = rg.rip;
-        else if (n == "rflags" || n == "eflags") out = rg.rflags;
-        else if (n == "r8")  out = rg.r8;  else if (n == "r9")  out = rg.r9;
-        else if (n == "r10") out = rg.r10; else if (n == "r11") out = rg.r11;
-        else if (n == "r12") out = rg.r12; else if (n == "r13") out = rg.r13;
-        else if (n == "r14") out = rg.r14; else if (n == "r15") out = rg.r15;
-        else return false;
-        return true;
-    };
-    // Read pointer-width: a 32-bit (WOW64) target's [addr] must not pull 4 adjacent bytes into the high dword.
-    cc.mem = [this](uint64_t a) -> uint64_t { uint64_t v = 0; readMemory(a, &v, isWow64_.load() ? 4 : 8); return v; };
-    return EvalCompiled(prog, cc, /*onError*/ false);  // unknown runtime state fails closed
-}
-
-bool Debugger::setTrapFlag(uint32_t tid, bool on) {
-    auto it = threads_.find(tid);
-    if (it == threads_.end()) return false;
-    if (isWow64_.load()) {
-        WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_CONTROL;
-        if (!Wow64GetThreadContext((HANDLE)it->second, &c)) return false;
-        if (on) c.EFlags |= TRAP_FLAG; else c.EFlags &= ~TRAP_FLAG;
-        c.ContextFlags = WOW64_CONTEXT_CONTROL;
-        return Wow64SetThreadContext((HANDLE)it->second, &c) != 0;
-    }
-    CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
-    if (!GetThreadContext((HANDLE)it->second, &ctx)) return false;
-    if (on) ctx.EFlags |= TRAP_FLAG; else ctx.EFlags &= ~TRAP_FLAG;
-    return SetThreadContext((HANDLE)it->second, &ctx) != 0;
-}
-
-// Set EFLAGS.RF (resume flag). A fault-class #DB from a hardware *execute*
-// breakpoint (or a trap-flag step that lands on one) leaves RIP on the trapping
-// instruction; RF makes the CPU run that one instruction without re-raising the
-// breakpoint, then the CPU clears RF automatically so the bp stays armed.
-void Debugger::setResumeFlag(uint32_t tid) {
-    auto it = threads_.find(tid);
-    if (it == threads_.end()) return;
-    if (isWow64_.load()) {
-        WOW64_CONTEXT c{}; c.ContextFlags = WOW64_CONTEXT_CONTROL;
-        if (!Wow64GetThreadContext((HANDLE)it->second, &c)) return;
-        c.EFlags |= 0x10000; // RF
-        c.ContextFlags = WOW64_CONTEXT_CONTROL;
-        Wow64SetThreadContext((HANDLE)it->second, &c);
-        return;
-    }
-    CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_CONTROL;
-    if (!GetThreadContext((HANDLE)it->second, &ctx)) return;
-    ctx.EFlags |= 0x10000; // RF
-    SetThreadContext((HANDLE)it->second, &ctx);
-}
-
-// Program DR0-DR3 + DR7 on one thread from the current hwSlots_ table.
-bool Debugger::applyHwToThread(void* hThread) {
-    DWORD64 dr7 = 0;
-    DWORD64 addrs[4] = {0, 0, 0, 0};
-    for (int i = 0; i < 4; ++i) {
-        if (!hwSlots_[i].used) continue;
-        addrs[i] = hwSlots_[i].addr;
-        dr7 |= (DWORD64)1 << (i * 2);              // Ln: local enable for slot i
-
-        // RWn condition: 00=execute, 01=write, 11=read/write.
-        DWORD64 rw = 0;
-        switch (hwSlots_[i].kind) {
-            case HwKind::Execute:   rw = 0b00; break;
-            case HwKind::Write:     rw = 0b01; break;
-            case HwKind::ReadWrite: rw = 0b11; break;
-        }
-        // LENn: 00=1, 01=2, 11=4, 10=8 bytes. Execute must be length 1 (00).
-        DWORD64 len = 0b00;
-        if (hwSlots_[i].kind != HwKind::Execute) {
-            switch (hwSlots_[i].size) { case 2: len = 0b01; break; case 4: len = 0b11; break;
-                                         case 8: len = 0b10; break; default: len = 0b00; break; }
-        }
-        dr7 |= (rw  << (16 + i * 4));
-        dr7 |= (len << (18 + i * 4));
-    }
-    // DR0-DR7 are shared physical registers and the DR7 layout is identical for x86/x64.
-    // Program them via the NATIVE 64-bit CONTEXT even for a WOW64 thread: debug registers
-    // set through the 32-bit WOW64_CONTEXT are not reliably armed by the kernel, so a
-    // WOW64 hardware breakpoint set that way often never fires. 32-bit DR addresses
-    // zero-extend into the DWORD64 fields, and CONTEXT_DEBUG_REGISTERS touches only the DRs.
-    CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext((HANDLE)hThread, &ctx)) return false;
-    ctx.Dr0 = addrs[0]; ctx.Dr1 = addrs[1]; ctx.Dr2 = addrs[2]; ctx.Dr3 = addrs[3];
-    ctx.Dr7 = dr7;
-    ctx.Dr6 = 0;
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    return SetThreadContext((HANDLE)hThread, &ctx) != FALSE;
-}
-
-bool Debugger::applyHwAllThreads() {
-    bool complete = true;
-    for (auto& kv : threads_) complete = applyHwToThread(kv.second) && complete;
-    return complete;
-}
-
-// Read DR6 for a thread and clear it (so the next hit is distinguishable).
-bool Debugger::readDr6Clear(uint32_t tid, uint64_t& dr6) {
-    dr6 = 0;
-    auto it = threads_.find(tid);
-    if (it == threads_.end()) return false;
-    // Read/clear DR6 via the native CONTEXT for both x86 and x64 (see applyHwToThread:
-    // the WOW64 debug-register view is unreliable). DR6 is the same physical register.
-    CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext((HANDLE)it->second, &ctx)) return false;
-    dr6 = ctx.Dr6;
-    if (ctx.Dr6 & 0xF) {
-        ctx.Dr6 = 0;
-        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (!SetThreadContext((HANDLE)it->second, &ctx)) return false;
-    }
-    return true;
-}
-
-void Debugger::captureContext(uint32_t tid) {
-    auto it = threads_.find(tid);
-    if (it == threads_.end()) return;
-    Registers r;
-    if (!ctxReadFull(it->second, r)) return;   // arch-aware (native CONTEXT or WOW64_CONTEXT)
-    std::lock_guard<std::mutex> lk(mtx_);
-    regs_ = r;
-}
-
-Debugger::StepDecode Debugger::decodeAt(uint64_t va) {
-    StepDecode d;
-    // 32-bit (WOW64) code must be measured/classified with an x86 decoder.
-    IDisassembler* dis = isWow64_.load() ? ownDis32_.get() : ownDis_.get();
-    if (!dis) return d;
-    uint8_t buf[16] = {0};
-    size_t n = readMemoryMasked(va, buf, sizeof(buf));
-    if (!n) return d;
-    Instruction in;
-    if (dis->decodeOne(buf, n, va, in)) {
-        d.length      = in.length ? in.length : 1;
-        d.isCall      = in.isCall;
-        d.isRet       = in.isRet;
-        d.isRepString = in.isRepString;
-    }
-    return d;
-}
-
 // ---- debug-thread main loop -------------------------------------------------
 
 void Debugger::threadEntry(uint32_t pid, bool launch, std::wstring applicationPath,
@@ -6630,124 +4093,73 @@ void Debugger::threadEntry(uint32_t pid, bool launch, std::wstring applicationPa
         threadMain(pid, launch, std::move(applicationPath), std::move(commandLine),
                    breakAtEntry, std::move(dllPlan), containedJob, controlEpoch);
     } catch (const std::exception& e) {
-        emergencyThreadCleanup(std::string("debugger worker exception: ") + e.what());
+        emergencyThreadCleanup("debugger worker initialization exception; cleanup required");
+        (void)e;
     } catch (...) {
         emergencyThreadCleanup("debugger worker exception: unknown failure");
     }
+    { std::lock_guard lock(mtx_); ownerFinished_ = true; detachCompletedAttempt_ = detachAttempt_; }
+    cmdCv_.notify_all();
 }
 
-void Debugger::emergencyThreadCleanup(const std::string& reason) noexcept {
-    networkObservationWant_.store(false);
+void Debugger::emergencyThreadCleanup(const char* reason) noexcept {
+    // Mutating event dispatch and retryable cleanup have their own catches while
+    // their local ownership survives. This outer boundary handles initialization
+    // failures only; even here a rejected native detach retains its event owner.
     try {
-        HANDLE process = (HANDLE)hProcess_;
-        uint32_t actualPid = 0;
-        std::vector<std::pair<uint64_t, uint8_t>> restores;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            actualPid = pid_;
-            restores.reserve(bps_.size() + traceBps_.size() + dllTargetBps_.size() +
-                             antiTraps_.size() + networkProbeBps_.size() +
-                             networkReturnBps_.size() + authorizationBps_.size() +
-                             authorizationReturnBps_.size());
-            for (const auto& [va, bp] : bps_)
-                if (bp.ownsByte) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : traceBps_) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : dllTargetBps_)
-                if (bp.ownsByte) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : antiTraps_) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : networkProbeBps_)
-                if (bp.ownsByte) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : networkReturnBps_)
-                if (bp.ownsByte) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : authorizationBps_)
-                if (bp.ownsByte) restores.push_back({ va, bp.orig });
-            for (const auto& [va, bp] : authorizationReturnBps_)
-                if (bp.ownsByte) restores.push_back({ va, bp.orig });
+        { std::lock_guard lock(hProcMtx_); hProcessShared_ = nullptr; hProcessIdentity_ = {}; }
+        for (;;) {
+            bool safe = !nativeDebugObjectOwned_;
+            if (!safe && !nativeMutationsPending()) {
+                safe = DebugActiveProcessStop(pid_) != FALSE;
+                if (safe) nativeDebugObjectOwned_ = false;
+            }
+            if (!safe && hProcess_ && WaitForSingleObject((HANDLE)hProcess_, 0) == WAIT_OBJECT_0) {
+                std::string error;
+                safe = reconcileNativeMutations(error);
+                if (safe) nativeDebugObjectOwned_ = false;
+            }
+            if (safe) break;
+            std::unique_lock lock(mtx_);
+            cleanupOnly_ = true;
+            state_ = DbgState::Paused;
+            quit_ = false;
+            pendingCommand_ = {};
+            startupOk_ = false; startupDone_ = true;
+            try { lastEvent_ = "Debugger initialization cleanup failed; Retry Detach"; startupErr_ = reason; }
+            catch (...) {} // formatting cannot release native ownership
+            detachCompletedAttempt_ = detachAttempt_;
+            const uint64_t completed = detachCompletedAttempt_;
+            cmdCv_.notify_all();
+            do {
+                cmdCv_.wait_for(lock, std::chrono::milliseconds(250));
+            } while (detachAttempt_ == completed && !destroying_);
+            quit_ = true;
         }
         {
-            std::lock_guard<std::mutex> lk(hProcMtx_);
-            hProcessShared_ = nullptr;
-            hProcessIdentity_ = {};
+            std::lock_guard lock(mtx_);
+            cancelPendingWritesLocked(); pendingCommand_ = {};
+            threadHandles_.clear(); threadList_.clear(); activeTid_ = 0;
+            state_ = DbgState::Detached; cleanupOnly_ = false;
+            startupOk_ = false; startupDone_ = true;
+            try { lastEvent_ = reason; startupErr_ = reason; } catch (...) {}
         }
-        if (process) {
-            try { cleanupGameMakerOwned(true); } catch (...) {}
-            for (const auto& [va, orig] : restores)
-                (void)replaceByteIfEqual(process, va, 0xCC, orig);
-            try { restoreAntiDebugState(true); } catch (...) {}
-            for (auto& slot : hwSlots_) slot = HwSlot{};
-            try { applyHwAllThreads(); } catch (...) {}
-        }
-        {
-            std::lock_guard<std::recursive_mutex> dhlk(DbgHelpMutex());
-            if (dbgHelpSessionInited_ && process) SymCleanup(process);
-            dbgHelpSessionInited_ = false;
-        }
-        if (actualPid) DebugActiveProcessStop(actualPid);
-        for (auto& [tid, handle] : threads_) {
-            (void)tid;
-            if (handle) CloseHandle((HANDLE)handle);
-        }
+        for (auto& [tid, handle] : threads_) if (handle) CloseHandle((HANDLE)handle);
         threads_.clear();
         {
-            std::lock_guard<std::mutex> lk(hProcMtx_);
+            std::lock_guard lock(hProcMtx_);
             if (hProcess_) CloseHandle((HANDLE)hProcess_);
-            hProcess_ = nullptr;
-            hProcessShared_ = nullptr;
-            hProcessIdentity_ = {};
-            // Never carry target-owned addresses into a later session after an
-            // emergency teardown, where they could name unrelated pages.
-            remoteAllocs_.clear();
-            remoteRegisterBuffers_.clear();
+            hProcess_ = nullptr; hProcessShared_ = nullptr; hProcessIdentity_ = {};
+            remoteAllocs_.clear(); remoteRegisterBuffers_.clear();
         }
-        traceCoverage_.stop();
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            cancelPendingWritesLocked();
-            activeWrite_.reset();
-            state_ = DbgState::Detached;
-            failedBpInstalls_.clear();
-            dllHostedLaunch_ = false;
-            lastEvent_ = reason;
-            startupErr_ = reason;
-            startupOk_ = false;
-            startupDone_ = true;
-            pendingCommand_ = {};
-            cancelCheckedRunToLocked(
-                "the debugger worker stopped before the checked RunTo request fired");
-            threadHandles_.clear();
-            threadList_.clear();
-            activeTid_ = 0;
-            pausedUserBpAddr_.reset();
-            runtimeTempBpAddr_.reset();
-            networkProbeBps_.clear();
-            networkProbeBpAddrs_.clear();
-            networkReturnBps_.clear();
-            networkReturnBpAddrs_.clear();
-            authorizationBps_.clear();
-            authorizationBpAddrs_.clear();
-            authorizationReturnBps_.clear();
-            authorizationReturnBpAddrs_.clear();
-            authorizationPendingReturnCount_ = 0;
-            networkCoverage_.active = false;
-            networkCoverage_.requested = false;
-            networkPendingPayloadBytes_ = 0;
-        }
-        networkPendingReturns_.clear();
-        authorizationPendingReturns_.clear();
-        authorizationWatch_.stop();
-        networkHandleLineage_.clear();
-        quit_ = true;
-        breakRequested_ = false;
-        traceSyncBreakRequested_ = false;
-        cmdCv_.notify_all();
     } catch (...) {
-        // This is the last-resort boundary for the process-wide debugger worker.
-        // Preserve liveness even if allocation while constructing diagnostics fails.
-        startupOk_ = false;
-        startupDone_ = true;
-        quit_ = true;
-        cmdCv_.notify_all();
+        // A mutex/runtime failure cannot be made safe by dropping a live native
+        // owner. Keep the thread and process authority until forced destruction
+        // can be resolved externally, without releasing the debug object.
+        while (nativeDebugObjectOwned_) Sleep(250);
     }
+    startupOk_ = false; startupDone_ = true;
+    cmdCv_.notify_all();
 }
 
 void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPath,
@@ -6866,7 +4278,11 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         startupOk_ = false; startupDone_ = true; cmdCv_.notify_all();
         return;
     }
+    nativeDebugObjectOwned_ = true;
     DebugSetProcessKillOnExit(FALSE);
+    executionFailure_.clear();
+    hardwareReconciliationRequired_ = false;
+    { std::lock_guard lock(mtx_); mutationError_.clear(); }
     uint64_t activeSessionGeneration = 0;
     uint64_t moduleLoadGeneration = 0;
     { std::lock_guard<std::mutex> lk(mtx_); pid_ = pid; state_ = DbgState::Running;
@@ -6966,7 +4382,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     // temporarily disarmed address. The set contains only suspend counts acquired
     // here; user-frozen threads keep their independent count.
     uint32_t exclusiveStepOwner = 0;
-    std::unordered_set<uint32_t> exclusiveStepSuspended;
+    std::unordered_map<uint32_t, uint32_t> exclusiveStepSuspended;
 
     bool   firstBreakpoint = true;
     // A WOW64 (32-bit) target raises MORE than one loader breakpoint during startup
@@ -7728,34 +5144,23 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         // readMemoryMasked stays O(log n) per read (see rebuildBpAddrs_).
         if (bpSetChanged) { std::lock_guard<std::mutex> lk(mtx_); rebuildBpAddrs_(); }
 
-        // Hardware breakpoints: fold pending changes into slots, reprogram threads.
-        std::vector<HwSlot> hwAdds; std::vector<uint64_t> hwRems;
-        { std::lock_guard<std::mutex> lk(mtx_); hwAdds.swap(pendingHwAdds_); hwRems.swap(pendingHwRems_); }
-        bool hwChanged = false;
-        for (uint64_t va : hwRems) {
-            for (auto& s : hwSlots_)
-                if (s.used && s.addr == va) { std::lock_guard<std::mutex> lk(mtx_); s = HwSlot{}; hwChanged = true; }
-        }
-        for (auto& add : hwAdds) {
-            { std::lock_guard<std::mutex> lk(mtx_);
-              if (gameMakerOwnsRangeLocked(add.addr,add.kind==HwKind::Execute?1:add.size)) continue; }
-            bool placed = false;
-            for (auto& s : hwSlots_) if (s.used && s.addr == add.addr) { placed = true; break; }
-            if (placed) continue;
-            for (auto& s : hwSlots_) if (!s.used) { std::lock_guard<std::mutex> lk(mtx_); s = add; hwChanged = true; placed = true; break; }
-        }
-        if (hwChanged && !applyHwAllThreads()) {
-            std::lock_guard<std::mutex> lk(mtx_);
-            lastEvent_ = "hardware breakpoint update incomplete";
-        }
+        applyPendingHardwareBreakpoints();
 
+        // Consume desired observer work under the same lock as the paused
+        // command predicate. Requests that arrive during this pass stay queued.
+        bool wantNetworkObservation = false;
+        { std::lock_guard lock(mtx_);
+          pendingNetworkSync_ = false;
+          wantNetworkObservation = networkObservationWant_.load(); }
         // Re-scan on every stopped debug event so late module loads gain probes.
-        if (networkObservationWant_.load()) {
+        if (wantNetworkObservation) {
             armNetTap();
         } else if (netTapArmed_ || !networkProbeBps_.empty() ||
                    !networkReturnBps_.empty()) {
             disarmNetTap();
-            if (parkedInternalTransfer) {
+            if (parkedInternalTransfer &&
+                (parkedInternalOwner == ReArmOwner::NetworkProbe || parkedInternalOwner == ReArmOwner::NetworkReturn) &&
+                !networkProbeBps_.count(pausedOnBpAddr) && !networkReturnBps_.count(pausedOnBpAddr)) {
                 // A queued user-breakpoint removal can transfer a currently
                 // parked shared byte to a network probe earlier in this same
                 // mutation pass. If Server Watch is also being stopped, the
@@ -7776,17 +5181,61 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     // Publish a one-line status for the UI (locks mtx_; never called while held).
     auto setEvent = [&](const char* s) { std::lock_guard<std::mutex> lk(mtx_); lastEvent_ = s; };
 
-    auto endExclusiveStep = [&]() {
-        for (uint32_t tid : exclusiveStepSuspended) {
-            if (auto it = threads_.find(tid); it != threads_.end())
-                ResumeThread((HANDLE)it->second);
+    auto threadHasExited = [](void* raw) {
+        const HANDLE handle = static_cast<HANDLE>(raw);
+        if (!handle) return false;
+        if (WaitForSingleObject(handle, 0) == WAIT_OBJECT_0) return true;
+        // EXIT_THREAD can already be pending while this held event keeps its
+        // handle unsignaled. The exact handle's published exit status still
+        // proves it cannot execute the exposed instruction.
+        DWORD status = STILL_ACTIVE;
+        return GetExitCodeThread(handle, &status) && status != STILL_ACTIVE;
+    };
+    auto suspendExclusivePeer = [&](uint32_t tid, void* handle) {
+        if (threadHasExited(handle)) return true;
+        auto [owned, inserted] = exclusiveStepSuspended.try_emplace(tid, 0);
+        if (!inserted && owned->second) return true;
+        // Allocate the count record before SuspendThread so even an allocation
+        // exception cannot strand an unrecorded suspension.
+        if (SuspendThread((HANDLE)handle) != DWORD(-1)) {
+            ++owned->second;
+            return true;
         }
-        exclusiveStepSuspended.clear();
+        const DWORD error = GetLastError();
+        exclusiveStepSuspended.erase(owned);
+        if (threadHasExited(handle)) return true;
+        recordExecutionFailure("could not suspend peer " + std::to_string(tid) +
+            " for exclusive stepping (error " + std::to_string(error) + "); target remains paused");
+        return false;
+    };
+    auto endExclusiveStep = [&]() {
+        // A release attempt retires the complete lease immediately. Any failed
+        // counts below are cleanup debt, never evidence of full peer exclusion.
         exclusiveStepOwner = 0;
+        // Keep counts that Windows did not release. A later retry or detach
+        // must still own those counts; clearing the set would strand a thread.
+        for (auto at = exclusiveStepSuspended.begin(); at != exclusiveStepSuspended.end();) {
+            const auto thread = threads_.find(at->first);
+            if (thread == threads_.end() || threadHasExited(thread->second)) {
+                at = exclusiveStepSuspended.erase(at);
+                continue;
+            }
+            while (at->second && ResumeThread((HANDLE)thread->second) != DWORD(-1)) --at->second;
+            if (!at->second) at = exclusiveStepSuspended.erase(at);
+            else if (threadHasExited(thread->second)) {
+                at = exclusiveStepSuspended.erase(at);
+            } else {
+                recordExecutionFailure("could not release debugger step suspension for thread " +
+                    std::to_string(at->first) + "; target remains paused");
+                ++at;
+            }
+        }
+        if (exclusiveStepSuspended.empty()) exclusiveStepOwner = 0;
     };
     auto beginExclusiveStep = [&](uint32_t ownerTid) {
         if (!ownerTid || exclusiveStepOwner == ownerTid) return;
         endExclusiveStep();
+        if (!exclusiveStepSuspended.empty()) return;
         std::unordered_set<uint32_t> userSuspended;
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -7795,8 +5244,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         exclusiveStepOwner = ownerTid;
         for (const auto& [tid, handle] : threads_) {
             if (tid == ownerTid || !handle || userSuspended.count(tid)) continue;
-            if (SuspendThread((HANDLE)handle) != static_cast<DWORD>(-1))
-                exclusiveStepSuspended.insert(tid);
+            (void)suspendExclusivePeer(tid, handle);
         }
     };
     auto rearmUserBreakpoint = [&](uint64_t va) {
@@ -8020,6 +5468,12 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         bool* transitionFailed, bool* pauseRequested) {
         if (transitionFailed) *transitionFailed = false;
         if (pauseRequested) *pauseRequested = false;
+        const auto returnThread = threads_.find(ownerTid);
+        if (returnThread == threads_.end() || !ctxSetRip(returnThread->second, returnAddress)) {
+            if (transitionFailed) *transitionFailed = true;
+            if (returnThread == threads_.end()) recordExecutionFailure("authorization return thread disappeared; target remains paused");
+            return false;
+        }
         if (!ownerAlreadyDisarmed &&
             !disarmAuthorizationReturn(returnAddress)) {
             if (transitionFailed) *transitionFailed = true;
@@ -8031,9 +5485,6 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 site != authorizationReturnBps_.end())
                 site->second.armed = false;
         }
-        if (auto thread = threads_.find(ownerTid); thread != threads_.end())
-            ctxSetRip(thread->second, returnAddress);
-
         AuthorizationWatchPendingReturn pending;
         const bool popped = authorizationPendingReturns_.pop(
             ownerTid, returnAddress, pending);
@@ -8102,6 +5553,13 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         if (ai != dllTargetBpAddrs_.end() && *ai == addr) dllTargetBpAddrs_.erase(ai);
         return true;
     };
+    auto peekTraceSite = [&](uint64_t addr, TraceBp& out) {
+        std::lock_guard lock(mtx_);
+        const auto at = traceBps_.find(addr);
+        if (at == traceBps_.end()) return false;
+        out = at->second;
+        return true;
+    };
     auto isDllTarget = [&](uint64_t addr) {
         std::lock_guard<std::mutex> lk(mtx_);
         return dllTargetBps_.count(addr) != 0;
@@ -8142,9 +5600,9 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
           } }
 
         TraceBp trace;
-        if (!userOwns && takeTraceSite(addr, trace)) {
+        const bool inheritsTrace = !userOwns && peekTraceSite(addr, trace);
+        if (inheritsTrace) {
             bp.orig = trace.orig;
-            traceCoverage_.markSkipped(trace.generation, addr);
         } else if (!userOwns && tempBpSet && tempBpAddr == addr) {
             bp.orig = tempBpOrig; // the temp mechanism continues owning the int3
             userOwns = true;
@@ -8165,14 +5623,32 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         }
 
         bp.ownsByte = !userOwns;
-        if (bp.ownsByte && !writeByteRPM((HANDLE)hProcess_, addr, 0xCC)) {
+        {
+            std::lock_guard lock(mtx_);
+            dllTargetBpAddrs_.reserve(dllTargetBpAddrs_.size() + 1);
+            dllTargetBps_.emplace(addr, bp); // ownership allocation precedes mutation
+            auto at = std::lower_bound(dllTargetBpAddrs_.begin(), dllTargetBpAddrs_.end(), addr);
+            dllTargetBpAddrs_.insert(at, addr);
+        }
+        uint8_t physicalByte = 0;
+        const bool physicalReady = !bp.ownsByte || (inheritsTrace
+            ? readByteRPM((HANDLE)hProcess_, addr, physicalByte) && physicalByte == 0xCC
+            : replaceByteIfEqual((HANDLE)hProcess_, addr, bp.orig, 0xCC));
+        if (!physicalReady) {
+            // A failed low-level write retains its own rollback ledger. This
+            // unsuccessful breakpoint must not mask or claim a byte.
+            { std::lock_guard lock(mtx_);
+              dllTargetBps_.erase(addr);
+              auto at = std::lower_bound(dllTargetBpAddrs_.begin(), dllTargetBpAddrs_.end(), addr);
+              if (at != dllTargetBpAddrs_.end() && *at == addr) dllTargetBpAddrs_.erase(at); }
             appendDllTargetError("could not arm " + target.label);
             return false;
         }
-        { std::lock_guard<std::mutex> lk(mtx_);
-          dllTargetBps_.emplace(addr, std::move(bp));
-          auto at = std::lower_bound(dllTargetBpAddrs_.begin(), dllTargetBpAddrs_.end(), addr);
-          dllTargetBpAddrs_.insert(at, addr); }
+        if (inheritsTrace) {
+            TraceBp transferred;
+            (void)takeTraceSite(addr, transferred);
+            traceCoverage_.markSkipped(trace.generation, addr);
+        }
         return true;
     };
     auto removeDllTargets = [&](uint64_t base, uint64_t size) {
@@ -8205,6 +5681,9 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     };
     // Arm a one-shot temp breakpoint at `addr`, remembering what it stands for.
     auto setTempBp = [&](uint64_t addr, TempKind kind, uint32_t ownerTid) -> bool {
+        // One physical temporary owner at a time. Refusal leaves every field of
+        // the older owner intact, including its pending re-arm obligation.
+        if (tempBpSet) return false;
         { std::lock_guard<std::mutex> lk(mtx_);
           if (gameMakerOwnsRangeLocked(addr,1)) return false; }
         tempBpAddr = addr; tempBpOrig = 0x90;
@@ -8214,6 +5693,8 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         tempSharesAnti = false;
         tempAntiOwnerBase = 0;
         TraceBp trace;
+        bool inheritsTrace = false;
+        bool tookDllOwnership = false;
         { std::lock_guard<std::mutex> lk(mtx_);
           if (auto anti = antiTraps_.find(addr); anti != antiTraps_.end()) {
                tempBpOrig = anti->second.orig;
@@ -8221,12 +5702,11 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                inheritedInt3 = true;
               tempAntiOwnerBase = anti->second.ownerImageBase;
           } }
-        if (!tempSharesAnti && takeTraceSite(addr, trace)) {
+        inheritsTrace = !tempSharesAnti && peekTraceSite(addr, trace);
+        if (inheritsTrace) {
             tempBpOrig = trace.orig;
             inheritedInt3 = true;
-            traceCoverage_.markSkipped(trace.generation, addr);
         } else if (!tempSharesAnti) {
-            bool tookDllOwnership = false;
             { std::lock_guard<std::mutex> lk(mtx_);
               if (auto dll = dllTargetBps_.find(addr);
                   dll != dllTargetBps_.end() && dll->second.ownsByte) {
@@ -8252,13 +5732,18 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             : replaceByteIfEqual((HANDLE)hProcess_, addr, tempBpOrig, 0xCC);
         if (!armed) {
             std::lock_guard<std::mutex> lk(mtx_);
-            if (auto dll = dllTargetBps_.find(addr); dll != dllTargetBps_.end())
-                dll->second.ownsByte = true; // the DLL target's original int3 remains live
+            if (auto dll = dllTargetBps_.find(addr); tookDllOwnership && dll != dllTargetBps_.end())
+                dll->second.ownsByte = true; // only the ownership transferred by this attempt
             tempBpSet = false; tempSharesAnti = false; tempAntiOwnerBase = 0;
             tempOwnerTid = 0; tempCheckedRunToToken = 0;
             tempKind = TempKind::None; return false;
         }
         tempBpSet = true; tempKind = kind;
+        if (inheritsTrace) {
+            TraceBp transferred;
+            (void)takeTraceSite(addr, transferred);
+            traceCoverage_.markSkipped(trace.generation, addr);
+        }
         {
             std::lock_guard<std::mutex> lk(mtx_);
             runtimeTempBpAddr_ = addr;
@@ -8419,6 +5904,11 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
     // the original byte, back RIP over the int3, then either park on it (condition
     // holds) or silently step+re-arm+run (condition false). Returns true to pause.
     auto handleUserBp = [&](uint64_t a, uint32_t tid) -> bool {
+        const auto stoppedThread = threads_.find(tid);
+        if (stoppedThread == threads_.end() || !ctxSetRip(stoppedThread->second, a)) {
+            if (stoppedThread == threads_.end()) recordExecutionFailure("breakpoint thread disappeared; target remains paused");
+            return true;
+        }
         if (!clearTempBp()) return true;
         steppingOut = false; stepPause = false; stepOutFinishing = false;
         if (!disarmBreakpoint(a)) {
@@ -8441,9 +5931,6 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 authorizationReturn = true;
             }
         }
-        // find(), not operator[]: an unknown tid must not insert a null HANDLE
-        // into threads_ (it would linger and get CloseHandle(nullptr)'d at cleanup).
-        if (auto th = threads_.find(tid); th != threads_.end()) ctxSetRip(th->second, a);
         // A pre-existing/user breakpoint may have shadowed a planned trace site.
         // Count it without changing any user condition, hit, or stop semantics.
         traceCoverage_.recordBlockHit(traceCoverage_.generation(), a);
@@ -8520,12 +6007,25 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         if (++stepOutIters > kStepOutCap) { steppingOut = false; setEvent("step out (capped)"); return true; }
         uint64_t rip = ripOf(tid);
         StepDecode d = decodeAt(rip);
+        if (!d.valid) {
+            steppingOut = false;
+            recordExecutionFailure("step out: instruction could not be decoded; target remains paused");
+            return true;
+        }
         switch (DecideStepOut(ClassifyInsn(d.isCall, d.isRet, d.isRepString))) {
             case StepOutAction::StepOverUnit:
                 // Skip the call/rep entirely: break at the return point and continue.
-                setTempBp(rip + d.length, TempKind::StepOutSkip, tid);
-                setTrapFlag(tid, false);
-                return false;
+                {
+                    uint64_t continuation = 0;
+                    if (!debugger_detail::CheckedInstructionContinuation(rip, d.length, d.valid,
+                            isWow64_.load(), continuation) ||
+                        !setTempBp(continuation, TempKind::StepOutSkip, tid)) {
+                        steppingOut = false;
+                        recordExecutionFailure("step out: temporary return breakpoint could not be armed; target remains paused");
+                        return true;
+                    }
+                }
+                return !setTrapFlag(tid, false);
             case StepOutAction::FinishAfterRet:
                 // Let the ret execute; the following single-step lands in the caller.
                 steppingOut = false; stepOutFinishing = true;
@@ -8538,14 +6038,50 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
         }
     };
 
+    auto reportNativeMutationFailure = [&]() {
+        std::string error = consumeNativeMutationFailure();
+        if (!error.empty()) recordExecutionFailure(std::move(error));
+        else if (nativeMutationsPending())
+            recordExecutionFailure("native memory mutation requires verified recovery; target remains paused");
+    };
+    auto reconcileNativeMutationState = [&]() {
+        std::string error;
+        bool complete = reconcileNativeMutations(error);
+        if (!complete)
+            recordExecutionFailure(error.empty()
+                ? "native memory mutation recovery is incomplete; target remains paused"
+                : std::move(error));
+        complete = retryPendingInstructionRewinds() && complete;
+        complete = retryPendingControlFlags() && complete;
+        if (hardwareReconciliationRequired_)
+            complete = applyHwAllThreads() && complete;
+        if (!exclusiveStepOwner && !exclusiveStepSuspended.empty()) {
+            endExclusiveStep();
+            complete = exclusiveStepSuspended.empty() && complete;
+        }
+        return complete;
+    };
+
+    auto reportOwnerException = [&](const char* reason) noexcept {
+        try { recordExecutionFailure(reason); } catch (...) {
+            // cleanupOnly and the retained event are sufficient to reject new
+            // execution even when memory is unavailable for error formatting.
+            try { std::lock_guard lock(mtx_); cleanupOnly_ = true; ++mutationErrorRevision_; }
+            catch (...) {}
+        }
+    };
+
     DEBUG_EVENT ev{};
     bool alive = true;
     bool debugEventHeldForCleanup = false;
+    bool eventOutstanding = false;
     DWORD heldContinueStatus = DBG_CONTINUE;
     const bool accountAntiDebugRunTime = activeAntiDebugPolicy_.syntheticClock ||
         activeAntiDebugPolicy_.rdtsc != RdtscInterception::Off;
     LARGE_INTEGER antiDebugRunStarted{};
     bool antiDebugRunActive = false;
+ownerEventPump:
+    try {
     while (alive) {
         if (!WaitForDebugEvent(&ev, 100)) {
             serviceGameMaker(false);
@@ -8567,14 +6103,14 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                         const bool read = ctxReadFull(thread->second, context);
                         const bool resumed = ResumeThread((HANDLE)thread->second) != DWORD(-1);
                         retired = read && context.rip != pendingRip;
-                        if (!resumed) traceEventCleanupComplete = false;
+                        if (!resumed) { ++exclusiveStepSuspended[pendingTid]; exclusiveStepOwner = 0; }
                     }
                 }
                 if (retired) retireQueuedTraceHit(pendingTid);
             }
             // Running detach requests an internal debug break first. Wait for
             // that event so cleanup owns a stopped process; if injection failed,
-            // the cleanup path explicitly suspends the known threads instead.
+            // cleanup reports a failed attempt without mutating the running target.
             if (quit_ && !traceSyncBreakRequested_.load()) {
                 // The existing lifecycle always completes detach after bounded
                 // cleanup. Preserve that contract while making any unresolved
@@ -8584,6 +6120,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             }
             continue;
         }
+        eventOutstanding = true;
         // ContinueDebugEvent resumes the target; WaitForDebugEvent stops it again.
         // Advance the virtual clocks only across that interval, before doing any
         // potentially slow debugger-side event processing or waiting for the user.
@@ -8630,12 +6167,14 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             // Any other event proves this thread's old window no longer applies.
             retireQueuedTraceHit(ev.dwThreadId);
         }
+        executionFailure_.clear();
         bool  pause = false;
         bool  gmlEvent = false;
         bool  preserveLoaderPhaseOnPause = false;
         bool  antiTrapTransitionFailed = false;
         bool  antiTrapFatalFailure = false;
         breakpointTransitionFailed = false;
+        bool  retryableInstructionRewindEvent = false; // stays handled across repeated failed command retries
         bool  needResumeFlag = false;   // set when stopped on a fault-class hw execute bp
         uint32_t breakDisplayTid = 0;   // !=0 => a Pause break; show/step this thread, not the helper
 
@@ -8812,9 +6351,8 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                       threadHandles_.push_back({ ev.dwThreadId, ev.u.CreateThread.hThread }); }
                 if (!applyHwToThread(ev.u.CreateThread.hThread))
                     setEvent("hardware breakpoint inheritance failed");
-                if (!quit_ && exclusiveStepOwner && ev.dwThreadId != exclusiveStepOwner &&
-                    SuspendThread(ev.u.CreateThread.hThread) != static_cast<DWORD>(-1))
-                    exclusiveStepSuspended.insert(ev.dwThreadId);
+                if (!quit_ && exclusiveStepOwner && ev.dwThreadId != exclusiveStepOwner)
+                    (void)suspendExclusivePeer(ev.dwThreadId, ev.u.CreateThread.hThread);
                 break;
             case EXIT_THREAD_DEBUG_EVENT: {
                 exclusiveStepSuspended.erase(ev.dwThreadId);
@@ -9017,7 +6555,8 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 if (dllPlan && !dllPlan->retarget.matched) {
                     DllDebugLaunchPlan candidate = *dllPlan;
                     const std::string reportedPath = m.path.empty() ? m.name : m.path;
-                    if (RetargetDllDebugLaunchPlan(candidate, reportedPath, m.base)) {
+                    if (modulePathTrusted && m.fileIdentity.valid &&
+                        RetargetDllDebugLaunchPlan(candidate, reportedPath, m.base)) {
                         *dllPlan = std::move(candidate);
                         { std::lock_guard<std::mutex> lk(mtx_);
                           dllTargetMatched_ = true;
@@ -9038,6 +6577,11 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                                              "/" + std::to_string(dllPlan->breakpoints.size()) +
                                              " target(s)";
                         { std::lock_guard<std::mutex> lk(mtx_); dllTargetLabel_ = std::move(status); }
+                    } else if (jvmdetail::baseNameLower(reportedPath) ==
+                               jvmdetail::baseNameLower(dllPlan->retarget.requestedDllPath)) {
+                        appendDllTargetError(!modulePathTrusted || !m.fileIdentity.valid
+                            ? "same-named DLL has no authoritative backing-file path; target remains unresolved"
+                            : "same-named DLL full path does not match the launch target; target remains unresolved");
                     }
                 }
                 // JVM awareness: capture the VM module's range and (when armed) plant
@@ -9494,10 +7038,14 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                         // A process-wide int3 can be reached by a non-owner thread.
                         // Step that thread across the pristine instruction without
                         // consuming the selected thread's run-to/step operation.
+                        const auto foreignThread = threads_.find(ev.dwThreadId);
+                        if (foreignThread == threads_.end() || !ctxSetRip(foreignThread->second, tempBpAddr)) {
+                            if (foreignThread == threads_.end()) recordExecutionFailure("temporary breakpoint thread disappeared; target remains paused");
+                            pause = true;
+                            break;
+                        }
                         if (replaceByteIfEqual((HANDLE)hProcess_, tempBpAddr, 0xCC,
                                                tempBpOrig)) {
-                            if (auto th = threads_.find(ev.dwThreadId); th != threads_.end())
-                                ctxSetRip(th->second, tempBpAddr);
                             foreignTempStepTid = ev.dwThreadId;
                             beginExclusiveStep(ev.dwThreadId);
                             setTrapFlag(ev.dwThreadId, true);
@@ -9519,6 +7067,12 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                         // A temp breakpoint fired (run-to-cursor, step-over return, or a
                         // call/rep skipped during step-out). Remove it and back RIP onto
                         // the target instruction.
+                        const auto ownerThread = threads_.find(ev.dwThreadId);
+                        if (ownerThread == threads_.end() || !ctxSetRip(ownerThread->second, tempBpAddr)) {
+                            if (ownerThread == threads_.end()) recordExecutionFailure("temporary breakpoint thread disappeared; target remains paused");
+                            pause = true;
+                            break;
+                        }
                         if (!restoreDebuggerOwnedByte((HANDLE)hProcess_, tempBpAddr,
                                                       tempBpOrig)) {
                             if (tempCheckedRunToToken) {
@@ -9535,8 +7089,6 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                             setEvent("temporary breakpoint restore failed");
                             break;
                         }
-                        if (auto th = threads_.find(ev.dwThreadId); th != threads_.end())
-                            ctxSetRip(th->second, tempBpAddr);
                         tempBpSet = false;
                         tempOwnerTid = 0;
                         const uint64_t hitCheckedRunToToken =
@@ -9594,7 +7146,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                                 checkedRunTo_.address == tempBpAddr &&
                                 checkedRunTo_.state ==
                                     CheckedRunToState::Armed) {
-                                if (pause && !breakpointTransitionFailed) {
+                                if (pause && !breakpointTransitionFailed && executionFailure_.empty()) {
                                     transitionCheckedRunToLocked(
                                         CheckedRunToState::Hit, {});
                                 } else {
@@ -9608,9 +7160,14 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                         if (takeDllTarget(addr, target)) {
                             if (target.ownsByte &&
                                 !restoreDebuggerOwnedByte((HANDLE)hProcess_, addr, target.orig)) {
+                                { std::lock_guard lock(mtx_);
+                                  dllTargetBps_[addr] = target;
+                                  auto at = std::lower_bound(dllTargetBpAddrs_.begin(), dllTargetBpAddrs_.end(), addr);
+                                  if (at == dllTargetBpAddrs_.end() || *at != addr)
+                                      dllTargetBpAddrs_.insert(at, addr); }
                                 breakpointTransitionFailed = true;
                                 pause = true;
-                                setEvent("DLL target breakpoint restore failed");
+                                setEvent("DLL target breakpoint restore failed; ownership retained");
                                 break;
                             }
                             if (!clearTempBp()) {
@@ -9618,8 +7175,14 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                                 break;
                             }
                             steppingOut = false; stepPause = false; stepOutFinishing = false;
-                            if (auto th = threads_.find(ev.dwThreadId); th != threads_.end())
-                                ctxSetRip(th->second, addr);
+                            const auto th = threads_.find(ev.dwThreadId);
+                            if (th == threads_.end() || !ctxSetRip(th->second, addr) || ctxReadRip(th->second) != addr) {
+                                breakpointTransitionFailed = true;
+                                pause = true;
+                                appendDllTargetError("DLL target instruction-pointer rewind failed");
+                                setEvent("DLL target instruction-pointer rewind failed");
+                                break;
+                            }
 
                             // A user bp added after launch may share this exact byte.
                             // Treat the requested DLL target as an unconditional stop,
@@ -9700,14 +7263,17 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                             std::lock_guard<std::mutex> lk(mtx_);
                             generation = authorizationBps_.at(addr).generation;
                         }
+                        const auto probeThread = threads_.find(ev.dwThreadId);
+                        if (probeThread == threads_.end() || !ctxSetRip(probeThread->second, addr)) {
+                            if (probeThread == threads_.end()) recordExecutionFailure("authorization probe thread disappeared; target remains paused");
+                            pause = true;
+                            break;
+                        }
                         if (!disarmAuthorizationBreakpoint(addr)) {
                             breakpointTransitionFailed = true;
                             pause = true;
                             setEvent("authorization probe restore failed");
                         } else {
-                            if (auto th = threads_.find(ev.dwThreadId);
-                                th != threads_.end())
-                                ctxSetRip(th->second, addr);
                             // A trace plan may have skipped this byte because the
                             // repeatable authorization probe already owned it. The
                             // actual execution still counts, without consuming or
@@ -9837,13 +7403,17 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     }()) {
                         NetworkProbeApi api = NetworkProbeApi::Unknown;
                         { std::lock_guard<std::mutex> lk(mtx_); api = networkProbeBps_.at(addr).api; }
+                        const auto probeThread = threads_.find(ev.dwThreadId);
+                        if (probeThread == threads_.end() || !ctxSetRip(probeThread->second, addr)) {
+                            if (probeThread == threads_.end()) recordExecutionFailure("network probe thread disappeared; target remains paused");
+                            pause = true;
+                            break;
+                        }
                         if (!disarmNetworkProbe(addr)) {
                             breakpointTransitionFailed = true;
                             pause = true;
                             setEvent("network probe restore failed");
                         } else {
-                            if (auto th = threads_.find(ev.dwThreadId); th != threads_.end())
-                                ctxSetRip(th->second, addr);
                             netTapCapture(addr, ev.dwThreadId, api);
                             reArmAddr = addr;
                             reArmOwner = ReArmOwner::NetworkProbe;
@@ -10135,6 +7705,23 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             pendingJvmInitVA = 0;
         }
 
+        reportNativeMutationFailure();
+        { std::lock_guard lock(mtx_);
+          retryableInstructionRewindEvent = !pendingInstructionRewinds_.empty(); }
+        if (!executionFailure_.empty() && alive) {
+            pause = true;
+            setEvent(executionFailure_.c_str());
+            // Preserve the step-off obligation when an automatic conditional
+            // pass failed before executing the restored instruction.
+            if (reArmAddr && stepTid == ev.dwThreadId && ripOf(stepTid) == reArmAddr) {
+                pausedOnBp = true;
+                pausedOnBpAddr = reArmAddr;
+                parkedInternalTransfer = reArmOwner != ReArmOwner::User;
+                parkedInternalOwner = reArmOwner;
+                { std::lock_guard lock(mtx_); pausedUserBpAddr_ = reArmAddr; }
+                reArmAddr = 0;
+            }
+        }
         if (pause && alive) {
             if (!gmlEvent) invalidateGameMakerPause();
             endExclusiveStep();
@@ -10164,16 +7751,24 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 if (command.command != Cmd::ServiceWrites) break;
                 // Preserve submission order with breakpoint ownership changes,
                 // then service the write without releasing the held event.
+                executionFailure_.clear();
+                (void)reconcileNativeMutationState();
                 applyPendingBps();
                 applyPendingTrace();
                 applyPendingAuthorization();
                 servicePendingWrites(controlEpoch);
                 serviceGameMaker(true);
+                reportNativeMutationFailure();
             }
             if(processExitPending) {
                 cleanupGameMakerOwned(false);
                 {std::lock_guard<std::mutex> lk(mtx_);state_=DbgState::Running;pausedUserBpAddr_.reset();}
-                ContinueDebugEvent(ev.dwProcessId,ev.dwThreadId,contStatus);
+                if (!ContinueDebugEvent(ev.dwProcessId,ev.dwThreadId,contStatus)) {
+                    recordExecutionFailure("ContinueDebugEvent failed while draining process exit (error " + std::to_string(GetLastError()) + ")");
+                    debugEventHeldForCleanup = true; heldContinueStatus = contStatus;
+                    break;
+                }
+                eventOutstanding = false;
                 continue;
             }
             Cmd c = command.command;
@@ -10189,13 +7784,28 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     pausedOnBpAddr = 0;
                     { std::lock_guard<std::mutex> lk(mtx_);
                       pausedUserBpAddr_.reset(); state_ = DbgState::Running; }
-                    ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, contStatus);
+                    if (!reconcileNativeMutationState()) {
+                        debugEventHeldForCleanup = true; heldContinueStatus = contStatus;
+                        break;
+                    }
+                    if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, contStatus)) {
+                        recordExecutionFailure("ContinueDebugEvent failed during detach drain (error " + std::to_string(GetLastError()) + ")");
+                        debugEventHeldForCleanup = true; heldContinueStatus = contStatus;
+                        break;
+                    }
+                    eventOutstanding = false;
                     continue;
                 }
                 debugEventHeldForCleanup = true;
                 heldContinueStatus = contStatus;
                 break;
             }
+            bool retryingInstructionRewind = false;
+            { std::lock_guard lock(mtx_);
+              retryableInstructionRewindEvent = retryableInstructionRewindEvent || !pendingInstructionRewinds_.empty();
+              retryingInstructionRewind = retryableInstructionRewindEvent; }
+            executionFailure_.clear();
+            (void)reconcileNativeMutationState();
             applyPendingBps();
             applyPendingTrace();
             applyPendingAuthorization();
@@ -10204,6 +7814,11 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             if (pendingJvmInitVA && !tempBpSet) {   // deferred JVM-init one-shot (see above)
                 setTempBp(pendingJvmInitVA, TempKind::JvmInit, 0);
                 pendingJvmInitVA = 0;
+            }
+            reportNativeMutationFailure();
+            if (!executionFailure_.empty()) {
+                { std::lock_guard lock(mtx_); state_ = DbgState::Paused; }
+                goto waitForPausedCommand;
             }
             if (gmlEvent) {
                 // A GML notification is inside the helper's preserved native
@@ -10216,9 +7831,18 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     goto waitForPausedCommand;
                 }
                 { std::lock_guard<std::mutex> lk(mtx_); state_ = DbgState::Running; }
+                if (!reconcileNativeMutationState()) {
+                    { std::lock_guard lock(mtx_); state_ = DbgState::Paused; }
+                    goto waitForPausedCommand;
+                }
                 if (ContinueDebugEvent(ev.dwProcessId,ev.dwThreadId,DBG_CONTINUE)) {
+                    eventOutstanding = false;
                     if (accountAntiDebugRunTime && QueryPerformanceCounter(&antiDebugRunStarted))
                         antiDebugRunActive = true;
+                } else {
+                    recordExecutionFailure("ContinueDebugEvent failed at GML resume (error " + std::to_string(GetLastError()) + ")");
+                    debugEventHeldForCleanup = true; heldContinueStatus = DBG_CONTINUE;
+                    break;
                 }
                 continue;
             }
@@ -10230,6 +7854,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 if (serviceBreakpointEdits) {
                     applyPendingBps();
                     applyPendingTrace();
+                    applyPendingAuthorization();
                 }
                 servicePendingWrites(controlEpoch);
                 std::lock_guard<std::mutex> lk(mtx_);
@@ -10240,18 +7865,21 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                     });
                 serviceBreakpointEdits = !pendingBpAdds_.empty() ||
                     !pendingBpRems_.empty() || !pendingBpConds_.empty() ||
-                    !pendingBpEveryN_.empty() || pendingTraceStart_ || pendingTraceStop_;
+                    !pendingBpEveryN_.empty() || !pendingHwAdds_.empty() ||
+                    !pendingHwRems_.empty() || pendingTraceStart_ || pendingTraceStop_ ||
+                    pendingAuthorizationStart_ || pendingAuthorizationStop_ || pendingNetworkSync_;
                 if (!pendingForThisEpoch && !serviceBreakpointEdits) {
                     state_ = DbgState::Running;
                     break;
                 }
             }
 
+            reportNativeMutationFailure();
             // A failed internal trap transition is surfaced as the original
             // breakpoint exception. Do not layer a user step command on top of
             // a context whose concealment setup did not complete.
             if (antiTrapTransitionFailed) c = Cmd::Continue;
-            if (breakpointTransitionFailed) {
+            if (breakpointTransitionFailed && !retryingInstructionRewind) {
                 c = Cmd::Continue;
                 contStatus = DBG_EXCEPTION_NOT_HANDLED;
             }
@@ -10264,10 +7892,24 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 if (activeTid_ && threads_.count(activeTid_)) tid = activeTid_;
             }
 
+            endExclusiveStep(); // retry any retained release counts before any execution
+            (void)retryPendingInstructionRewinds();
+            if (hardwareReconciliationRequired_ && !applyHwAllThreads())
+                recordExecutionFailure("hardware breakpoint reconciliation failed; target remains paused");
+            const bool commandWasOnBreakpoint = pausedOnBp;
+            const uint64_t commandBreakpoint = pausedOnBpAddr;
+            const bool commandInternalTransfer = parkedInternalTransfer;
+            const ReArmOwner commandInternalOwner = parkedInternalOwner;
+            const bool commandHadTemp = tempBpSet;
+            Registers commandContext;
+            const auto commandThread = threads_.find(tid);
+            if (commandThread == threads_.end() || !ctxReadFull(commandThread->second, commandContext))
+                recordExecutionFailure("execution command: thread context could not be read; target remains paused");
+
             // Run-to-cursor: arm a one-shot temp breakpoint at the target, then resume
             // exactly like Continue (which also steps off / re-arms a bp we are parked
             // on). Skip if the target is the very breakpoint we are sitting on.
-            if (c == Cmd::RunTo) {
+            if (c == Cmd::RunTo && executionFailure_.empty()) {
                 const uint64_t target = command.argument;
                 const bool armed = target && !tempBpSet &&
                     !(pausedOnBp && target == pausedOnBpAddr) &&
@@ -10339,7 +7981,7 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 c = Cmd::Continue;
             }
 
-            if (pausedOnBp) {
+            if (executionFailure_.empty() && pausedOnBp) {
                 // Parked on a user breakpoint (original byte restored, RIP backed up).
                 // Decide how to step off it, re-arm it, and then realize the command.
                 uint64_t   A  = pausedOnBpAddr; pausedOnBp = false;
@@ -10350,6 +7992,8 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 parkedInternalOwner = ReArmOwner::User;
                 { std::lock_guard<std::mutex> lk(mtx_); pausedUserBpAddr_.reset(); }
                 StepDecode od = decodeAt(A);
+                if (!od.valid)
+                    recordExecutionFailure("breakpoint step-off: instruction could not be decoded; target remains paused");
                 InsnKind   k  = ClassifyInsn(od.isCall, od.isRet, od.isRepString);
                 StepCmd    sc = (c == Cmd::StepInto) ? StepCmd::StepInto
                               : (c == Cmd::StepOver) ? StepCmd::StepOver
@@ -10367,39 +8011,50 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 } else {
                     // TempBpAfter: a call/rep sits directly on the breakpoint. Run over it
                     // and re-arm the user bp once the temp bp at its return point fires.
-                    uint32_t L = od.length ? od.length : 1;
+                    uint64_t continuation = 0;
+                    const bool continuationValid = debugger_detail::CheckedInstructionContinuation(
+                        A, od.length, od.valid, isWow64_.load(), continuation);
+                    bool continuationArmed = false;
                     if (plan.after == AfterReArm::ContinueStepOut) {
                         steppingOut = true; stepOutIters = 0; stepOutFinishing = false;
                         stepOutAnchorRsp = rspOf(tid);
-                        setTempBp(A + L, TempKind::StepOutSkip, tid);
+                        continuationArmed = continuationValid && setTempBp(continuation, TempKind::StepOutSkip, tid);
                     } else {
-                        setTempBp(A + L, TempKind::StepOver, tid);
+                        continuationArmed = continuationValid && setTempBp(continuation, TempKind::StepOver, tid);
                     }
-                    if (tempBpSet) {
+                    if (continuationArmed) {
                         tempReArm = A;            // re-armed when the temp bp at the return point fires
                         tempReArmOwner = resumeOwner;
                         beginExclusiveStep(tid);
                     } else {
-                        // The temp bp couldn't be written: don't strand the user bp at A (it was
-                        // disarmed when we parked on it). Re-arm it now and fall back to a plain
-                        // continue with the breakpoint live, rather than free-running past it.
-                        const bool rearmed = rearmOwnedBreakpoint(A, resumeOwner);
-                        if (!rearmed) breakpointTransitionFailed = true;
+                        // No instruction ran. Keep the restored-byte ownership
+                        // and parked RIP available for a retry of the command.
+                        recordExecutionFailure("breakpoint step-off: temporary return breakpoint could not be armed; target remains paused");
                         steppingOut = false; stepOutFinishing = false;
                     }
                     setTrapFlag(tid, false);
                 }
-            } else {
+            } else if (executionFailure_.empty()) {
                 switch (c) {
                     case Cmd::StepInto:
                         stepTid = tid; beginExclusiveStep(tid);
                         setTrapFlag(tid, true); stepPause = true; break;
                     case Cmd::StepOver: {
-                        StepDecode d = decodeAt(ripOf(tid));
+                        StepDecode d = decodeAt(commandContext.rip);
+                        if (!d.valid) {
+                            recordExecutionFailure("step over: instruction could not be decoded; target remains paused");
+                            break;
+                        }
                         if (DecideStepOver(ClassifyInsn(d.isCall, d.isRet, d.isRepString))
                                 == StepOverAction::StepOverUnit) {
-                            setTempBp(ripOf(tid) + d.length, TempKind::StepOver, tid); // over the call/rep
-                            if (tempBpSet) beginExclusiveStep(tid);
+                            uint64_t continuation = 0;
+                            if (!debugger_detail::CheckedInstructionContinuation(commandContext.rip, d.length,
+                                    d.valid, isWow64_.load(), continuation) ||
+                                !setTempBp(continuation, TempKind::StepOver, tid)) {
+                                recordExecutionFailure("step over: temporary return breakpoint could not be armed; target remains paused");
+                                break;
+                            }
+                            beginExclusiveStep(tid);
                             setTrapFlag(tid, false); // run to the return point, don't single-step
                         } else { stepTid = tid; beginExclusiveStep(tid);
                                  setTrapFlag(tid, true); stepPause = true; }
@@ -10427,6 +8082,29 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
             // hook must retain TF until the hook's first original instruction has
             // executed and the internal int3 is re-armed.
             if (antiRearms.find(tid)) setTrapFlag(tid, true);
+            reportNativeMutationFailure();
+            if (!executionFailure_.empty()) {
+                if (!commandHadTemp && tempBpSet && !clearTempBp())
+                    recordExecutionFailure("failed execution command retained its temporary breakpoint; target remains paused");
+                endExclusiveStep();
+                stepPause = false;
+                steppingOut = false;
+                stepOutFinishing = false;
+                if (commandWasOnBreakpoint) {
+                    pausedOnBp = true;
+                    pausedOnBpAddr = commandBreakpoint;
+                    parkedInternalTransfer = commandInternalTransfer;
+                    parkedInternalOwner = commandInternalOwner;
+                    reArmAddr = 0;
+                    if (!commandHadTemp) tempReArm = 0;
+                }
+                { std::lock_guard lock(mtx_);
+                  state_ = DbgState::Paused;
+                  if (commandWasOnBreakpoint) pausedUserBpAddr_ = commandBreakpoint;
+                  lastEvent_ = executionFailure_; }
+                captureContext(tid);
+                goto waitForPausedCommand;
+            }
         }
 
         if (quit_ && alive) {
@@ -10437,164 +8115,290 @@ void Debugger::threadMain(uint32_t pid, bool launch, std::wstring applicationPat
                 break;
             }
         }
-        if (ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, contStatus) &&
-            alive && accountAntiDebugRunTime &&
-            QueryPerformanceCounter(&antiDebugRunStarted)) {
-            antiDebugRunActive = true;
+        if (alive && !reconcileNativeMutationState()) {
+            debugEventHeldForCleanup = true; heldContinueStatus = contStatus;
+            break;
         }
+        if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, contStatus)) {
+            recordExecutionFailure("ContinueDebugEvent failed (error " + std::to_string(GetLastError()) + "); closing the held debug session");
+            debugEventHeldForCleanup = true;
+            heldContinueStatus = contStatus;
+            break;
+        }
+        eventOutstanding = false;
+        if (alive && accountAntiDebugRunTime && QueryPerformanceCounter(&antiDebugRunStarted))
+            antiDebugRunActive = true;
     }
 
-    // Cleanup: restore all breakpoint bytes, clear DR registers, stop debugging.
+    } catch (const std::exception& error) {
+        debugEventHeldForCleanup = eventOutstanding;
+        quit_ = true;
+        reportOwnerException("debug event owner failed; retaining cleanup authority");
+        (void)error;
+    } catch (...) {
+        debugEventHeldForCleanup = eventOutstanding;
+        quit_ = true;
+        reportOwnerException("debug event owner failed; retaining cleanup authority");
+    }
+
+    // Cleanup has the same event owner as execution. A failed attempt publishes
+    // completion to the lifecycle worker but retains every handle and restoration
+    // record, so Retry Detach cannot accidentally release an uncertain target.
     {
-        std::lock_guard<std::mutex> lk(mtx_);
+        std::lock_guard lock(mtx_);
+        cleanupOnly_ = true;
+        if (alive) state_ = DbgState::Paused;
         cancelPendingWritesLocked();
-        cancelCheckedRunToLocked(
-            "the debugger session ended before the checked RunTo request fired");
-        failedBpInstalls_.clear();
+        if (checkedRunTo_.state == CheckedRunToState::Pending || checkedRunTo_.state == CheckedRunToState::Armed)
+            transitionCheckedRunToLocked(CheckedRunToState::Cancelled, {});
+        pendingCommand_ = {};
         activeWrite_.reset();
     }
-    {   // Drop the UI-visible handle FIRST: a pause() (DebugBreakProcess) landing after
-        // DebugActiveProcessStop would inject an int3 into a process that no longer has
-        // a debugger and kill it. Nulling under hProcMtx_ makes the UI see "gone" before
-        // we stop debugging; the restores below use hProcess_ directly so they still work.
-        std::lock_guard<std::mutex> lk(hProcMtx_);
+    {
+        std::lock_guard lock(hProcMtx_);
         hProcessShared_ = nullptr;
         hProcessIdentity_ = {};
     }
-    breakRequested_ = false;   // a pause that raced the teardown must not leak into a reattach
-    traceSyncBreakRequested_ = false;
+    breakRequested_ = false;
+    networkObservationWant_.store(false);
+    traceCoverage_.stop();
+    authorizationWatch_.stop();
 
-    // The normal detach path holds a debug event. If injection failed, explicitly
-    // suspend every thread we can still identify before touching code bytes or DR
-    // registers. Track only counts acquired here so user/exclusive counts unwind
-    // independently below.
-    std::unordered_set<uint32_t> cleanupSuspended;
-    if (alive && !debugEventHeldForCleanup) {
-        for (const auto& [tid, handle] : threads_) {
-            if (!handle || exclusiveStepSuspended.count(tid)) continue;
-            if (SuspendThread((HANDLE)handle) != static_cast<DWORD>(-1))
-                cleanupSuspended.insert(tid);
+    // Every ownership map remains intact until native detach succeeds. Walking
+    // those records also avoids an allocation failure losing a cleanup inventory.
+    bool debuggerDetached = false;
+    bool cleanupPrepared = false; // once acknowledged, retries never mutate the running target
+    auto targetExited = [&]() {
+        return hProcess_ && WaitForSingleObject((HANDLE)hProcess_, 0) == WAIT_OBJECT_0;
+    };
+    auto targetTerminating = [&]() {
+        DWORD status = STILL_ACTIVE;
+        return hProcess_ && GetExitCodeProcess((HANDLE)hProcess_, &status) && status != STILL_ACTIVE;
+    };
+    auto threadExited = [&](uint32_t tid) {
+        const auto found = threads_.find(tid);
+        return found == threads_.end() || !found->second || threadHasExited(found->second);
+    };
+    auto restoreCleanupByte = [&](uint64_t address, uint8_t original) {
+        if (restoreDebuggerOwnedByte((HANDLE)hProcess_, address, original)) return true;
+        MEMORY_BASIC_INFORMATION region{};
+        return VirtualQueryEx((HANDLE)hProcess_, (LPCVOID)address, &region, sizeof(region)) == sizeof(region) &&
+            region.State != MEM_COMMIT;
+    };
+    auto resumeOwnedCounts = [&](auto& counts) {
+        bool complete = true;
+        for (auto it = counts.begin(); it != counts.end(); ) {
+            const uint32_t tid = *it;
+            if (threadExited(tid) || ResumeThread((HANDLE)threads_.at(tid)) != DWORD(-1))
+                it = counts.erase(it);
+            else { complete = false; ++it; }
+        }
+        return complete;
+    };
+    for (;;) {
+        alive = alive && !targetExited();
+        executionFailure_.clear();
+        bool complete = true;
+        try {
+        DWORD terminatingStatus = STILL_ACTIVE;
+        if (alive && debugEventHeldForCleanup && hProcess_ &&
+            GetExitCodeProcess((HANDLE)hProcess_, &terminatingStatus) && terminatingStatus != STILL_ACTIVE) {
+            if (ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, heldContinueStatus)) {
+                eventOutstanding = false; debugEventHeldForCleanup = false;
+                goto ownerEventPump;
+            }
+            complete = false;
+        }
+        if (alive && !debugEventHeldForCleanup && !debuggerDetached && !cleanupPrepared) {
+            // A known thread list is not proof of a process-wide stop: Windows
+            // may have an unconsumed CREATE_THREAD. No target mutation is legal
+            // until WaitForDebugEvent has supplied a real held event.
+            complete = false;
+            recordExecutionFailure("could not acquire a debug event; target is still running");
+        }
+        if (alive && complete && !debuggerDetached && !cleanupPrepared) {
+            // Detach supersedes execution preparation: repair toward disabled
+            // TF/RF and empty DR slots, never retry an abandoned enable request.
+            for (auto& [key, repair] : pendingControlFlagRepairs_) repair.on = false;
+            { std::lock_guard lock(mtx_); for (auto& slot : hwSlots_) slot = HwSlot{}; }
+            complete = reconcileNativeMutationState();
+            if (complete) {
+                cleanupGameMakerOwned(true);
+                { std::lock_guard lock(mtx_);
+                  if (gmlSnapshot_.state == GameMakerSessionState::Failed) complete = false; }
+                // A queued trace INT3 is discarded by detach. Rewind its exact
+                // stopped context before Windows releases the debug object.
+                for (const auto& [tid, hit] : queuedTraceHits) {
+                    if (threadExited(tid)) continue;
+                    Registers context{};
+                    if (!ctxReadFull(threads_.at(tid), context)) { complete = false; continue; }
+                    if (context.rip == hit.address + 1 && !ctxSetRip(threads_.at(tid), hit.address))
+                        complete = false;
+                }
+                complete = retryPendingInstructionRewinds() && complete;
+                {
+                    std::lock_guard lock(mtx_);
+                    auto restoreOwned = [&](const auto& owners) {
+                        for (const auto& [address, bp] : owners)
+                            if (bp.ownsByte) complete = restoreCleanupByte(address, bp.orig) && complete;
+                    };
+                    restoreOwned(bps_); restoreOwned(dllTargetBps_);
+                    restoreOwned(networkProbeBps_); restoreOwned(networkReturnBps_);
+                    restoreOwned(authorizationBps_); restoreOwned(authorizationReturnBps_);
+                    for (const auto& [address, bp] : traceBps_)
+                        complete = restoreCleanupByte(address, bp.orig) && complete;
+                    for (const auto& [address, bp] : antiTraps_)
+                        complete = restoreCleanupByte(address, bp.orig) && complete;
+                    if (tempBpSet) complete = restoreCleanupByte(tempBpAddr, tempBpOrig) && complete;
+                    for (const auto& patch : antiDebugPatches_.patches()) {
+                        std::vector<uint8_t> current(patch.concealed.size());
+                        if (!readRemoteExact((HANDLE)hProcess_, patch.address, current.data(), current.size())) {
+                            MEMORY_BASIC_INFORMATION region{};
+                            const bool unmapped = VirtualQueryEx((HANDLE)hProcess_, (LPCVOID)patch.address,
+                                &region, sizeof(region)) == sizeof(region) && region.State != MEM_COMMIT;
+                            complete = unmapped && complete;
+                        } else if (PristinePatchSet::shouldRestore(patch, current)) {
+                            complete = writeRemoteExact((HANDLE)hProcess_, patch.address,
+                                patch.original.data(), patch.original.size()) && complete;
+                        }
+                    }
+                }
+                { std::lock_guard lock(mtx_); for (auto& slot : hwSlots_) slot = HwSlot{}; }
+                for (const auto& [tid, handle] : threads_) {
+                    if (threadExited(tid)) continue;
+                    complete = applyHwToThread(handle) && complete;
+                    complete = setTrapFlag(tid, false) && complete;
+                }
+                complete = reconcileNativeMutationState() && complete;
+                // Diagnostic history can survive a verified repair; pending
+                // recovery and checked postconditions decide release authority.
+                (void)consumeNativeMutationFailure();
+            }
+        }
+        if (alive && complete && !debuggerDetached && !cleanupPrepared) {
+            // Remote register buffers may be referenced by target code and are
+            // intentionally transferred to the target. Other allocations remain
+            // owned until VirtualFreeEx succeeds.
+            {
+                std::lock_guard lock(hProcMtx_);
+                for (auto it = remoteAllocs_.begin(); it != remoteAllocs_.end(); ) {
+                    if (remoteRegisterBuffers_.count(*it) ||
+                        VirtualFreeEx((HANDLE)hProcess_, (LPVOID)*it, 0, MEM_RELEASE))
+                        it = remoteAllocs_.erase(it);
+                    else { complete = false; ++it; }
+                }
+            }
+            // The held event still freezes the process while explicit suspend
+            // counts are released. Every failed ResumeThread retains its count.
+            { std::lock_guard lock(mtx_); complete = resumeOwnedCounts(suspended_) && complete; }
+            endExclusiveStep();
+            complete = exclusiveStepSuspended.empty() && complete;
+        }
+        if (alive && complete && !cleanupPrepared) {
+            if (sandboxJob && !TerminateJobObject(sandboxJob, 1)) complete = false;
+            if (complete) cleanupPrepared = true;
+        }
+        if (complete && cleanupPrepared && debugEventHeldForCleanup) {
+            // A debug object removal does not acknowledge an owned INT3. Mark
+            // the final exception handled only after every byte, context, cache
+            // and suspend-count postcondition has been verified. Target execution
+            // is safe after this boundary even if native detach itself fails.
+            if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, heldContinueStatus)) {
+                complete = false;
+                recordExecutionFailure("could not acknowledge the cleaned debug event (error " +
+                    std::to_string(GetLastError()) + "); Retry Detach");
+            } else {
+                eventOutstanding = false;
+                debugEventHeldForCleanup = false;
+            }
+        }
+        if (complete && !debuggerDetached) {
+            // After event acknowledgement, retries only release the debug
+            // attachment. Reapplying saved originals to a now-running target
+            // could overwrite target changes, so cleanupPrepared is irreversible.
+            debuggerDetached = DebugActiveProcessStop(pid) != FALSE;
+            if (debuggerDetached) nativeDebugObjectOwned_ = false;
+            if (!debuggerDetached && !targetExited()) complete = false;
+            else {
+                debugEventHeldForCleanup = false;
+            }
+        }
+        if (!alive) {
+            std::string ignored;
+            (void)reconcileNativeMutations(ignored); // signaled process retires the ledger
+            nativeDebugObjectOwned_ = false;
+            complete = true;
+        }
+        } catch (const std::exception& error) {
+            complete = false;
+            reportOwnerException("cleanup attempt failed; ownership retained");
+            (void)error;
+        } catch (...) {
+            complete = false;
+            reportOwnerException("cleanup attempt failed; ownership retained");
+        }
+        if (complete) break;
+        {
+            std::unique_lock lock(mtx_);
+            cleanupOnly_ = true;
+            state_ = debugEventHeldForCleanup ? DbgState::Paused : DbgState::Running;
+            quit_ = false;
+            pendingCommand_ = {};
+            detachCompletedAttempt_ = detachAttempt_;
+            try {
+                lastEvent_ = cleanupPrepared && !debugEventHeldForCleanup
+                    ? "Detach failed after verified cleanup: target is running; Retry Detach to release attachment"
+                    : "Detach failed: target ownership retained; Retry Detach to verify cleanup";
+                if (!executionFailure_.empty()) lastEvent_ += "; " + executionFailure_;
+                mutationError_ = lastEvent_;
+            } catch (...) {} // failed diagnostics must not discard the held event
+            ++mutationErrorRevision_;
+            const uint64_t completedAttempt = detachCompletedAttempt_;
+            cmdCv_.notify_all();
+            // Normal callers receive a failed attempt immediately. Destruction
+            // cannot abandon a joinable owner or release uncertain target state;
+            // it keeps retrying until cleanup succeeds or the target exits.
+            while (detachAttempt_ == completedAttempt && !targetExited() && !targetTerminating()) {
+                if (destroying_) {
+                    cmdCv_.wait_for(lock, std::chrono::milliseconds(250));
+                    break;
+                }
+                cmdCv_.wait_for(lock, std::chrono::milliseconds(250));
+            }
+            quit_ = true;
+        }
+        if (alive && !debugEventHeldForCleanup && !debuggerDetached && !cleanupPrepared) {
+            if (!hProcess_) goto ownerEventPump; // await the initial CREATE_PROCESS handle
+            if (traceSyncBreakRequested_.load() || DebugBreakProcess((HANDLE)hProcess_)) {
+                traceSyncBreakRequested_ = true;
+                goto ownerEventPump;
+            }
         }
     }
-    cleanupGameMakerOwned(alive);
-    {   // Remote detour allocations are target mutations too. Release them only
-        // after the process is stopped/suspended, never from detach()'s UI thread.
-        // Successful register-text buffers are different: the live target may
-        // have copied their pointers anywhere, so detaching transfers their
-        // lifetime to the target instead of manufacturing dangling pointers.
-        // A terminated process has already reclaimed every mapping itself.
-        std::lock_guard<std::mutex> lk(hProcMtx_);
-        if (hProcess_ && alive)
-            for (uint64_t address : remoteAllocs_)
-                if (!remoteRegisterBuffers_.count(address))
-                    VirtualFreeEx((HANDLE)hProcess_, (LPVOID)address, 0, MEM_RELEASE);
-        remoteAllocs_.clear();
-        remoteRegisterBuffers_.clear();
-    }
-    traceCoverage_.stop();
-    breakpointCleanupComplete = removeAllTraceBps() && breakpointCleanupComplete;
-    authorizationWatch_.stop();
-    removeAllAuthorizationBps();
-    removeDllTargets(/*all=*/0, 0);
-    for (auto& kv : bps_)
-        if (kv.second.ownsByte)
-            breakpointCleanupComplete =
-                restoreDebuggerOwnedByte((HANDLE)hProcess_, kv.first, kv.second.orig) &&
-                breakpointCleanupComplete;
-    if (tempBpSet)
-        breakpointCleanupComplete =
-            restoreDebuggerOwnedByte((HANDLE)hProcess_, tempBpAddr, tempBpOrig) &&
-            breakpointCleanupComplete;
-    // Network entry/return probes are internal and absent from bps_. Restore only
-    // physical bytes they still own; user-colliding sites were restored above.
-    for (const auto& [addr, probe] : networkProbeBps_)
-        if (probe.ownsByte)
-            breakpointCleanupComplete =
-                restoreDebuggerOwnedByte((HANDLE)hProcess_, addr, probe.orig) &&
-                breakpointCleanupComplete;
-    for (const auto& [addr, site] : networkReturnBps_)
-        if (site.ownsByte)
-            breakpointCleanupComplete =
-                restoreDebuggerOwnedByte((HANDLE)hProcess_, addr, site.orig) &&
-                breakpointCleanupComplete;
+    if (sandboxJob) { CloseHandle(sandboxJob); sandboxJob = nullptr; }
     {
-        std::lock_guard<std::mutex> lk(mtx_);
-        networkProbeBps_.clear(); networkProbeBpAddrs_.clear();
-        networkReturnBps_.clear(); networkReturnBpAddrs_.clear();
-        networkCoverage_.active = false;
-        networkCoverage_.requested = false;
-        networkPendingPayloadBytes_ = 0;
-    }
-    networkPendingReturns_.clear();
-    networkHandleLineage_.clear();
-    networkObservationWant_.store(false);
-    netTapArmed_ = false;
-    abandonAntiRearms(false);
-    restoreAntiDebugState(alive);             // hooks + PEB/heap pristine values
-    for (auto& s : hwSlots_) s = HwSlot{};
-    const bool hardwareCleanupComplete = applyHwAllThreads(); // walks threads_; close later
-    {   // Thaw any user-frozen threads so the process isn't left with suspended
-        // threads after we detach (SuspendThread's count persists past detach).
-        std::vector<uint32_t> toResume;
-        { std::lock_guard<std::mutex> lk(mtx_); toResume.assign(suspended_.begin(), suspended_.end()); suspended_.clear(); }
-        for (uint32_t tid : toResume) { auto it = threads_.find(tid); if (it != threads_.end()) ResumeThread((HANDLE)it->second); }
-    }
-    endExclusiveStep();
-    for (uint32_t tid : cleanupSuspended) {
-        if (auto it = threads_.find(tid); it != threads_.end())
-            ResumeThread((HANDLE)it->second);
-    }
-    cleanupSuspended.clear();
-    if (debugEventHeldForCleanup)
-        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, heldContinueStatus);
-    {   // Stop publishing borrowed debug-event handles before closing them. UI
-        // operations hold mtx_ while using a raw handle; the running sampler owns
-        // DuplicateHandle copies, so clearing here closes the last lifetime race.
-        std::lock_guard<std::mutex> lk(mtx_);
-        threadHandles_.clear();
-        threadList_.clear();
-        activeTid_ = 0;
-        pausedUserBpAddr_.reset();
-        runtimeTempBpAddr_.reset();
-    }
-    for (auto& kv : threads_) CloseHandle((HANDLE)kv.second);
-    threads_.clear();
-
-    // A contained unpack target must receive its termination request while the
-    // debugger still controls it. Detaching first would briefly let hostile code
-    // run outside debugger control before kill-on-close took effect.
-    if (sandboxJob) {
-        TerminateJobObject(sandboxJob, 1);
-        CloseHandle(sandboxJob); // kill-on-close is the in-job termination backstop
-        sandboxJob = nullptr;
-    }
-    {   // The unwind session is keyed to hProcess_ and must be torn down before
-        // that handle is closed. It never owns symbol-server access.
         std::lock_guard<std::recursive_mutex> dhlk(DbgHelpMutex());
         if (dbgHelpSessionInited_ && hProcess_) SymCleanup((HANDLE)hProcess_);
         dbgHelpSessionInited_ = false;
     }
-    DebugActiveProcessStop(pid);
-    {   // Close the process handle under hProcMtx_ so a UI-thread pause/readMemory/
-        // writeMemory/regions can't be mid-call on a handle we are about to close.
-        std::lock_guard<std::mutex> lk(hProcMtx_);
-        if (hProcess_) { CloseHandle((HANDLE)hProcess_); hProcess_ = nullptr; }
-        hProcessShared_ = nullptr;
-        hProcessIdentity_ = {};
+    {
+        std::lock_guard lock(mtx_);
+        threadHandles_.clear(); threadList_.clear(); activeTid_ = 0;
+        pausedUserBpAddr_.reset(); runtimeTempBpAddr_.reset();
+        suspended_.clear(); pendingInstructionRewinds_.clear();
+        cleanupOnly_ = false;
+        if (state_ != DbgState::Terminated) state_ = DbgState::Detached;
+        lastEvent_ = alive ? "Detached after verified cleanup" : "Target exited";
     }
-    { std::lock_guard<std::mutex> lk(mtx_);
-      if (state_ != DbgState::Terminated) state_ = DbgState::Detached;
-      if (alive && (!hardwareCleanupComplete || !breakpointCleanupComplete))
-          lastEvent_ = !hardwareCleanupComplete && !breakpointCleanupComplete
-              ? "detached with incomplete breakpoint-byte and hardware-register cleanup"
-              : (!hardwareCleanupComplete
-                    ? "detached with incomplete hardware-breakpoint cleanup"
-                    : "detached with incomplete breakpoint-byte cleanup");
-      if (alive && !traceEventCleanupComplete) {
-          if (!hardwareCleanupComplete || !breakpointCleanupComplete)
-              lastEvent_ += "; queued trace-event cleanup unresolved";
-          else lastEvent_ = "detached with unresolved queued trace breakpoint events";
-      } }
+    for (auto& [tid, handle] : threads_) if (handle) CloseHandle((HANDLE)handle);
+    threads_.clear();
+    {
+        std::lock_guard lock(hProcMtx_);
+        if (hProcess_) { CloseHandle((HANDLE)hProcess_); hProcess_ = nullptr; }
+        hProcessShared_ = nullptr; hProcessIdentity_ = {};
+        remoteAllocs_.clear(); remoteRegisterBuffers_.clear();
+    }
+
 }
 
 } // namespace ds

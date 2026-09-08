@@ -36,6 +36,7 @@ int main() {
         checkInspectorObservationValidity(path);
         checkNavigatorRefinement(path);
         checkWorkflowRefinement(path);
+        checkHexRefinement(path); // actual-font matrix runs after default-font fixtures
     } catch (const std::exception& error) {
         std::printf("EXCEPTION: %s\n", error.what());
         ++failures;

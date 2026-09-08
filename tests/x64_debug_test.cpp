@@ -567,6 +567,95 @@ static void checkPausedTraceMutation(Debugger& debugger, const DbgSnapshot& befo
     CloseHandle(process);
 }
 
+// Force a real Win32 cleanup failure without allowing the debuggee to run.
+// The breakpoint is on a private, unused page; restoring its protection lets
+// the same event owner prove its original byte and complete a later detach.
+static void checkFailedDetachRecovery(const char* self) {
+    const int failuresBefore = g_fail;
+    Debugger debugger;
+    std::string error;
+    if (!launchSelf(debugger, self, error) || !waitPaused(debugger, 8000)) {
+        CHECK(false);
+        return;
+    }
+    const auto initial = debugger.snapshot();
+    const DebugTargetIdentity target{initial.pid, initial.sessionGeneration};
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, target.pid);
+    CHECK(process != nullptr);
+    if (!process) return;
+    void* page = VirtualAllocEx(process, nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    CHECK(page != nullptr);
+    if (page) {
+        const uint8_t original = 0x90;
+        SIZE_T count = 0;
+        const bool written = WriteProcessMemory(process, page, &original, 1, &count) && count == 1;
+        CHECK(written);
+        const auto address = reinterpret_cast<uint64_t>(page);
+        CHECK(written && debugger.addBreakpointForSession(target, address));
+        bool armed = false;
+        for (int elapsed = 0; elapsed < 5000; elapsed += 5) {
+            uint8_t current = 0;
+            if (ReadProcessMemory(process, page, &current, 1, &count) && count == 1 && current == 0xCC) {
+                armed = true;
+                break;
+            }
+            Sleep(5);
+        }
+        CHECK(armed);
+        DWORD originalProtection = 0;
+        const bool protectedPage = armed && VirtualProtectEx(process, page, 4096,
+            PAGE_NOACCESS, &originalProtection) != FALSE;
+        CHECK(protectedPage);
+        auto waitCompletion = [&](uint64_t request) {
+            for (int elapsed = 0; request && elapsed < 5000; elapsed += 5) {
+                const auto state = debugger.lifecycleSnapshot();
+                if (state.requestId == request && state.completed && !state.busy) return true;
+                Sleep(5);
+            }
+            return false;
+        };
+        if (protectedPage) {
+            const uint64_t failedRequest = debugger.requestDetach(target);
+            CHECK(failedRequest != 0);
+            const bool finished = waitCompletion(failedRequest);
+            CHECK(finished);
+            const auto failure = debugger.lifecycleSnapshot();
+            const auto retained = debugger.snapshot();
+            CHECK(finished && !failure.succeeded && !failure.error.empty());
+            CHECK(retained.cleanupOnly && retained.state == DbgState::Paused);
+            CHECK(DebugTargetIdentityMatches(target, {retained.pid, retained.sessionGeneration}));
+            CHECK(!debugger.continueForSession(target));
+            CHECK(!debugger.stepIntoForSession(target));
+            CHECK(!debugger.addBreakpointForSession(target, address + 1));
+            CHECK(WaitForSingleObject(process, 0) == WAIT_TIMEOUT);
+            DWORD unused = 0;
+            const bool repaired = VirtualProtectEx(process, page, 4096, originalProtection, &unused) != FALSE;
+            CHECK(repaired);
+            // Even a failed assertion must release the deliberately injected
+            // obstruction before the fixture attempts another cleanup.
+            if (repaired && !debugger.lifecycleSnapshot().busy) {
+                const uint64_t retry = debugger.requestDetach(target);
+                CHECK(retry != 0 && retry != failedRequest);
+                CHECK(waitCompletion(retry));
+                CHECK(debugger.lifecycleSnapshot().succeeded);
+                CHECK(debugger.snapshot().state == DbgState::Detached);
+                uint8_t restored = 0;
+                CHECK(ReadProcessMemory(process, page, &restored, 1, &count) && count == 1 && restored == original);
+            }
+        }
+        if (debugger.snapshot().state != DbgState::Detached) (void)debugger.detach();
+        CHECK(VirtualFreeEx(process, page, 0, MEM_RELEASE) != FALSE);
+    }
+    // Reap only the self-launched fixture, including when an assertion failed.
+    TerminateProcess(process, 0);
+    (void)debugger.detach();
+    WaitForSingleObject(process, 5000);
+    CloseHandle(process);
+    std::printf("[%s] failed detach retains ownership and explicit retry restores it\n",
+        failuresBefore == g_fail ? "pass" : "fail");
+}
+
 int main() {
     char marker[8]{};
     if (GetEnvironmentVariableA("DS_X64_DEBUGGEE", marker,
@@ -1602,6 +1691,20 @@ int main() {
         CHECK(httpSession && httpConnection && httpRequest);
         CHECK(httpSession != httpConnection && httpConnection != httpRequest &&
               httpSession != httpRequest);
+        if (!httpSent || !httpResponded || !httpRead || !inetSent || !inetRead) {
+            const auto failed = debugger.snapshot();
+            DWORD exitStatus = STILL_ACTIVE;
+            bool exitKnown = false;
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, failed.pid);
+            if (process) {
+                exitKnown = GetExitCodeProcess(process, &exitStatus) != FALSE;
+                CloseHandle(process);
+            }
+            std::printf("[diag] network exchange incomplete state=%u tid=%u exitKnown=%u exit=0x%lX event=%s mutation=%s\n",
+                static_cast<unsigned>(failed.state), failed.activeTid,
+                static_cast<unsigned>(exitKnown), static_cast<unsigned long>(exitStatus),
+                failed.lastEvent.c_str(), failed.mutationError.c_str());
+        }
         CHECK(httpSent);
         if (!failedWinHttpSendHonest || !failedWinInetSendHonest) {
             for (const NetworkObservationEvent& event : observation.events) {
@@ -1693,6 +1796,8 @@ int main() {
     CHECK(!crash.exceptionFirstChance);
     CHECK(crash.regs.rip != 0 && !crash.frames.empty());
     debugger.detach();
+
+    checkFailedDetachRecovery(self);
 
     if (g_fail) {
         std::printf("%d CHECK(s) FAILED\n", g_fail);

@@ -19,7 +19,7 @@ namespace ds {
 enum class PatchLang { Asm, C };
 
 struct PatchCtx {
-    Arch     arch   = Arch::X64;
+    DecoderConfig machine;
     uint64_t siteVA = 0;          // address the body is being assembled for (rel operands)
 };
 

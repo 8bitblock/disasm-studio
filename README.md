@@ -80,6 +80,19 @@ The project uses **vcpkg manifest mode** (`vcpkg.json`), so the first build auto
 ### Compile
 Open `DisasmStudio.sln` in Visual Studio 2022, pick **x64 / Debug** (or Release), and build (F7). The binary lands in `build\x64\<Config>\DisasmStudio.exe`. For command-line or CI builds, `build.ps1` locates only a complete VS 2022 C++ instance and passes its exact `v143` version to both MSBuild and vcpkg; `-VisualStudioPath` selects a particular side-by-side instance without hardcoding it in the repository.
 
+Full verification uses a current Release build followed by every declared test:
+
+```powershell
+.\build.ps1 -Configuration Release
+if ($LASTEXITCODE) { throw 'Release build failed' }
+.\tests\run_core_tests.ps1 -Suite All
+if ($LASTEXITCODE) { throw 'Verification failed' }
+```
+
+The build wrapper defaults to one MSBuild project and two compiler processes per project to bound memory use; `-MaxParallelProjects` and `-MaxCompileProcesses` allow explicit overrides. The test runner selects the same exact v143 toolset as the build. `All` includes the Core tests, all three production app-object suites (`static_listing_actions_test`, `release_workbench_test`, and `feature_tabs_ui_test`), and the x64, WOW64 and `authorization_watch_live_test` native debugger suites. `All` and `Live` require launch/debugger prerequisites; they fail if those prerequisites are unavailable. CI runs each category explicitly after its pinned-dependency Release build and retains verification logs.
+
+For a faster local loop, `tests\run_core_tests.bat` defaults to `Core`; pass a test name to run one declaration, or `-Suite Integration` / `-Suite Live` to run a category. `-ListOnly` displays the exact selection without compiling or launching anything. Each run writes build/run logs and a machine-readable `summary.json` under `build/test-results`; failures return a nonzero exit code and preserve artifacts.
+
 If the ImGui backend headers (`imgui_impl_dx11.h`, `imgui_impl_win32.h`) aren't found, confirm the `dx11-binding` and `win32-binding` features installed: `vcpkg install` from the project root reads `vcpkg.json`.
 
 ### Distribution (self-contained exe)

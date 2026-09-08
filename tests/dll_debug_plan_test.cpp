@@ -324,7 +324,9 @@ int main() {
         auto plan = BuildDllDebugLaunchPlan(x86, namedRequest("C:\\One\\SAMPLE.dll"),
                                             hostEnvironment(DllBitness::X64));
         CHECK(plan.valid);
-        CHECK(RetargetDllDebugLaunchPlan(plan, "sample.DLL", 0x71000000));
+        CHECK(!RetargetDllDebugLaunchPlan(plan, "sample.DLL", 0x71000000));
+        CHECK(!plan.retarget.matched && !plan.retarget.errors.empty());
+        CHECK(RetargetDllDebugLaunchPlan(plan, "C:\\One\\sample.DLL", 0x71000000));
         CHECK(plan.retarget.matched && plan.retarget.loadedImageBase == 0x71000000);
         CHECK(plan.breakpoints[0].runtimeVA == 0x71001000);
         CHECK(plan.breakpoints[1].runtimeVA == 0x71001010);
@@ -335,6 +337,10 @@ int main() {
         CHECK(!RetargetDllDebugLaunchPlan(plan, "D:\\Other\\different.dll", 0x72000000));
         CHECK(!plan.retarget.matched);
         CHECK(plan.breakpoints[0].runtimeVA == 0);
+        CHECK(!RetargetDllDebugLaunchPlan(plan, "C:\\One\\sample.DLL", UINT32_MAX - 0x800));
+        CHECK(!plan.retarget.matched && plan.breakpoints[0].runtimeVA == 0);
+        CHECK(!RetargetDllDebugLaunchPlan(plan, "C:\\One\\sample.DLL", UINT64_MAX - 0x800));
+        CHECK(!plan.retarget.matched && plan.breakpoints[1].runtimeVA == 0);
     }
 
     if (!g_fail) std::printf("dll_debug_plan_test: all checks passed\n");

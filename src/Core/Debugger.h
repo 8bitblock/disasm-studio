@@ -238,10 +238,15 @@ TempBreakpointCleanupDisposition ClassifyTempBreakpointCleanup(
 struct DbgSnapshot {
     size_t traceOwnedSites = 0; // physical owners, including a failed older-generation restore
     DbgState                 state = DbgState::Detached;
+    bool                     cleanupOnly = false; // only Retry Detach is allowed after incomplete cleanup
     uint32_t                 pid = 0, tid = 0;     // tid = active/displayed thread
     uint64_t                 sessionGeneration = 0; // changes on every successful attach/launch
     Registers                regs;
     std::string              lastEvent = "idle";
+    // Retained until the next session; a later ordinary event cannot erase why
+    // an execution mutation was refused. Revision identifies new failures.
+    std::string              mutationError;
+    uint64_t                 mutationErrorRevision = 0;
     std::vector<SwBreakpointInfo> breakpoints;     // software (0xCC), with conditions
     std::vector<HwBreakpointInfo> hwBreakpoints;   // DR0-DR3 (address + kind + size)
     std::vector<ThreadInfo>  threads;
@@ -307,7 +312,7 @@ public:
     // retargeted from RVAs when the exact DLL appears in LOAD_DLL.
     bool launchAndAttachDll(const DllDebugLaunchPlan& plan, std::string& err);
 
-    void detach();
+    bool detach(); // false retains a cleanup-only paused owner for Retry Detach
     bool detachForSession(DebugTargetIdentity expected);
 
     // Execution control (posted to the debug thread; return immediately).
@@ -599,6 +604,9 @@ public:
     // acquire a reattached target's handle and label it with the old generation.
     // The caller closes the returned handle.
     void* duplicateProcessHandleForSession(DebugTargetIdentity expected);
+    // Cheap identity check for already sampled display data. No process read or
+    // handle duplication; publication and comparison share hProcMtx_.
+    bool memorySessionMatches(DebugTargetIdentity expected);
     uint64_t processCreationTimeForSession(DebugTargetIdentity expected);
 
     DbgSnapshot snapshot();
@@ -672,7 +680,7 @@ private:
                       std::wstring commandLine, bool breakAtEntry,
                       std::optional<DllDebugLaunchPlan> dllPlan,
                       bool containedJob, uint64_t controlEpoch);
-    void   emergencyThreadCleanup(const std::string& reason) noexcept;
+    void   emergencyThreadCleanup(const char* reason) noexcept;
     uint64_t beginSessionControl();
     bool   waitForStartup(std::string& err);
     void   lifecycleWorkerLoop();
@@ -713,7 +721,12 @@ private:
     bool   disarmAuthorizationReturn(uint64_t va);
     bool   rearmAuthorizationReturn(uint64_t va);
     bool   setTrapFlag(uint32_t tid, bool on);
-    void   setResumeFlag(uint32_t tid);   // EFLAGS.RF, to step past a fault-class hw exec bp
+    bool   updateControlFlag(uint32_t tid, uint32_t mask, bool on, const char* operation);
+    bool   retryPendingControlFlags();
+    struct ControlFlagRepair { void* thread = nullptr; uint32_t tid = 0, mask = 0; bool on = false; };
+    std::unordered_map<uint64_t, ControlFlagRepair> pendingControlFlagRepairs_; // event owner
+    void   recordExecutionFailure(std::string error); // event owner; publishes under mtx_
+    bool   setResumeFlag(uint32_t tid);   // EFLAGS.RF, to step past a fault-class hw exec bp
 
     // Arch-aware thread-context access: native x64 CONTEXT for 64-bit targets, or
     // WOW64_CONTEXT (Wow64Get/SetThreadContext) for 32-bit (WOW64) targets. The
@@ -724,15 +737,19 @@ private:
     bool     ctxWriteFull(void* hThread, const Registers& r);   // get-modify-set
     uint64_t ctxReadRip(void* hThread);
     bool     ctxSetRip(void* hThread, uint64_t rip);
+    bool     retryPendingInstructionRewinds(); // event owner, before accepting execution
+    struct InstructionRewind { void* thread = nullptr; uint64_t address = 0; };
+    std::unordered_map<uint32_t, InstructionRewind> pendingInstructionRewinds_; // mtx_
 
     // Decode just enough about the instruction at `va` to drive stepping
     // (length + call/ret/rep classification). Reads debuggee memory.
-    struct StepDecode { uint32_t length = 1; bool isCall = false; bool isRet = false; bool isRepString = false; };
+    struct StepDecode { bool valid = false; uint32_t length = 0; bool isCall = false; bool isRet = false; bool isRepString = false; };
     StepDecode decodeAt(uint64_t va);
 
     // Hardware-breakpoint helpers (debug thread).
     bool   applyHwToThread(void* hThread);
     bool   applyHwAllThreads();
+    void   applyPendingHardwareBreakpoints();
     bool   readDr6Clear(uint32_t tid, uint64_t& dr6);
 
     enum class AntiTrapKind : uint8_t {
@@ -808,6 +825,16 @@ private:
     uint32_t                         activeTid_ = 0;
     Registers                        regs_;
     std::string                      lastEvent_ = "idle";
+    std::string                      mutationError_; // guarded by mtx_
+    uint64_t                         mutationErrorRevision_ = 0;
+    std::string                      executionFailure_; // debug-event owner only
+    bool                             cleanupOnly_ = false; // mtx_: owner retained after failed detach
+    bool                             ownerFinished_ = true; // mtx_: safe to join only after this publication
+    bool                             destroying_ = false; // mtx_: terminal cleanup keeps ownership until repaired/exited
+    uint64_t                         detachAttempt_ = 0;
+    uint64_t                         detachCompletedAttempt_ = 0;
+    bool                             nativeDebugObjectOwned_ = false; // event owner, checked native detach boundary
+    bool                             hardwareReconciliationRequired_ = false; // event owner; never resume unknown DR state
     std::shared_ptr<GameMakerSession> gmlSession_; // native fields used only on event thread
     GameMakerSessionSnapshot          gmlSnapshot_; // mtx_ protects publications and requests
     uint64_t                         gmlGeneration_ = 0;
@@ -905,6 +932,7 @@ private:
     // ---- guided network observation (internal, never UI-visible breakpoints) -
     std::atomic<bool> networkObservationWant_{false};
     bool              netTapArmed_ = false;
+    bool              pendingNetworkSync_ = false; // mtx_: wake the held event for Start/Stop/retry
     struct NetworkProbeBp {
         uint8_t orig = 0;
         NetworkProbeApi api = NetworkProbeApi::Unknown;

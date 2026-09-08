@@ -43,6 +43,7 @@
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -115,6 +116,7 @@ static bool liveDocumentSessionState(const DbgSnapshot& snapshot) {
 }
 
 static bool hasEnabledProjectPatches(const ProjectState& project) {
+    if (project.patchRecoveryPending) return false;
     for (const PjPatch& patch : project.patches) {
         if (patch.patchSetId == kUngroupedPatchSetId) return true;
         const PjPatchSet* set = FindPatchSet(project.patchSets,
@@ -585,17 +587,101 @@ App::~App() {
 }
 
 void App::requestExit() {
-    if (binaryView_ && !binaryView_->prepareTypeDraftsForExit(ctx_)) return;
+    if (exit_ || exitPending_) return;
+    exitFailure_.clear();
+    if (binaryView_ && !binaryView_->prepareTypeDraftsForExit(ctx_)) {
+        exitFailure_ = "Pending type edits need a save or discard decision before closing.";
+        return;
+    }
+    exitPending_ = true;
+    exitArtifactRevision_ = ctx_.artifactWriteCompletionRevision;
+    exitDebugRequestId_ = 0;
+    pollExit();
+}
+
+void App::pollExitWithoutRendering() {
+    ctx_.pollArtifactWrites();
+    pollExit();
+}
+
+std::string App::exitFailureReason() {
+    if (!exitFailure_.empty()) return exitFailure_;
+    const auto target = ctx_.debug.snapshot();
+    if (target.cleanupOnly) return target.lastEvent;
+    const auto lifecycle = ctx_.debug.lifecycleSnapshot();
+    if (!lifecycle.error.empty()) return lifecycle.error;
+    if (!ctx_.projectSaveError.empty()) return ctx_.projectSaveError;
+    if (ctx_.artifactWriteFailed && !ctx_.artifactWriteFailure.empty())
+        return ctx_.artifactWriteFailure;
+    return "The active document still needs attention before it can close.";
+}
+
+void App::pollExit() {
+    if (!exitPending_) return;
+    // Consume accepted file jobs before leaving, including their UI callback.
+    // A failed/partial output cancels this close attempt so its error stays visible.
+    if (ctx_.artifactWriteCompletionRevision != exitArtifactRevision_ &&
+        ctx_.artifactWriteFailed) {
+        exitFailure_ = ctx_.artifactWriteFailure;
+        exitPending_ = false;
+        return;
+    }
+    if (ctx_.artifactWrites.pending()) return;
+
+    const auto lifecycle = ctx_.debug.lifecycleSnapshot();
+    if (exitDebugRequestId_) {
+        // A different lifecycle request belongs to a newer user action.
+        if (lifecycle.requestId != exitDebugRequestId_) {
+            exitFailure_ = "A newer debugger operation replaced this close request.";
+            exitPending_ = false;
+            return;
+        }
+        if (lifecycle.busy) return;
+        if (!lifecycle.completed ||
+            (!lifecycle.succeeded && (lifecycle.command == DbgLifecycleCommand::Detach ||
+                                     ctx_.debug.snapshot().cleanupOnly))) {
+            exitFailure_ = lifecycle.error.empty() ? "Debugger cleanup did not complete." : lifecycle.error;
+            exitPending_ = false;
+            return;
+        }
+        exitDebugRequestId_ = 0;
+    } else if (lifecycle.busy) {
+        exitDebugRequestId_ = lifecycle.requestId;
+        if (lifecycle.command != DbgLifecycleCommand::Detach)
+            ctx_.debug.cancelLifecycle(lifecycle.requestId);
+        return;
+    }
+
+    const auto target = ctx_.debug.snapshot();
+    if (target.state != DbgState::Detached) {
+        exitDebugRequestId_ = ctx_.debug.requestDetach({target.pid, target.sessionGeneration});
+        if (!exitDebugRequestId_) {
+            exitPending_ = false;
+            exitFailure_ = "Could not request debugger cleanup; the application remains open.";
+            ui::Toast(ui::ToastKind::Error, exitFailure_);
+        }
+        return;
+    }
+
+    // The document can change while cleanup runs, so validate and save it at the
+    // final close boundary. Failed debugger cleanup never reaches destruction.
+    exitPending_ = false;
+    if (binaryView_ && !binaryView_->prepareTypeDraftsForExit(ctx_)) {
+        exitFailure_ = "Pending type edits need a save or discard decision before closing.";
+        return;
+    }
     std::string error;
     if (binaryView_ && !binaryView_->prepareDocumentTransition(
             ctx_, ctx_.staticDocumentId(), false, error)) {
-        ui::Toast(ui::ToastKind::Error,
-                  error.empty() ? "Could not prepare the active document for exit."
-                                : error);
+        exitFailure_ = error.empty() ? "Could not prepare the active document for exit." : error;
+        ui::Toast(ui::ToastKind::Error, exitFailure_);
         return;
     }
     if (ctx_.saveProject()) exit_ = true;
-    else ui::Toast(ui::ToastKind::Error, ctx_.projectSaveError);
+    else {
+        exitFailure_ = ctx_.projectSaveError;
+        ui::Toast(ui::ToastKind::Error, exitFailure_);
+    }
 }
 
 namespace {
@@ -2509,46 +2595,42 @@ void App::saveBinaryAs() {
     ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    PatchSetImageResult built = BuildPatchSetImageForSelection(
-        ctx_.staticBinary(), ctx_.staticProject().patches,
-        ctx_.staticProject().patchSets, {},
-        PatchSetImageSource::CurrentEnabledSets);
-    if (!built.success) {
-        char msg[512];
-        const PjPatchSetPlan* failedPlan =
-            !built.currentPlan.success ? &built.currentPlan
-            : !built.desiredPlan.success ? &built.desiredPlan : nullptr;
-        const char* planError = failedPlan &&
-                                failedPlan->error != PjPatchSetPlanError::None
-            ? PjPatchSetPlanErrorText(failedPlan->error) : nullptr;
-        if (built.failedPatch != std::numeric_limits<size_t>::max()) {
-            std::snprintf(msg, sizeof(msg),
-                          "Save blocked: patch #%zu at 0x%llX is invalid (%s%s%s). No file was written.",
-                          built.failedPatch + 1,
-                          static_cast<unsigned long long>(built.failedAddress),
-                          PatchSetImageErrorText(built.error),
-                          planError ? ": " : "",
-                          planError ? planError : "");
-        } else {
-            std::snprintf(msg, sizeof(msg),
-                          "Save blocked: %s%s%s. No file was written.",
-                          PatchSetImageErrorText(built.error),
-                          planError ? ": " : "",
-                          planError ? planError : "");
-        }
-        ui::Toast(ui::ToastKind::Error, msg);
+    if (ctx_.staticProject().patchRecoveryPending) {
+        ui::Toast(ui::ToastKind::Error, "Save blocked: resolve saved-patch recovery in Patches first.");
         return;
     }
-    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
-    char msg[256];
-    if (f && f.write(reinterpret_cast<const char*>(built.image.data()),
-                     static_cast<std::streamsize>(built.image.size()))) {
-        std::snprintf(msg, sizeof(msg), "Wrote %zu bytes with %zu patch(es) applied.",
-                      built.image.size(),
-                      built.desiredPlan.activePatchIndices.size());
-        ui::Toast(ui::ToastKind::Success, msg);
-    } else {
-        ui::Toast(ui::ToastKind::Error, "Save failed: could not write the file (check the path / permissions).");
+    if (ctx_.artifactWrites.pending()) {
+        ui::Toast(ui::ToastKind::Error, "A file save is still pending; wait for its result.");
+        return;
+    }
+    try {
+        // Copy mapping/patch metadata and share immutable image storage. Full
+        // composition and image allocation happen exclusively on the worker.
+        auto image = ctx_.staticBinary();
+        auto patches = ctx_.staticProject().patches;
+        auto sets = ctx_.staticProject().patchSets;
+        const std::filesystem::path destination(file.data());
+        std::string message;
+        const bool queued = ctx_.queueArtifactWrite(
+            [image = std::move(image), patches = std::move(patches),
+             sets = std::move(sets), destination] {
+                auto built = BuildPatchSetImageForSelection(image, patches, sets, {},
+                    PatchSetImageSource::CurrentEnabledSets);
+                if (!built.success) {
+                    ArtifactWriteResult result; result.path = destination;
+                    result.error = "Save blocked: " + std::string(PatchSetImageErrorText(built.error));
+                    if (built.failedPatch != std::numeric_limits<size_t>::max())
+                        result.error += " at patch #" + std::to_string(built.failedPatch + 1);
+                    const auto& plan = !built.currentPlan.success ? built.currentPlan : built.desiredPlan;
+                    if (plan.error != PjPatchSetPlanError::None)
+                        result.error += ": " + std::string(PjPatchSetPlanErrorText(plan.error));
+                    return result;
+                }
+                return WriteArtifactBytes(destination, built.image);
+            }, message);
+        ui::Toast(queued ? ui::ToastKind::Info : ui::ToastKind::Error, message);
+    } catch (const std::exception& error) {
+        ui::Toast(ui::ToastKind::Error, std::string("Could not capture save inputs: ") + error.what());
     }
 }
 
@@ -2589,40 +2671,20 @@ void App::extractEmbeddedJar() {
     ofn.lpstrDefExt = ji.isJar ? L"jar" : L"zip";
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
-    if (f && f.write(reinterpret_cast<const char*>(bytes.data() + ji.jarOffset),
-                     (std::streamsize)ji.jarSize)) {
-        char msg[256];
-        std::snprintf(msg, sizeof(msg), "Extracted %llu bytes (%zu entr%s)%s%s.",
-                      (unsigned long long)ji.jarSize, ji.entries.size(),
-                      ji.entries.size() == 1 ? "y" : "ies",
-                      ji.mainClass.empty() ? "" : ", Main-Class ",
-                      ji.mainClass.c_str());
-        ui::Toast(ui::ToastKind::Success, msg);
-    } else {
-        ui::Toast(ui::ToastKind::Error, "Extract failed: could not write the file (check the path / permissions).");
-    }
+    const auto owned = ctx_.staticBinary().ownedBytes();
+    const auto offset = ji.jarOffset, count = ji.jarSize;
+    const std::filesystem::path destination(file.data());
+    std::string message;
+    const bool queued = ctx_.queueArtifactWrite([owned, offset, count, destination] {
+        return WriteArtifactBytes(destination,
+            std::span<const uint8_t>(*owned).subspan(static_cast<size_t>(offset), static_cast<size_t>(count)));
+    }, message);
+    ui::Toast(queued ? ui::ToastKind::Info : ui::ToastKind::Error, message);
 }
 
 // ---- Archive entry browser ("Archive Entries" popup) ------------------------
 
 namespace {
-
-// Re-read the archive's container file from disk and decompress one entry. The
-// browser snapshot may outlive the loaded binary ("Open as binary" replaces it),
-// so the bytes always come fresh from sourcePath, never from ctx_.staticBinary().
-bool extractArchiveEntryBytes(const std::string& srcPath, uint64_t zipBase,
-                              const JavaZipEntry& e, std::vector<uint8_t>& out,
-                              std::string& err) {
-    std::ifstream f(pathFromUtf8(srcPath), std::ios::binary | std::ios::ate);
-    if (!f) { err = "could not open " + srcPath; return false; }
-    std::streamsize n = f.tellg();
-    if (n <= 0) { err = "could not read " + srcPath; return false; }
-    f.seekg(0);
-    std::vector<uint8_t> bytes(static_cast<size_t>(n));
-    if (!f.read(reinterpret_cast<char*>(bytes.data()), n)) { err = "could not read " + srcPath; return false; }
-    return ExtractZipEntry(bytes.data(), bytes.size(), zipBase, e, out, &err);
-}
 
 // "lib/app.jar" -> "app.jar" with Windows-invalid filename chars replaced.
 std::string sanitizeEntryBaseName(const std::string& entryName) {
@@ -2630,28 +2692,37 @@ std::string sanitizeEntryBaseName(const std::string& entryName) {
     std::string b = (s == std::string::npos) ? entryName : entryName.substr(s + 1);
     for (char& c : b)
         if ((unsigned char)c < 0x20 || std::strchr("<>:\"/\\|?*", c)) c = '_';
+    while (!b.empty() && (b.back() == '.' || b.back() == ' ')) b.pop_back();
     if (b.empty()) b = "entry";
+    std::string stem = b.substr(0, b.find('.'));
+    for (char& c : stem) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    const bool numberedDevice = stem.size() == 4 && stem[3] >= '1' && stem[3] <= '9' &&
+        (stem.starts_with("COM") || stem.starts_with("LPT"));
+    if (numberedDevice || stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL")
+        b.insert(b.begin(), '_');
     return b;
 }
 
-// Write extracted entry bytes to %TEMP%\DisasmStudio\extracted\<name>, prefixing a
-// counter on collision so a re-extract never clobbers a file that may still be the
-// loaded binary. Returns the path, empty on failure.
-std::string writeExtractedTemp(const std::string& name, const std::vector<uint8_t>& bytes) {
-    char tmp[MAX_PATH] = {0};
-    if (!GetEnvironmentVariableA("TEMP", tmp, sizeof(tmp))) return {};
-    std::string dir = std::string(tmp) + "\\DisasmStudio";
-    CreateDirectoryA(dir.c_str(), nullptr);
-    dir += "\\extracted";
-    CreateDirectoryA(dir.c_str(), nullptr);
-    std::string path = dir + "\\" + name;
-    for (int counter = 1; GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES && counter < 1000; ++counter)
-        path = dir + "\\" + std::to_string(counter) + "_" + name;
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) return {};
-    if (!bytes.empty() &&
-        !f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size())) return {};
-    return path;
+// Reserve a private extraction directory with an atomic create. The final
+// filename is installed without replacement, preserving every previous entry.
+ArtifactWriteResult writeExtractedTemp(const std::string& name, const std::vector<uint8_t>& bytes) {
+    static std::atomic<uint64_t> sequence{0};
+    const auto root = std::filesystem::temp_directory_path() / L"DisasmStudio" / L"extracted";
+    std::filesystem::create_directories(root);
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        const auto dir = root / (std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(sequence.fetch_add(1)));
+        std::error_code error;
+        if (!std::filesystem::create_directory(dir, error)) {
+            if (!error || error == std::errc::file_exists) continue;
+            ArtifactWriteResult result; result.error = error.message(); return result;
+        }
+        auto result = WriteArtifactBytes(dir / pathFromUtf8(name), bytes, false);
+        if (!result.success) std::filesystem::remove(dir, error);
+        return result;
+    }
+    ArtifactWriteResult result; result.error = "Could not reserve a unique extraction directory.";
+    return result;
 }
 
 } // namespace
@@ -2660,6 +2731,7 @@ void App::openArchiveBrowser() {
     if (!ctx_.staticBinary().loaded() || ctx_.staticJavaInfo().entries.empty()) return;
     archiveBrowser_ = {};
     archiveBrowser_.sourcePath = ctx_.staticBinary().path();
+    archiveBrowser_.sourceBytes = ctx_.staticBinary().ownedBytes();
     size_t s = archiveBrowser_.sourcePath.find_last_of("/\\");
     archiveBrowser_.sourceName = (s == std::string::npos) ? archiveBrowser_.sourcePath
                                                           : archiveBrowser_.sourcePath.substr(s + 1);
@@ -2671,13 +2743,6 @@ void App::openArchiveBrowser() {
 // Save-dialog flow for one archive entry: extractEmbeddedJar's shape, but
 // writing the DECOMPRESSED entry bytes rather than the raw archive span.
 void App::extractArchiveEntryToFile(const JavaZipEntry& e) {
-    std::vector<uint8_t> bytes;
-    std::string err;
-    if (!extractArchiveEntryBytes(archiveBrowser_.sourcePath, archiveBrowser_.zipBase, e, bytes, err)) {
-        ui::Toast(ui::ToastKind::Error, "Extract failed: " + err);
-        return;
-    }
-
     std::string base = sanitizeEntryBaseName(e.name);
     std::wstring def;
     {
@@ -2694,15 +2759,20 @@ void App::extractArchiveEntryToFile(const JavaZipEntry& e) {
     ofn.nMaxFile    = static_cast<DWORD>(file.size());
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
-    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
-    if (f && (bytes.empty() ||
-              f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size()))) {
-        char msg[512];
-        std::snprintf(msg, sizeof(msg), "Extracted %s (%zu bytes).", e.name.c_str(), bytes.size());
-        ui::Toast(ui::ToastKind::Success, msg);
-    } else {
-        ui::Toast(ui::ToastKind::Error, "Extract failed: could not write the file (check the path / permissions).");
-    }
+    const auto owned = archiveBrowser_.sourceBytes;
+    const auto zipBase = archiveBrowser_.zipBase;
+    const std::filesystem::path destination(file.data());
+    std::string message;
+    const bool queued = ctx_.queueArtifactWrite([owned, zipBase, entry = e, destination] {
+        std::vector<uint8_t> bytes;
+        ArtifactWriteResult result; result.path = destination;
+        if (!owned || !ExtractZipEntry(owned->data(), owned->size(), zipBase, entry, bytes, &result.error)) {
+            if (result.error.empty()) result.error = "Archive snapshot is unavailable.";
+            return result;
+        }
+        return WriteArtifactBytes(destination, bytes);
+    }, message);
+    ui::Toast(queued ? ui::ToastKind::Info : ui::ToastKind::Error, message);
 }
 
 void App::renderArchiveBrowser() {
@@ -2765,30 +2835,31 @@ void App::renderArchiveBrowser() {
                         archiveBrowser_.selected < (int)archiveBrowser_.entries.size();
     ImGui::BeginDisabled(!hasSel);
     if (ImGui::Button("Open as binary") && hasSel) {
-        const JavaZipEntry& e = archiveBrowser_.entries[archiveBrowser_.selected];
-        std::vector<uint8_t> bytes;
-        std::string err;
-        if (!extractArchiveEntryBytes(archiveBrowser_.sourcePath, archiveBrowser_.zipBase, e, bytes, err)) {
-            ui::Toast(ui::ToastKind::Error, "Extract failed: " + err);
-        } else {
-            std::string tmpPath = writeExtractedTemp(sanitizeEntryBaseName(e.name), bytes);
-            if (tmpPath.empty()) {
-                ui::Toast(ui::ToastKind::Error,
-                          "Could not write the extracted entry to %TEMP%\\DisasmStudio\\extracted.");
-            // NOTE: loadBinaryPath re-runs the scans, so a nested .jar/.zip entry
-            // re-raises requestedBrowseArchive and reopens this browser for it —
-            // the Native EXE -> JAR -> class chain is intended.
-            } else if (!ctx_.beginBinaryLoadPath(tmpPath)) {
-                ui::Toast(ui::ToastKind::Error, "Extracted, but its background load could not start: " + tmpPath);
-            } else {
-                ctx_.requestedTab = "Binary View";
-                char msg[512];
-                std::snprintf(msg, sizeof(msg), "Extracted %s (%zu bytes); opening in the background.",
-                              e.name.c_str(), bytes.size());
-                ui::Toast(ui::ToastKind::Info, msg);
-                ImGui::CloseCurrentPopup();
+        const auto owned = archiveBrowser_.sourceBytes;
+        const auto zipBase = archiveBrowser_.zipBase;
+        const auto entry = archiveBrowser_.entries[archiveBrowser_.selected];
+        const auto document = ctx_.staticDocumentId();
+        const auto generation = ctx_.staticImageGeneration();
+        const auto revision = ctx_.staticBinary().imageRevision();
+        std::string message;
+        const bool queued = ctx_.queueArtifactWrite([owned, zipBase, entry] {
+            std::vector<uint8_t> bytes;
+            ArtifactWriteResult result;
+            if (!owned || !ExtractZipEntry(owned->data(), owned->size(), zipBase, entry, bytes, &result.error)) {
+                if (result.error.empty()) result.error = "Archive snapshot is unavailable.";
+                return result;
             }
-        }
+            return writeExtractedTemp(sanitizeEntryBaseName(entry.name), bytes);
+        }, message, [this, document, generation, revision](const ArtifactWriteResult& result) {
+            if (!result.success || ctx_.staticDocumentId() != document || ctx_.staticImageGeneration() != generation ||
+                ctx_.staticBinary().imageRevision() != revision || ctx_.binaryLoadPending()) return;
+            std::string path;
+            if (utf8FromWide(result.path.c_str(), path) && ctx_.beginBinaryLoadPath(path))
+                ctx_.requestedTab = "Binary View";
+            else ui::Toast(ui::ToastKind::Error, "Entry saved, but its background load could not start.");
+        });
+        ui::Toast(queued ? ui::ToastKind::Info : ui::ToastKind::Error, message);
+        if (queued) ImGui::CloseCurrentPopup();
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Decompress the selected entry to %%TEMP%% and load it as the active binary.");
@@ -2801,6 +2872,32 @@ void App::renderArchiveBrowser() {
     ImGui::SameLine();
     if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
+}
+
+bool AppContext::queueArtifactWrite(std::function<ArtifactWriteResult()> ownedJob,
+    std::string& message, std::function<void(const ArtifactWriteResult&)> completion) {
+    if (!artifactWrites.start(std::move(ownedJob), message)) return false;
+    artifactWriteCompletion = std::move(completion);
+    message = "File save queued in the background.";
+    return true;
+}
+
+void AppContext::pollArtifactWrites() {
+    ArtifactWriteResult result;
+    if (!artifactWrites.take(result)) return;
+    ++artifactWriteCompletionRevision;
+    artifactWriteFailed = !result.success || !result.warning.empty();
+    artifactWriteFailure = !result.success ? result.error : result.warning;
+    auto completion = std::move(artifactWriteCompletion);
+    artifactWriteCompletion = {};
+    if (!result.success) ui::Toast(ui::ToastKind::Error, "Save failed: " + result.error);
+    else if (!result.warning.empty()) ui::Toast(ui::ToastKind::Warn, result.warning);
+    else {
+        std::string path;
+        utf8FromWide(result.path.c_str(), path);
+        ui::Toast(ui::ToastKind::Success, "Wrote " + std::to_string(result.bytes) + " bytes to " + path);
+    }
+    if (completion) completion(result);
 }
 
 bool AppContext::exportAnalysisFile(const std::string& defaultBaseName,
@@ -2842,13 +2939,11 @@ bool AppContext::exportAnalysisFile(const std::string& defaultBaseName,
     };
     const std::string& body = (endsWithCI(".html") || endsWithCI(".htm")) ? html : markdown;
 
-    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
-    if (f && f.write(body.data(), (std::streamsize)body.size())) {
-        msg = "Wrote " + std::to_string(body.size()) + " bytes to " + p;
-        return true;
-    }
-    msg = "Failed to write " + p + " (check the path / permissions).";
-    return false;
+    const std::filesystem::path destination(file.data());
+    return queueArtifactWrite([destination, body = std::string(body)] {
+        return WriteArtifactBytes(destination, std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+    }, msg);
 }
 
 bool AppContext::selectCodeExportPath(const std::string& defaultName,
@@ -2889,8 +2984,9 @@ bool AppContext::selectCodeExportPath(const std::string& defaultName,
 bool AppContext::saveBytesFile(const std::string& defaultName,
                                const std::vector<uint8_t>& bytes, std::string& msg,
                                const wchar_t* filterSpec, const wchar_t* defExt,
-                               std::string* savedPath) {
-    if (savedPath) savedPath->clear();
+                               std::function<void(const ArtifactWriteResult&)> completion,
+                               std::string reportSuffix, std::string report) {
+    if (artifactWrites.pending()) { msg = "A file save is still pending; wait for its result."; return false; }
     std::wstring def;
     if (!wideFromUtf8(defaultName.empty() ? std::string("resource.bin") : defaultName, def))
         def = L"resource.bin";
@@ -2912,15 +3008,21 @@ bool AppContext::saveBytesFile(const std::string& defaultName,
         msg = "Failed to encode the selected path as UTF-8.";
         return false;
     }
-    std::ofstream f(std::filesystem::path(file.data()), std::ios::binary | std::ios::trunc);
-    if (f && (bytes.empty() ||
-              f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size()))) {
-        if (savedPath) *savedPath = p;
-        msg = "Wrote " + std::to_string(bytes.size()) + " bytes to " + p;
-        return true;
-    }
-    msg = "Failed to write " + p + " (check the path / permissions).";
-    return false;
+    const std::filesystem::path destination(file.data());
+    try {
+        return queueArtifactWrite([destination, bytes = std::vector<uint8_t>(bytes),
+            suffix = std::move(reportSuffix), report = std::move(report)] {
+            auto result = WriteArtifactBytes(destination, bytes);
+            if (result.success && !suffix.empty()) {
+                auto reportPath = destination;
+                reportPath += pathFromUtf8(suffix);
+                auto written = WriteArtifactBytes(reportPath, std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(report.data()), report.size()));
+                if (!written.success) result.warning = "Artifact saved, but its report failed: " + written.error;
+            }
+            return result;
+        }, msg, std::move(completion));
+    } catch (const std::exception& error) { msg = error.what(); return false; }
 }
 
 void App::closeBinary() {
@@ -3367,7 +3469,8 @@ void App::renderMenuBar() {
             const bool otherPopup = ImGui::IsPopupOpen(nullptr,
                 ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
             ImGui::BeginDisabled(otherPopup);
-            const bool searchClicked = ImGui::InvisibleButton("##global_search", searchSize);
+            const bool searchClicked = ImGui::InvisibleButton("##global_search", searchSize,
+                ImGuiButtonFlags_EnableNav);
             const bool searchHovered = ImGui::IsItemHovered();
             const bool searchFocused = ImGui::IsItemFocused();
             dl->AddRectFilled(searchAt,
@@ -3517,32 +3620,27 @@ bool App::saveStaticUnpackArtifact(int artifactKind, bool loadAfterSave) {
     if (dot != std::string::npos) base.resize(dot);
     if (base.empty()) base = "packed-image";
 
-    std::string message, savedPath;
-    if (!ctx_.saveBytesFile(base + suffix, *bytes, message, filter, extension, &savedPath)) {
-        if (!message.empty()) staticUnpackPopup_.error = message;
-        return false;
-    }
-
-    std::wstring reportPath;
-    if (wideFromUtf8(savedPath + ".static-unpack-report.txt", reportPath)) {
-        std::ofstream out(std::filesystem::path(reportPath), std::ios::binary | std::ios::trunc);
-        if (!out || !(out << result.report))
-            ui::Toast(ui::ToastKind::Warn, "Artifact saved, but its static-unpack report could not be written.");
-    } else {
-        ui::Toast(ui::ToastKind::Warn, "Artifact saved, but its report path could not be encoded.");
-    }
-
-    if (artifactKind == 0 && !result.oepTrusted) {
-        ui::Toast(ui::ToastKind::Warn,
-                  "Saved reconstructed PE for analysis; its original entry point remains unverified.");
-    } else {
-        ui::Toast(ui::ToastKind::Success, "Saved static-unpack artifact and recovery report.");
-    }
-    if (loadable && loadAfterSave && ctx_.beginBinaryLoadPath(savedPath)) {
-        ctx_.requestedTab = "Binary View";
-        pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::StaticUnpack;
-    }
-    return true;
+    const auto document = ctx_.staticDocumentId();
+    const auto generation = ctx_.staticImageGeneration();
+    const auto revision = ctx_.staticBinary().imageRevision();
+    const bool trusted = result.oepTrusted;
+    std::string message;
+    const bool queued = ctx_.saveBytesFile(base + suffix, *bytes, message, filter, extension,
+        [this, document, generation, revision, loadable, loadAfterSave, trusted](const ArtifactWriteResult& saved) {
+            if (!saved.success || !saved.warning.empty()) return;
+            if (loadable && !trusted) ui::Toast(ui::ToastKind::Warn,
+                "Saved reconstructed PE for analysis; its original entry point remains unverified.");
+            if (!loadable || !loadAfterSave || ctx_.staticDocumentId() != document || ctx_.staticImageGeneration() != generation ||
+                ctx_.staticBinary().imageRevision() != revision || ctx_.binaryLoadPending()) return;
+            std::string path;
+            if (utf8FromWide(saved.path.c_str(), path) && ctx_.beginBinaryLoadPath(path)) {
+                ctx_.requestedTab = "Binary View";
+                pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::StaticUnpack;
+            } else ui::Toast(ui::ToastKind::Error, "Artifact saved, but its background load could not start.");
+        }, ".static-unpack-report.txt", result.report);
+    if (!queued && !message.empty()) staticUnpackPopup_.error = message;
+    if (queued) ui::Toast(ui::ToastKind::Info, message);
+    return queued;
 }
 
 void App::renderStaticUnpackPopup() {
@@ -3960,48 +4058,41 @@ bool App::savePassiveDumpArtifacts(bool loadAfterSave) {
         ? (runnable ? ".passive-unpacked.exe" : ".passive-recovered-analysis.exe")
         : ".passive-capture.bin";
 
-    std::string message, savedPath;
-    const bool saved = ctx_.saveBytesFile(
-        baseName, bytes, message,
+    const auto document = ctx_.staticDocumentId();
+    const auto generation = ctx_.staticImageGeneration();
+    const auto revision = ctx_.staticBinary().imageRevision();
+    // Capture whether this request owns a launch; completion must not terminate
+    // a later launch that happened to reuse the same popup.
+    const auto capturedPid = passiveDumpPopup_.result.pid;
+    const auto capturedGeneration = passiveResultGeneration_;
+    std::string message;
+    const bool queued = ctx_.saveBytesFile(baseName, bytes, message,
         rebuilt ? L"PE executable\0*.exe\0All Files\0*.*\0"
                 : L"Mapped process capture\0*.bin\0All Files\0*.*\0",
-        rebuilt ? L"exe" : L"bin", &savedPath);
-    if (!saved) {
-        if (!message.empty()) passiveDumpPopup_.error = message;
-        return false;
-    }
-
-    std::wstring reportWide;
-    if (!wideFromUtf8(savedPath + ".passive-report.txt", reportWide)) {
-        passiveDumpPopup_.error = "The image was saved, but the report path could not be encoded.";
-        return false;
-    }
-    std::ofstream reportFile(std::filesystem::path(reportWide), std::ios::binary | std::ios::trunc);
-    if (!reportFile || !(reportFile << passiveDumpPopup_.result.report)) {
-        passiveDumpPopup_.error = "The image was saved, but the passive-dump report could not be written.";
-        ui::Toast(ui::ToastKind::Warn, passiveDumpPopup_.error);
-        return false;
-    }
-    if (rebuilt && !runnable) {
-        ui::Toast(ui::ToastKind::Warn, manualOepValidated
-            ? "Saved reconstructed PE for analysis; its manual OEP is validated, but disk-backfilled bytes prevent runnable classification."
-            : "Saved reconstructed PE for analysis; its original entry point remains unverified.");
-    } else {
-        ui::Toast(ui::ToastKind::Success, "Saved passive process image and capture report.");
-    }
-    if (rebuilt && loadAfterSave) {
-        // Loading hands the analyst to a new binary and closes this modal. Do
-        // not leave an owned launch alive with its explicit stop control hidden.
-        if (ctx_.beginBinaryLoadPath(savedPath)) {
-            if (passiveDumpPopup_.result.launched &&
-                passiveDumpPopup_.result.launchContained)
-                passiveDumpService_.terminateContainedLaunch();
-            ctx_.requestedTab = "Binary View";
-            passiveDumpPopup_.result.launchContained = false;
-            pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::PassiveDump;
-        }
-    }
-    return true;
+        rebuilt ? L"exe" : L"bin",
+        [this, document, generation, revision, capturedPid, capturedGeneration, rebuilt, runnable, manualOepValidated, loadAfterSave]
+        (const ArtifactWriteResult& saved) {
+            if (!saved.success || !saved.warning.empty()) return;
+            if (rebuilt && !runnable) ui::Toast(ui::ToastKind::Warn, manualOepValidated
+                ? "Saved reconstructed PE for analysis; disk-backfilled bytes prevent runnable classification."
+                : "Saved reconstructed PE for analysis; its original entry point remains unverified.");
+            if (!rebuilt || !loadAfterSave || ctx_.staticDocumentId() != document || ctx_.staticImageGeneration() != generation ||
+                ctx_.staticBinary().imageRevision() != revision || ctx_.binaryLoadPending()) return;
+            std::string path;
+            if (utf8FromWide(saved.path.c_str(), path) && ctx_.beginBinaryLoadPath(path)) {
+                if (!passiveDumpService_.busy() && passiveResultGeneration_ == capturedGeneration &&
+                    passiveDumpPopup_.result.pid == capturedPid &&
+                    passiveDumpPopup_.result.launched && passiveDumpPopup_.result.launchContained) {
+                    passiveDumpService_.terminateContainedLaunch();
+                    passiveDumpPopup_.result.launchContained = false;
+                }
+                ctx_.requestedTab = "Binary View";
+                pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::PassiveDump;
+            } else ui::Toast(ui::ToastKind::Error, "Artifact saved, but its background load could not start.");
+        }, ".passive-report.txt", passiveDumpPopup_.result.report);
+    if (!queued && !message.empty()) passiveDumpPopup_.error = message;
+    if (queued) ui::Toast(ui::ToastKind::Info, message);
+    return queued;
 }
 
 void App::renderPassiveDumpPopup() {
@@ -4014,6 +4105,7 @@ void App::renderPassiveDumpPopup() {
     PassiveDumpResult completed;
     if (passiveDumpService_.tryTakeResult(completed)) {
         passiveDumpPopup_.result = std::move(completed);
+        ++passiveResultGeneration_;
         passiveDumpPopup_.error = passiveDumpPopup_.result.error;
     }
     if (passiveDumpPopup_.open) {
@@ -4376,7 +4468,7 @@ static float TabStripHeight() {
     const float k = theme::UiScale();
     const float h = 34.0f * k;
     const float m = ImGui::GetFrameHeight() + 8.0f * k;
-    return h > m ? h : m;
+    return std::max({h, m, ImGui::GetStyle().WindowMinSize.y});
 }
 
 static float StatusStripHeight() {
@@ -4469,7 +4561,8 @@ void App::renderDocumentStrip() {
             // The close button is drawn inside this hit area. Let that later
             // item receive the pointer instead of the full tab swallowing it.
             ImGui::SetNextItemAllowOverlap();
-            const bool clicked = ImGui::InvisibleButton("##document", ImVec2(tabW, tabH));
+            const bool clicked = ImGui::InvisibleButton("##document", ImVec2(tabW, tabH),
+                ImGuiButtonFlags_EnableNav);
             const bool hovered = ImGui::IsItemHovered();
             const bool documentTooltipReady = hovered && ImGui::IsItemHovered(
                 ImGuiHoveredFlags_DelayNormal |
@@ -4545,25 +4638,30 @@ void App::renderDocumentStrip() {
             const bool pointerOverDocument = ImGui::IsWindowHovered(
                 ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
                 ImGui::IsMouseHoveringRect(a, b);
-            const bool showClose = !compactDocument && (document.active || hovered || focused ||
+            bool showClose = !compactDocument && (document.active || hovered || focused ||
                                    pointerOverDocument);
             bool closeHovered = false;
-            if (showClose) {
+            // Keep the target in keyboard navigation even while its glyph is
+            // hidden, then reveal it using the public item-focus query.
+            if (!compactDocument) {
                 ImGui::SetCursorScreenPos(closePos);
                 const bool closeClicked = ImGui::InvisibleButton(
-                    "##close", ImVec2(closeSize, closeSize));
+                    "##close", ImVec2(closeSize, closeSize), ImGuiButtonFlags_EnableNav);
                 closeHovered = ImGui::IsItemHovered();
                 const bool closeFocused = ImGui::IsItemFocused();
+                showClose = showClose || closeFocused;
                 const ImU32 closeCol = ImGui::GetColorU32(
                     (closeHovered || closeFocused) ? theme::col::bad()
                                                    : theme::col::muted());
                 const float inset = 4.0f * k;
-                dl->AddLine(ImVec2(closePos.x + inset, closePos.y + inset),
-                            ImVec2(closePos.x + closeSize - inset,
-                                   closePos.y + closeSize - inset), closeCol, 1.4f * k);
-                dl->AddLine(ImVec2(closePos.x + closeSize - inset, closePos.y + inset),
-                            ImVec2(closePos.x + inset,
-                                   closePos.y + closeSize - inset), closeCol, 1.4f * k);
+                if (showClose) {
+                    dl->AddLine(ImVec2(closePos.x + inset, closePos.y + inset),
+                                ImVec2(closePos.x + closeSize - inset,
+                                       closePos.y + closeSize - inset), closeCol, 1.4f * k);
+                    dl->AddLine(ImVec2(closePos.x + closeSize - inset, closePos.y + inset),
+                                ImVec2(closePos.x + inset,
+                                       closePos.y + closeSize - inset), closeCol, 1.4f * k);
+                }
                 if (closeClicked) close = document.id;
             }
             if (document.dirty) {
@@ -4593,7 +4691,7 @@ void App::renderDocumentStrip() {
         const ImVec2 addB(addA.x + 34.0f * k, win.y + stripH);
         ImGui::SetCursorScreenPos(addA);
         const bool addClicked = ImGui::InvisibleButton(
-            "##open-document", ImVec2(addB.x - addA.x, tabH));
+            "##open-document", ImVec2(addB.x - addA.x, tabH), ImGuiButtonFlags_EnableNav);
         const bool addHovered = ImGui::IsItemHovered();
         const bool addFocused = ImGui::IsItemFocused();
         const bool addHeld = ImGui::IsItemActive();
@@ -4618,12 +4716,18 @@ void App::renderDocumentStrip() {
         }
         ImGui::SetCursorScreenPos(ImVec2(win.x + vp->WorkSize.x - 36.0f * k,
                                         win.y + topPad));
-        if (ImGui::InvisibleButton("##document_list", ImVec2(28.0f * k, tabH)))
+        if (ImGui::InvisibleButton("##document_list", ImVec2(28.0f * k, tabH),
+                                  ImGuiButtonFlags_EnableNav))
             ImGui::OpenPopup("##all_documents");
         const bool listHovered = ImGui::IsItemHovered();
+        const bool listFocused = ImGui::IsItemFocused();
         const ImVec2 listAt = ImGui::GetItemRectMin();
+        if (listFocused)
+            dl->AddRect(listAt, ImGui::GetItemRectMax(), ImGui::GetColorU32(accent),
+                        2.0f * k, 0, (std::max)(1.0f, std::round(k)));
         const float listCx = listAt.x + 14.0f * k, listCy = listAt.y + tabH * 0.5f;
-        const ImU32 listInk = ImGui::GetColorU32(listHovered ? accent : theme::col::muted());
+        const ImU32 listInk = ImGui::GetColorU32(listHovered || listFocused
+            ? accent : theme::col::muted());
         dl->AddLine(ImVec2(listCx - 4.0f * k, listCy - 2.0f * k),
                     ImVec2(listCx, listCy + 2.0f * k), listInk, k);
         dl->AddLine(ImVec2(listCx, listCy + 2.0f * k),
@@ -4758,7 +4862,8 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             const float width = commandWidth(icon, fallback, label);
             const ImVec2 p = ImGui::GetCursorScreenPos();
             if (!enabled) ImGui::BeginDisabled();
-            const bool clicked = ImGui::InvisibleButton(id, ImVec2(width, commandH));
+            const bool clicked = ImGui::InvisibleButton(id, ImVec2(width, commandH),
+                ImGuiButtonFlags_EnableNav);
             const bool hovered = ImGui::IsItemHovered(
                 ImGuiHoveredFlags_AllowWhenDisabled);
             const bool focused = ImGui::IsItemFocused();
@@ -4828,8 +4933,8 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             executionModeControl();
             nextGroup();
         }
-        const bool modePaused = !lifecycle.busy && (ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused);
-        const bool modeRunning = !lifecycle.busy && running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
+        const bool modePaused = !s.cleanupOnly && !lifecycle.busy && (ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused);
+        const bool modeRunning = !s.cleanupOnly && !lifecycle.busy && running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
 
         const bool lifecycleIdle = !lifecycle.busy;
         const bool canLaunch = lifecycleIdle && ctx_.binaryLaunchable();
@@ -4849,6 +4954,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                     cancellable ? "Cancel startup" : "Stopping...",
                     "Debugger startup and cleanup run in the background",
                     true, cancellable)) d.cancelLifecycle(lifecycle.requestId);
+        } else if (s.cleanupOnly) {
+            if (commandButton("##cmd_primary", DS_ICON_STOP, "[]", "Retry Detach",
+                    "Cleanup is incomplete. Retry restoring the target before ending this session.",
+                    true, true)) d.requestDetach(frameTarget);
         } else if (attached) {
             if (running) {
                 if (commandButton("##cmd_primary", DS_ICON_PAUSE, "||", "Pause",
@@ -4908,8 +5017,8 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         const bool exactTraceImage = ctx_.frameDebugSnapshot &&
             ctx_.debuggerRuntimeImage(*ctx_.frameDebugSnapshot,
                                       traceRuntimeBase, traceRuntimeSize);
-        const bool traceStartEnabled = traceOn ||
-            (modePaused && !ctx_.gmlExecutionMode && loaded && exactTraceImage);
+        const bool traceStartEnabled = !s.cleanupOnly && (traceOn ||
+            (modePaused && !ctx_.gmlExecutionMode && loaded && exactTraceImage));
         nextGroup();
         if (commandButton("##cmd_trace", DS_ICON_LIGHTNING, "tr", "Trace",
                           traceOn
@@ -5244,7 +5353,8 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
 
             ImGui::PushID(i);
             ImGui::SetCursorScreenPos(a);
-            bool clicked = ImGui::InvisibleButton("##tabcard", ImVec2(cardW, cardH));
+            bool clicked = ImGui::InvisibleButton("##tabcard", ImVec2(cardW, cardH),
+                ImGuiButtonFlags_EnableNav);
             bool hovered = ImGui::IsItemHovered();
             const bool focused = ImGui::IsItemFocused();
             const bool held = ImGui::IsItemActive();
@@ -5661,14 +5771,15 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                     rightX, statusPos.y + (statusH - lh) * 0.5f);
                 ImGui::SetCursorScreenPos(cursorPos);
                 if (ImGui::InvisibleButton("##status_cursor",
-                                           ImVec2(cursorW, lh))) {
+                                           ImVec2(cursorW, lh), ImGuiButtonFlags_EnableNav)) {
                     ImGui::SetClipboardText(cursorText + 7); // address only
                     ui::Toast(ui::ToastKind::Success,
                               "Cursor address copied to the clipboard.");
                 }
                 const bool hovered = ImGui::IsItemHovered();
+                const bool focused = ImGui::IsItemFocused();
                 dl->AddText(cursorPos,
-                            ImGui::GetColorU32(hovered ? theme::col::accent()
+                            ImGui::GetColorU32(hovered || focused ? theme::col::accent()
                                                       : theme::col::muted()),
                             cursorText);
                 if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -5790,9 +5901,15 @@ void App::renderStatusBar(const DbgSnapshot& d) {
 
         const ImVec2 activityPos(activityLeft, statusPos.y + (statusH - activityHeight) * 0.5f);
         ImGui::SetCursorScreenPos(activityPos);
-        if (ImGui::InvisibleButton("##status_activity_details", ImVec2(labelWidth, activityHeight)))
+        if (ImGui::InvisibleButton("##status_activity_details", ImVec2(labelWidth, activityHeight),
+                                  ImGuiButtonFlags_EnableNav))
             ImGui::OpenPopup("##status_activity_popup");
         const bool activityHovered = ImGui::IsItemHovered();
+        const bool activityFocused = ImGui::IsItemFocused();
+        if (activityFocused)
+            dl->AddRect(activityPos, ImGui::GetItemRectMax(),
+                ImGui::GetColorU32(theme::col::accent()), 2.0f * scale, 0,
+                (std::max)(1.0f, std::round(scale)));
         const ImVec4 issueColor = analysisHealth.jobsFailed || moduleHealth.jobsFailed || saveFailure
             ? theme::col::bad() : theme::col::warn();
         const ImVec4 jobColor = activityCount && (activities[0].kind == StatusActivity::Live ||
@@ -5826,7 +5943,8 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                 displayLabel[length - 3] = '.';
             }
             dl->AddText(ImVec2(activityPos.x + 16.0f * scale, midY - lh * 0.5f),
-                        ImGui::GetColorU32(activityHovered ? theme::col::accent() : theme::col::muted()),
+                        ImGui::GetColorU32(activityHovered || activityFocused
+                            ? theme::col::accent() : theme::col::muted()),
                         displayLabel);
         } else {
             for (int i = -1; i <= 1; ++i)
@@ -5855,16 +5973,23 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                 : activities[0].kind == StatusActivity::Export
                     ? static_cast<const void*>(&ctx_.staticCodeExport()) : static_cast<const void*>(&ctx_);
             ImGui::PushID(owner);
-            if (ImGui::InvisibleButton("##status_activity_stop", ImVec2(stopWidth, activityHeight)))
+            if (ImGui::InvisibleButton("##status_activity_stop", ImVec2(stopWidth, activityHeight),
+                                      ImGuiButtonFlags_EnableNav))
                 stopActivity(activities[0].kind);
             const bool stopHovered = ImGui::IsItemHovered();
+            const bool stopFocused = ImGui::IsItemFocused();
+            if (stopFocused)
+                dl->AddRect(stopPos, ImGui::GetItemRectMax(),
+                    ImGui::GetColorU32(theme::col::accent()), 2.0f * scale, 0,
+                    (std::max)(1.0f, std::round(scale)));
             ImGui::PopID();
             ImGui::PopID();
             const float halfSide = 3.25f * scale;
             const ImVec2 center(stopPos.x + stopWidth * 0.5f, midY);
             dl->AddRectFilled(ImVec2(center.x - halfSide, center.y - halfSide),
                               ImVec2(center.x + halfSide, center.y + halfSide),
-                              ImGui::GetColorU32(stopHovered ? theme::col::bad() : theme::col::muted()), scale);
+                              ImGui::GetColorU32(stopHovered || stopFocused
+                                  ? theme::col::bad() : theme::col::muted()), scale);
             if (stopHovered) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 ImGui::SetTooltip("%s", stopLabel(activities[0].kind));
@@ -6767,77 +6892,62 @@ bool App::saveUnpackArtifacts(bool loadAfterSave) {
     const std::vector<uint8_t>& bytes = success ? unpackPopup_.result.image
                                                 : unpackPopup_.result.rawMappedImage;
     if (bytes.empty()) return false;
-    std::vector<wchar_t> file(kDialogPathChars, L'\0');
     std::string leaf = pathLeafLower(ctx_.staticBinary().path());
     size_t dot = leaf.find_last_of('.');
     if (dot != std::string::npos) leaf.resize(dot);
     leaf += success ? ".unpacked.exe" : ".unpack-failure.mapped.bin";
-    std::wstring def; if (wideFromUtf8(leaf, def)) wcsncpy_s(file.data(), file.size(), def.c_str(), _TRUNCATE);
-    OPENFILENAMEW ofn{};
-    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = GetActiveWindow();
-    ofn.lpstrFilter = success ? L"PE executable\0*.exe\0All Files\0*.*\0"
-                              : L"Raw mapped image\0*.bin\0All Files\0*.*\0";
-    ofn.lpstrFile = file.data(); ofn.nMaxFile = static_cast<DWORD>(file.size());
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    if (!GetSaveFileNameW(&ofn)) return false;
-    const std::filesystem::path path(file.data());
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out || !out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
-        unpackPopup_.error = "Could not write the unpack artifact."; return false;
+    std::ostringstream reportFile;
+    reportFile << unpackPopup_.result.report;
+    const UnpackReport telemetry = unpackEngine_.report();
+    reportFile << "\ntelemetry samples: " << telemetry.status.totalSamples
+               << "\nOEP candidates: " << telemetry.candidates.size()
+               << "\nentropy settled: " << (telemetry.entropy.settled ? "yes" : "no")
+               << "\nVM-like trace: " << (telemetry.vmTrace.vmLike ? "yes" : "no")
+               << " (score " << telemetry.vmTrace.score << ")\n";
+    reportFile << "entropy window: " << telemetry.entropy.windowStartMs << ".."
+               << telemetry.entropy.windowEndMs << " ms, spread " << telemetry.entropy.spread
+               << ", changed bytes/pages " << telemetry.entropy.changedBytes << "/"
+               << telemetry.entropy.changedPages << "\n";
+    for (const auto& candidate : telemetry.candidates) {
+        reportFile << "OEP 0x" << std::hex << candidate.va << std::dec
+                   << ": score " << candidate.score << " ("
+                   << UnpackConfidenceName(candidate.confidence) << "), observations "
+                   << candidate.observations << "\n";
+        for (const auto& evidence : candidate.evidence)
+            reportFile << "  +" << evidence.score << " " << OepEvidenceName(evidence.kind)
+                       << " x" << evidence.occurrences << ": " << evidence.detail << "\n";
     }
-    std::filesystem::path reportPath = path;
-    reportPath += L".unpack-report.txt";
-    std::ofstream reportFile(reportPath, std::ios::binary | std::ios::trunc);
-    bool reportSaved = false;
-    if (reportFile) {
-        reportFile << unpackPopup_.result.report;
-        const UnpackReport telemetry = unpackEngine_.report();
-        reportFile << "\ntelemetry samples: " << telemetry.status.totalSamples
-                   << "\nOEP candidates: " << telemetry.candidates.size()
-                   << "\nentropy settled: " << (telemetry.entropy.settled ? "yes" : "no")
-                   << "\nVM-like trace: " << (telemetry.vmTrace.vmLike ? "yes" : "no")
-                   << " (score " << telemetry.vmTrace.score << ")\n";
-        reportFile << "entropy window: " << telemetry.entropy.windowStartMs << ".."
-                   << telemetry.entropy.windowEndMs << " ms, spread " << telemetry.entropy.spread
-                   << ", changed bytes/pages " << telemetry.entropy.changedBytes << "/"
-                   << telemetry.entropy.changedPages << "\n";
-        for (const auto& candidate : telemetry.candidates) {
-            reportFile << "OEP 0x" << std::hex << candidate.va << std::dec
-                       << ": score " << candidate.score << " ("
-                       << UnpackConfidenceName(candidate.confidence) << "), observations "
-                       << candidate.observations << "\n";
-            for (const auto& evidence : candidate.evidence)
-                reportFile << "  +" << evidence.score << " " << OepEvidenceName(evidence.kind)
-                           << " x" << evidence.occurrences << ": " << evidence.detail << "\n";
-        }
-        for (const auto& evidence : telemetry.vmTrace.evidence)
-            reportFile << "VM evidence: " << evidence << "\n";
-        for (const auto& rip : telemetry.vmTrace.hotRips)
-            reportFile << "hot RIP 0x" << std::hex << rip.rip << std::dec
-                       << ": " << rip.hits << " hit(s)\n";
-        for (const auto& handler : telemetry.vmTrace.handlers)
-            reportFile << "handler 0x" << std::hex << handler.rip << std::dec
-                       << ": " << handler.hits << " hit(s), fan-in " << handler.fanIn << "\n";
-        for (const auto& loop : telemetry.vmTrace.loops)
-            reportFile << "loop 0x" << std::hex << loop.from << " -> 0x" << loop.to
-                       << std::dec << ": " << loop.hits << " hit(s)\n";
-        reportFile.flush();
-        reportSaved = static_cast<bool>(reportFile);
-    }
-    if (!reportSaved) {
-        unpackPopup_.error = "The unpack artifact was saved, but its repair/telemetry report could not be written.";
-        ui::Toast(ui::ToastKind::Warn, unpackPopup_.error);
-        return false;
-    }
-    ui::Toast(ui::ToastKind::Success, "Saved unpack artifact and repair/telemetry report.");
-    if (success && loadAfterSave) {
-        std::string utf8;
-        if (utf8FromWide(file.data(), utf8) && ctx_.beginBinaryLoadPath(utf8)) {
-            ctx_.requestedTab = "Binary View";
-            pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::AdaptiveUnpack;
-        }
-    }
-    return true;
+    for (const auto& evidence : telemetry.vmTrace.evidence)
+        reportFile << "VM evidence: " << evidence << "\n";
+    for (const auto& rip : telemetry.vmTrace.hotRips)
+        reportFile << "hot RIP 0x" << std::hex << rip.rip << std::dec
+                   << ": " << rip.hits << " hit(s)\n";
+    for (const auto& handler : telemetry.vmTrace.handlers)
+        reportFile << "handler 0x" << std::hex << handler.rip << std::dec
+                   << ": " << handler.hits << " hit(s), fan-in " << handler.fanIn << "\n";
+    for (const auto& loop : telemetry.vmTrace.loops)
+        reportFile << "loop 0x" << std::hex << loop.from << " -> 0x" << loop.to
+                   << std::dec << ": " << loop.hits << " hit(s)\n";
+    const auto document = ctx_.staticDocumentId();
+    const auto generation = ctx_.staticImageGeneration();
+    const auto revision = ctx_.staticBinary().imageRevision();
+    std::string message;
+    const bool queued = ctx_.saveBytesFile(leaf, bytes, message,
+        success ? L"PE executable\0*.exe\0All Files\0*.*\0" : L"Raw mapped image\0*.bin\0All Files\0*.*\0",
+        success ? L"exe" : L"bin",
+        [this, document, generation, revision, success, loadAfterSave](const ArtifactWriteResult& saved) {
+            if (!saved.success || !saved.warning.empty() || !success || !loadAfterSave ||
+                ctx_.staticDocumentId() != document || ctx_.staticImageGeneration() != generation || ctx_.staticBinary().imageRevision() != revision ||
+                ctx_.binaryLoadPending()) return;
+            std::string path;
+            if (utf8FromWide(saved.path.c_str(), path) && ctx_.beginBinaryLoadPath(path)) {
+                ctx_.requestedTab = "Binary View";
+                pendingDocumentLoadOwner_ = PendingDocumentLoadOwner::AdaptiveUnpack;
+            } else ui::Toast(ui::ToastKind::Error, "Artifact saved, but its background load could not start.");
+        }, ".unpack-report.txt", reportFile.str());
+    if (!queued && !message.empty()) unpackPopup_.error = message;
+    if (queued) ui::Toast(ui::ToastKind::Info, message);
+    return queued;
 }
 
 void App::renderUnpackPopup() {
@@ -7334,13 +7444,13 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
 
 bool App::wantsContinuousRedraw() {
     // Toasts fade out on a timer - freeze-frames would strand them on screen.
-    if (ui::ToastsActive()) return true;
+    if (exitPending_ || ui::ToastsActive()) return true;
     // Keep ticking through the short debounce interval so autosave fires even
     // when the user stops interacting immediately after an edit.
     if (ctx_.projectDirty() ||
         ctx_.projectSaveState == AppContext::ProjectSaveState::Saving) return true;
     // Background work in flight: progress spinners animate and results stream in.
-    if (ctx_.binaryLoadPending() || ctx_.staticAnalysis().bulkPending() || ctx_.moduleAnalysisPending() ||
+    if (ctx_.artifactWrites.pending() || ctx_.binaryLoadPending() || ctx_.staticAnalysis().bulkPending() || ctx_.moduleAnalysisPending() ||
         ctx_.livescan.busy() || ctx_.staticCodeExport().pending() ||
         staticUnpackService_.pending() || passiveDumpService_.busy() ||
         ctx_.traceSeedPlanning) return true;
@@ -7793,6 +7903,8 @@ void App::render() {
     renderHelpWindow();
 
     ctx_.pollProjectSave();
+    ctx_.pollArtifactWrites();
+    pollExit();
 
     // Debounced autosave. All serialized state has already been mirrored by the
     // active tab this frame; the atomic Project writer makes each attempt crash-

@@ -4,6 +4,7 @@
 #include "../Ui/Widgets.h"
 #include "../Ui/Splitter.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 
 #include <algorithm>
 #include <cctype>
@@ -132,6 +133,9 @@ void ProjectsTab::render(AppContext& ctx) {
 
     // Resizable master/detail workbench. The old fixed 420 px card wasted space
     // on small windows and could not take advantage of larger displays.
+    if (lastScale_ > 0.0f && lastScale_ != scale)
+        listWidth_ *= scale / lastScale_;
+    lastScale_ = scale;
     if (listWidth_ <= 0.0f) listWidth_ = 360.0f * scale;
     const ImVec2 panelSpace = ImGui::GetContentRegionAvail();
     const bool stacked = panelSpace.x < 620.0f * scale;
@@ -169,7 +173,12 @@ void ProjectsTab::render(AppContext& ctx) {
             ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("Arch",   ImGuiTableColumnFlags_WidthFixed, 50.0f * scale);
-        ImGui::TableSetupColumn("Opened", ImGuiTableColumnFlags_WidthFixed, 120.0f * scale);
+        // Names remain the useful primary target in a narrow navigator. The
+        // date remains available in the row tooltip and selected-project detail.
+        const bool compactList = ImGui::GetWindowSize().x < 460.0f * scale;
+        ImGui::TableSetupColumn("Opened", ImGuiTableColumnFlags_WidthFixed |
+            (compactList ? ImGuiTableColumnFlags_Disabled : ImGuiTableColumnFlags_None),
+            120.0f * scale);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
         int removeAt = -1;
@@ -195,10 +204,18 @@ void ProjectsTab::render(AppContext& ctx) {
                 selectedHash_ = r.hash;
                 selectedHashValid_ = true;
             }
-            ImGui::GetWindowDrawList()->AddText(rowPos, ImGui::GetColorU32(ImGuiCol_Text), rowLabel.c_str());
+            const float nameRight = rowPos.x + ImGui::GetContentRegionAvail().x;
+            ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(), rowPos,
+                ImVec2(nameRight, rowPos.y + ImGui::GetTextLineHeight()), nameRight, nameRight,
+                rowLabel.c_str(), rowLabel.c_str() + rowLabel.size(), nullptr);
             if (active) ImGui::PopStyleColor();
             const bool rowHovered = ImGui::IsItemHovered();
-            ui::ItemTooltip(r.path.c_str(), false);
+            const std::string recentTip = r.path + "\n" +
+                (r.arch.empty() ? "Unknown architecture" : r.arch) +
+                " | Last opened: " + whenStr(r.lastOpenedUnix) +
+                (r.status.empty() ? "" : "\n" + r.status) +
+                "\nDouble-click or press Enter to open.";
+            ui::ItemTooltip(recentTip.c_str(), false);
             if ((rowHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) ||
                 (ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
                 openRecent(r);
@@ -212,7 +229,8 @@ void ProjectsTab::render(AppContext& ctx) {
                 ImGui::EndPopup();
             }
             ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(r.arch.empty() ? "-" : r.arch.c_str());
-            ImGui::TableSetColumnIndex(2); ImGui::TextDisabled("%s", whenStr(r.lastOpenedUnix).c_str());
+            if (ImGui::TableSetColumnIndex(2))
+                ImGui::TextDisabled("%s", whenStr(r.lastOpenedUnix).c_str());
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -247,6 +265,7 @@ void ProjectsTab::render(AppContext& ctx) {
         ui::KeyValueRow("Path", "%s", r.path.c_str());
         ui::ItemTooltip(r.path.c_str(), false);
         ui::KeyValueRow("Arch", "%s", r.arch.empty() ? "-" : r.arch.c_str());
+        if (!r.status.empty()) ui::KeyValueRow("Status", "%s", r.status.c_str());
         ui::KeyValueRow("Hash", "%016llX", (unsigned long long)r.hash);
         ui::KeyValueRow("Last opened", "%s", whenStr(r.lastOpenedUnix).c_str());
         if (ImGui::Button("Open this project")) {

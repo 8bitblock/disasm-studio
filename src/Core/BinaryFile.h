@@ -5,6 +5,7 @@
 // disassembler and views have section/entry-point context to work with.
 //
 #include "AddressSpan.h"
+#include "OwnedImage.h"
 
 #include <array>
 #include <cstddef>
@@ -163,7 +164,10 @@ public:
         uint64_t va = 0;
         return CheckedAddressAdd(imageBase_, entryRVA_, va) ? va : 0;
     }
-    const std::vector<uint8_t>& bytes()       const { return data_; }
+    const std::vector<uint8_t>& bytes()       const { return data_.bytes(); }
+    // Constant-time, immutable byte ownership for exports/extraction. Later
+    // checked image writes detach; closing/replacing this document is safe.
+    std::shared_ptr<const std::vector<uint8_t>> ownedBytes() const { return data_.snapshot(); }
     const std::vector<Section>& sections()    const { return sections_; }
 
     // Configure the analyst/detector-selected entry and additional named roots
@@ -747,7 +751,7 @@ private:
     std::string          path_;
     BinaryLoadError      loadError_ = BinaryLoadError::None;
     std::string          loadErrorText_;
-    std::vector<uint8_t> data_;
+    OwnedImage data_;
     std::vector<Section> sections_;
     uint64_t             imageRevision_ = 1;
     mutable uint64_t     hash_      = 0;       // cached contentHash of the pristine file

@@ -115,6 +115,62 @@ static void checkLivePatchByteRestoration(const std::string& path) {
     f.tab->mainView_ = 0;
     f.tab->frameSnap_ = &f.detached;
 
+    // Numeric observations use the same real, test-owned debugger process.
+    // Decode absolute memory operands through the production x64 decoder.
+    const uint64_t scalarAddress = scratch + 0x12340;
+    const uint8_t ten[] = {10, 0, 0, 0};
+    const uint8_t eleven[] = {11, 0, 0, 0};
+    CHECK(f.ctx.debug.memorySessionMatches(owner));
+    CHECK(!f.ctx.debug.memorySessionMatches({owner.pid, owner.sessionGeneration + 1}));
+    CHECK(f.ctx.debug.writeMemoryForSession(owner.pid, owner.sessionGeneration,
+        scalarAddress, ten, sizeof(ten)) == sizeof(ten));
+    auto scalarInstruction = [&](uint64_t address, bool byteWidth) {
+        uint8_t bytes[9]{};
+        bytes[0] = byteWidth ? 0xA0 : 0xA1; // mov al/eax, moffs64
+        std::memcpy(bytes + 1, &address, sizeof(address));
+        Instruction instruction;
+        CHECK(f.ctx.staticDisassembler()->decodeOne(bytes, sizeof(bytes), scratch, instruction));
+        return instruction;
+    };
+    const Instruction scalar = scalarInstruction(scalarAddress, false);
+    auto observeScalar = [&](const Instruction& instruction) {
+        MemoryValueHint value;
+        frame([&] { value = f.tab->memoryValueHint(f.ctx, instruction, &f.detached); });
+        return value;
+    };
+    CHECK(observeScalar(scalar).text.find(" = 10 (u32, 0x0000000A)") != std::string::npos);
+    CHECK(f.ctx.debug.writeMemoryForSession(owner.pid, owner.sessionGeneration,
+        scalarAddress, eleven, sizeof(eleven)) == sizeof(eleven));
+    for (int i = 0; i < 20; ++i) frame([] {}); // advance the visible sample clock beyond 250 ms
+    CHECK(observeScalar(scalar).text.find(" = 11 (u32, 0x0000000B)") != std::string::npos);
+
+    // A one-byte operand at a page end must remain readable even when the next
+    // page is inaccessible. Wider operands at that same address are unavailable.
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const uint64_t edgeAddress = scratch + systemInfo.dwPageSize - 1;
+    const uint8_t edgeByte = 127;
+    CHECK(f.ctx.debug.writeMemoryForSession(owner.pid, owner.sessionGeneration,
+        edgeAddress, &edgeByte, 1) == 1);
+    HANDLE childProcess = static_cast<HANDLE>(f.ctx.debug.duplicateProcessHandleForSession(owner));
+    CHECK(childProcess != nullptr);
+    if (childProcess) {
+        DWORD oldProtection = 0;
+        const BOOL protectedPage = VirtualProtectEx(childProcess,
+            reinterpret_cast<void*>(scratch + systemInfo.dwPageSize),
+            systemInfo.dwPageSize, PAGE_NOACCESS, &oldProtection);
+        CHECK(protectedPage != FALSE);
+        if (protectedPage) {
+            CHECK(observeScalar(scalarInstruction(edgeAddress, true)).text.find(" = 127 (u8, 0x7F)") != std::string::npos);
+            CHECK(observeScalar(scalarInstruction(edgeAddress, false)).text.find("unavailable (u32)") != std::string::npos);
+            DWORD ignored = 0;
+            CHECK(VirtualProtectEx(childProcess,
+                reinterpret_cast<void*>(scratch + systemInfo.dwPageSize),
+                systemInfo.dwPageSize, oldProtection, &ignored) != FALSE);
+        }
+        CloseHandle(childProcess);
+    }
+
     auto logicalBytes = [&] {
         std::vector<uint8_t> bytes(pristine.size());
         CHECK(f.ctx.debug.readMemoryMaskedForSession(
@@ -220,6 +276,9 @@ static void checkLivePatchByteRestoration(const std::string& path) {
           after.sessionGeneration == owner.sessionGeneration &&
           after.regs.rip == originalRip && after.activeTid == originalTid);
     f.ctx.debug.detach(); // closes the kill-on-close job containing only our child
+    CHECK(!f.ctx.debug.memorySessionMatches(owner));
+    // Retaining the former pause/cached value after detach grants no authority.
+    CHECK(observeScalar(scalar).text.empty());
     std::printf("Live patch restoration: %s (%d new failure(s))\n",
         failures == failuresBefore ? "passed" : "FAILED", failures - failuresBefore);
 }

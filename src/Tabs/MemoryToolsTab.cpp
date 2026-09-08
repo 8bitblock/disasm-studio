@@ -621,6 +621,10 @@ void MemoryToolsTab::handleTargetTransition(const TargetToken& target) {
     regionOwner_ = {};
     viewBytesRead_ = 0;
     viewHavePrevious_ = false;
+    viewValid_.fill(0);
+    viewPreviousValid_.fill(0);
+    viewWildcard_.fill(0);
+    viewStatus_.clear();
     viewOwner_ = {};
     viewBase_ = 0;
     viewBaseValid_ = false;
@@ -1470,41 +1474,104 @@ void MemoryToolsTab::renderScanner(AppContext& ctx, const TargetToken& target) {
 
 void MemoryToolsTab::navigateViewer(uint64_t address, bool recordHistory,
                                     uint32_t selectionBytes) {
+    const uint64_t limit = lastTarget_.valid() && lastTarget_.is32 ? UINT32_MAX : UINT64_MAX;
+    if (address > limit) {
+        viewStatus_ = "Address exceeds this 32-bit target's range.";
+        return;
+    }
+    // Keep all displayed addresses representable, including a jump to UINT64_MAX.
+    const uint64_t nextBase = (std::min)(address & ~uint64_t{0xFu},
+                                        limit - (viewBytes_.size() - 1));
+    const uint32_t available = static_cast<uint32_t>(viewBytes_.size() -
+                                                     (address - nextBase));
+    const uint32_t selected = (std::min)((std::max)(selectionBytes, 1u), available);
     if (recordHistory) {
         if (viewHistory_.empty()) {
-            viewHistory_.push_back(address);
+            viewHistory_.push_back({address, selected});
             viewHistoryIndex_ = 0;
-        } else if (viewHistory_[viewHistoryIndex_] != address) {
+        } else if (viewHistory_[viewHistoryIndex_].address != address ||
+                   viewHistory_[viewHistoryIndex_].selectionBytes != selected) {
             viewHistory_.erase(viewHistory_.begin() +
                                    static_cast<std::ptrdiff_t>(viewHistoryIndex_ + 1),
                                viewHistory_.end());
-            viewHistory_.push_back(address);
+            viewHistory_.push_back({address, selected});
+            if (viewHistory_.size() > 256) viewHistory_.erase(viewHistory_.begin());
             viewHistoryIndex_ = viewHistory_.size() - 1;
         }
     }
-    const uint64_t nextBase = address & ~uint64_t{0xFu};
     if (!viewBaseValid_ || nextBase != viewBase_) {
         viewBytesRead_ = 0;
         viewHavePrevious_ = false;
+        viewValid_.fill(0);
+        viewPreviousValid_.fill(0);
         viewOwner_ = {};
     }
+    viewWildcard_.fill(0);
+    viewEdit_[0] = '\0';
+    viewStatus_.clear();
     viewBase_ = nextBase;
     viewBaseValid_ = true;
     std::snprintf(viewAddress_, sizeof(viewAddress_), "%llX",
                   static_cast<unsigned long long>(address));
     viewSelectionBegin_ = static_cast<int>(address - viewBase_);
-    const uint32_t available = static_cast<uint32_t>(viewBytes_.size()) -
-                               static_cast<uint32_t>(viewSelectionBegin_);
-    const uint32_t selected = (std::min)((std::max)(selectionBytes, 1u), available);
     viewSelectionEnd_ = viewSelectionBegin_ + static_cast<int>(selected) - 1;
+    viewScrollSelection_ = true;
     viewLastRefresh_ = 0.0;
     viewNeedsRefresh_ = true;
 }
 
+bool MemoryToolsTab::viewerRangeReadable(int offset, size_t size) const {
+    if (offset < 0 || !size || static_cast<size_t>(offset) >= viewValid_.size() ||
+        size > viewValid_.size() - static_cast<size_t>(offset)) return false;
+    return std::all_of(viewValid_.begin() + offset,
+                       viewValid_.begin() + offset + size,
+                       [](uint8_t valid) { return valid != 0; });
+}
+
+void MemoryToolsTab::selectViewerByte(int offset, bool extend) {
+    offset = (std::clamp)(offset, 0, static_cast<int>(viewBytes_.size()) - 1);
+    if (extend && viewSelectionBegin_ >= 0) viewSelectionEnd_ = offset;
+    else viewSelectionBegin_ = viewSelectionEnd_ = offset;
+    viewEdit_[0] = '\0'; // A draft must never silently move to a different address.
+    const int lo = (std::min)(viewSelectionBegin_, viewSelectionEnd_);
+    std::snprintf(viewAddress_, sizeof(viewAddress_), "%llX",
+                  static_cast<unsigned long long>(viewBase_ + lo));
+    if (!viewHistory_.empty())
+        viewHistory_[viewHistoryIndex_] = {viewBase_ + lo,
+            static_cast<uint32_t>(std::abs(viewSelectionEnd_ - viewSelectionBegin_) + 1)};
+}
+
+std::string MemoryToolsTab::viewerSelectionText(bool pattern, bool ascii) const {
+    const int lo = (std::min)(viewSelectionBegin_, viewSelectionEnd_);
+    const int hi = (std::max)(viewSelectionBegin_, viewSelectionEnd_);
+    if (lo < 0 || hi >= static_cast<int>(viewBytes_.size())) return {};
+    if (!pattern && !viewerRangeReadable(lo, static_cast<size_t>(hi - lo + 1)))
+        return {};
+    std::string text;
+    for (int i = lo; i <= hi; ++i) {
+        if (ascii) {
+            const uint8_t ch = viewBytes_[i];
+            text.push_back(ch >= 32 && ch < 127 ? static_cast<char>(ch) : '.');
+        } else {
+            if (!text.empty()) text.push_back(' ');
+            if (pattern && (!viewValid_[i] || viewWildcard_[i])) text += "??";
+            else {
+                char byte[4]{};
+                std::snprintf(byte, sizeof(byte), "%02X", viewBytes_[i]);
+                text += byte;
+            }
+        }
+    }
+    return text;
+}
+
 void MemoryToolsTab::refreshViewer(AppContext& ctx, const TargetToken& target,
                                    bool force) {
-    if (!target.valid()) {
+    if (!target.valid() || !viewBaseValid_) {
         viewBytesRead_ = 0;
+        viewValid_.fill(0);
+        viewPreviousValid_.fill(0);
+        viewHavePrevious_ = false;
         return;
     }
     const double now = ImGui::GetTime();
@@ -1514,111 +1581,222 @@ void MemoryToolsTab::refreshViewer(AppContext& ctx, const TargetToken& target,
     viewLastRefresh_ = now;
     viewNeedsRefresh_ = false;
 
-    std::array<uint8_t, 256> bytes{};
-    std::string error;
-    const size_t got = readTarget(&ctx.debug, &passive_, target, viewBase_,
-                                  bytes.data(), bytes.size(), &error);
-    if (viewOwner_.sameSession(target) && viewBytesRead_) {
+    if (viewOwner_.sameSession(target)) {
         viewPrevious_ = viewBytes_;
+        viewPreviousValid_ = viewValid_;
         viewHavePrevious_ = true;
     } else {
         viewHavePrevious_ = false;
+        viewPreviousValid_.fill(0);
     }
-    viewBytes_ = bytes;
-    viewBytesRead_ = got;
+    viewBytes_.fill(0);
+    viewValid_.fill(0);
+    viewBytesRead_ = 0;
+    viewStatus_.clear();
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uint64_t pageSize = info.dwPageSize ? info.dwPageSize : 4096;
+    const uint64_t limit = target.is32 ? UINT32_MAX : UINT64_MAX;
+    // A failed page must not hide a later readable page. At most two OS-page
+    // reads cover this small viewer; each read still checks the exact session.
+    for (size_t offset = 0; offset < viewBytes_.size();) {
+        const uint64_t address = viewBase_ + offset;
+        if (address > limit) break;
+        size_t count = (std::min)(viewBytes_.size() - offset,
+            static_cast<size_t>(pageSize - address % pageSize));
+        if (count - 1 > limit - address)
+            count = static_cast<size_t>(limit - address + 1);
+        std::string error;
+        const size_t got = (std::min)(count, readTarget(&ctx.debug, &passive_,
+            target, address, viewBytes_.data() + offset, count, &error));
+        std::fill_n(viewValid_.begin() + offset, got, uint8_t{1});
+        viewBytesRead_ += got;
+        if (got != count && viewStatus_.empty())
+            viewStatus_ = error.empty() ? "Some bytes could not be read." : error;
+        offset += count;
+    }
     viewOwner_ = target;
-    if (!got && !error.empty()) regionStatus_ = "Viewer: " + error;
+    if (viewBytesRead_ != viewBytes_.size() && viewStatus_.empty())
+        viewStatus_ = "Outside the target address range.";
 }
 
 void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target) {
     const float scale = theme::UiScale();
+    const uint64_t targetLimit = target.is32 ? UINT32_MAX : UINT64_MAX;
+    const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+                         !ImGui::GetIO().WantTextInput;
+    auto restoreHistory = [&] {
+        const ViewerLocation location = viewHistory_[viewHistoryIndex_];
+        navigateViewer(location.address, false, location.selectionBytes);
+    };
+    if (focused && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_G))
+        viewFocusAddress_ = true;
+    if (focused && ImGui::GetIO().KeyAlt && !viewHistory_.empty()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && viewHistoryIndex_ > 0) {
+            --viewHistoryIndex_; restoreHistory();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) &&
+            viewHistoryIndex_ + 1 < viewHistory_.size()) {
+            ++viewHistoryIndex_; restoreHistory();
+        }
+    }
     ImGui::BeginDisabled(viewHistory_.empty() || viewHistoryIndex_ == 0);
-    if (ImGui::SmallButton("<##mem_back")) {
+    if (ImGui::Button("<##mem_back")) {
         --viewHistoryIndex_;
-        navigateViewer(viewHistory_[viewHistoryIndex_], false);
+        restoreHistory();
     }
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Back (Alt+Left)");
     ImGui::SameLine();
     ImGui::BeginDisabled(viewHistory_.empty() ||
                          viewHistoryIndex_ + 1 >= viewHistory_.size());
-    if (ImGui::SmallButton(">##mem_forward")) {
+    if (ImGui::Button(">##mem_forward")) {
         ++viewHistoryIndex_;
-        navigateViewer(viewHistory_[viewHistoryIndex_], false);
+        restoreHistory();
     }
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Forward (Alt+Right)");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(150.0f * theme::UiScale());
-    const bool enter = ImGui::InputText("##memory_view_address", viewAddress_,
-        sizeof(viewAddress_), ImGuiInputTextFlags_CharsHexadecimal |
-                              ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SetNextItemWidth((std::max)(100.0f * scale,
+        (std::min)(190.0f * scale, ImGui::GetContentRegionAvail().x - 50.0f * scale)));
+    if (viewFocusAddress_) { ImGui::SetKeyboardFocusHere(); viewFocusAddress_ = false; }
+    const bool enter = ImGui::InputTextWithHint("##memory_view_address", "Hex address (Ctrl+G)",
+        viewAddress_, sizeof(viewAddress_), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
     if (enter || ImGui::Button("Go")) {
         uint64_t address = 0;
-        if (parseHexAddress(viewAddress_, address)) navigateViewer(address);
+        if (parseHexAddress(viewAddress_, address) && address <= targetLimit)
+            navigateViewer(address);
+        else if (parseHexAddress(viewAddress_, address))
+            ui::Toast(ui::ToastKind::Error, "Address exceeds this 32-bit target's range.");
         else ui::Toast(ui::ToastKind::Error, "Memory address must be hexadecimal.");
     }
-    ui::SameLineIfFits(145.0f * scale);
-    if (ImGui::SmallButton("-100"))
+    ui::SameLineIfFits(275.0f * scale);
+    ImGui::BeginDisabled(!viewBaseValid_ || viewBase_ == 0);
+    if (ImGui::Button("-0x100"))
         navigateViewer(viewBase_ >= 0x100 ? viewBase_ - 0x100 : 0);
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::SmallButton("+100") && viewBase_ <= UINT64_MAX - 0x100)
+    ImGui::BeginDisabled(!viewBaseValid_ || viewBase_ > targetLimit - 0x100);
+    if (ImGui::Button("+0x100"))
         navigateViewer(viewBase_ + 0x100);
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::SmallButton(DS_ICON_REFRESH "##memory_view_refresh"))
+    if (ImGui::Button("Refresh"))
         refreshViewer(ctx, target, true);
-    ui::SameLineIfFits(70.0f * scale);
-    ImGui::Checkbox("Auto", &viewAutoRefresh_);
+    ui::SameLineIfFits(100.0f * scale);
+    ImGui::Checkbox("Live refresh", &viewAutoRefresh_);
 
     refreshViewer(ctx, target, false);
     ImGui::PushTextWrapPos();
-    ImGui::TextDisabled("Accent = selection; amber = changed since the previous refresh. Shift-click extends the selection.");
+    ImGui::TextDisabled("%zu/256 bytes readable | %s", viewBytesRead_,
+        viewAutoRefresh_ ? "updates every 250 ms" : "snapshot held");
+    if (!viewStatus_.empty()) ImGui::TextColored(theme::col::warn(), "%s", viewStatus_.c_str());
     ImGui::PopTextWrapPos();
 
-    if (ImGui::BeginChild("##memory_hex_grid", ImVec2(0, -84.0f * theme::UiScale()),
+    const float gridHeight = (std::clamp)(ImGui::GetContentRegionAvail().y * 0.56f,
+                                         100.0f * scale, 350.0f * scale);
+    if (ImGui::BeginChild("##memory_hex_grid", ImVec2(0, gridHeight),
                           ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_HorizontalScrollbar)) {
-        const float cell = 29.0f * theme::UiScale();
+        if (ImGui::IsWindowFocused() && !ImGui::GetIO().WantTextInput &&
+            !ImGui::GetIO().KeyAlt) {
+            const ImGuiIO& io = ImGui::GetIO();
+            int next = (std::max)(viewSelectionEnd_, 0);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) --next;
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) ++next;
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) next -= 16;
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) next += 16;
+            if (ImGui::IsKeyPressed(ImGuiKey_Home)) next = io.KeyCtrl ? 0 : next & ~15;
+            if (ImGui::IsKeyPressed(ImGuiKey_End)) next = io.KeyCtrl ? 255 : next | 15;
+            if (next != viewSelectionEnd_) {
+                selectViewerByte(next, io.KeyShift); viewScrollSelection_ = true;
+            }
+            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+                selectViewerByte(0, false); selectViewerByte(255, true);
+            }
+            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+                const std::string text = viewerSelectionText(io.KeyShift);
+                if (!text.empty()) ImGui::SetClipboardText(text.c_str());
+                else ui::Toast(ui::ToastKind::Warn,
+                    "Unreadable selection: use Ctrl+Shift+C to copy an AOB with ??.");
+            }
+        }
         ui::PushMono();
-        ImGui::TextUnformatted("                 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F    ASCII");
+        const float cell = ImGui::CalcTextSize("00").x + 7.0f * scale;
+        const float asciiCell = ImGui::CalcTextSize("M").x + 1.0f * scale;
+        const float byteStart = ImGui::CalcTextSize(target.is32 ? "00000000" : "0000000000000000").x +
+                                16.0f * scale;
+        const float asciiStart = byteStart + 16 * (cell + 1.0f) + 8.0f * scale;
+        ImGui::TextUnformatted("Address");
+        for (int column = 0; column < 16; ++column) {
+            ImGui::SameLine(byteStart + column * (cell + 1.0f));
+            ImGui::TextDisabled("%02X", column);
+        }
+        ImGui::SameLine(asciiStart); ImGui::TextDisabled("ASCII");
         for (size_t line = 0; line < 16; ++line) {
             const size_t first = line * 16;
             ImGui::PushID(static_cast<int>(line));
-            ImGui::Text("%016llX ", static_cast<unsigned long long>(viewBase_ + first));
-            ImGui::SameLine(0.0f, 3.0f);
+            ImGui::Text("%0*llX", target.is32 ? 8 : 16,
+                         static_cast<unsigned long long>(viewBase_ + first));
             for (size_t column = 0; column < 16; ++column) {
                 const size_t offset = first + column;
+                ImGui::SameLine(byteStart + column * (cell + 1.0f));
                 ImGui::PushID(static_cast<int>(column));
                 char byte[4] = "??";
-                if (offset < viewBytesRead_)
+                if (viewValid_[offset])
                     std::snprintf(byte, sizeof(byte), "%02X", viewBytes_[offset]);
                 const int lo = (std::min)(viewSelectionBegin_, viewSelectionEnd_);
                 const int hi = (std::max)(viewSelectionBegin_, viewSelectionEnd_);
                 const bool selected = viewSelectionBegin_ >= 0 &&
                                       static_cast<int>(offset) >= lo &&
                                       static_cast<int>(offset) <= hi;
-                const bool changed = offset < viewBytesRead_ && viewHavePrevious_ &&
+                const bool changed = viewValid_[offset] && viewHavePrevious_ &&
+                                     viewPreviousValid_[offset] &&
                                      viewBytes_[offset] != viewPrevious_[offset];
-                if (changed && !selected) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, theme::col::warn());
+                ImGui::PushStyleColor(ImGuiCol_Text, !viewValid_[offset] ? theme::col::muted() :
+                    changed ? theme::col::warn() : ImGui::GetStyleColorVec4(ImGuiCol_Text));
+                const bool activated = ImGui::Selectable(byte, selected, 0, ImVec2(cell, 0.0f));
+                if (activated || ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    selectViewerByte(static_cast<int>(offset), ImGui::GetIO().KeyShift);
                 }
-                if (ImGui::Selectable(byte, selected, 0, ImVec2(cell, 0.0f))) {
-                    if (ImGui::GetIO().KeyShift && viewSelectionBegin_ >= 0)
-                        viewSelectionEnd_ = static_cast<int>(offset);
-                    else
-                        viewSelectionBegin_ = viewSelectionEnd_ = static_cast<int>(offset);
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+                    selectViewerByte(static_cast<int>(offset), true);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s%s%s",
+                    hexAddress(viewBase_ + offset).c_str(),
+                    viewValid_[offset] ? "Readable byte" : "Unreadable byte; never treated as zero",
+                    changed ? " | changed since previous refresh" : "",
+                    viewWildcard_[offset] ? " | copied as ?? in AOB" : "");
+                if (viewWildcard_[offset]) {
+                    const ImVec2 min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
+                    ImGui::GetWindowDrawList()->AddLine(ImVec2(min.x, max.y - 1),
+                        ImVec2(max.x, max.y - 1), ImGui::GetColorU32(theme::col::accent()), 1.0f);
                 }
-                if (changed && !selected) ImGui::PopStyleColor();
+                if (viewScrollSelection_ && static_cast<int>(offset) == viewSelectionEnd_) {
+                    ImGui::SetScrollHereY(0.5f); viewScrollSelection_ = false;
+                }
+                ImGui::PopStyleColor();
                 ImGui::PopID();
-                if (column != 15) ImGui::SameLine(0.0f, 1.0f);
             }
-            ImGui::SameLine(0.0f, 8.0f);
-            char ascii[17]{};
             for (size_t column = 0; column < 16; ++column) {
                 const size_t offset = first + column;
-                const unsigned char ch = offset < viewBytesRead_ ? viewBytes_[offset] : 0;
-                ascii[column] = ch >= 32 && ch < 127 ? static_cast<char>(ch) : '.';
+                const uint8_t ch = viewBytes_[offset];
+                const char text[2] = {viewValid_[offset] ?
+                    (ch >= 32 && ch < 127 ? static_cast<char>(ch) : '.') : '?', '\0'};
+                ImGui::SameLine(asciiStart + column * asciiCell);
+                ImGui::PushID(static_cast<int>(offset) + 256);
+                const bool selected = viewSelectionBegin_ >= 0 &&
+                    static_cast<int>(offset) >= (std::min)(viewSelectionBegin_, viewSelectionEnd_) &&
+                    static_cast<int>(offset) <= (std::max)(viewSelectionBegin_, viewSelectionEnd_);
+                const bool activated = ImGui::Selectable(text, selected, 0, ImVec2(asciiCell, 0));
+                if (activated || ImGui::IsItemClicked(ImGuiMouseButton_Left))
+                    selectViewerByte(static_cast<int>(offset), ImGui::GetIO().KeyShift);
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+                    selectViewerByte(static_cast<int>(offset), true);
+                ImGui::PopID();
             }
-            ImGui::TextUnformatted(ascii);
             ImGui::PopID();
         }
         ui::PopMono();
@@ -1627,71 +1805,133 @@ void MemoryToolsTab::renderHexViewer(AppContext& ctx, const TargetToken& target)
 
     const int selectionLo = (std::min)(viewSelectionBegin_, viewSelectionEnd_);
     const int selectionHi = (std::max)(viewSelectionBegin_, viewSelectionEnd_);
-    const bool validSelection = selectionLo >= 0 && selectionHi >= selectionLo &&
-                                static_cast<size_t>(selectionHi) < viewBytesRead_;
-    ImGui::BeginDisabled(!validSelection);
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##memory_edit", "bytes: e.g. 90 90 01", viewEdit_,
-                             sizeof(viewEdit_));
-    ImGui::EndDisabled();
-    ImGui::BeginDisabled(!validSelection || !target.canWrite);
-    if (ImGui::Button("Write")) {
-        MemoryScanValue value;
-        std::string error;
-        if (!ParseMemoryScanValue(MemoryValueType::ByteArray, viewEdit_, value, &error) ||
-            (!value.mask.empty() && std::find(value.mask.begin(), value.mask.end(), 0u) !=
-                                    value.mask.end())) {
-            if (error.empty()) error = "Writes cannot contain ?? wildcards.";
-            ui::Toast(ui::ToastKind::Error, error);
-        } else if (value.bytes.size() != static_cast<size_t>(selectionHi - selectionLo + 1)) {
-            ui::Toast(ui::ToastKind::Error,
-                      "Write length must exactly match the selected byte span.");
-        } else if (writeTarget(&ctx.debug, &passive_, target,
-                               viewBase_ + static_cast<uint64_t>(selectionLo),
-                               value.bytes, false, error)) {
-            ui::Toast(ui::ToastKind::Success, "Verified memory write applied.");
-            refreshViewer(ctx, target, true);
-        } else {
-            ui::Toast(ui::ToastKind::Error, error);
-        }
+    const bool hasSelection = selectionLo >= 0 && selectionHi >= selectionLo &&
+                              selectionHi < static_cast<int>(viewBytes_.size());
+    const size_t selectionSize = hasSelection ? static_cast<size_t>(selectionHi - selectionLo + 1) : 0;
+    const bool validSelection = hasSelection && viewerRangeReadable(selectionLo, selectionSize);
+    if (hasSelection) {
+        ImGui::PushTextWrapPos();
+        ImGui::Text("%s - %s | %zu byte%s", hexAddress(viewBase_ + selectionLo).c_str(),
+            hexAddress(viewBase_ + selectionHi).c_str(), selectionSize, selectionSize == 1 ? "" : "s");
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::BeginDisabled(!hasSelection);
+    if (ImGui::Button("Copy...")) ImGui::OpenPopup("##memory_copy");
+    if (ImGui::BeginPopup("##memory_copy")) {
+        if (ImGui::MenuItem("Exact bytes", "Ctrl+C", false, validSelection))
+            ImGui::SetClipboardText(viewerSelectionText(false).c_str());
+        if (ImGui::MenuItem("AOB with wildcards", "Ctrl+Shift+C"))
+            ImGui::SetClipboardText(viewerSelectionText(true).c_str());
+        if (ImGui::MenuItem("ASCII display", nullptr, false, validSelection))
+            ImGui::SetClipboardText(viewerSelectionText(false, true).c_str());
+        if (ImGui::MenuItem("Selected address"))
+            ImGui::SetClipboardText(hexAddress(viewBase_ + selectionLo).c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Use ?? for selected bytes"))
+            std::fill(viewWildcard_.begin() + selectionLo,
+                      viewWildcard_.begin() + selectionHi + 1, uint8_t{1});
+        if (ImGui::MenuItem("Use exact selected bytes"))
+            std::fill(viewWildcard_.begin() + selectionLo,
+                      viewWildcard_.begin() + selectionHi + 1, uint8_t{0});
+        if (ImGui::MenuItem("Clear all wildcard marks")) viewWildcard_.fill(0);
+        ImGui::TextDisabled("Underlined bytes and unreadable bytes become ?? in AOB copies.");
+        ImGui::TextDisabled("Marks apply to this view until navigation; memory is unchanged.");
+        ImGui::EndPopup();
     }
     ImGui::EndDisabled();
-    ui::SameLineIfFits(60.0f * scale);
-    ImGui::BeginDisabled(!validSelection);
-    if (ImGui::Button("Copy")) {
-        std::string text;
-        char byte[4]{};
-        for (int i = selectionLo; i <= selectionHi; ++i) {
-            std::snprintf(byte, sizeof(byte), "%02X", viewBytes_[static_cast<size_t>(i)]);
-            if (!text.empty()) text.push_back(' ');
-            text += byte;
-        }
-        ImGui::SetClipboardText(text.c_str());
-        std::snprintf(viewEdit_, sizeof(viewEdit_), "%s", text.c_str());
-    }
     ui::SameLineIfFits(115.0f * scale);
+    ImGui::BeginDisabled(!validSelection);
     if (ImGui::Button("Add address")) {
-        const uint64_t address = viewBase_ + static_cast<uint64_t>(selectionLo);
         std::vector<uint8_t> captured(viewBytes_.begin() + selectionLo,
                                       viewBytes_.begin() + selectionHi + 1);
         const MemoryValueType type = captured.size() == 1 ? MemoryValueType::UInt8 :
             captured.size() == 2 ? MemoryValueType::UInt16 :
             captured.size() == 4 ? MemoryValueType::UInt32 :
             captured.size() == 8 ? MemoryValueType::UInt64 : MemoryValueType::ByteArray;
-        addAddressRow(ctx, target, address, type, &captured, "viewer selection");
-    }
-    ui::SameLineIfFits(135.0f * scale);
-    if (ImGui::Button("Follow pointer")) {
-        const size_t width = target.is32 ? 4u : 8u;
-        if (static_cast<size_t>(selectionLo) + width <= viewBytesRead_) {
-            uint64_t pointer = 0;
-            std::memcpy(&pointer, viewBytes_.data() + selectionLo, width);
-            navigateViewer(pointer);
-        } else {
-            ui::Toast(ui::ToastKind::Warn, "Select a readable pointer-sized value.");
-        }
+        addAddressRow(ctx, target, viewBase_ + selectionLo, type, &captured, "viewer selection");
     }
     ImGui::EndDisabled();
+    const size_t pointerWidth = target.is32 ? 4u : 8u;
+    ui::SameLineIfFits(140.0f * scale);
+    ImGui::BeginDisabled(!viewerRangeReadable(selectionLo, pointerWidth));
+    bool followedPointer = false;
+    if (ImGui::Button("Follow pointer")) {
+        uint64_t pointer = 0;
+        std::memcpy(&pointer, viewBytes_.data() + selectionLo, pointerWidth);
+        navigateViewer(pointer);
+        followedPointer = true;
+    }
+    ImGui::EndDisabled();
+    if (followedPointer) return;
+
+    // These are interpretations of bytes at the selection start, not inferred
+    // variable types. Their read width is independent of the selected span.
+    if (ImGui::CollapsingHeader("Value at selection", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(85.0f * scale);
+        ImGui::Combo("##memory_value_type", &viewValueType_, kMemoryTypeNames, 10);
+        const MemoryValueType type = static_cast<MemoryValueType>(viewValueType_);
+        const size_t width = MemoryValueTypeFixedSize(type);
+        const bool readable = viewerRangeReadable(selectionLo, width);
+        ui::SameLineIfFits(180.0f * scale);
+        const std::string value = readable ? formatMemoryValue(type,
+            viewBytes_.data() + selectionLo, width) : "unreadable";
+        ImGui::TextUnformatted(value.c_str());
+        if (readable && type != MemoryValueType::Float32 && type != MemoryValueType::Float64) {
+            ui::SameLineIfFits(110.0f * scale);
+            ImGui::TextDisabled("(%s)", formatMemoryValue(type,
+                viewBytes_.data() + selectionLo, width, true).c_str());
+        }
+        ImGui::BeginDisabled(!readable);
+        if (ImGui::SmallButton("Copy value")) ImGui::SetClipboardText(value.c_str());
+        ui::SameLineIfFits(150.0f * scale);
+        if (ImGui::SmallButton("Add typed address")) {
+            std::vector<uint8_t> captured(viewBytes_.begin() + selectionLo,
+                                          viewBytes_.begin() + selectionLo + width);
+            addAddressRow(ctx, target, viewBase_ + selectionLo, type, &captured, "viewer value");
+        }
+        ImGui::EndDisabled();
+        ui::SameLineIfFits(175.0f * scale);
+        ImGui::TextDisabled("%zu bytes, little-endian", width);
+    }
+    if (ImGui::CollapsingHeader("Edit selected bytes")) {
+        ImGui::PushTextWrapPos();
+        ImGui::BeginDisabled(!validSelection || !target.canWrite);
+        if (ImGui::SmallButton("Load selection into editor"))
+            std::snprintf(viewEdit_, sizeof(viewEdit_), "%s", viewerSelectionText(false).c_str());
+        ImGui::TextDisabled("Exact-length, verified write. Selecting another span clears this draft.");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##memory_edit", "bytes: e.g. 90 90 01", viewEdit_,
+                                 sizeof(viewEdit_));
+        ImGui::EndDisabled();
+        ImGui::BeginDisabled(!validSelection || !target.canWrite || !viewEdit_[0]);
+        if (ImGui::Button("Write selected bytes")) {
+            MemoryScanValue value;
+            std::string error;
+            if (!ParseMemoryScanValue(MemoryValueType::ByteArray, viewEdit_, value, &error) ||
+                (!value.mask.empty() && std::find(value.mask.begin(), value.mask.end(), 0u) !=
+                                        value.mask.end())) {
+                if (error.empty()) error = "Writes cannot contain ?? wildcards.";
+                ui::Toast(ui::ToastKind::Error, error);
+            } else if (value.bytes.size() != selectionSize) {
+                ui::Toast(ui::ToastKind::Error,
+                          "Write length must exactly match the selected byte span.");
+            } else if (writeTarget(&ctx.debug, &passive_, target,
+                                   viewBase_ + static_cast<uint64_t>(selectionLo),
+                                   value.bytes, false, error)) {
+                ui::Toast(ui::ToastKind::Success, "Verified memory write applied.");
+                refreshViewer(ctx, target, true);
+            } else {
+                ui::Toast(ui::ToastKind::Error, error);
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::PopTextWrapPos();
+    }
+    if (ImGui::CollapsingHeader("Viewer controls")) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("Click bytes or ASCII; drag or Shift-click to select. Arrow keys move; Shift+arrows extend. Home/End move within a row; Ctrl+Home/End and Ctrl+A cover this view. Ctrl+C copies bytes; Ctrl+Shift+C copies AOB. Ctrl+G focuses the address; Alt+Left/Right use history. Amber = changed; ?? = unreadable; underline = wildcard mark.");
+        ImGui::PopTextWrapPos();
+    }
 }
 
 void MemoryToolsTab::renderRegionBrowser(AppContext& ctx,
@@ -1982,31 +2222,34 @@ void MemoryToolsTab::startPointerScan(AppContext& ctx, const TargetToken& target
 void MemoryToolsTab::renderPointerScanner(AppContext& ctx,
                                           const TargetToken& target) {
     pumpPointerCompletion();
+    const float scale = theme::UiScale();
+    const bool running = pointerRunning_.load(std::memory_order_acquire);
     ImGui::TextWrapped("Finds bounded pointer paths ending at a live address. Module roots are ASLR-stable and rank first.");
-    ImGui::SetNextItemWidth(160.0f * theme::UiScale());
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(160.0f * scale);
     ImGui::InputText("Target (hex)", pointerTarget_, sizeof(pointerTarget_),
                      ImGuiInputTextFlags_CharsHexadecimal);
-    ImGui::SetNextItemWidth(90.0f * theme::UiScale());
+    ImGui::SetNextItemWidth(90.0f * scale);
     ImGui::InputInt("Max depth", &pointerDepth_);
     pointerDepth_ = (std::clamp)(pointerDepth_, 1, 16);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(100.0f * theme::UiScale());
+    ui::SameLineIfFits(100.0f * scale + ImGui::CalcTextSize("Max offset").x + ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::SetNextItemWidth(100.0f * scale);
     ImGui::InputInt("Max offset", &pointerMaxOffset_);
     pointerMaxOffset_ = (std::clamp)(pointerMaxOffset_, 0, 1 << 20);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(90.0f * theme::UiScale());
+    ui::SameLineIfFits(90.0f * scale + ImGui::CalcTextSize("Read MiB").x + ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::SetNextItemWidth(90.0f * scale);
     ImGui::InputInt("Read MiB", &pointerMaxMiB_);
     pointerMaxMiB_ = (std::clamp)(pointerMaxMiB_, 16, 1024);
     ImGui::Checkbox("Module roots only", &pointerStaticRootsOnly_);
-    ImGui::SameLine();
+    ui::SameLineIfFits(ImGui::GetFrameHeight() + ImGui::CalcTextSize("Writable storage only").x + ImGui::GetStyle().ItemInnerSpacing.x);
     ImGui::Checkbox("Writable storage only", &pointerWritableOnly_);
+    ImGui::EndDisabled();
 
-    const bool running = pointerRunning_.load(std::memory_order_acquire);
     ImGui::BeginDisabled(running || !target.valid());
     if (ui::AccentButton("Pointer scan", theme::col::accent())) startPointerScan(ctx, target);
     ImGui::EndDisabled();
     if (running) {
-        ImGui::SameLine();
+        ui::SameLineIfFits(ImGui::CalcTextSize("Cancel").x + ImGui::GetStyle().FramePadding.x * 2);
         if (ImGui::Button("Cancel")) cancelPointerScan();
         const uint64_t total = pointerTotal_.load(std::memory_order_relaxed);
         const uint64_t done = pointerProgress_.load(std::memory_order_relaxed);
@@ -2014,7 +2257,20 @@ void MemoryToolsTab::renderPointerScanner(AppContext& ctx,
                                       static_cast<float>(total) : 0.0f,
                            ImVec2(-1, 0), nullptr);
     }
-    if (!pointerStatus_.empty()) ImGui::TextDisabled("%s", pointerStatus_.c_str());
+    if (!pointerStatus_.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", pointerStatus_.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    if (pointerRows_.empty()) {
+        ImGui::TextWrapped(running ? "Searching for pointer paths..."
+            : pointerStatus_.empty()
+                ? "Enter a target address and run Pointer scan. Results can be added to the address table with a double-click or the context menu."
+                : "No pointer paths to show. Review the scan status above, adjust the target or scan limits, then run Pointer scan again.");
+        return;
+    }
+    ImGui::TextDisabled("%zu pointer path%s", pointerRows_.size(), pointerRows_.size() == 1 ? "" : "s");
+    ui::ItemTooltip("Double-click a path to add it to the address table. Right-click for viewer actions.");
 
     if (ImGui::BeginTable("##pointer_results", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
@@ -2022,8 +2278,8 @@ void MemoryToolsTab::renderPointerScanner(AppContext& ctx,
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Root", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Offsets", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Depth", ImGuiTableColumnFlags_WidthFixed, 52.0f);
-        ImGui::TableSetupColumn("Stable", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+        ImGui::TableSetupColumn("Depth", ImGuiTableColumnFlags_WidthFixed, 52.0f * scale);
+        ImGui::TableSetupColumn("Root kind", ImGuiTableColumnFlags_WidthFixed, 72.0f * scale);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(pointerRows_.size()));

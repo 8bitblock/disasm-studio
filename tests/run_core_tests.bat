@@ -1,207 +1,15 @@
 @echo off
-rem Build + run the Core test harnesses with MSVC. Most are dependency-light;
-rem xref_arch_test links the static decoder libraries installed by the app build.
-rem Run from any directory; Visual Studio is located with vswhere. Pass one test
-rem name as the optional first argument to run only that declaration.
-rem
-rem Test declarations live at the bottom as "rem TEST|name|dependencies" records.
-rem Environment-dependent process/debugger checks use LIVE_TEST records. They are
-rem reported as explicit skips in the default local suite and run when selected
-rem by name, for example: run_core_tests.bat wow64_debug_test. CI sets
-rem DS_REQUIRE_LIVE_DEBUG_TESTS=1 so an unavailable target/privilege is a failure.
-rem Keeping them as data avoids CALL/GOTO subroutines: cmd.exe can mis-seek labels in
-rem LF-only batch files, silently skip calls, or re-enter the main body.
-setlocal EnableExtensions EnableDelayedExpansion
-set "FILTER=%~1"
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0validate_test_manifest.ps1" -ManifestPath "%~f0"
-if errorlevel 1 exit /b 1
-
-pushd "%~dp0.." >nul
-if errorlevel 1 (
-    echo Failed to enter the project root.
-    exit /b 1
-)
-
-rem Use the same VS2022 major selected by the app build. An explicit path is
-rem useful for side-by-side installations; otherwise constrain vswhere so a
-rem newer Visual Studio cannot silently change the test ABI/toolset.
-set "VSPATH=%VCPKG_VISUAL_STUDIO_PATH%"
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-set "VS2022_RANGE=[17.0,18.0)"
-set "VSWHERE_MISSING="
-if not defined VSPATH if not exist "!VSWHERE!" set "VSWHERE_MISSING=1"
-if defined VSWHERE_MISSING (
-    echo vswhere.exe was not found. Install Visual Studio 2022 with the C++ workload or set VCPKG_VISUAL_STUDIO_PATH.
-    popd
-    exit /b 1
-)
-if not defined VSPATH for /f "usebackq delims=" %%i in (`""!VSWHERE!" -latest -version "!VS2022_RANGE!" -products * -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath"`) do set "VSPATH=%%i"
-if not defined VSPATH (
-    echo A complete Visual Studio 2022 C++ installation was not found.
-    popd
-    exit /b 1
-)
-if not exist "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" (
-    echo The selected Visual Studio path is missing vcvars64.bat: "!VSPATH!"
-    popd
-    exit /b 1
-)
-
-call "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-if errorlevel 1 (
-    echo Visual Studio environment setup failed.
-    popd
-    exit /b 1
-)
-
-rem An isolated directory prevents concurrent or previously interrupted runs
-rem from sharing compiler outputs. cmd.exe instances can start with identical
-rem RANDOM sequences, so retry mkdir atomically instead of trusting one token.
-set "OUT="
-for /l %%R in (1,1,32) do if not defined OUT (
-    set "CANDIDATE=%TEMP%\dsm_tests_!RANDOM!_!RANDOM!_!RANDOM!"
-    mkdir "!CANDIDATE!" >nul 2>&1 && set "OUT=!CANDIDATE!"
-)
-if not defined OUT (
-    echo Failed to create an isolated test output directory under %TEMP%.
-    popd
-    exit /b 1
-)
-
-set /a DECLARED=0
-set /a SELECTED=0
-set /a SKIPPED=0
-set /a FAILED=0
-
-for /f "usebackq tokens=2,* delims=|" %%A in (`findstr /b /l /c:"rem TEST|" "%~f0"`) do (
-    set /a DECLARED+=1
-    set "NAME=%%A"
-    set "DEPS=%%B"
-    set "RUN_THIS=1"
-    if defined FILTER if /i not "!NAME!"=="!FILTER!" set "RUN_THIS=0"
-
-    if "!RUN_THIS!"=="1" (
-        set /a SELECTED+=1
-        echo.
-        echo ---- !NAME! ----
-        rem The pure gate ABI fixture links freshly assembled production gates.
-        rem It neither injects nor requires an application build.
-        if /i "!NAME!"=="gamemaker_helper_gate_test" (
-            ml64 /nologo /c /Fo"!OUT!\gamemaker_gates.obj" src\GameMakerHelper\GameMakerGates.asm
-            if errorlevel 1 set /a FAILED+=1
-            ml64 /nologo /c /Fo"!OUT!\gamemaker_gate_fixture.obj" tests\gamemaker_helper_gate_test.asm
-            if errorlevel 1 set /a FAILED+=1
-            set "DEPS=!DEPS! "!OUT!\gamemaker_gates.obj" "!OUT!\gamemaker_gate_fixture.obj""
-        )
-        cl /nologo /std:c++20 /EHsc /I src tests\!NAME!.cpp !DEPS! /Fo"!OUT!\\" /Fe"!OUT!\!NAME!.exe" >"!OUT!\!NAME!.build.log" 2>&1
-        set "BUILD_RC=!ERRORLEVEL!"
-
-        if not "!BUILD_RC!"=="0" (
-            echo BUILD FAILED ^(exit !BUILD_RC!^):
-            type "!OUT!\!NAME!.build.log"
-            set /a FAILED+=1
-        ) else (
-            "!OUT!\!NAME!.exe"
-            set "TEST_RC=!ERRORLEVEL!"
-            if not "!TEST_RC!"=="0" (
-                echo TEST FAILED: !NAME! ^(exit !TEST_RC!^)
-                set /a FAILED+=1
-            )
-        )
-    )
-)
-
-for /f "usebackq tokens=2,* delims=|" %%A in (`findstr /b /l /c:"rem LIVE_TEST|" "%~f0"`) do (
-    set /a DECLARED+=1
-    set "NAME=%%A"
-    set "DEPS=%%B"
-    set "RUN_THIS=0"
-    if defined FILTER if /i "!NAME!"=="!FILTER!" set "RUN_THIS=1"
-
-    if "!RUN_THIS!"=="1" (
-        set /a SELECTED+=1
-        echo.
-        echo ---- !NAME! [LIVE] ----
-        cl /nologo /std:c++20 /EHsc /I src tests\!NAME!.cpp !DEPS! /Fo"!OUT!\\" /Fe"!OUT!\!NAME!.exe" >"!OUT!\!NAME!.build.log" 2>&1
-        set "BUILD_RC=!ERRORLEVEL!"
-
-        if not "!BUILD_RC!"=="0" (
-            echo BUILD FAILED ^(exit !BUILD_RC!^):
-            type "!OUT!\!NAME!.build.log"
-            set /a FAILED+=1
-        ) else (
-            "!OUT!\!NAME!.exe"
-            set "TEST_RC=!ERRORLEVEL!"
-            if not "!TEST_RC!"=="0" (
-                echo TEST FAILED: !NAME! ^(exit !TEST_RC!^)
-                set /a FAILED+=1
-            )
-        )
-    ) else if not defined FILTER (
-        set /a SKIPPED+=1
-        echo SKIP [LIVE]: !NAME! ^(requires a launchable target and debugger privileges^)
-    )
-)
-
-for /f "usebackq tokens=2,* delims=|" %%A in (`findstr /b /l /c:"rem INTEGRATION_TEST|" "%~f0"`) do (
-    set /a DECLARED+=1
-    set "NAME=%%A"
-    set "RUN_THIS=0"
-    if defined FILTER if /i "!NAME!"=="!FILTER!" set "RUN_THIS=1"
-    if "!RUN_THIS!"=="1" (
-        set /a SELECTED+=1
-        echo.
-        echo ---- !NAME! [INTEGRATION] ----
-        powershell -NoProfile -ExecutionPolicy Bypass -File "%%B"
-        if errorlevel 1 set /a FAILED+=1
-    ) else if not defined FILTER (
-        set /a SKIPPED+=1
-        echo SKIP [INTEGRATION]: !NAME! ^(requires a current Release app build^)
-    )
-)
-
-echo.
-if !DECLARED! EQU 0 (
-    echo ===== NO TEST BINARIES DECLARED =====
-    set /a FAILED+=1
-) else if !SELECTED! EQU 0 (
-    echo ===== NO TEST MATCHED "!FILTER!" =====
-    set /a FAILED+=1
-) else if !FAILED! EQU 0 (
-    echo ===== ALL !SELECTED! SELECTED TEST BINARIES PASSED ^(!DECLARED! DECLARED, !SKIPPED! EXPLICITLY SKIPPED^) =====
-) else (
-    echo ===== !FAILED! OF !SELECTED! SELECTED TEST BINARIES FAILED ^(!DECLARED! DECLARED, !SKIPPED! EXPLICITLY SKIPPED^) =====
-)
-
-set "RESULT=!FAILED!"
-popd
-rem A passing run has no useful artifacts, but a failure keeps its exact build
-rem logs for diagnosis. Guard recursive cleanup with the leaf name generated by
-rem the bounded mkdir loop above; never delete an empty or unexpected path.
-if "!RESULT!"=="0" (
-    set "OUT_NAME="
-    if defined OUT for %%I in ("!OUT!") do set "OUT_NAME=%%~nxI"
-    if defined OUT_NAME if /i "!OUT_NAME:~0,10!"=="dsm_tests_" (
-        rem A just-exited live debugger fixture can retain its image mapping for a
-        rem fraction of a second. Retry only this run's already-validated exact
-        rem directory; never enumerate or remove sibling dsm_tests directories.
-        for /l %%R in (1,1,5) do if exist "!OUT!\" (
-            rmdir /s /q "!OUT!" >nul 2>&1
-            if exist "!OUT!\" ping 127.0.0.1 -n 2 >nul
-        )
-        if exist "!OUT!\" (
-            echo ERROR: Could not remove current temporary test directory "!OUT!" after bounded retries.
-            set /a RESULT+=1
-        )
-    ) else (
-        echo WARNING: Refusing to remove unexpected temporary test path "!OUT!".
-    )
-) else (
-    echo Failed-test artifacts retained at "!OUT!".
-)
-exit /b !RESULT!
-
+rem Compatibility entrypoint and validated test manifest. Execution is owned by
+rem run_core_tests.ps1: default Core; -Suite All includes every declaration;
+rem -Suite Integration or Live selects that category; a test name selects one.
+rem Build Release|x64 before All/Integration. Live/All require debugger support.
+rem Logs and summary.json are retained under build/test-results.
+setlocal EnableExtensions DisableDelayedExpansion
+set "DS_TEST_SHELL=powershell.exe"
+where pwsh.exe >nul 2>&1
+if not errorlevel 1 set "DS_TEST_SHELL=pwsh.exe"
+"%DS_TEST_SHELL%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_core_tests.ps1" %*
+exit /b %ERRORLEVEL%
 rem TEST|fuzzy_test|
 rem TEST|function_filter_test|
 rem TEST|investigation_index_test|src\Core\InvestigationIndex.cpp
@@ -215,6 +23,7 @@ rem TEST|semantic_transfer_test|src\Core\SemanticTransfer.cpp
 rem TEST|symbol_service_test|src\Core\SymbolService.cpp src\Core\SymbolResolver.cpp src\Core\Demangle.cpp
 rem TEST|preferences_test|src\Core\Preferences.cpp src\Core\AtomicFile.cpp
 rem TEST|instr_dataref_test|
+rem TEST|instruction_byte_pattern_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib
 rem TEST|step_logic_test|
 rem TEST|memcompare_test|
 rem TEST|memory_scan_test|src\Core\MemoryScan.cpp
@@ -324,10 +133,10 @@ rem TEST|funcannotate_test|src\Core\FuncAnnotate.cpp src\Core\NetworkApiCatalog.
 rem TEST|cortex_test|src\Core\Cortex.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\AuthorizationAnalysis.cpp src\Core\PersistentStateCatalog.cpp src\Core\GameMakerArchive.cpp
 rem TEST|prism_test|src\Core\Prism.cpp
 
-rem LIVE_TEST|x64_debug_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
-rem TEST|debugger_lifecycle_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
-rem LIVE_TEST|wow64_debug_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
-rem LIVE_TEST|authorization_watch_live_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
+rem LIVE_TEST|x64_debug_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\DebuggerBreakpointMemory.cpp src\Core\DebuggerBreakpoints.cpp src\Core\DebuggerExecution.cpp src\Core\DebuggerObservers.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
+rem TEST|debugger_lifecycle_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\DebuggerBreakpointMemory.cpp src\Core\DebuggerBreakpoints.cpp src\Core\DebuggerExecution.cpp src\Core\DebuggerObservers.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
+rem LIVE_TEST|wow64_debug_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\DebuggerBreakpointMemory.cpp src\Core\DebuggerBreakpoints.cpp src\Core\DebuggerExecution.cpp src\Core\DebuggerObservers.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
+rem LIVE_TEST|authorization_watch_live_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\Debugger.cpp src\Core\DebuggerBreakpointMemory.cpp src\Core\DebuggerBreakpoints.cpp src\Core\DebuggerExecution.cpp src\Core\DebuggerObservers.cpp src\Core\Cond.cpp src\Core\AntiDebug.cpp src\Core\TraceCoverage.cpp src\Core\AuthorizationWatch.cpp src\Core\DllDebugPlan.cpp src\Core\NetworkEndpoint.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Disasm\ZydisDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib ws2_32.lib winhttp.lib wininet.lib src\Core\GameMakerArchive.cpp src\Core\DebuggerGameMaker.cpp src\Core\GameMakerDebug.cpp src\Core\GameMakerRunner.cpp src\Core\GameMakerHelperImage.cpp src\Core\GameMakerInspection.cpp
 
 rem TEST|ui_widgets_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Ui\Widgets.cpp src\Ui\Theme.cpp src\Ui\Fonts.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\imgui.lib
 rem INTEGRATION_TEST|static_listing_actions_test|tests\run_static_listing_actions_test.ps1
@@ -347,3 +156,8 @@ rem TEST|gamemaker_helper_state_test|src\Core\GameMakerDebug.cpp src\Core\GameMa
 rem TEST|gamemaker_hook_mutation_test|
 rem TEST|gamemaker_project_test|src\Core\Project.cpp src\Core\AtomicFile.cpp src\Core\Json.cpp src\Core\ConnectionSchema.cpp
 rem TEST|gamemaker_load_test|src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp src\Disasm\GmlDisassembler.cpp src\Core\FunctionAnalyzer.cpp src\Core\CodeDataClassifier.cpp src\Core\JumpTableResolver.cpp src\Core\CFG.cpp src\Core\Demangle.cpp
+
+rem TEST|patch_recovery_test|src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp src\Core\Project.cpp src\Core\AtomicFile.cpp src\Core\Json.cpp src\Core\ConnectionSchema.cpp
+rem TEST|assembler_encoding_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Disasm\Assembler.cpp src\Core\PatchCompiler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\keystone.lib shell32.lib
+rem TEST|artifact_write_test|src\Core\ArtifactWrite.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
+rem TEST|debugger_memory_mutation_test|src\Core\DebuggerBreakpointMemory.cpp

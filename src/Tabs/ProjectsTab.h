@@ -22,6 +22,7 @@ private:
     bool     lastSeenBinaryLoaded_ = false;
     uint64_t selectedHash_        = 0;
     float    listWidth_           = 0.0f; // retained master/detail splitter width
+    float    lastScale_           = 0.0f;
     uint64_t lastSeenHash_        = ~0ull; // re-read the index when the active project changes
     char     filter_[256]         = {};
     std::string openError_;

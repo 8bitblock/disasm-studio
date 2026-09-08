@@ -9,6 +9,7 @@
 //   .\instr_dataref_test.exe
 //
 #include "Tabs/DataRef.h"
+#include "Core/MemoryValueHint.h"
 
 #include <cstdio>
 
@@ -26,7 +27,85 @@ static Instruction mk(const char* mnem, const char* ops, uint64_t addr, uint32_t
     return in;
 }
 
+static void memoryValueHints() {
+    Instruction in = mk("mov", "eax, [0x123456]", 0x1000, 6);
+    TypedOperand operand;
+    operand.kind = OperandKind::Memory;
+    operand.access = OperandAccess::Read;
+    operand.widthBits = 32;
+    operand.displacementValid = true;
+    operand.displacement = 0x123456;
+    in.typedOperands = {operand};
+    MemoryValueReference ref;
+    CHECK(TryGetMemoryValueReference(in, ref));
+    CHECK(ref.address == 0x123456 && ref.widthBits == 32);
+    const uint8_t ten[] = {10, 0, 0, 0};
+    auto hint = FormatMemoryValueHint(ref, ten, sizeof(ten), ByteOrder::Little, true);
+    CHECK(hint.text == "LIVE [0x123456] = 10 (u32, 0x0000000A)");
+    CHECK(hint.tooltip.find("Signed i32: 10") != std::string::npos);
+    CHECK(hint.tooltip.find("float32 interpretation") != std::string::npos);
+    hint = FormatMemoryValueHint(ref, ten, 3, ByteOrder::Little, true);
+    CHECK(hint.text.find("unavailable") != std::string::npos);
+    CHECK(hint.text.find("= 10") == std::string::npos);
+    hint = FormatMemoryValueHint(ref, nullptr, 4, ByteOrder::Little, false);
+    CHECK(hint.text.find("FILE") == 0 && hint.text.find("unavailable") != std::string::npos);
+    const uint8_t bigTen[] = {0, 0, 0, 10};
+    hint = FormatMemoryValueHint(ref, bigTen, sizeof(bigTen), ByteOrder::Big, false);
+    CHECK(hint.text == "FILE [0x123456] = 10 (u32, 0x0000000A)");
+    const uint8_t negative[] = {255,255,255,255,255,255,255,255};
+    hint = FormatMemoryValueHint({0, 64}, negative, 8, ByteOrder::Little, false);
+    CHECK(hint.tooltip.find("Signed i64: -1") != std::string::npos);
+    CHECK(hint.text.find("18446744073709551615") != std::string::npos);
+    const uint8_t min64[] = {0,0,0,0,0,0,0,128};
+    CHECK(FormatMemoryValueHint({0,64}, min64,8,ByteOrder::Little,false).tooltip.find(
+              "Signed i64: -9223372036854775808") != std::string::npos);
+    CHECK(FormatMemoryValueHint({0,8}, negative,1,ByteOrder::Little,false).tooltip.find(
+              "Signed i8: -1") != std::string::npos);
+    CHECK(FormatMemoryValueHint({0,16}, negative,2,ByteOrder::Big,false).tooltip.find(
+              "Signed i16: -1") != std::string::npos);
+    const uint8_t floatTen[] = {0,0,32,65};
+    CHECK(FormatMemoryValueHint({0,32}, floatTen,4,ByteOrder::Little,false).tooltip.find(
+              "float32 interpretation: 10") != std::string::npos);
+    CHECK(FormatMemoryValueHint({0,128}, negative,8,ByteOrder::Little,false).text.empty());
+    in.mnemonic = "lea";
+    CHECK(!TryGetMemoryValueReference(in, ref));
+    in.mnemonic = "mov";
+    in.typedOperands[0].access = OperandAccess::Write;
+    CHECK(TryGetMemoryValueReference(in, ref)); // show current destination contents
+    in.typedOperands[0].baseRegister = "rax";
+    CHECK(!TryGetMemoryValueReference(in, ref));
+    in.typedOperands[0].baseRegister.clear();
+    in.typedOperands[0].segmentRegister = "fs";
+    CHECK(!TryGetMemoryValueReference(in, ref));
+    in.typedOperands[0].segmentRegister.clear();
+    in.typedOperands[0].indexRegister = "ecx";
+    CHECK(!TryGetMemoryValueReference(in, ref));
+    in.typedOperands[0].indexRegister.clear();
+    in.typedOperands[0].displacement = 0;
+    CHECK(TryGetMemoryValueReference(in, ref) && ref.address == 0);
+    in.typedOperands[0].baseRegister = "rip";
+    in.typedOperands[0].displacement = 8;
+    CHECK(TryGetMemoryValueReference(in, ref) && ref.address == 0x100e);
+    in.address = UINT64_MAX - 7;
+    in.typedOperands[0].displacement = 0;
+    CHECK(!TryGetMemoryValueReference(in, ref)); // four-byte read would wrap
+    in.typedOperands[0].widthBits = 8;
+    CHECK(TryGetMemoryValueReference(in, ref) && ref.address == UINT64_MAX - 1);
+    in.typedOperands[0].widthBits = 0;
+    CHECK(!TryGetMemoryValueReference(in, ref));
+    in.typedOperands[0].widthBits = 128;
+    CHECK(!TryGetMemoryValueReference(in, ref));
+    in.typedOperands.clear();
+    CHECK(!TryGetMemoryValueReference(in, ref)); // do not guess width from text
+    in = mk("mov", "eax, 0x123456", 0x1000, 5);
+    operand.kind = OperandKind::Immediate;
+    operand.immediate = 0x123456;
+    in.typedOperands = {operand};
+    CHECK(!TryGetMemoryValueReference(in, ref));
+}
+
 int main() {
+    memoryValueHints();
     uint64_t ref = 0xDEADBEEFull;
 
     // Absolute direct memory operand (Zydis resolves RIP-relative to absolute):

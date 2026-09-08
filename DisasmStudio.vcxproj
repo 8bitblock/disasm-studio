@@ -126,6 +126,11 @@
     <ClCompile Include="src\Core\JumpTableResolver.cpp" />
     <ClCompile Include="src\Core\FunctionNamer.cpp" />
     <ClCompile Include="src\Core\Debugger.cpp" />
+    <ClCompile Include="src\Core\DebuggerBreakpointMemory.cpp" />
+    <ClCompile Include="src\Core\DebuggerBreakpoints.cpp" />
+    <ClCompile Include="src\Core\DebuggerExecution.cpp" />
+    <ClCompile Include="src\Core\DebuggerObservers.cpp" />
+    <ClCompile Include="src\Core\ArtifactWrite.cpp" />
     <ClCompile Include="src\Core\DebuggerGameMaker.cpp" />
     <ClCompile Include="src\Core\SymbolResolver.cpp" />
     <ClCompile Include="src\Core\SymbolService.cpp" />
@@ -260,6 +265,8 @@
     <ClInclude Include="src\Core\AddressSpan.h" />
     <ClInclude Include="src\Core\AttachImagePolicy.h" />
     <ClInclude Include="src\Core\AddressInspector.h" />
+    <ClInclude Include="src\Core\MemoryValueHint.h" />
+    <ClInclude Include="src\Core\InstructionBytePattern.h" />
     <ClInclude Include="src\Core\BinaryFile.h" />
     <ClInclude Include="src\Core\ResourceDecode.h" />
     <ClInclude Include="src\Core\RegisterEdit.h" />
@@ -295,6 +302,12 @@
     <ClInclude Include="src\Core\TypeSystem.h" />
     <ClInclude Include="src\Core\InstructionSemantics.h" />
     <ClInclude Include="src\Core\PatchedImage.h" />
+    <ClInclude Include="src\Core\DebuggerInternal.h" />
+    <ClInclude Include="src\Core\DebuggerMemoryMutation.h" />
+    <ClInclude Include="src\Core\DebuggerExecutionPolicy.h" />
+    <ClInclude Include="src\Core\ArtifactWrite.h" />
+    <ClInclude Include="src\Core\OwnedImage.h" />
+    <ClInclude Include="src\Core\PatchRecovery.h" />
     <ClInclude Include="src\Core\PatchRefresh.h" />
     <ClInclude Include="src\Core\LivePatchOriginal.h" />
     <ClInclude Include="src\Core\Decompiler.h" />

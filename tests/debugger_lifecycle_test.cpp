@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <stdexcept>
 #include <thread>
@@ -16,6 +17,42 @@ struct LifecycleTestAccess {
     }
     static void record(Debugger& debugger, const NetworkObservationEvent& event) {
         debugger.writeNetworkObservationLog(event);
+    }
+    static bool queueWakesHeldEvent(Debugger& debugger, const std::function<void()>& submit) {
+        auto waiter = std::async(std::launch::async, [&] {
+            return debugger.waitForCommand(debugger.controlEpoch_).command;
+        });
+        submit();
+        const bool woke = waiter.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        if (!woke) debugger.cont(); // bounded failure: release the test waiter
+        const bool service = waiter.get() == Debugger::Cmd::ServiceWrites;
+        std::lock_guard lock(debugger.mtx_);
+        debugger.pendingHwAdds_.clear(); debugger.pendingHwRems_.clear();
+        debugger.pendingNetworkSync_ = false; debugger.pendingCommand_ = {};
+        return woke && service && debugger.state_ == DbgState::Paused;
+    }
+    static bool hardwareLastIntentWins(Debugger& debugger) {
+        if (!debugger.addHardwareBreakpointForSession({17, 19}, 0x2000) ||
+            !debugger.removeHardwareBreakpointForSession({17, 19}, 0x2000)) return false;
+        { std::lock_guard lock(debugger.mtx_);
+          if (!debugger.pendingHwAdds_.empty() || debugger.pendingHwRems_.size() != 1) return false; }
+        if (!debugger.addHardwareBreakpointForSession({17, 19}, 0x2000, HwKind::Write, 4)) return false;
+        std::lock_guard lock(debugger.mtx_);
+        const bool replacement = debugger.pendingHwAdds_.size() == 1 && debugger.pendingHwRems_.size() == 1 &&
+            debugger.pendingHwAdds_[0].kind == HwKind::Write;
+        debugger.pendingHwAdds_.clear(); debugger.pendingHwRems_.clear();
+        return replacement;
+    }
+    static bool mutationCancelsEarlierExecution(Debugger& debugger) {
+        debugger.cont();
+        debugger.recordExecutionFailure("injected mutation failure; target remains paused");
+        { std::lock_guard lock(debugger.mtx_);
+          if (debugger.pendingCommand_.command != Debugger::Cmd::None ||
+              debugger.mutationError_.empty() || debugger.state_ != DbgState::Paused) return false; }
+        debugger.cont(); // explicit command after the visible failure remains legal
+        const auto command = debugger.waitForCommand(debugger.controlEpoch_);
+        debugger.executionFailure_.clear();
+        return command.command == Debugger::Cmd::Continue;
     }
     static constexpr size_t byteCap() { return Debugger::kNetLogQueueBytes; }
     static void syntheticSession(Debugger& debugger, bool present) {
@@ -97,6 +134,21 @@ int main() {
     try {
         Debugger debugger;
         regionCoverageChecks(debugger);
+        debugger_detail::LifecycleTestAccess::syntheticSession(debugger, true);
+        check(debugger_detail::LifecycleTestAccess::queueWakesHeldEvent(debugger, [&] {
+            (void)debugger.addHardwareBreakpointForSession({17, 19}, 0x1000);
+        }), "paused hardware edits must wake the held event without execution");
+        check(debugger_detail::LifecycleTestAccess::queueWakesHeldEvent(debugger, [&] {
+            debugger.startNetworkObservation();
+        }), "paused observer start must wake the held event without execution");
+        check(debugger_detail::LifecycleTestAccess::queueWakesHeldEvent(debugger, [&] {
+            debugger.stopNetworkObservation();
+        }), "paused observer stop/retry must wake the held event without execution");
+        check(debugger_detail::LifecycleTestAccess::hardwareLastIntentWins(debugger),
+              "hardware add/remove must coalesce to final intent and retain remove/add replacement order");
+        check(debugger_detail::LifecycleTestAccess::mutationCancelsEarlierExecution(debugger),
+              "a failed mutation must cancel an earlier queued Continue and permit an explicit later retry");
+        debugger_detail::LifecycleTestAccess::syntheticSession(debugger, false);
         check(debugger.requestAttach(0) == 0, "invalid PID must be rejected immediately");
         uint64_t cancelledRequest = 0;
         {

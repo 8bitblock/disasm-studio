@@ -14,7 +14,7 @@ jobs:
     # DisasmStudio targets Visual Studio 2022; avoid the floating windows-latest
     # label (which now follows the VS 2026 Windows 2025 image).
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -53,6 +53,7 @@ jobs:
           if ($LASTEXITCODE) { throw "vcpkg integration failed ($LASTEXITCODE)" }
 
       - name: Build (Release | x64)
+        id: build
         shell: pwsh
         run: |
           & .\build.ps1 `
@@ -63,18 +64,35 @@ jobs:
           if ($LASTEXITCODE) { throw "Release build failed ($LASTEXITCODE)" }
 
       - name: Run declared Core test suite
-        shell: cmd
-        run: tests\run_core_tests.bat
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: tests\run_core_tests.ps1 -Suite Core
 
-      - name: Run mandatory live debugger tests
+      # These link current production app objects. All three declarations must
+      # execute; they are deliberately excluded from the quick Core-only loop.
+      - name: Run app-object integration suites (static listing, release workbench, feature tabs)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        env:
+          DS_PATCH_RESTORATION_LIVE_TEST: '1'
+        run: tests\run_core_tests.ps1 -Suite Integration
+
+      - name: Run mandatory live debugger tests (x64, WOW64, authorization watch)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         env:
           DS_REQUIRE_LIVE_DEBUG_TESTS: '1'
-        run: |
-          & tests\run_core_tests.bat x64_debug_test
-          if ($LASTEXITCODE) { throw "x64 debugger integration test failed ($LASTEXITCODE)" }
-          & tests\run_core_tests.bat wow64_debug_test
-          if ($LASTEXITCODE) { throw "WOW64 debugger integration test failed ($LASTEXITCODE)" }
+        run: tests\run_core_tests.ps1 -Suite Live
+
+      - name: Upload verification logs and summaries
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DisasmStudio-verification
+          path: |
+            build/test-results/**/*.log
+            build/test-results/**/summary.json
+          if-no-files-found: warn
 
       - name: Smoke launch Release executable
         shell: pwsh

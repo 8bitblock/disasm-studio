@@ -1,10 +1,12 @@
 #include "BinaryViewTab.h"
+#include "../Core/PatchRecovery.h"
 #include "../Core/FunctionAnalyzer.h"
 #include "../Core/FunctionNamer.h"
 #include "../Core/CFG.h"
 #include "../Core/Cond.h"
 #include "../Core/BranchComment.h"
 #include "../Core/CodeByteSignatureBuilder.h"
+#include "../Core/InstructionBytePattern.h"
 #include "../Core/Decompiler.h"
 #include "../Core/Demangle.h"
 #include "../Core/AnalysisService.h"
@@ -119,6 +121,10 @@ static ListingInstructionScope listingInstructionScope(const AppContext& ctx) {
 }
 
 static void handoffStaticSignature(AppContext& ctx, std::string signature) {
+    if (signature.empty()) {
+        ui::Toast(ui::ToastKind::Warn, "No complete byte pattern was available. Refresh the selection and try again.");
+        return;
+    }
     ctx.pendingSignature = std::move(signature);
     ctx.pendingSignatureLive = false;
     ctx.pendingSignatureTarget = {};
@@ -149,6 +155,7 @@ projectOverridesSnapshot(const ProjectState& project) {
 }
 
 static uint64_t projectPatchDigest(const ProjectState& project) {
+    if (project.patchRecoveryPending) return DigestOrderedPatches({});
     // Analysis is keyed by the effective experiment selection, not just the
     // legacy byte vector. Set membership and enabled flags can change the
     // in-memory image without adding/removing a record, so bind both here.
@@ -167,6 +174,7 @@ static uint64_t projectPatchDigest(const ProjectState& project) {
 
 static bool projectPatchSetEnabled(const ProjectState& project,
                                    uint64_t setId) {
+    if (project.patchRecoveryPending) return false;
     if (setId == kUngroupedPatchSetId) return true;
     const PjPatchSet* set = FindPatchSet(project.patchSets, setId);
     return set && set->enabled;
@@ -205,7 +213,8 @@ static bool projectHasActivePatches(const ProjectState& project) {
 
 static uint64_t patchPresentationSignature(const AppContext& ctx) {
     return ctx.staticBinary().imageRevision() ^
-           (ctx.projectRevision * 0xD6E8FEB86659FD93ull);
+           (ctx.projectRevision * 0xD6E8FEB86659FD93ull) ^
+           (ctx.staticProject().patchRecoveryPending ? 0xE9A94687015D49D5ull : 0);
 }
 
 // Listing data is target data, not host data.  Keep this tiny reader next to the
@@ -538,7 +547,7 @@ static bool containsAsciiInsensitive(std::string_view haystack, const char* need
 static std::string bytesToCArray(const std::string& hexBytes) {
     std::string out;
     for (size_t i = 0; i < hexBytes.size();) {
-        if (hexBytes[i] == ' ') { ++i; continue; }
+        if (std::isspace(static_cast<unsigned char>(hexBytes[i]))) { ++i; continue; }
         if (i + 1 >= hexBytes.size()) break;
         if (!out.empty()) out += ", ";
         out += "0x"; out += hexBytes[i]; out += hexBytes[i + 1];
@@ -1420,6 +1429,9 @@ void BinaryViewTab::renderAssembly(AppContext& ctx) {
     nextToolbarItem("Strings", true);
     ImGui::Checkbox("Strings###Str", &showStringComments_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Inline string / imported-API comments");
+    nextToolbarItem("Values", true);
+    ImGui::Checkbox("Values", &showMemoryValues_);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the stored numeric value at direct memory operands. FILE values come from file bytes; hover for signed and floating point interpretations.");
     nextToolbarItem("Arrows", true);
     ImGui::Checkbox("Arrows", &showJumpArrows_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Branch arrows in the flow gutter");
@@ -8064,7 +8076,7 @@ void BinaryViewTab::asmSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) {
             Instruction in;
             if (!listingActionInstruction(ctx, va, in, listingSelectionError_)) break;
             std::vector<uint8_t> fill;
-            listingSelectionCanNop_ &= ArchitectureNopFill(ctx.staticArch(), in.length, fill);
+            listingSelectionCanNop_ &= ArchitectureNopFill(ctx.staticDecoderConfig(), in.length, fill);
             listingSelectionChecked_.push_back(std::move(in));
         }
         listingSelectionCheckKey_ = selectionKey;
@@ -8072,6 +8084,12 @@ void BinaryViewTab::asmSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) {
     const auto& selectedInstructions = listingSelectionChecked_;
     const auto& selectionError = listingSelectionError_;
     const bool selectionDisplayed = selectedInstructions.size() == sel.size();
+    bool contiguous = selectionDisplayed;
+    uint64_t selectedSpan = 0;
+    for (const auto& in : selectedInstructions) {
+        if (selectedSpan > UINT64_MAX - lo || in.address != lo + selectedSpan) contiguous = false;
+        selectedSpan += in.length;
+    }
     const bool selectionBoundariesActionable = std::all_of(sel.begin(), sel.end(),
         [&](uint64_t va) { return listingInstructionBoundaryActionable(va); });
     const bool liveBreakpointArch = ArchSupportsDebugger(ctx.staticArch());
@@ -8093,23 +8111,24 @@ void BinaryViewTab::asmSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) {
     if (!selectionBoundariesActionable)
         ImGui::TextDisabled("~ includes provisional alignment; breakpoint/patch actions will accept the selected displayed boundaries");
     if (ImGui::MenuItem("Create signature from selection -> Sig Scanner", nullptr, false,
-                        selectionBoundariesActionable)) {
+                        selectionBoundariesActionable && contiguous)) {
         handoffStaticSignature(ctx, buildSignature(ctx, lo, hi, false, false));
     }
-    if (ImGui::MenuItem("Create signature (wildcard calls/jumps)##sel", nullptr, false,
-                        selectionBoundariesActionable)) {   // ##sel: unique ID vs per-line item
+    if (ImGui::MenuItem("Create signature (with wildcards)##sel", nullptr, false,
+                        selectionBoundariesActionable && contiguous && ArchIsX86(ctx.staticArch()))) {
         handoffStaticSignature(ctx, buildSignature(ctx, lo, hi, false, true));
     }
-    if (ImGui::MenuItem("Copy bytes##sel")) {                                 // ##sel: unique ID vs per-line item
-        std::string bytes;
-        for (uint64_t va : sel) { Instruction in2; if (decodeAt(va, in2)) { if (!bytes.empty()) bytes += ' '; bytes += in2.bytes; } }
-        ImGui::SetClipboardText(bytes.c_str());
-    }
-    if (ImGui::MenuItem("Copy as C array##sel")) {
-        std::string bytes;
-        for (uint64_t va : sel) { Instruction in2; if (decodeAt(va, in2)) { if (!bytes.empty()) bytes += ' '; bytes += in2.bytes; } }
-        ImGui::SetClipboardText(bytesToCArray(bytes).c_str());
-    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", contiguous ? kInstructionWildcardHelp : "Select contiguous complete instructions to create a scan signature.");
+    if (ImGui::MenuItem("Copy bytes (without wildcards)##sel", "Ctrl+C", false, selectionDisplayed))
+        copyAssemblyBytes(ctx, snap, false, false);
+    if (ImGui::MenuItem("Copy bytes (with wildcards)##sel", "Ctrl+Shift+C", false,
+                        selectionDisplayed && ArchIsX86(ctx.staticArch())))
+        copyAssemblyBytes(ctx, snap, false, true);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", kInstructionWildcardHelp);
+    if (!contiguous) ImGui::TextDisabled("Byte copy separates non-adjacent ranges with a new line.");
+    if (ImGui::MenuItem("Copy as C array##sel", nullptr, false, selectionDisplayed))
+        copyAssemblyBytes(ctx, snap, false, false, true);
     if (ImGui::MenuItem("Copy instructions")) {
         std::string text;
         for (uint64_t va : sel) {
@@ -8122,19 +8141,13 @@ void BinaryViewTab::asmSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) {
     if (ImGui::MenuItem("NOP out selection", nullptr, false, canNopSelection) && acceptSelection()) {
         for (uint64_t va : sel) {
             Instruction in2; std::vector<uint8_t> fill;
-            if (decodeAt(va, in2) && ArchitectureNopFill(ctx.staticArch(), in2.length, fill))
+            if (decodeAt(va, in2) && ArchitectureNopFill(ctx.staticDecoderConfig(), in2.length, fill))
                 if (!applyStaticInstructionPatch(ctx, va, std::move(fill), in2.length, false)) break;
         }
     }
     if (!canNopSelection && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", !selectionDisplayed ? selectionError.c_str()
             : "No exact NOP replacement exists for one or more selected instructions.");
-    bool contiguous = selectionDisplayed;
-    uint64_t selectedSpan = 0;
-    for (const auto& in : selectedInstructions) {
-        if (selectedSpan > UINT64_MAX - lo || in.address != lo + selectedSpan) contiguous = false;
-        selectedSpan += in.length;
-    }
     const bool canAssemble = selectionDisplayed && contiguous && selectedSpan <= UINT32_MAX &&
                              ArchSupportsAssembler(ctx.staticArch());
     if (ImGui::MenuItem("Assemble over selection (region patch)...", nullptr, false, canAssemble) && acceptSelection()) {
@@ -8250,36 +8263,70 @@ void BinaryViewTab::liveSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) 
         size_t got = ctx.debug.readMemoryMaskedForSession(
             snap.pid, snap.sessionGeneration, va, mem, sizeof(mem));
         IDisassembler* d = liveDecoder(ctx, snap.is32);
-        return got && d && d->decodeOne(mem, got, va, out) && out.length;
+        return got && d && d->decodeOne(mem, got, va, out) && out.length && out.length <= got;
+    };
+
+    auto selectedSignature = [&](bool wildcard) -> std::string {
+        // Ctrl-click can select disjoint rows. Never scan their intervening code
+        // or turn the selected rows into a nonexistent contiguous byte range.
+        std::vector<Instruction> instructions;
+        for (uint64_t va : sel) {
+            Instruction in;
+            std::string readError;
+            if (!liveInstructionForCopy(ctx, snap, va, in, readError)) {
+                ui::Toast(ui::ToastKind::Warn, readError);
+                return {};
+            }
+            if (!instructions.empty() &&
+                (instructions.back().address > UINT64_MAX - instructions.back().length ||
+                 instructions.back().address + instructions.back().length != va)) {
+                ui::Toast(ui::ToastKind::Warn, "Select contiguous, readable instructions to create a scan signature.");
+                return {};
+            }
+            instructions.push_back(std::move(in));
+            if (instructions.size() > 512) {
+                ui::Toast(ui::ToastKind::Warn, "Select at most 512 instructions for a scan signature.");
+                return {};
+            }
+        }
+        const DbgSnapshot current = ctx.debug.snapshot();
+        if (!current.attached() || !DebugTargetIdentityMatches(
+            {current.pid, current.sessionGeneration}, frameTarget)) return {};
+        std::string pattern, error;
+        if (!InstructionSelectionBytePattern(instructions, snap.is32 ? Arch::X86 : Arch::X64,
+                                             wildcard, pattern, error)) {
+            ui::Toast(ui::ToastKind::Warn, error);
+            return {};
+        }
+        return pattern;
     };
 
     ImGui::TextDisabled("Selection: %d line(s)  0x%llX-0x%llX",
                         (int)sel.size(), (unsigned long long)lo, (unsigned long long)hi);
     if (ImGui::MenuItem("Scan selected bytes in process memory")) {
-        // buildSignature(live=true) reads the bytes from the debuggee; wildcard=false
-        // keeps it a literal hex string the hex search parser can consume.
-        std::string sig = buildSignature(ctx, lo, hi, true, false, &snap);
-        liveFindKind_ = 2;                                  // hex bytes
-        std::snprintf(liveFind_, sizeof(liveFind_), "%s", sig.c_str());
-        startLivePatternSearch(ctx, sig, liveFindKind_, frameTarget, true);
-        openFindPopup_ = true;                              // surface results in the Live Search panel
+        if (std::string sig = selectedSignature(false); !sig.empty()) {
+            liveFindKind_ = 2;
+            std::snprintf(liveFind_, sizeof(liveFind_), "%s", sig.c_str());
+            startLivePatternSearch(ctx, sig, liveFindKind_, frameTarget, true);
+            openFindPopup_ = true;
+        }
     }
     if (ImGui::MenuItem("Create signature from selection -> Sig Scanner")) {
-        handoffLiveSignature(ctx, buildSignature(ctx, lo, hi, true, false, &snap), frameTarget);
+        if (std::string sig = selectedSignature(false); !sig.empty())
+            handoffLiveSignature(ctx, std::move(sig), frameTarget);
     }
-    if (ImGui::MenuItem("Create signature (wildcard calls/jumps)##livesel")) {
-        handoffLiveSignature(ctx, buildSignature(ctx, lo, hi, true, true, &snap), frameTarget);
+    if (ImGui::MenuItem("Create signature (with wildcards)##livesel")) {
+        if (std::string sig = selectedSignature(true); !sig.empty())
+            handoffLiveSignature(ctx, std::move(sig), frameTarget);
     }
-    if (ImGui::MenuItem("Copy bytes##livesel")) {
-        std::string bytes;
-        for (uint64_t va : sel) { Instruction in2; if (decodeAt(va, in2)) { if (!bytes.empty()) bytes += ' '; bytes += in2.bytes; } }
-        ImGui::SetClipboardText(bytes.c_str());
-    }
-    if (ImGui::MenuItem("Copy as C array##livesel")) {
-        std::string bytes;
-        for (uint64_t va : sel) { Instruction in2; if (decodeAt(va, in2)) { if (!bytes.empty()) bytes += ' '; bytes += in2.bytes; } }
-        ImGui::SetClipboardText(bytesToCArray(bytes).c_str());
-    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kInstructionWildcardHelp);
+    if (ImGui::MenuItem("Copy bytes (without wildcards)##livesel", "Ctrl+C"))
+        copyAssemblyBytes(ctx, snap, true, false);
+    if (ImGui::MenuItem("Copy bytes (with wildcards)##livesel", "Ctrl+Shift+C"))
+        copyAssemblyBytes(ctx, snap, true, true);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kInstructionWildcardHelp);
+    if (ImGui::MenuItem("Copy as C array##livesel"))
+        copyAssemblyBytes(ctx, snap, true, false, true);
     if (ImGui::MenuItem("Copy instructions##livesel")) {
         std::string text;
         for (uint64_t va : sel) {
@@ -8318,11 +8365,106 @@ void BinaryViewTab::liveSelectionMenu(AppContext& ctx, const DbgSnapshot& snap) 
     if (ImGui::MenuItem("Clear selection##livesel")) { selVAs_.clear(); selAnchorVA_ = 0; selAnchorValid_ = false; }
 }
 
-// Shared single-instruction copy actions, used by BOTH the static and live per-row
-// context menus so they can't drift or double up against the selection menu.
-void BinaryViewTab::emitInstrCopyMenu(const Instruction& in) {
-    if (ImGui::MenuItem("Copy bytes")) ImGui::SetClipboardText(in.bytes.c_str());
-    if (ImGui::MenuItem("Copy as C array")) ImGui::SetClipboardText(bytesToCArray(in.bytes).c_str());
+static void copyInstructionPatterns(std::span<const Instruction> instructions,
+                                    Arch arch, bool wildcard, bool cArray = false) {
+    std::string bytes, error;
+    if (!InstructionSelectionBytePattern(instructions, arch, wildcard, bytes, error)) {
+        ui::Toast(ui::ToastKind::Warn, error);
+        return; // Preserve the clipboard on any incomplete or unsupported copy.
+    }
+    if (cArray) bytes = bytesToCArray(bytes);
+    ImGui::SetClipboardText(bytes.c_str());
+    ui::Toast(ui::ToastKind::Success, wildcard ? "Copied bytes with wildcards." : "Copied instruction bytes.");
+}
+
+bool BinaryViewTab::liveInstructionForCopy(AppContext& ctx, const DbgSnapshot& snap,
+                                          uint64_t address, Instruction& out, std::string& error) {
+    error.clear();
+    const auto found = liveIdxOf_.find(address);
+    if (!snap.attached() || !liveSessionIdentityValid_ || liveSessionPidSeen_ != snap.pid ||
+        liveSessionGenerationSeen_ != snap.sessionGeneration || found == liveIdxOf_.end() ||
+        found->second < 0 || static_cast<size_t>(found->second) >= liveInsns_.size()) {
+        error = "The selected live rows are no longer displayed in this session. Refresh the selection.";
+        return false;
+    }
+    const Instruction& displayed = liveInsns_[found->second];
+    uint8_t current[16]{};
+    if (displayed.address != address || !displayed.length || displayed.length > sizeof(current) ||
+        ctx.debug.readMemoryMaskedForSession(snap.pid, snap.sessionGeneration, address,
+                                            current, displayed.length) != displayed.length) {
+        error = "A selected live instruction could not be read completely. Refresh the selection.";
+        return false;
+    }
+    // Read just the displayed span, including an instruction at a page end.
+    // Compare logical bytes without decoding a different instruction boundary.
+    const Arch arch = snap.is32 ? Arch::X86 : Arch::X64;
+    std::string expected;
+    if (!InstructionBytePattern(displayed, arch, false, expected, error)) return false;
+    std::string actual;
+    for (uint32_t i = 0; i < displayed.length; ++i) {
+        char hex[4]; std::snprintf(hex, sizeof(hex), "%02X", current[i]);
+        if (i) actual += ' ';
+        actual += hex;
+    }
+    if (actual != expected) {
+        error = "Live instruction bytes changed since display. Refresh the selection before copying.";
+        return false;
+    }
+    out = displayed;
+    return true;
+}
+
+void BinaryViewTab::copyAssemblyBytes(AppContext& ctx, const DbgSnapshot& snap,
+                                      bool live, bool wildcard, bool cArray) {
+    std::vector<uint64_t> addresses;
+    if (selVAs_.size() > 1) addresses.assign(selVAs_.begin(), selVAs_.end());
+    else if (cursorValid_) addresses.push_back(cursorVA_);
+    std::sort(addresses.begin(), addresses.end());
+    std::vector<Instruction> instructions;
+    instructions.reserve(addresses.size());
+    size_t bytes = 0;
+    for (uint64_t va : addresses) {
+        Instruction in;
+        std::string error;
+        if (live) {
+            liveInstructionForCopy(ctx, snap, va, in, error);
+        } else if (!listingActionInstruction(ctx, va, in, error) && error.empty())
+            error = "A selected instruction is no longer available. Refresh the selection.";
+        if (error.empty() && in.length > kInstructionPatternByteLimit - bytes)
+            error = "Select at most 64 KiB of instruction bytes to copy.";
+        if (!error.empty()) { ui::Toast(ui::ToastKind::Warn, error); return; }
+        bytes += in.length;
+        instructions.push_back(std::move(in));
+    }
+    if (live) {
+        const DbgSnapshot current = ctx.debug.snapshot();
+        if (!snap.attached() || !current.attached() || !DebugTargetIdentityMatches(
+            {current.pid, current.sessionGeneration}, {snap.pid, snap.sessionGeneration})) {
+            ui::Toast(ui::ToastKind::Warn, "The debugger session changed. Select the live instructions again.");
+            return;
+        }
+    }
+    copyInstructionPatterns(instructions, live ? (snap.is32 ? Arch::X86 : Arch::X64) : ctx.staticArch(),
+                            wildcard, cArray);
+}
+
+void BinaryViewTab::assemblyCopyShortcut(AppContext& ctx, const DbgSnapshot& snap, bool live) {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (cursorValid_ && ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !io.WantTextInput &&
+        !ImGui::IsAnyItemActive() && io.KeyCtrl && !io.KeyAlt &&
+        ImGui::IsKeyPressed(ImGuiKey_C, false) &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        copyAssemblyBytes(ctx, snap, live, io.KeyShift);
+}
+
+// Shared by the FILE/LIVE listings, Graph and decompiler's side assembly.
+void BinaryViewTab::emitInstrCopyMenu(const Instruction& in, Arch arch, bool shortcuts) {
+    if (ImGui::MenuItem("Copy bytes (without wildcards)", shortcuts ? "Ctrl+C" : nullptr))
+        copyInstructionPatterns(std::span(&in, 1), arch, false);
+    if (ImGui::MenuItem("Copy bytes (with wildcards)", shortcuts ? "Ctrl+Shift+C" : nullptr, false, ArchIsX86(arch)))
+        copyInstructionPatterns(std::span(&in, 1), arch, true);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", kInstructionWildcardHelp);
+    if (ImGui::MenuItem("Copy as C array")) copyInstructionPatterns(std::span(&in, 1), arch, false, true);
     if (ImGui::MenuItem("Copy instruction")) { const std::string t = InstructionText(in); ImGui::SetClipboardText(t.c_str()); }
 }
 
@@ -8555,7 +8697,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Copy address")) { char c[24]; std::snprintf(c, sizeof(c), "0x%llX", (unsigned long long)in.address); ImGui::SetClipboardText(c); }
-        if (!inSel) emitInstrCopyMenu(in);   // selection menu already offers these when multi-selecting
+        if (!inSel) emitInstrCopyMenu(in, ctx.staticArch());
         if (ImGui::BeginMenu("Where did this value come from?", ArchIsX86_32Or64(ctx.staticArch()) && !functionsDirty_)) {
             std::unordered_set<std::string> offered;
             for (const auto& operand : in.typedOperands) {
@@ -8665,7 +8807,7 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
             ImGui::SetTooltip("Opening Patch explicitly accepts this displayed address as an analyst-selected instruction boundary.");
         std::vector<uint8_t> staticNops;
         const bool canNop = !inSel && in.length && displayedInstructionStart &&
-                            ArchitectureNopFill(ctx.staticArch(), in.length, staticNops);
+                            ArchitectureNopFill(ctx.staticDecoderConfig(), in.length, staticNops);
         const char* nopLabel = boundaryActionable
             ? "NOP out instruction" : "NOP out instruction (accept displayed boundary)";
         if (ImGui::MenuItem(nopLabel, nullptr, false, canNop) && acceptListingInstructionBoundary(ctx, in.address)) {
@@ -8686,11 +8828,12 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
                 handoffStaticSignature(
                     ctx, buildSignature(ctx, in.address, in.address, false, false));
             }
-            if (ImGui::MenuItem("Create signature (wildcard calls/jumps)", nullptr,
-                                false, boundaryActionable)) {
+            if (ImGui::MenuItem("Create signature (with wildcards)", nullptr,
+                                false, boundaryActionable && ArchIsX86(ctx.staticArch()))) {
                 handoffStaticSignature(
                     ctx, buildSignature(ctx, in.address, in.address, false, true));
             }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", kInstructionWildcardHelp);
         }
         ImGui::Separator();
         if (selAnchorValid_ && selAnchorVA_ != in.address && ImGui::MenuItem("Select from anchor to here"))
@@ -8839,6 +8982,15 @@ void BinaryViewTab::renderAsmRow(AppContext& ctx, Instruction in, const DbgSnaps
         }
     }
     bool dataComment = false;
+    if (showMemoryValues_ && !gmlInstruction) {
+        const auto value = memoryValueHint(ctx, in);
+        if (!value.text.empty()) {
+            appendComment();
+            ImGui::TextColored(theme::col::accent(), "; %s", value.text.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", value.tooltip.c_str());
+            dataComment = true;
+        }
+    }
     if (showStringComments_ && !gmlInstruction) {
         uint64_t ref = 0;
         bool hasRef = TryGetInstrDataRef(in, ref);
@@ -9276,6 +9428,7 @@ void BinaryViewTab::renderAssemblyFull(AppContext& ctx) {
         }
         clipper.End();
         hoverToken_ = nextHoverTok;
+        assemblyCopyShortcut(ctx, snap, false);
         listingDrawList = endDisassemblyTable();
     }
     ui::PopMono();
@@ -9510,6 +9663,7 @@ void BinaryViewTab::renderAssemblyWindow(AppContext& ctx) {
             asmWindowScrollSampleValid_ = true;
         }
         hoverToken_ = nextHoverTok;
+        assemblyCopyShortcut(ctx, snap, false);
         listingDrawList = endDisassemblyTable();
     }
     ui::PopMono();
@@ -9792,6 +9946,62 @@ static std::string patchSetTransitionFailure(
     return text;
 }
 
+bool BinaryViewTab::restoreSavedPatches(AppContext& ctx, bool announce) {
+    ProjectState& project = ctx.staticProject();
+    const auto restored = RecoverSavedPatchSelection(ctx.staticBinary(), project,
+        [&](std::vector<uint8_t> image) {
+            ctx.staticCodeExport().cancelAndWaitIdle();
+            return ctx.commitStaticPatchedImage(std::move(image),
+                DocumentLiveImageCommit::InvalidateMappedIdentity);
+        });
+    if (!restored.success) {
+        std::string detail;
+        switch (restored.error) {
+        case PatchRecoveryError::ImageChanged:
+            detail = "the pristine recovery image changed; reopen this document before retrying";
+            break;
+        case PatchRecoveryError::CommitFailed:
+            detail = "the complete private image could not be committed";
+            break;
+        default:
+            detail = patchSetTransitionFailure(restored.selection, project.patches, project.patchSets);
+            break;
+        }
+        projectPatchWarning_ = "Saved patch recovery failed: " + detail + ". All " +
+            std::to_string(project.patches.size()) +
+            " record(s) remain saved and unapplied. Retry recovery or forget a specific record in Patches.";
+        patchStatus_ = projectPatchWarning_;
+        if (announce) ui::Toast(ui::ToastKind::Error, patchStatus_);
+        return false;
+    }
+    projectPatchWarning_.clear();
+    patchSetDiagnostic_.clear();
+    patchCompareValid_ = false;
+    if (announce) {
+        if (restored.imageChanged) invalidatePatchSetImage(ctx);
+        // Breakpoint intent was previously decoded against pristine bytes.
+        restoreSavedBreakpointBoundaries(ctx);
+        patchStatus_ = "Saved patch selection recovered: " +
+            std::to_string(activeProjectPatchCount(project)) + " active record(s).";
+        ui::Toast(ui::ToastKind::Success, patchStatus_);
+    }
+    return true;
+}
+
+bool BinaryViewTab::forgetUnrestoredPatch(AppContext& ctx, size_t index) {
+    if (!ForgetUnrestoredPatch(ctx.staticBinary(), ctx.staticProject(), index)) {
+        patchStatus_ = "Cannot forget this record: its recovery image or row is stale.";
+        ui::Toast(ui::ToastKind::Error, patchStatus_);
+        return false;
+    }
+    ctx.markProjectDirty();
+    patchCompareValid_ = false;
+    // Refresh the diagnostic and apply only after every remaining record passes.
+    // Explicitly forgetting one record never implicitly forgets another.
+    restoreSavedPatches(ctx, true);
+    return true;
+}
+
 void BinaryViewTab::invalidatePatchSetImage(AppContext& ctx) {
     codeExportStarted_ = false;
     codeExportStatus_ = "Code export cancelled because the active patch experiment changed.";
@@ -9867,6 +10077,12 @@ bool BinaryViewTab::transitionPatchSetState(
     DocumentLiveImageCommit liveImageCommit,
     bool exactLiveStateChanged, bool announce) {
     const ProjectState& current = ctx.staticProject();
+    if (current.patchRecoveryPending) {
+        patchSetDiagnostic_ = "Patch change refused: recover the retained saved records in Patches first.";
+        patchStatus_ = patchSetDiagnostic_;
+        if (announce) ui::Toast(ui::ToastKind::Error, patchStatus_);
+        return false;
+    }
     PatchSetImageResult baseline;
     PatchSetImageResult desired;
     try {
@@ -9971,6 +10187,11 @@ bool BinaryViewTab::transitionPatchSetState(
 
 void BinaryViewTab::revertPatchAt(AppContext& ctx, uint64_t va,
                                   size_t exactIndex) {
+    if (ctx.staticProject().patchRecoveryPending) {
+        patchStatus_ = "Patch revert refused: saved records were not applied; use Forget record in Patches.";
+        ui::Toast(ui::ToastKind::Error, patchStatus_);
+        return;
+    }
     const uint64_t fileVA = patchKeyFor(ctx, va);   // patches are keyed by file VA
     auto& V = ctx.staticProject().patches;
     if (exactIndex != (std::numeric_limits<size_t>::max)() &&
@@ -11677,39 +11898,11 @@ void BinaryViewTab::onBinaryLoaded(AppContext& ctx) {
     // across sessions. The content hash was already cached from the pristine file
     // (above), so these writes don't change the project's sidecar key. Do this BEFORE
     // kicking off the background analysis so functions/strings reflect the patched bytes.
-    const auto& savedPatches = ctx.staticProject().patches;
-    if (!savedPatches.empty()) {
-        const size_t savedPatchCount = savedPatches.size();
-        const size_t savedActiveCount =
-            activeProjectPatchCount(ctx.staticProject());
-        ctx.staticCodeExport().cancelAndWaitIdle();
-        PatchSetImageResult restored = BuildPatchSetImageForSelection(
-            ctx.staticBinary(), savedPatches,
-            ctx.staticProject().patchSets, {},
-            PatchSetImageSource::Pristine);
-        if (!restored.success) {
-            projectPatchWarning_ = "Saved patch selection was not restored: " +
-                patchSetTransitionFailure(restored, savedPatches,
-                                          ctx.staticProject().patchSets) +
-                ". No saved patches were applied; all " +
-                std::to_string(savedPatchCount) + " record(s) were quarantined.";
-            ctx.staticProject().patches.clear();
-            ctx.markProjectDirty();
-        } else if (restored.image != ctx.staticBinary().bytes() &&
-                   !ctx.commitStaticPatchedImage(
-                       std::move(restored.image),
-                       DocumentLiveImageCommit::InvalidateMappedIdentity)) {
-            // The candidate is complete and privately owned. A failed commit
-            // therefore leaves the loaded image byte-for-byte pristine.
-            projectPatchWarning_ =
-                "The complete saved patch image could not be committed. No saved patches were applied; " +
-                std::to_string(savedActiveCount) + " active and " +
-                std::to_string(savedPatchCount - savedActiveCount) +
-                " disabled patch record(s) were quarantined.";
-            ctx.staticProject().patches.clear();
-            ctx.markProjectDirty();
-        }
-    }
+    // A freshly loaded image starts a new recovery attempt. Runtime recovery
+    // state is never serialized, and a reused document gets new byte authority.
+    ctx.staticProject().patchRecoveryPending = false;
+    ctx.staticProject().patchRecoveryImageRevision = 0;
+    if (!ctx.staticProject().patches.empty()) restoreSavedPatches(ctx);
     restoreSavedBreakpointBoundaries(ctx);
     // Every live capture owns a new byte snapshot. The registry cache can come
     // from older self-modified code or a different decoder; analyze this image
@@ -11985,6 +12178,7 @@ void BinaryViewTab::restoreNavigationLocation(const DocumentLocation& location) 
         // next renders; preserve the separate last FILE instruction meanwhile.
         cursorVA_ = 0; cursorValid_ = false; cursorLive_ = false;
         hexCursorOff_ = location.va; hexPendScroll_ = location.va;
+        hexSelA_ = hexSelB_ = location.va;
         hexEditNibble_ = -1; hexLastScrollValid_ = false;
     } else {
         setStaticCursor(location.va);
@@ -12033,6 +12227,7 @@ void BinaryViewTab::navigateToFileOffset(AppContext& ctx, uint64_t offset) {
     const DocumentLocation source = navigation_ ? navigation_->current() : DocumentLocation{};
     mainView_ = 2;
     selectFileOffset(ctx, offset);
+    hexSelA_ = hexSelB_ = offset;
     if (navigation_) {
         const DocumentLocation destination = navigation_->current();
         navigation_->replaceCurrent(source);
@@ -12618,6 +12813,8 @@ void BinaryViewTab::renderLiveAssembly(AppContext& ctx) {
     nextToolbarItem("Arrows", true); ImGui::Checkbox("Arrows", &showJumpArrows_);
     nextToolbarItem("Hints", true); ImGui::Checkbox("Hints", &showRegHints_);
     nextToolbarItem("Strings", true); ImGui::Checkbox("Strings###Str", &showStringComments_);
+    nextToolbarItem("Values", true); ImGui::Checkbox("Values", &showMemoryValues_);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sample direct memory operands from this process every 250 ms. Hover a value for signed and floating point interpretations.");
     nextToolbarItem("Names", true); ImGui::Checkbox("Names", &showNames_);
     if (running) { nextToolbarItem("Last captured values"); ImGui::TextDisabled("Last captured values"); }
     if (!ImGui::GetIO().WantTextInput && ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F))
@@ -12969,7 +13166,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
                     char cb[32]; std::snprintf(cb, sizeof(cb), "0x%llX", (unsigned long long)in.address);
                     ImGui::SetClipboardText(cb);
                 }
-                if (!inSel) emitInstrCopyMenu(in);   // selection menu already offers these when multi-selecting
+                if (!inSel) emitInstrCopyMenu(in, snap.is32 ? Arch::X86 : Arch::X64);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Find references to this address")) startXrefSearch(ctx, in.address, true);
                 uint64_t operandRef = 0;
@@ -13044,6 +13241,14 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
                     appendLiveComment(); ImGui::TextColored(theme::col::good(), "; Jump will be taken (current flags)");
                 } else if (t == 0) {
                     appendLiveComment(); ImGui::TextColored(theme::col::muted(), "; Jump will not be taken (current flags)");
+                }
+            }
+            if (showMemoryValues_ && ImGui::IsRectVisible(ImVec2(1, ImGui::GetTextLineHeight()))) {
+                const auto value = memoryValueHint(ctx, in, &snap);
+                if (!value.text.empty()) {
+                    appendLiveComment();
+                    ImGui::TextColored(theme::col::accent(), "; %s", value.text.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", value.tooltip.c_str());
                 }
             }
             // x64dbg-style inline string/data comment for a referenced address.
@@ -13150,6 +13355,7 @@ void BinaryViewTab::renderLiveListing(AppContext& ctx, const DbgSnapshot& snap, 
             liveWindowScrollSampleValid_ = true;
         }
         hoverToken_ = nextHoverTok;   // remember for next frame's highlight
+        assemblyCopyShortcut(ctx, snap, true);
         listingDrawList = endDisassemblyTable();
     }
     ui::PopMono();
@@ -13633,10 +13839,9 @@ void BinaryViewTab::renderLiveSearchPopup(AppContext& ctx) {
     ImGui::EndPopup();
 }
 
-// Build a byte-pattern signature ("48 8B ?? ..") covering the instruction(s) in
-// [lo, hi]. With `wildcard`, the rel8/rel32 displacement of a call/jmp/jcc is
-// masked to ?? so the signature survives recompilation/relocation. `live` reads
-// the attached debuggee's memory instead of the on-disk image.
+// Build complete instruction patterns through an inclusive final instruction
+// address. Both sources fail closed on truncation, a non-boundary endpoint or a
+// size cap; scanner handoffs must never quietly use a partial selection.
 std::string BinaryViewTab::buildSignature(AppContext& ctx, uint64_t lo, uint64_t hi,
                                           bool live, bool wildcard,
                                           const DbgSnapshot* liveSource) {
@@ -13653,62 +13858,38 @@ std::string BinaryViewTab::buildSignature(AppContext& ctx, uint64_t lo, uint64_t
     };
     if (live && !liveSourceCurrent()) return {};
     IDisassembler* dis = live ? liveDecoder(ctx, source->is32) : ctx.staticDisassembler();
-    if (!dis) return "";
-    std::string out;
+    if (!dis || lo > hi) return {};
+    const Arch arch = live ? (source->is32 ? Arch::X86 : Arch::X64) : ctx.staticArch();
+    std::vector<Instruction> instructions;
+    size_t byteCount = 0;
     uint64_t a = lo;
-    for (int guard = 0; a <= hi && guard < 512; ++guard) {
+    for (int guard = 0; guard < 512; ++guard) {
         uint8_t mem[16] = {0};
+        const uint8_t* bytes = mem;
         size_t got = 0;
         if (live) {
             got = ctx.debug.readMemoryMaskedForSession(sourceTarget.pid,
                 sourceTarget.sessionGeneration, a, mem, sizeof(mem));
         } else {
-            size_t avail = 0; const uint8_t* p = ctx.staticBinary().ptrFromVA(a, avail);
-            if (p) { got = std::min<size_t>(avail, sizeof(mem)); std::memcpy(mem, p, got); }
+            bytes = ctx.staticBinary().ptrFromVA(a, got);
+            got = std::min(got, kInstructionPatternByteLimit - byteCount);
         }
-        if (!got) { if (live) return {}; break; }
+        if (!bytes || !got) return {};
         Instruction in;
-        if (!dis->decodeOne(mem, got, a, in) || !in.length) { if (live) return {}; break; }
-        uint32_t len = in.length > sizeof(mem) ? (uint32_t)sizeof(mem) : in.length;
-
-        // Bytes [wcStart, wcStart+wcCount) are masked when wildcarding a branch. The
-        // "displacement lives in the trailing rel8/rel16/rel32 bytes" rule is an x86/x64
-        // encoding fact; other arches (ARM/ARM64/MIPS/PPC/RISC-V) encode the branch offset
-        // as a bitfield inside a fixed-width word, so masking trailing bytes there would
-        // wildcard the wrong bits. Gate on x86/x64 (the live decoder is always x86/x64);
-        // off-x86 we emit a literal signature, matching the non-wildcard menu item.
-        uint32_t wcStart = len, wcCount = 0;
-        if (wildcard && (live || ArchIsX86(ctx.staticArch())) &&
-            (in.isCall || in.isBranch) && HasBranchTarget(in)) {
-            // Walk past legacy prefixes to the opcode byte; a 0x66 operand-size prefix
-            // shrinks a direct near branch's displacement from rel32 to rel16.
-            uint32_t oi = 0; bool has66 = false;
-            while (oi < len) {
-                uint8_t b = mem[oi];
-                if (b == 0x66) { has66 = true; ++oi; }
-                else if (b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-                         b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
-                         b == 0x64 || b == 0x65) { ++oi; }     // addr-size / lock / rep / segment
-                else break;
-            }
-            uint8_t  op      = (oi < len) ? mem[oi] : 0;
-            bool     nearRel = (op == 0xE8 || op == 0xE9) ||                                   // direct call/jmp rel
-                               (op == 0x0F && oi + 1 < len && (mem[oi + 1] & 0xF0) == 0x80);   // jcc rel near
-            const bool default16 = !live && ctx.staticArch() == Arch::X86_16;
-            uint32_t rel     = nearRel ? (default16 ? (has66 ? 4u : 2u)
-                                                     : (has66 ? 2u : 4u))
-                                       : (len >= 5 ? 4u : 1u);  // else length heuristic (FF /2,/4 disp32; rel8)
-            if (rel < len) { wcStart = len - rel; wcCount = rel; }
+        if (!dis->decodeOne(bytes, got, a, in) || !in.length || in.length > got ||
+            in.length > kInstructionPatternByteLimit - byteCount) return {};
+        byteCount += in.length;
+        const uint32_t length = in.length;
+        instructions.push_back(std::move(in));
+        if (a == hi) {
+            if (live && !liveSourceCurrent()) return {};
+            std::string out, error;
+            return InstructionSelectionBytePattern(instructions, arch, wildcard, out, error) ? out : std::string{};
         }
-        for (uint32_t i = 0; i < len; ++i) {
-            if (!out.empty()) out.push_back(' ');
-            if (i >= wcStart && i < wcStart + wcCount) out += "??";
-            else { char hb[4]; std::snprintf(hb, sizeof(hb), "%02X", mem[i]); out += hb; }
-        }
-        a += in.length;
+        if (a > UINT64_MAX - length || a + length > hi) return {};
+        a += length;
     }
-    if (live && (a <= hi || !liveSourceCurrent())) return {};
-    return out;
+    return {};
 }
 
 // Apply `bytes` at `va`: optionally NOP-pad a short encoding up to origLen, record
@@ -13721,6 +13902,11 @@ bool BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
                                     PatchApplyOutcome* outcome,
                                     bool addressIsExplicitlyStatic) {
     if (outcome) *outcome = {};
+    if (ctx.staticProject().patchRecoveryPending) {
+        patchStatus_ = "Patch refused: recover the retained saved records in Patches first.";
+        ui::Toast(ui::ToastKind::Error, patchStatus_);
+        return false;
+    }
     if (bytes.empty()) return false;
     // Bind the whole action to the frame which supplied the address/module
     // mapping. Identity-aware memory APIs reject a detach/reattach race after
@@ -13735,10 +13921,14 @@ bool BinaryViewTab::applyPatchBytes(AppContext& ctx, uint64_t va,
     // ambient inference and use the checked static->runtime translation below.
     const bool liveRequest = !addressIsExplicitlyStatic && attached &&
                              mainView_ == 4;
-    const Arch patchArch = liveRequest ? (patchSnap.is32 ? Arch::X86 : Arch::X64) : ctx.staticArch();
+    DecoderConfig patchMachine = ctx.staticDecoderConfig();
+    if (liveRequest) {
+        patchMachine = {};
+        patchMachine.arch = patchSnap.is32 ? Arch::X86 : Arch::X64;
+    }
     if (padNop && origLen && bytes.size() < origLen) {
         std::string nopError;
-        if (!PadWithArchitectureNops(patchArch, bytes, origLen, &nopError)) {
+        if (!PadWithArchitectureNops(patchMachine, bytes, origLen, &nopError)) {
             patchStatus_ = nopError;
             ui::Toast(ui::ToastKind::Error, "Patch refused: " + nopError);
             return false;
@@ -14007,8 +14197,11 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
     const bool     live     = patchPopupLive_;
     const bool     is32     = snap.is32;
     const Arch     liveArch = is32 ? Arch::X86 : Arch::X64;
-    const Arch     patchArch = live ? liveArch : ctx.staticArch();
-    const bool     canAssemble = ArchSupportsAssembler(patchArch);
+    DecoderConfig patchMachine = live ? DecoderConfig{} : ctx.staticDecoderConfig();
+    if (live) patchMachine.arch = liveArch;
+    const Arch patchArch = patchMachine.arch;
+    std::string assemblerUnavailable;
+    const bool canAssemble = PatchAssemblerAvailable(patchMachine, &assemblerUnavailable);
     IDisassembler* pdis     = live ? liveDecoder(ctx, snap.is32) : ctx.staticDisassembler();
     if (opening) {
         patchPopupOutcome_ = {};
@@ -14085,7 +14278,7 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
     ImGui::RadioButton("Assembly", &patchMode_, 1);
     ImGui::EndDisabled();
     if (!canAssemble && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("Keystone patch assembly is unavailable for %s; Hex bytes remain available.", ArchName(patchArch));
+        ImGui::SetTooltip("%s", assemblerUnavailable.c_str());
     ImGui::SameLine();
     ImGui::RadioButton("Hex bytes", &patchMode_, 0);
 
@@ -14106,7 +14299,7 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
         ImGui::InputText("##asm", patchAsmText_, sizeof(patchAsmText_));
         ui::PopMono();
         if (patchAsmText_[0]) {
-            AsmResult r = Assemble(patchArch, patchAsmText_, patchVA_);
+            AsmResult r = Assemble(patchMachine, patchAsmText_, patchVA_);
             if (r.ok) {
                 bytes = r.bytes;
                 std::string hx;
@@ -14131,7 +14324,7 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
                                "Enter complete hexadecimal byte pairs; no prefix will be applied.");
         std::vector<uint8_t> exactNops;
         std::string nopReason;
-        const bool canNop = patchLen_ && ArchitectureNopFill(patchArch, patchLen_, exactNops, &nopReason);
+        const bool canNop = patchLen_ && ArchitectureNopFill(patchMachine, patchLen_, exactNops, &nopReason);
         ImGui::BeginDisabled(!canNop);
         if (ImGui::SmallButton("NOP fill")) {
             std::string s;
@@ -14160,7 +14353,7 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
     std::vector<uint8_t> effectiveBytes = bytes;
     std::string padReason;
     const bool padPossible = bytes.empty() || !patchPadNop_ || !patchLen_ || bytes.size() >= patchLen_ ||
-                             PadWithArchitectureNops(patchArch, effectiveBytes, patchLen_, &padReason);
+                             PadWithArchitectureNops(patchMachine, effectiveBytes, patchLen_, &padReason);
     if (!padPossible) {
         ImGui::SameLine(); ImGui::TextColored(theme::col::warn(), "%s", padReason.c_str());
     }
@@ -14212,7 +14405,7 @@ void BinaryViewTab::renderPatchPopup(AppContext& ctx) {
     ImGui::EndDisabled();
     ImGui::SameLine();
     std::vector<uint8_t> nopOut;
-    const bool canNopOut = patchLen_ && ArchitectureNopFill(patchArch, patchLen_, nopOut);
+    const bool canNopOut = patchLen_ && ArchitectureNopFill(patchMachine, patchLen_, nopOut);
     ImGui::BeginDisabled(!canNopOut || !popupFileKnown || liveWriteBlocked || patchPopupOutcome_.staticCommitted);
     if (ImGui::Button("NOP out"))
         applyPopup(std::move(nopOut), false);
@@ -17616,6 +17809,8 @@ void BinaryViewTab::renderDecompiler(AppContext& ctx) {
                 if (ImGui::Selectable(label, current)) gotoStatic(ctx, va);
                 if (ImGui::IsItemHovered()) { hoverThisFrame = va; hoverThisFrameValid = true; }
                 if (ImGui::BeginPopupContextItem("##decasm_actions")) {
+                    emitInstrCopyMenu(in, ctx.staticArch(), false);
+                    ImGui::Separator();
                     renderContextActionMenu(ctx, contextActionTarget(ctx, va, false));
                     ImGui::EndPopup();
                 }
@@ -17759,19 +17954,45 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
         !cursorValid_)
         selectFileOffset(ctx, hexCursorOff_);
 
+    // The toolbar and keyboard use exactly the same bounded copy. Keep a
+    // selection tied to actual bytes, including after an image gets smaller.
+    const bool haveSelection = hexSelA_ != ~0ull && hexSelB_ != ~0ull &&
+        hexSelA_ < total && hexSelB_ < total;
+    if (!haveSelection) hexSelA_ = hexSelB_ = ~0ull;
+    auto copySelection = [&] {
+        if (hexSelA_ == ~0ull || hexSelB_ == ~0ull) return;
+        const uint64_t lo = std::min(hexSelA_, hexSelB_);
+        const uint64_t selected = std::max(hexSelA_, hexSelB_) - lo + 1;
+        constexpr uint64_t copyLimit = 1ull << 20;
+        const uint64_t count = std::min(selected, copyLimit);
+        std::string text;
+        text.reserve(static_cast<size_t>(count) * 3);
+        char byte[4];
+        for (uint64_t i = 0; i < count; ++i) {
+            std::snprintf(byte, sizeof(byte), "%02X", bytes[static_cast<size_t>(lo + i)]);
+            if (i) text += ' ';
+            text += byte;
+        }
+        ImGui::SetClipboardText(text.c_str());
+        if (count < selected)
+            ui::Toast(ui::ToastKind::Warn, "Copied the first 1,048,576 bytes of the selection (clipboard limit).");
+        else
+            ui::Toast(ui::ToastKind::Success, "Copied " + std::to_string(count) + (count == 1 ? " byte." : " bytes."));
+    };
+
     // ---- toolbar: cursor status, goto-offset, copy selection ----------------
     {
         uint64_t cva = 0;
         bool mapped = ctx.staticBinary().offsetToVA(hexCursorOff_, cva);
         if (mapped) ImGui::Text("VA 0x%llX", (unsigned long long)cva);
-        else        ImGui::TextDisabled("no VA (unmapped file bytes: header/padding)");
+        else        ImGui::TextDisabled("Read-only: this file byte has no mapped VA");
         char offsetLabel[64];
         std::snprintf(offsetLabel, sizeof(offsetLabel), "File offset 0x%llX", (unsigned long long)hexCursorOff_);
         nextToolbarItem(offsetLabel);
         ImGui::TextDisabled("%s", offsetLabel);
         ui::SameLineIfFits(160.0f * theme::UiScale());
         ImGui::SetNextItemWidth(std::min(160.0f * theme::UiScale(), ImGui::GetContentRegionAvail().x));
-        if (ImGui::InputTextWithHint("##hexoff", "goto offset", hexGotoOff_, sizeof(hexGotoOff_),
+        if (ImGui::InputTextWithHint("##hexoff", "File offset + Enter", hexGotoOff_, sizeof(hexGotoOff_),
                                      ImGuiInputTextFlags_EnterReturnsTrue)) {
             const auto parsed = ParseInvestigationAddress(hexGotoOff_);
             if (parsed.status == InvestigationAddressParseStatus::Valid &&
@@ -17783,18 +18004,13 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
                           "Enter a complete file offset inside this image (hex, 0x..., ...h, or 0d...).");
             }
         }
+        ui::ItemTooltip("Jump to a file offset, including unmapped headers and padding.\nHexadecimal by default; use 0d for decimal. Press Enter to go.");
         const bool haveSel = hexSelA_ != ~0ull && hexSelB_ != ~0ull;
         nextToolbarItem("Copy");
         ImGui::BeginDisabled(!haveSel);
-        if (ImGui::SmallButton("Copy") && haveSel) {
-            uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::min<uint64_t>(std::max(hexSelA_, hexSelB_), total - 1);
-            hi = std::min(hi, lo + (1ull << 20));            // cap the clipboard at ~1 MiB of bytes
-            std::string s; s.reserve((size_t)(hi - lo + 1) * 3);
-            char b[4];
-            for (uint64_t a = lo; a <= hi; ++a) { std::snprintf(b, sizeof(b), "%02X", bytes[(size_t)a]); if (!s.empty()) s += ' '; s += b; }
-            ImGui::SetClipboardText(s.c_str());
-        }
+        if (ImGui::SmallButton("Copy") && haveSel) copySelection();
         ImGui::EndDisabled();
+        ui::ItemTooltip("Copy selected bytes as hexadecimal (Ctrl+C). Copies up to 1 MiB of bytes.");
         if (haveSel) {
             uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::max(hexSelA_, hexSelB_);
             char selectionLabel[64];
@@ -17802,7 +18018,13 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
             nextToolbarItem(selectionLabel);
             ImGui::TextDisabled("%s", selectionLabel);
         }
-        ImGui::TextDisabled("Type hex digits to edit  /  Tab switches hex and ASCII  /  Drag to select");
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::TextWrapped("%s column%s  |  Tab switches column  |  Shift+arrows or drag selects  |  Ctrl+C copies",
+            hexAsciiCol_ ? "ASCII" : "Hex", mapped ? (hexAsciiCol_ ? ": type to edit" : ": type two digits to edit") : ": read-only");
+        ImGui::PopStyleColor();
+        ui::ItemTooltip("Click a byte to focus the editor. Arrow keys and Page Up/Down move the cursor.\n"
+                        "Home/End moves to the row edge; Ctrl+Home/End moves to the file edge. Hold Shift to extend selection.\n"
+                        "Tab switches Hex/ASCII; Escape cancels an unfinished hex byte. Amber bytes have active patches.");
     }
 
     uint64_t typedHexVA = 0;
@@ -17818,6 +18040,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
                 ctx.staticProject().patches,
                 ctx.staticProject().patchSets);
             for (size_t index : plan.activePatchIndices) {
+                if (ctx.staticProject().patchRecoveryPending) break;
                 if (index >= ctx.staticProject().patches.size()) continue;
                 const PjPatch& p = ctx.staticProject().patches[index];
                 uint64_t off = 0;
@@ -17841,7 +18064,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
     const float byteW    = charW * 3.0f;                  // "XX "
     const float groupGap = charW;                          // extra gap after 8 bytes
     const float vaX      = charW;                          // VA column start
-    const float hexX     = vaX + charW * 14.0f;            // 12 digits + 2 spaces
+    const float hexX     = vaX + charW * 18.0f;            // full 64-bit VA + 2 spaces
     const float asciiX   = hexX + 16.0f * byteW + groupGap + charW * 2.0f;
     const float rowW     = asciiX + 16.0f * charW + charW;
     const float lineH    = ImGui::GetTextLineHeightWithSpacing();   // clipper row stride
@@ -17859,6 +18082,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
         uint64_t off = 0;
         if (ctx.staticBinary().vaToOffset(cursorVA_, off) && off < total) {
             hexCursorOff_ = off; hexPendScroll_ = off; hexEditNibble_ = -1;
+            hexSelA_ = hexSelB_ = off;
         }
         hexLastScroll_ = cursorVA_; hexLastScrollValid_ = true;
     }
@@ -17877,9 +18101,19 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  move(+16);
         if (ImGui::IsKeyPressed(ImGuiKey_PageUp))     move(-(int64_t)pageRows * 16);
         if (ImGui::IsKeyPressed(ImGuiKey_PageDown))   move(+(int64_t)pageRows * 16);
+        if (ImGui::IsKeyPressed(ImGuiKey_Home))
+            hexCursorOff_ = ImGui::GetIO().KeyCtrl ? 0 : (hexCursorOff_ / 16) * 16;
+        if (ImGui::IsKeyPressed(ImGuiKey_End))
+            hexCursorOff_ = ImGui::GetIO().KeyCtrl ? total - 1 : std::min(total - 1, (hexCursorOff_ / 16) * 16 + 15);
         if (ImGui::IsKeyPressed(ImGuiKey_Tab))        { hexAsciiCol_ = !hexAsciiCol_; hexEditNibble_ = -1; }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape))     hexEditNibble_ = -1;
-        if (hexCursorOff_ != prevOff) { hexPendScroll_ = hexCursorOff_; hexEditNibble_ = -1; }
+        if (hexCursorOff_ != prevOff) {
+            hexPendScroll_ = hexCursorOff_; hexEditNibble_ = -1;
+            if (ImGui::GetIO().KeyShift) {
+                if (hexSelA_ == ~0ull) hexSelA_ = prevOff;
+                hexSelB_ = hexCursorOff_;
+            } else hexSelA_ = hexSelB_ = hexCursorOff_;
+        }
 
         // Ctrl+C copies the selection (same format as the toolbar button).
         // Typed characters: hex nibbles (hex column) or raw bytes (ascii column).
@@ -17887,10 +18121,16 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
         if (!io.KeyCtrl) {
             for (int n = 0; n < io.InputQueueCharacters.Size; ++n) {
                 unsigned int ch = (unsigned int)io.InputQueueCharacters[n];
+                uint64_t editVA = 0;
+                if (!ctx.staticBinary().offsetToVA(hexCursorOff_, editVA)) {
+                    hexEditNibble_ = -1;
+                    break; // unmapped bytes are visibly read-only; do not advance as if edited
+                }
                 if (hexAsciiCol_) {
                     if (ch >= 0x20 && ch < 0x7F) {
                         hexCommitByte(ctx, hexCursorOff_, (uint8_t)ch);
                         move(+1); hexPendScroll_ = hexCursorOff_;
+                        hexSelA_ = hexSelB_ = hexCursorOff_;
                     }
                 } else {
                     int nib = -1;
@@ -17903,6 +18143,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
                         hexCommitByte(ctx, hexCursorOff_, (uint8_t)(hexEditByte_ | nib));
                         hexEditNibble_ = -1;
                         move(+1); hexPendScroll_ = hexCursorOff_;
+                        hexSelA_ = hexSelB_ = hexCursorOff_;
                     }
                 }
             }
@@ -17976,6 +18217,10 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
             if (hexDragging_ && hovered && ImGui::IsMouseDown(0)) {
                 bool ascii = false;
                 hexSelB_ = (uint64_t)byteFromMouse(ascii);
+                if (hexCursorOff_ != hexSelB_) {
+                    hexCursorOff_ = hexSelB_;
+                    selectFileOffset(ctx, hexCursorOff_);
+                }
             }
             if (hovered && ImGui::IsMouseReleased(0)) hexDragging_ = false;
             if (hovered) {
@@ -18033,15 +18278,7 @@ void BinaryViewTab::renderHex(AppContext& ctx) {
     if (!ImGui::IsMouseDown(0)) hexDragging_ = false;   // release outside any row
 
     // Ctrl+C anywhere in the focused child copies the selection.
-    if (focused && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) &&
-        hexSelA_ != ~0ull && hexSelB_ != ~0ull) {
-        uint64_t lo = std::min(hexSelA_, hexSelB_), hi = std::min<uint64_t>(std::max(hexSelA_, hexSelB_), total - 1);
-        hi = std::min(hi, lo + (1ull << 20));
-        std::string s; s.reserve((size_t)(hi - lo + 1) * 3);
-        char b[4];
-        for (uint64_t a = lo; a <= hi; ++a) { std::snprintf(b, sizeof(b), "%02X", bytes[(size_t)a]); if (!s.empty()) s += ' '; s += b; }
-        ImGui::SetClipboardText(s.c_str());
-    }
+    if (focused && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) copySelection();
 
     ImGui::EndChild();
     ui::PopMono();
@@ -18240,6 +18477,58 @@ std::string BinaryViewTab::guessSignature(AppContext& ctx, uint64_t fnStart, uin
     for (int i = 0; i < args; ++i) { if (i) sig += ", "; sig += "a" + std::to_string(i + 1); }
     sig += ")";
     return sig;
+}
+
+MemoryValueHint BinaryViewTab::memoryValueHint(AppContext& ctx, const Instruction& in,
+                                               const DbgSnapshot* live) {
+    MemoryValueReference reference;
+    if ((!live && (ctx.staticArch() == Arch::GML || ctx.staticArch() == Arch::JVM)) ||
+        !TryGetMemoryValueReference(in, reference)) return {};
+    const size_t width = reference.widthBits / 8;
+    if (!live) {
+        size_t available = 0;
+        const uint8_t* bytes = ctx.staticBinary().ptrFromVA(reference.address, available);
+        return FormatMemoryValueHint(reference, bytes, available,
+                                     ctx.staticDecoderConfig().byteOrder, false);
+    }
+    if ((live->state != DbgState::Paused && live->state != DbgState::Running) ||
+        !live->pid || !live->sessionGeneration) return {};
+    const DebugTargetIdentity owner{live->pid, live->sessionGeneration};
+    if (!ctx.debug.memorySessionMatches(owner)) {
+        memoryValueCache_.clear();
+        memoryValueOwner_ = {};
+        memoryValueStopKey_ = 0;
+        return {};
+    }
+    const uint64_t stopKey = liveStopKey(*live);
+    if (owner.pid != memoryValueOwner_.pid ||
+        owner.sessionGeneration != memoryValueOwner_.sessionGeneration ||
+        stopKey != memoryValueStopKey_) {
+        memoryValueCache_.clear();
+        memoryValueOwner_ = owner;
+        memoryValueStopKey_ = stopKey;
+    }
+    const int frame = ImGui::GetFrameCount();
+    if (memoryValueFrame_ != frame) { memoryValueFrame_ = frame; memoryValueReads_ = 0; }
+    const auto key = std::make_pair(reference.address, reference.widthBits);
+    auto sample = memoryValueCache_.find(key);
+    const double now = ImGui::GetTime();
+    ctx.wantContinuousRedraw = true;
+    if (sample == memoryValueCache_.end() || now - sample->second.sampledAt >= 0.25) {
+        // Work is bounded per frame and cached by address AND operand width so
+        // a byte at a page edge never requires an unrelated eight-byte read.
+        if (memoryValueReads_ >= 16) return {};
+        ++memoryValueReads_;
+        if (sample == memoryValueCache_.end() && memoryValueCache_.size() >= 512)
+            memoryValueCache_.clear();
+        MemoryValueSample current;
+        current.sampledAt = now;
+        current.count = ctx.debug.readMemoryMaskedForSession(owner.pid,
+            owner.sessionGeneration, reference.address, current.bytes, width);
+        sample = memoryValueCache_.insert_or_assign(key, current).first;
+    }
+    return FormatMemoryValueHint(reference, sample->second.bytes, sample->second.count,
+                                 ByteOrder::Little, true);
 }
 
 std::string BinaryViewTab::dataRefToken(AppContext& ctx, uint64_t va, bool live) {
@@ -18462,6 +18751,10 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
                 }
             }
         }
+        if (showMemoryValues_) {
+            const auto value = memoryValueHint(ctx, in);
+            if (!value.text.empty()) { r += "  ; "; r += value.text; }
+        }
         if (!in.comment.empty()) { r += "  ; "; r += in.comment.substr(0, 48); }   // decoder annotation (JVM)
         std::string singleLine;
         singleLine.reserve(r.size());
@@ -18630,6 +18923,14 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
             char address[32]; std::snprintf(address, sizeof(address), "0x%llX", (unsigned long long)fileCursorVA);
             ImGui::SetClipboardText(address);
         }
+        for (const auto& block : g.blocks) {
+            const auto selected = std::find_if(block.insns.begin(), block.insns.end(),
+                [&](const Instruction& in) { return in.address == fileCursorVA; });
+            if (selected != block.insns.end()) {
+                emitInstrCopyMenu(*selected, ctx.staticArch());
+                break;
+            }
+        }
         ImGui::EndDisabled();
         ImGui::Separator();
         if (ImGui::MenuItem("Fit graph")) cfgView_.fit(low, high, extent);
@@ -18637,6 +18938,13 @@ void BinaryViewTab::renderGraph(AppContext& ctx) {
         ImGui::EndPopup();
     }
     cfgViewCursor_ = fileCursorVA; cfgViewCursorValid_ = fileCursorValid;
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && !gio.WantTextInput &&
+        !ImGui::IsAnyItemActive() && gio.KeyCtrl && !gio.KeyAlt &&
+        ImGui::IsKeyPressed(ImGuiKey_C, false) && selectedBlock != SIZE_MAX && selectedRow != SIZE_MAX &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        const Instruction& in = g.blocks[selectedBlock].insns[selectedRow];
+        copyInstructionPatterns(std::span(&in, 1), ctx.staticArch(), gio.KeyShift);
+    }
 
     auto screen = [&](float x, float y) {
         const ui::GraphPoint p = cfgView_.project({x, y});
@@ -19790,6 +20098,10 @@ void BinaryViewTab::openHotPatch(AppContext& ctx, uint64_t siteVA, uint32_t orig
 }
 
 void BinaryViewTab::applyHotPatch(AppContext& ctx) {
+    if (ctx.staticProject().patchRecoveryPending) {
+        hotStatus_ = "Recover the retained saved records in Patches first.";
+        return;
+    }
     if (!hotSiteValid_) { hotStatus_ = "select an instruction span first"; return; }
     if (!ArchIsX86_32Or64(ctx.staticArch())) {
         hotStatus_ = std::string("refused: code-cave detours are x86/x64-only (active: ") +
@@ -19797,7 +20109,7 @@ void BinaryViewTab::applyHotPatch(AppContext& ctx) {
         return;
     }
     const PatchLang lang = hotLang_ == 1 ? PatchLang::C : PatchLang::Asm;
-    PatchCtx pc; pc.arch = archOf(ctx); pc.siteVA = hotSiteVA_;
+    PatchCtx pc; pc.machine = ctx.staticDecoderConfig(); pc.siteVA = hotSiteVA_;
     CompileResult cr = CompilePatch(lang, hotEditor_, pc);
     if (!cr.ok) { hotStatus_ = std::string("compile: ") + cr.diagnostics; return; }
     normalizePatchDestination(ctx.staticProject());
@@ -20635,7 +20947,7 @@ void BinaryViewTab::renderResourcesTab(AppContext& ctx) {
             std::string msg, nm = ResStem(r) + ResRawExt(r);
             const bool ok = ctx.saveBytesFile(nm, raw, msg);
             if (!msg.empty())
-                ui::Toast(ok ? ui::ToastKind::Success : ui::ToastKind::Error, msg.c_str());
+                ui::Toast(ok ? ui::ToastKind::Info : ui::ToastKind::Error, msg.c_str());
         }
         if (!resourceSaveLabel_.empty()) {
             ImGui::SameLine();
@@ -20645,9 +20957,9 @@ void BinaryViewTab::renderResourcesTab(AppContext& ctx) {
                 const wchar_t* filt = ico ? L"Icon (*.ico)\0*.ico\0All Files\0*.*\0"
                                           : L"Bitmap (*.bmp)\0*.bmp\0All Files\0*.*\0";
                 const bool ok = ctx.saveBytesFile(resourceSaveName_, resourceSaveBytes_, msg,
-                                                  filt, ico ? L"ico" : L"bmp");
+                                                   filt, ico ? L"ico" : L"bmp");
                 if (!msg.empty())
-                    ui::Toast(ok ? ui::ToastKind::Success : ui::ToastKind::Error, msg.c_str());
+                    ui::Toast(ok ? ui::ToastKind::Info : ui::ToastKind::Error, msg.c_str());
             }
         }
         ImGui::Separator();
@@ -21054,6 +21366,14 @@ void BinaryViewTab::renderAddressInspectorTab(AppContext& ctx) {
 
 void BinaryViewTab::renderPatchSetsPanel(AppContext& ctx) {
     ProjectState& project = ctx.staticProject();
+    if (project.patchRecoveryPending) {
+        ImGui::TextColored(theme::col::warn(), "%zu saved patch record(s) await recovery", project.patches.size());
+        ImGui::TextWrapped("%s", projectPatchWarning_.c_str());
+        if (ImGui::Button("Retry saved patch recovery")) restoreSavedPatches(ctx, true);
+        ImGui::TextDisabled("Forget record removes only that unapplied record, then retries the remaining selection.");
+        ImGui::Separator();
+        return;
+    }
     normalizePatchDestination(project);
 
     std::unordered_map<uint64_t, std::pair<size_t, uint64_t>> setStats;
@@ -22606,15 +22926,16 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
                     ImGui::TableSetColumnIndex(1);
                     ImGui::TextUnformatted(projectPatchSetName(ctx.staticProject(), V[i].patchSetId).c_str());
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::TextColored(enabled ? theme::col::good() : theme::col::muted(),
-                                       "%s", enabled ? "active" : "off");
+                    const bool pendingRecovery = ctx.staticProject().patchRecoveryPending;
+                    ImGui::TextColored(pendingRecovery ? theme::col::warn() : enabled ? theme::col::good() : theme::col::muted(),
+                                       "%s", pendingRecovery ? "pending" : enabled ? "active" : "off");
                     ImGui::TableSetColumnIndex(3); ImGui::TextDisabled("%s", hex(V[i].orig).c_str());
                     ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(hex(V[i].bytes).c_str());
                     ImGui::TableSetColumnIndex(5);
                     // Defer the actual revert until after the table loop so V isn't
                     // mutated mid-iteration; revertPatchAt() does the byte restore
                     // (live + image), the erase, and every cache invalidation.
-                    if (ImGui::SmallButton("revert")) {
+                    if (ImGui::SmallButton(pendingRecovery ? "Forget record" : "revert")) {
                         revertVA = V[i].address;
                         revertIndex = static_cast<size_t>(i);
                         doRevert = true;
@@ -22624,7 +22945,10 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
                 ImGui::EndTable();
             }
             ui::PopMono();
-            if (doRevert) revertPatchAt(ctx, revertVA, revertIndex);
+            if (doRevert) {
+                if (ctx.staticProject().patchRecoveryPending) forgetUnrestoredPatch(ctx, revertIndex);
+                else revertPatchAt(ctx, revertVA, revertIndex);
+            }
             ImGui::EndTabItem();
         }
         if (lowerPrimary && ImGui::BeginTabItem("Imports", nullptr,
@@ -24343,6 +24667,9 @@ void BinaryViewTab::render(AppContext& ctx) {
                                                 ImGuiInputTextFlags_EnterReturnsTrue);
         const bool gotoEdited = ImGui::IsItemEdited();
         ui::PopMono();
+        ui::ItemTooltip("Enter an address, module+offset, or symbol and press Enter.\n"
+                        "Bare addresses follow the current FILE/LIVE view. Use FILE: or LIVE: to choose explicitly.\n"
+                        "Hexadecimal by default; use 0d for decimal. Ctrl+G opens the symbol picker.");
         if (gotoEdited) { pendingGoto_ = {}; gotoStatus_.clear(); }
         if (gotoHit) submitGoto(ctx, gotoBuf_, false);
         if (!pendingGoto_.popup) pollPendingGoto(ctx);

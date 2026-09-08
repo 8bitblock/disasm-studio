@@ -1,13 +1,19 @@
 #include "Assembler.h"
 #include <keystone/keystone.h>
+#include <memory>
 
 namespace ds {
 
-AsmResult Assemble(Arch arch, const std::string& text, uint64_t address) {
+AsmResult Assemble(const DecoderConfig& config, const std::string& text, uint64_t address) {
     AsmResult res;
+    if (!PatchAssemblerAvailable(config, &res.error)) return res;
+    if (text.empty() || text.find('\0') != std::string::npos) {
+        res.error = "assembly must be nonempty text without embedded NUL bytes";
+        return res;
+    }
 
     ks_arch karch; ks_mode kmode;
-    switch (arch) {
+    switch (config.arch) {
         case Arch::X86:   karch = KS_ARCH_X86;   kmode = KS_MODE_32;            break;
         case Arch::X64:   karch = KS_ARCH_X86;   kmode = KS_MODE_64;            break;
         case Arch::ARM:   karch = KS_ARCH_ARM;   kmode = KS_MODE_ARM;           break;
@@ -19,28 +25,42 @@ AsmResult Assemble(Arch arch, const std::string& text, uint64_t address) {
             res.error = "patch assembler supports x86 / x64 / ARM / Thumb / ARM64 only";
             return res;
     }
+    if (config.byteOrder == ByteOrder::Big)
+        kmode = static_cast<ks_mode>(kmode | KS_MODE_BIG_ENDIAN);
+    if (config.features.armV8 && (config.arch == Arch::ARM || config.arch == Arch::THUMB))
+        kmode = static_cast<ks_mode>(kmode | KS_MODE_V8);
 
     ks_engine* ks = nullptr;
-    if (ks_open(karch, kmode, &ks) != KS_ERR_OK || !ks) {
-        res.error = "failed to initialize the assembler engine";
+    const ks_err opened = ks_open(karch, kmode, &ks);
+    if (opened != KS_ERR_OK || !ks) {
+        res.error = std::string("failed to initialize the requested assembler configuration: ") + ks_strerror(opened);
         return res;
     }
+    const std::unique_ptr<ks_engine, decltype(&ks_close)> engine(ks, &ks_close);
 
     unsigned char* enc = nullptr;
     size_t encSize = 0, stmtCount = 0;
-    if (ks_asm(ks, text.c_str(), address, &enc, &encSize, &stmtCount) != KS_ERR_OK) {
+    const int assembled = ks_asm(ks, text.c_str(), address, &enc, &encSize, &stmtCount);
+    const std::unique_ptr<unsigned char, decltype(&ks_free)> encoding(enc, &ks_free);
+    if (assembled != 0) {
         res.error = ks_strerror(ks_errno(ks));
-        if (enc) ks_free(enc);
-        ks_close(ks);
         return res;
     }
-
-    res.bytes.assign(enc, enc + encSize);
+    if (!enc || encSize == 0 || stmtCount == 0) {
+        res.error = "assembly produced no instruction bytes";
+        return res;
+    }
+    try { res.bytes.assign(enc, enc + encSize); }
+    catch (const std::bad_alloc&) {
+        res.error = "not enough memory to retain assembled bytes";
+        return res;
+    } catch (const std::length_error&) {
+        res.error = "assembled bytes exceed the container limit";
+        return res;
+    }
     res.count = stmtCount;
     res.ok    = true;
 
-    ks_free(enc);
-    ks_close(ks);
     return res;
 }
 

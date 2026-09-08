@@ -281,6 +281,7 @@ bool Debugger::connectGameMaker(std::shared_ptr<const GameMakerArchive> archive,
     const std::string& path, uint64_t hash, const std::vector<GmlSavedBreakpoint>& breakpoints,
     std::string& error) {
     std::lock_guard lock(mtx_);
+    if (cleanupOnly_ || pendingCommand_.command == Cmd::Detach) { error="Native cleanup is pending; Retry Detach first."; return false; }
     if ((state_!=DbgState::Running && state_!=DbgState::Paused) || isWow64_ || !archive || !archive->ok || !hash) {
         error="Attach to the x64 Nubby process and open its data.win first."; return false;
     }
@@ -317,6 +318,7 @@ bool Debugger::setGameMakerBreakpoints(uint64_t hash,const std::vector<GmlSavedB
     DebugTargetIdentity target;
     {
         std::lock_guard lock(mtx_);
+    if (cleanupOnly_ || pendingCommand_.command == Cmd::Detach) { error="Native cleanup is pending; Retry Detach first."; return false; }
         if(!gmlSession_ || gmlSession_->hash!=hash || breakpoints.size()>kGmlMaxBreakpoints) {
             error="The breakpoint list does not belong to this GameMaker connection.";return false;
         }
@@ -336,6 +338,7 @@ bool Debugger::gameMakerCommand(GmlControlCommand command,GmlPauseIdentity expec
     DebugTargetIdentity target;
     {
         std::lock_guard lock(mtx_);
+    if (cleanupOnly_ || pendingCommand_.command == Cmd::Detach) { error="Native cleanup is pending; Retry Detach first."; return false; }
         if(!gmlSession_ || !gmlSnapshot_.ready()) {error="GameMaker instruction debugging is not ready.";return false;}
         target=gmlSession_->target;
         if(command==GmlControlCommand::Pause && state_==DbgState::Running) {
@@ -355,6 +358,7 @@ bool Debugger::gameMakerCommand(GmlControlCommand command,GmlPauseIdentity expec
 }
 bool Debugger::editGameMakerNumeric(GmlPauseIdentity expected,uint64_t revision,uint32_t slot,std::string value,std::string& error) {
     std::lock_guard lock(mtx_);
+    if (cleanupOnly_ || pendingCommand_.command == Cmd::Detach) { error="Native cleanup is pending; Retry Detach first."; return false; }
     if(!gmlSession_ || state_!=DbgState::Paused || !gmlSnapshot_.stop || activeTid_!=expected.tid ||
         !GmlPauseIdentityMatches(expected,gmlSnapshot_.stop->identity) || revision!=gmlSnapshot_.revision || slot>=gmlSnapshot_.stop->numericSlotCount ||
         value.size()>128 || gmlSession_->edits.size()>=16) {
@@ -365,6 +369,7 @@ bool Debugger::editGameMakerNumeric(GmlPauseIdentity expected,uint64_t revision,
 }
 bool Debugger::inspectGameMakerInstance(GmlPauseIdentity expected,uint32_t objectIndex,uint64_t instanceId,std::string& error) {
     std::lock_guard lock(mtx_);
+    if (cleanupOnly_ || pendingCommand_.command == Cmd::Detach) { error="Native cleanup is pending; Retry Detach first."; return false; }
     if(!gmlSession_ || state_!=DbgState::Paused || !gmlSnapshot_.stop || activeTid_!=expected.tid ||
         !GmlPauseIdentityMatches(expected,gmlSnapshot_.stop->identity) ||
         (instanceId && objectIndex!=kGmlNoCodeIndex) ||
@@ -378,7 +383,7 @@ bool Debugger::inspectGameMakerInstance(GmlPauseIdentity expected,uint32_t objec
 void Debugger::disconnectGameMaker() {
     DebugTargetIdentity target;
     {
-        std::lock_guard lock(mtx_);if(!gmlSession_)return;
+        std::lock_guard lock(mtx_);if(cleanupOnly_ || pendingCommand_.command == Cmd::Detach || !gmlSession_)return;
         gmlSession_->disableRequested=true;target=gmlSession_->target;
         if(state_==DbgState::Paused){if(pendingCommand_.command==Cmd::None)pendingCommand_={Cmd::ServiceWrites,0,controlEpoch_};cmdCv_.notify_all();return;}
     }

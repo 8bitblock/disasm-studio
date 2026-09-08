@@ -12,6 +12,7 @@
 #include "../Core/Decompiler.h"        // DecompResult (pseudocode + per-line VA map)
 #include "../Core/AnalysisJobs.h"      // ListingLayout / ListingRowType
 #include "../Core/AddressInspector.h"  // validity-bearing FILE/LIVE address projection
+#include "../Core/MemoryValueHint.h"  // decoder-width numeric memory observations
 #include "../Core/LivePatchOriginal.h" // session-only live-patch rollback bytes
 #include "../Core/RegisterEdit.h"      // bounded register value/text editor input
 #include "../Core/InvestigationIndex.h" // immutable unified-omnibox snapshots
@@ -167,12 +168,19 @@ private:
     void selectRange(AppContext& ctx, uint64_t a, uint64_t b);             // retain selected displayed instructions
     void asmSelectionMenu(AppContext& ctx, const struct DbgSnapshot& snap); // batch actions over selVAs_ (static listing)
     void liveSelectionMenu(AppContext& ctx, const struct DbgSnapshot& snap); // batch actions over selVAs_ (live listing)
-    void emitInstrCopyMenu(const Instruction& in);                          // shared Copy bytes/C-array/instruction (static + live menus)
+    void emitInstrCopyMenu(const Instruction& in, Arch arch, bool shortcuts = true);
+    void copyAssemblyBytes(AppContext& ctx, const DbgSnapshot& snap,
+                           bool live, bool wildcard, bool cArray = false);
+    void assemblyCopyShortcut(AppContext& ctx, const DbgSnapshot& snap, bool live);
+    bool liveInstructionForCopy(AppContext& ctx, const DbgSnapshot& snap,
+                                uint64_t address, Instruction& out, std::string& error);
     void stepAsmCursor(AppContext& ctx, int delta);                         // exact on-demand page stepping
     void drawAsmArrows(float x0, float y0, float x1, float y1,
                        ImDrawList* listingDrawList = nullptr); // branch arrows in the scrolling table's drawlist
     void revertPatchAt(AppContext& ctx, uint64_t va,
                        size_t exactIndex = (std::numeric_limits<size_t>::max)()); // restore one recorded patch
+    bool restoreSavedPatches(AppContext& ctx, bool announce = false);
+    bool forgetUnrestoredPatch(AppContext& ctx, size_t index);
     bool transitionPatchSetState(AppContext& ctx,
                                  std::vector<PjPatch> desiredPatches,
                                  std::vector<PjPatchSet> desiredSets,
@@ -302,6 +310,8 @@ private:
     // Resolve a constant data address to a decompiler token (quoted string literal,
     // import/global name), or "" if not meaningful. `live` reads process memory.
     std::string dataRefToken(AppContext& ctx, uint64_t va, bool live);
+    MemoryValueHint memoryValueHint(AppContext& ctx, const Instruction& in,
+                                    const DbgSnapshot* live = nullptr);
     bool isNoreturnTarget(AppContext& ctx, uint64_t fileVA) const;
     ResolvedJumpTable resolveJumpTable(AppContext& ctx, const Instruction& in); // switch tables
     void renderSidePanel(AppContext& ctx);
@@ -730,6 +740,16 @@ private:
     // rows, every frame while paused.
     std::unordered_map<uint64_t, std::string> strCmtCache_;
     uint64_t  strCmtCacheKey_ = 0;
+    struct MemoryValueSample {
+        uint8_t bytes[8]{};
+        size_t count = 0;
+        double sampledAt = -1;
+    };
+    std::map<std::pair<uint64_t, uint16_t>, MemoryValueSample> memoryValueCache_;
+    DebugTargetIdentity memoryValueOwner_{};
+    uint64_t memoryValueStopKey_ = 0;
+    int memoryValueFrame_ = -1;
+    unsigned memoryValueReads_ = 0;
     uint64_t  lastScrolledRip_ = 0;    // focus addr we last auto-scrolled to (live view)
     bool      lastScrolledRipValid_ = false; // focus may legitimately be LIVE VA 0
     uint64_t  lastAsmScroll_   = 0;    // last centered static VA
@@ -976,6 +996,7 @@ private:
 
     // Inline string/data comments + cross-reference (xref) search.
     bool                  showStringComments_ = true;
+    bool                  showMemoryValues_   = true;
     bool                  showHints_          = true;   // inline "what it does" gloss per instruction
     bool                  gmlReadableInstructions_ = true; // display labels; decoded bytecode stays exact
     uint64_t              xrefTarget_ = 0;

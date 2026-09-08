@@ -463,21 +463,19 @@ bool RetargetDllDebugLaunchPlan(DllDebugLaunchPlan& plan,
 
     const std::string requested = NormalizeWindowsPath(plan.retarget.requestedDllPath);
     const std::string loaded = NormalizeWindowsPath(loadedDllPath);
-    if (requested != loaded) {
-        const bool loadedIsLeafOnly = loaded.find('\\') == std::string::npos;
-        if (!loadedIsLeafOnly || WindowsPathLeaf(requested).empty() ||
-            WindowsPathLeaf(requested) != loaded) {
-            plan.retarget.errors.emplace_back("The loaded module does not match the requested DLL path or leaf name.");
-            return false;
-        }
-        plan.retarget.evidence.emplace_back(
-            "Matched the loaded module by case-insensitive DLL leaf name because the debug event reported no directory.");
-    } else {
-        plan.retarget.evidence.emplace_back("Matched the loaded module by case-insensitive absolute path.");
+    // A leaf spelling can come from an unresolved/debuggee-controlled image
+    // name. It cannot authorize mutation of a same-named DLL from another path.
+    if (loaded.find('\\') == std::string::npos || requested != loaded) {
+        plan.retarget.errors.emplace_back(
+            "The loaded module lacks an authoritative matching full DLL path; target remains unresolved.");
+        return false;
     }
+    plan.retarget.evidence.emplace_back("Matched the loaded module by case-insensitive absolute path.");
 
     for (const auto& target : plan.breakpoints) {
-        if (target.rva > std::numeric_limits<uint64_t>::max() - loadedImageBase) {
+        if (target.rva > std::numeric_limits<uint64_t>::max() - loadedImageBase ||
+            (plan.inspection.bitness == DllBitness::X86 &&
+             (loadedImageBase > UINT32_MAX || target.rva > UINT32_MAX - loadedImageBase))) {
             plan.retarget.errors.emplace_back("A breakpoint RVA overflows the loaded image address space.");
             return false;
         }

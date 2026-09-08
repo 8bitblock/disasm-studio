@@ -1,10 +1,12 @@
 param([ValidateSet('Release')][string]$Configuration = 'Release', [switch]$CompileOnly,
-      [switch]$ReleaseWorkbenchOnly, [switch]$FeatureTabsOnly, [string]$ObjectRoot)
+      [switch]$ReleaseWorkbenchOnly, [switch]$FeatureTabsOnly, [string]$ObjectRoot,
+      [string]$DependencyRoot, [string]$OutputRoot)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 $objectRoot = if ($ObjectRoot) { [IO.Path]::GetFullPath($ObjectRoot) }
               else { Join-Path $taskRoot "build\int\x64\$Configuration" }
-$dependencyRoot = Join-Path $taskRoot 'vcpkg_installed\x64-windows-static\x64-windows-static'
+$dependencyRoot = if ($DependencyRoot) { [IO.Path]::GetFullPath($DependencyRoot) }
+                  else { Join-Path $taskRoot 'vcpkg_installed\x64-windows-static\x64-windows-static' }
 if (!(Test-Path -LiteralPath (Join-Path $objectRoot 'BinaryViewTab.obj'))) {
     throw 'Build DisasmStudio.sln Release|x64 first; this integration harness links the production app objects.'
 }
@@ -27,7 +29,8 @@ if ($LASTEXITCODE) { throw 'Visual Studio environment setup failed.' }
 foreach ($line in $environmentLines) {
     if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
 }
-$outputRoot = Join-Path ([IO.Path]::GetTempPath()) ('ds_static_listing_' + [Guid]::NewGuid().ToString('N'))
+$outputRoot = if ($OutputRoot) { Join-Path ([IO.Path]::GetFullPath($OutputRoot)) 'app-objects' }
+              else { Join-Path ([IO.Path]::GetTempPath()) ('ds_static_listing_' + [Guid]::NewGuid().ToString('N')) }
 [IO.Directory]::CreateDirectory($outputRoot) | Out-Null
 $source = Join-Path $PSScriptRoot $(if ($FeatureTabsOnly) { 'feature_tabs_ui_test.cpp' } elseif ($ReleaseWorkbenchOnly) { 'release_workbench_test.cpp' } else { 'static_listing_actions_test.cpp' })
 $testObject = Join-Path $outputRoot 'static_listing_actions_test.obj'
@@ -70,7 +73,7 @@ $symbols = & dumpbin.exe /nologo /symbols $testObject
 foreach ($line in $symbols) {
     if ($line -match 'UNDEF.*External\s+\|\s+(\?\S+)') {
         $symbol = $matches[1]
-        foreach ($fixtureClass in @('BinaryViewTab', 'CortexTab', 'SigScannerTab', 'BinaryTechTab', 'BinaryDiffTab', 'ProjectsTab', 'MemoryToolsTab')) {
+        foreach ($fixtureClass in @('BinaryViewTab', 'CortexTab', 'SigScannerTab', 'BinaryTechTab', 'BinaryDiffTab', 'ProjectsTab', 'MemoryToolsTab', 'PrismTab', 'CommunicationsTab')) {
             if ($symbol.Contains('@' + $fixtureClass + '@ds@@QE')) {
                 $original = $symbol.Replace('@' + $fixtureClass + '@ds@@QE', '@' + $fixtureClass + '@ds@@AE')
                 $linkArguments += ('/ALTERNATENAME:' + $symbol + '=' + $original)

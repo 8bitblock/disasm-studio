@@ -1555,7 +1555,7 @@ void CortexTab::render(AppContext& ctx) {
             std::string html = RenderCortexHtml(rep_);
             std::string msg;
             if (ctx.exportAnalysisFile("cortex-report", md, html, msg))
-                ui::Toast(ui::ToastKind::Success, msg);
+                ui::Toast(ui::ToastKind::Info, msg);
             else if (!msg.empty())
                 ui::Toast(ui::ToastKind::Warn, msg);
         }

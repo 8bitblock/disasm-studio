@@ -686,9 +686,13 @@ void ConnectionsTab::render(AppContext& ctx) {
     ImGui::TextDisabled("%d shown / %zu tracked \xC2\xB7 %d active", (int)view.size(), log_.size(), activeCount);
 
     if (view.empty()) {
-        ImGui::TextWrapped(log_.empty()
-            ? "No connections have been sampled yet. Use Refresh now or leave Auto enabled."
-            : "No connections match the current filters. Clear the search or relax Active only, TCP only, or Attached process only.");
+        if (log_.empty()) {
+            ImGui::TextWrapped("No connections have been sampled yet. Use Refresh now or leave Auto enabled.");
+        } else if (ui::EmptyState(DS_ICON_SEARCH, "No matching connections",
+                                 "Your search or scope filters hide the tracked connections.", "Reset filters")) {
+            filter_[0] = '\0';
+            activeOnly_ = tcpOnly_ = attachedOnly_ = false;
+        }
         return;
     }
     // Server Watch owns its own workspace. History retains the full viewport

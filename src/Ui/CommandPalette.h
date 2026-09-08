@@ -61,6 +61,7 @@ private:
     bool                        focusNext_  = false;
     int                         sel_        = 0;
     bool                        selMoved_   = false;
+    bool                        selectionExplicit_ = false;
     char                        query_[160] = "";
     std::string                 lastQuery_  = "\x01";   // != "" so the first frame rebuilds
     std::vector<PaletteItem>    actions_;

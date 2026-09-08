@@ -214,6 +214,11 @@ struct ProjectState {
     // Presentation order only. Patch application always follows `patches` so
     // enabling/disabling a set cannot silently reorder surviving records.
     std::vector<PjPatchSet>                     patchSets;
+    // Session state only: recovery never deletes saved intent or pretends that
+    // rejected records are present in the image. Retrying requires the exact
+    // pristine image on which the first restoration attempt was made.
+    bool                                      patchRecoveryPending = false;
+    uint64_t                                  patchRecoveryImageRevision = 0;
     std::vector<PjSynthesis>                    syntheses;      // F1 saved synthesis results
     std::vector<PjHotPatch>                     hotPatches;     // F2 sources; legacy Python is read-only
     std::vector<PjLabel>                        labels;         // class/method/field/resource/event labels

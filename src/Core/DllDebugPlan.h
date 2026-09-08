@@ -160,9 +160,9 @@ DllDebugLaunchPlan BuildDllDebugLaunchPlan(
     const DllHostEnvironment& environment);
 
 // Update breakpoint runtime VAs after LOAD_DLL_DEBUG_EVENT identifies the
-// requested module. Matching is case-insensitive; a leaf-name match is accepted
-// only when the debug event could report no directory at all. Two different
-// absolute paths are never treated as the same DLL.
+// requested module. Matching requires a case-insensitive full path from the
+// debug event's backing file. A leaf-only name remains unresolved and never
+// grants authority to plant breakpoints in a same-named DLL.
 bool RetargetDllDebugLaunchPlan(DllDebugLaunchPlan& plan,
                                 const std::string& loadedDllPath,
                                 uint64_t loadedImageBase);

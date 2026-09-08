@@ -158,8 +158,11 @@ struct Fixture {
 #include "seven_improvements_fixture.inc"
 #include "notes_editor_fixture.inc"
 #include "value_origin_ui_fixture.inc"
+#include "memory_value_hints_fixture.inc"
+#include "instruction_copy_fixture.inc"
 #include "release_workbench_fixture.inc"
 #include "navigator_refinement_fixture.inc"
+#include "hex_refinement_fixture.inc"
 #include "context_action_regressions.inc"
 #include "patch_restoration_fixture.inc"
 #include "trace_workflow_fixture.inc"
@@ -270,6 +273,55 @@ static void checkSavedPatchReopen(const std::string& path) {
     const auto* accepted = reopened.tab->listingBoundaryAuthority_.acceptedSnapshot(kTarget);
     CHECK(accepted && accepted->instruction.length == 1 && accepted->bytes == std::vector<uint8_t>{0x90});
     CHECK(reopened.tab->staticBreakpointValidationErrors_.empty());
+}
+
+static void checkSavedPatchRecovery(const std::string& path) {
+    ProjectState saved;
+    saved.patchSets = {{9, "disabled saved experiment", false}};
+    saved.patches = {{kTarget, {0xFF,0xC0}, {0x90,0x90}},
+                     {kTarget + 8, {0x01,0x02}, {0x90,0x90}, 9}};
+    Fixture f(path, true, &saved);
+    auto& project = f.ctx.staticProject();
+    CHECK(project.patchRecoveryPending && project.patches.size() == 2);
+    CHECK(f.tab->projectPatchWarning_.find("patch #2") != std::string::npos);
+    size_t available = 0;
+    auto* bytes = f.ctx.staticBinary().ptrFromVA(kTarget, available);
+    CHECK(bytes && available >= 2 && bytes[0] == 0xFF && bytes[1] == 0xC0);
+    const uint64_t revision = f.ctx.staticBinary().imageRevision();
+    frame([&] { CHECK(!f.tab->restoreSavedPatches(f.ctx, true)); });
+    CHECK(project.patches.size() == 2 && f.ctx.staticBinary().imageRevision() == revision);
+    frame([&] {
+        CHECK(!f.tab->applyPatchBytes(f.ctx, kTarget + 16, {0x90,0x90}, 2, false));
+        f.tab->revertPatchAt(f.ctx, kTarget, 0);
+    });
+    CHECK(project.patches.size() == 2 && f.ctx.staticBinary().imageRevision() == revision);
+    f.tab->saveProjectState(f.ctx);
+    ProjectState roundtrip;
+    CHECK(DeserializeProject(SerializeProject(project), roundtrip));
+    CHECK(roundtrip.patches.size() == 2 && roundtrip.patchSets.size() == 1);
+    CHECK(roundtrip.patches[1].orig == std::vector<uint8_t>({0x01,0x02}));
+    frame([&] { CHECK(f.tab->forgetUnrestoredPatch(f.ctx, 1)); });
+    CHECK(!project.patchRecoveryPending && project.patches.size() == 1);
+    CHECK(f.tab->projectPatchWarning_.empty());
+    bytes = f.ctx.staticBinary().ptrFromVA(kTarget, available);
+    CHECK(bytes && bytes[0] == 0x90 && bytes[1] == 0x90);
+}
+
+static void checkBigEndianPatchPadding(const std::string& path) {
+    Fixture f(path);
+    DecoderConfig machine;
+    machine.arch = Arch::ARM;
+    machine.byteOrder = ByteOrder::Big;
+    machine.engine = Engine::Capstone;
+    CHECK(f.ctx.setStaticDecoderConfiguration(machine));
+    frame([&] {
+        CHECK(f.tab->applyPatchBytes(f.ctx, kTarget, {0xE3,0xA0,0x00,0x01}, 8, true));
+    });
+    size_t available = 0;
+    const auto* bytes = f.ctx.staticBinary().ptrFromVA(kTarget, available);
+    const std::vector<uint8_t> expected{0xE3,0xA0,0x00,0x01,0xE3,0x20,0xF0,0x00};
+    CHECK(bytes && available >= expected.size() && std::equal(expected.begin(), expected.end(), bytes));
+    CHECK(f.ctx.staticProject().patches.size() == 1 && f.ctx.staticProject().patches[0].bytes == expected);
 }
 
 static void checkContextMenu(const std::string& path, bool full) {
@@ -978,6 +1030,148 @@ static void checkWorkbenchShell() {
     theme::SetUiScale(1.0f); theme::ApplyTheme(priorTheme);
 }
 
+#include "shell_refinement_fixture.inc"
+#include "ui_consistency_fixture.inc"
+
+namespace ds {
+// Observe the real App/service close boundary without exposing a product API.
+struct AppExitTestAccess {
+    static AppContext& context(App& app) { return app.ctx_; }
+    static void poll(App& app) { app.ctx_.pollArtifactWrites(); app.pollExit(); }
+};
+namespace debugger_detail {
+struct LifecycleTestAccess {
+    static void publish(Debugger& debugger, DbgLifecycleSnapshot snapshot) {
+        // This fixture never queues native work, changes DbgState or gives the
+        // idle lifecycle worker a target. Only public completion evidence varies.
+        std::lock_guard lock(debugger.lifecycleMtx_);
+        debugger.lifecycle_ = std::move(snapshot);
+    }
+    static void setCleanupOnly(Debugger& debugger, bool value) {
+        // Retain only the public cleanup evidence; this fixture owns no target.
+        std::lock_guard lock(debugger.mtx_);
+        debugger.cleanupOnly_ = value;
+    }
+};
+}
+}
+
+static void checkApplicationExit(const std::string& path) {
+    enum class ArtifactCase { Success, Failure, ReportFailure };
+    const auto root = std::filesystem::path(path).parent_path();
+    for (const auto scenario : {ArtifactCase::Success, ArtifactCase::Failure, ArtifactCase::ReportFailure}) {
+        App app;
+        auto& ctx = AppExitTestAccess::context(app);
+        std::promise<void> release;
+        const auto gate = release.get_future().share();
+        bool completed = false, callbackBeforeExit = false;
+        std::string completionFailure;
+        DbgLifecycleSnapshot historical;
+        historical.requestId = 899;
+        historical.command = DbgLifecycleCommand::Launch;
+        historical.completed = true;
+        historical.error = "unrelated historical launch failure";
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, historical);
+        std::string message;
+        CHECK(ctx.queueArtifactWrite([gate, root, scenario] {
+            gate.wait();
+            const std::vector<uint8_t> bytes{0x12, 0x34};
+            if (scenario == ArtifactCase::Failure)
+                return WriteArtifactBytes(root / L"exit-missing-parent" / L"failed.bin", bytes);
+            auto result = WriteArtifactBytes(root / L"exit-artifact.bin", bytes);
+            if (scenario == ArtifactCase::ReportFailure) {
+                const auto report = WriteArtifactBytes(root / L"exit-missing-parent" / L"report.txt", bytes);
+                if (!report.success) result.warning = "Artifact saved, but report failed: " + report.error;
+            }
+            return result;
+        }, message, [&](const ArtifactWriteResult& result) {
+            completed = true;
+            callbackBeforeExit = !app.wantsExit();
+            completionFailure = result.success ? result.warning : result.error;
+        }));
+        app.requestExit();
+        AppExitTestAccess::poll(app);
+        CHECK(!app.wantsExit()); // the accepted writer is still gated
+        release.set_value();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!completed && std::chrono::steady_clock::now() < deadline) {
+            AppExitTestAccess::poll(app);
+            Sleep(1);
+        }
+        CHECK(completed && callbackBeforeExit);
+        CHECK(app.wantsExit() == (scenario == ArtifactCase::Success));
+        if (scenario != ArtifactCase::Success) {
+            CHECK(!completionFailure.empty() && app.exitFailureReason() == completionFailure);
+            AppExitTestAccess::poll(app);
+            CHECK(!app.wantsExit()); // failure cancels rather than defers close
+            app.requestExit();      // a new explicit close can acknowledge it
+            CHECK(app.wantsExit());
+        }
+    }
+
+    enum class LifecycleCase { Success, Failure, Superseded };
+    for (const auto scenario : {LifecycleCase::Success, LifecycleCase::Failure, LifecycleCase::Superseded}) {
+        App app;
+        auto& ctx = AppExitTestAccess::context(app);
+        DbgLifecycleSnapshot lifecycle;
+        lifecycle.requestId = 900;
+        lifecycle.command = DbgLifecycleCommand::Detach;
+        lifecycle.state = DbgLifecycleState::Stopping;
+        lifecycle.busy = true;
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, lifecycle);
+        app.requestExit();
+        CHECK(!app.wantsExit());
+        lifecycle.busy = false;
+        lifecycle.completed = true;
+        lifecycle.succeeded = scenario != LifecycleCase::Failure;
+        lifecycle.state = lifecycle.succeeded ? DbgLifecycleState::Detached : DbgLifecycleState::Failed;
+        if (scenario == LifecycleCase::Superseded) ++lifecycle.requestId;
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, lifecycle);
+        AppExitTestAccess::poll(app);
+        CHECK(app.wantsExit() == (scenario == LifecycleCase::Success));
+        if (scenario != LifecycleCase::Success) {
+            AppExitTestAccess::poll(app);
+            CHECK(!app.wantsExit());
+        }
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, {});
+    }
+    for (const bool cleanupFailed : {false, true}) {
+        App app;
+        auto& ctx = AppExitTestAccess::context(app);
+        DbgLifecycleSnapshot startup;
+        startup.requestId = 901;
+        startup.command = DbgLifecycleCommand::Launch;
+        startup.state = DbgLifecycleState::Starting;
+        startup.busy = true;
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, startup);
+        app.requestExit();
+        CHECK(!app.wantsExit());
+        const auto cancelled = ctx.debug.lifecycleSnapshot();
+        CHECK(cancelled.requestId == startup.requestId && cancelled.busy &&
+              cancelled.state == DbgLifecycleState::Stopping);
+        startup.busy = false;
+        startup.completed = true;
+        startup.cancelled = true;
+        startup.state = cleanupFailed ? DbgLifecycleState::Failed : DbgLifecycleState::Detached;
+        if (cleanupFailed) startup.error = "Startup cancellation could not restore the target.";
+        debugger_detail::LifecycleTestAccess::setCleanupOnly(ctx.debug, cleanupFailed);
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, startup);
+        AppExitTestAccess::poll(app);
+        CHECK(app.wantsExit() == !cleanupFailed);
+        CHECK(!app.exitPending());
+        if (cleanupFailed) {
+            CHECK(app.exitFailureReason() == startup.error);
+            AppExitTestAccess::poll(app);
+            CHECK(!app.wantsExit() && !app.exitPending());
+            const auto retained = ctx.debug.lifecycleSnapshot();
+            CHECK(retained.requestId == startup.requestId &&
+                  retained.command == DbgLifecycleCommand::Launch && !retained.busy);
+        }
+        debugger_detail::LifecycleTestAccess::setCleanupOnly(ctx.debug, false);
+        debugger_detail::LifecycleTestAccess::publish(ctx.debug, {});
+    }
+}
+
 int main() {
     char patchRestorationChild[8]{};
     if (GetEnvironmentVariableA("DS_PATCH_RESTORATION_CHILD", patchRestorationChild,
@@ -1016,6 +1210,8 @@ int main() {
         checkSelectionMenu(path, true);
         checkSelectionMenu(path, false);
         checkSavedPatchReopen(path);
+        checkSavedPatchRecovery(path);
+        checkBigEndianPatchPadding(path);
         checkContextMenu(path, true);
         checkContextMenu(path, false);
         checkPopupAfterEviction(path);
@@ -1031,6 +1227,8 @@ int main() {
         checkTypesClosePrompt(path);
         checkNotesEditorBoundaries();
         checkValueOriginWorkbench(path);
+        checkMemoryValueHints(path);
+        checkInstructionCopy(path);
         checkContextActionDispatcher(path);
         checkEffectivePatchPreview(path, false);
         checkEffectivePatchPreview(path, true);
@@ -1044,6 +1242,11 @@ int main() {
         checkRegisterEditorPresentation(path);
         checkInspectorObservationValidity(path);
         checkWorkbenchShell();
+        checkApplicationExit(path);
+        checkPaletteActionRetention();
+        checkShellKeyboardNavigation();
+        checkUiConsistencyMatrix();
+        checkHexRefinement(path); // actual-font matrix runs after default-font fixtures
     } catch (const std::exception& error) { std::printf("EXCEPTION: %s\n", error.what()); ++failures; }
     ImGui::DestroyContext();
     std::printf("static_listing_actions_test: %s (%d failure(s))\n", failures ? "FAILED" : "passed", failures);
