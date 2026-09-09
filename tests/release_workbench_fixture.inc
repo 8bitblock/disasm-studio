@@ -52,14 +52,15 @@ static void checkReleaseWorkbench(const std::string& path) {
             ImGuiWindow* navigator = releaseWindow("##right_inspector");
             ImGuiWindow* functions = releaseWindow("navigator_functions");
             ImGuiWindow* strings = releaseWindow("navigator_strings");
-            ImGuiWindow* queue = releaseWindow("navigator_analysis_queue");
-            CHECK(navigator && functions && strings && queue);
-            if (!navigator || !functions || !strings || !queue) return;
+            CHECK(navigator && functions && strings);
+            if (!navigator || !functions || !strings) return;
             CHECK(functions->Size.y > ImGui::GetTextLineHeight() * 3);
             CHECK(strings->Size.y > ImGui::GetTextLineHeight() * 3);
             CHECK(functions->Pos.y + functions->Size.y <= strings->Pos.y + 1.0f);
-            CHECK(strings->Pos.y + strings->Size.y <= queue->Pos.y + 1.0f);
-            for (ImGuiWindow* child : {functions, strings, queue}) {
+            CHECK(functions->Size.y > strings->Size.y);
+            CHECK(functions->Size.y < strings->Size.y * 1.2f);
+            CHECK(strings->Pos.y + strings->Size.y >= navigator->InnerRect.Max.y - 2.0f);
+            for (ImGuiWindow* child : {functions, strings}) {
                 CHECK(child->Pos.x >= navigator->Pos.x - 1.0f);
                 CHECK(child->Pos.x + child->Size.x <= navigator->Pos.x + navigator->Size.x + 1.0f);
                 CHECK(child->Pos.y + child->Size.y <= navigator->Pos.y + navigator->Size.y + 1.0f);
@@ -72,6 +73,11 @@ static void checkReleaseWorkbench(const std::string& path) {
         CHECK(visibleText.find("check_activation") != std::string::npos);
         CHECK(visibleText.find("Activated") != std::string::npos);
         CHECK(releaseWindow("navigator_optional") == nullptr);
+        CHECK(releaseWindow("navigator_analysis_queue") == nullptr);
+        CHECK(releaseWindow("##binary_command_band") == nullptr);
+        CHECK(visibleText.find("Registers") != std::string::npos);
+        CHECK(visibleText.find("GENERAL PURPOSE") != std::string::npos);
+        CHECK(visibleText.find("FILE / no process attached") != std::string::npos);
         ImGuiWindow* navigator = releaseWindow("##right_inspector");
         ImGuiWindow* viewport = releaseWindow("##analysis_viewport");
         ImGuiWindow* evidence = releaseWindow("##evidence_inspector");
@@ -82,9 +88,8 @@ static void checkReleaseWorkbench(const std::string& path) {
             CHECK(evidence->Pos.x + evidence->Size.x <= size.x + 1.0f);
         }
 
-        // Intermediate widths used to keep the inspector open while squeezing
-        // instruction text. Collapse only its presentation, retaining the user's
-        // chosen width and independent pane state for the return to a wide window.
+        // The reference keeps both side rails open at ordinary laptop widths.
+        // Collapse only when the actual center would fall below 300 logical px.
         const ImVec2 wideSize = size;
         const float scale = theme::UiScale();
         const float retainedEvidenceWidth = f.tab->evidenceInspectorW_;
@@ -94,12 +99,16 @@ static void checkReleaseWorkbench(const std::string& path) {
         viewport = releaseWindow("##analysis_viewport");
         CHECK(evidence && viewport);
         if (evidence && viewport) {
-            CHECK(std::fabs(evidence->Size.x - 34.0f * scale) <= 1.0f);
-            CHECK(viewport->Size.x >= 760.0f * scale);
+            CHECK(std::fabs(evidence->Size.x - 252.0f * scale) <= 1.0f);
+            CHECK(viewport->Size.x >= 300.0f * scale);
         }
         CHECK(!f.tab->evidenceInspectorCollapsed_ && !f.tab->lowerDockCollapsed_);
         CHECK(f.tab->evidenceInspectorW_ == retainedEvidenceWidth);
         permanentNavigator();
+        size = ImVec2(680.0f * scale, 800.0f * scale);
+        settle();
+        evidence = releaseWindow("##evidence_inspector");
+        CHECK(evidence && std::fabs(evidence->Size.x - 34.0f * scale) <= 1.0f);
 
         // Responsive collapse must leave evidence reachable. The real rail
         // button opens the same inspector in a bounded popup without changing
@@ -117,9 +126,8 @@ static void checkReleaseWorkbench(const std::string& path) {
             CHECK(popup->Pos.y >= host->WorkPos.y);
             CHECK(popup->Pos.x + popup->Size.x <= host->WorkPos.x + host->WorkSize.x + 1.0f);
             CHECK(popup->Pos.y + popup->Size.y <= host->WorkPos.y + host->WorkSize.y + 1.0f);
-            CHECK(visibleText.find("Evidence inspector") != std::string::npos);
-            CHECK(visibleText.find("Open register editor") != std::string::npos);
-            CHECK(visibleText.find("Open Authorization trail") != std::string::npos);
+            CHECK(visibleText.find("Registers") != std::string::npos);
+            CHECK(visibleText.find("GENERAL PURPOSE") != std::string::npos);
         };
         auto openEvidencePopup = [&] {
             releaseActivate(releaseWindow("##evidence_inspector"), "###evidence_toggle");
@@ -138,7 +146,7 @@ static void checkReleaseWorkbench(const std::string& path) {
         // analyst had already collapsed the pane manually.
         f.tab->evidenceInspectorCollapsed_ = true;
         openEvidencePopup();
-        size = ImVec2(820, 560);
+        size = ImVec2(620.0f * scale, 560.0f * scale);
         settle();
         popupBounds();
         CHECK(f.tab->evidenceInspectorCollapsed_);
@@ -148,7 +156,7 @@ static void checkReleaseWorkbench(const std::string& path) {
         settle();
         CHECK(evidencePopup() == nullptr);
         CHECK(f.tab->evidenceInspectorCollapsed_);
-        size = ImVec2(1200.0f * scale, 800.0f * scale);
+        size = ImVec2(680.0f * scale, 800.0f * scale);
         settle();
 
         // Handoffs close the popup so its destination can be used immediately.
@@ -160,6 +168,16 @@ static void checkReleaseWorkbench(const std::string& path) {
         CHECK(!f.tab->lowerDockCollapsed_ && !f.tab->lowerAdvancedMode_);
         CHECK(f.tab->evidenceInspectorCollapsed_);
         openEvidencePopup();
+        // Popup tree state survives the first viewport case. Only activate a
+        // closed header; toggling an already-open Details section hides the target.
+        if (ImGuiWindow* popup = evidencePopup(); popup &&
+            !popup->StateStorage.GetBool(popup->GetID("Details##evidence_details")))
+            releaseActivate(popup, "Details##evidence_details");
+        settle();
+        if (ImGuiWindow* popup = evidencePopup())
+            CHECK(popup->StateStorage.GetBool(popup->GetID("Details##evidence_details")));
+        if (ImGuiWindow* popup = evidencePopup()) popup->Scroll.y = popup->ScrollMax.y;
+        settle();
         releaseActivate(evidencePopup(), "Open Authorization trail");
         settle();
         CHECK(evidencePopup() == nullptr);
@@ -179,7 +197,11 @@ static void checkReleaseWorkbench(const std::string& path) {
 
         // Actual workflow and rail actions must leave the two navigator lists
         // present and must not couple subsequent independent expand operations.
-        releaseActivate(releaseWindow("##binary_command_band"), "Focus code");
+        releaseActivate(ImGui::FindWindowByName("Release workbench QA"), "###binary_workspace");
+        settle();
+        releaseActivate(evidencePopup(), "Focus code");
+        settle();
+        ImGui::ClosePopupsOverWindow(nullptr, false);
         settle();
         CHECK(f.tab->evidenceInspectorCollapsed_ && f.tab->lowerDockCollapsed_);
         CHECK(f.tab->analysisQueueCollapsed_ && f.ctx.analysisQueueCollapsed);
@@ -197,7 +219,7 @@ static void checkReleaseWorkbench(const std::string& path) {
                     labelTop = std::min(labelTop, vertex.pos.y);
                     labelBottom = std::max(labelBottom, vertex.pos.y);
                 }
-            const float expectedHeight = ImGui::CalcTextSize("Evidence inspector").x;
+            const float expectedHeight = ImGui::CalcTextSize("Registers / evidence").x * 0.76f;
             CHECK(labelBottom - labelTop >= expectedHeight - ImGui::GetFontSize() * 2.0f);
             CHECK(labelBottom - labelTop > collapsedEvidence->Size.x * 2.0f);
             CHECK(labelBottom <= collapsedEvidence->Pos.y + collapsedEvidence->Size.y + 1.0f);
@@ -217,24 +239,42 @@ static void checkReleaseWorkbench(const std::string& path) {
         releaseActivate(releaseWindow("##bottom_tool_drawer"), "##button", "lower_dock_edge_toggle");
         settle();
         CHECK(f.tab->lowerDockCollapsed_);
+        auto openNavigatorTools = [&] {
+            releaseActivate(releaseWindow("navigator_functions"), "...##function_tools");
+            settle();
+            releaseActivate(evidencePopup(), "Navigator tools and analysis queue");
+            settle();
+            CHECK(visibleText.find("Navigator tools") != std::string::npos);
+            CHECK(releaseWindow("navigator_analysis_queue") != nullptr);
+            permanentNavigator();
+        };
+        openNavigatorTools();
         releaseActivate(releaseWindow("navigator_analysis_queue"), "###queue_toggle");
         settle();
         CHECK(!f.tab->analysisQueueCollapsed_ && !f.ctx.analysisQueueCollapsed);
         CHECK(f.tab->lowerDockCollapsed_ && !f.tab->evidenceInspectorCollapsed_);
         permanentNavigator();
 
-        // The real menu is the only action opening an optional category. The
-        // same choice then survives representation/preset changes and resizing.
-        releaseActivate(releaseWindow("##right_inspector"), "Customize##navigator");
+        // Optional categories live in the tools popup. Their preference survives
+        // closing it, representation/preset changes, resizing and document UI recreation.
+        releaseActivate(evidencePopup(), "Choose tools");
         settle();
         ImGuiWindow* menu = ImGui::GetCurrentContext()->OpenPopupStack.empty()
             ? nullptr : ImGui::GetCurrentContext()->OpenPopupStack.back().Window;
         releaseActivate(menu, "Bookmarks");
         settle();
-        CHECK(releaseWindow("navigator_optional") != nullptr);
         CHECK(f.ctx.navigatorOptionalMask != 0);
         const uint32_t manualChoice = f.ctx.navigatorOptionalMask;
+        // Native menu selection dismisses its popup chain. Reopening the tools
+        // must expose the newly selected category without changing that choice.
+        openNavigatorTools();
+        CHECK(releaseWindow("navigator_optional") != nullptr);
+        CHECK(f.ctx.navigatorOptionalMask == manualChoice);
         permanentNavigator();
+        ImGui::ClosePopupsOverWindow(nullptr, false);
+        settle();
+        CHECK(releaseWindow("navigator_optional") == nullptr);
+        CHECK(releaseWindow("navigator_analysis_queue") == nullptr);
         frame([&] { f.tab->applyWorkflow(f.ctx, 1); }, "Workflow transition");
         CHECK(f.ctx.requestedTab == "Communications");
         settle();
@@ -244,8 +284,12 @@ static void checkReleaseWorkbench(const std::string& path) {
         size = size.x > 1400 ? ImVec2(1366, 800) : ImVec2(1920, 1200);
         settle();
         CHECK(f.ctx.navigatorOptionalMask == manualChoice);
+        CHECK(releaseWindow("navigator_optional") == nullptr);
+        openNavigatorTools();
         CHECK(releaseWindow("navigator_optional") != nullptr);
         permanentNavigator();
+        ImGui::ClosePopupsOverWindow(nullptr, false);
+        settle();
 
         // Recreating a document UI must read the workspace preference before
         // its first frame writes state back; it cannot silently erase the menu.
@@ -257,6 +301,8 @@ static void checkReleaseWorkbench(const std::string& path) {
         settle();
         CHECK(f.ctx.navigatorOptionalMask == manualChoice);
         CHECK(f.tab->navigatorOptionalMask_ == manualChoice);
+        CHECK(releaseWindow("navigator_optional") == nullptr);
+        openNavigatorTools();
         CHECK(releaseWindow("navigator_optional") != nullptr);
         permanentNavigator();
         ImGui::ClosePopupsOverWindow(nullptr, false);
@@ -375,6 +421,9 @@ static void checkInspectorObservationValidity(const std::string& path) {
     paint();
     unknownOutcome();
     CHECK(visibleText.find("Current paused context or instruction bytes could not be verified") != std::string::npos);
+    CHECK(visibleText.find(AuthorizationTrailConclusionKindText(conclusion.kind)) == std::string::npos);
+    releaseActivate(ImGui::FindWindowByName("Inspector validity QA"), "Details##evidence_details");
+    paint(); paint();
     CHECK(visibleText.find(AuthorizationTrailConclusionKindText(conclusion.kind)) != std::string::npos);
     CHECK(!f.ctx.debug.snapshot().attached()); // cached UI state is deliberately not debugger authority
     f.detached.regs.rflags = 1ull << 6;

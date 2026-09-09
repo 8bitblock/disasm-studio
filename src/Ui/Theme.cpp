@@ -139,10 +139,67 @@ static Palette PaletteFor(ThemeId id) {
     return p;
 }
 
+// The mockup separates the code canvas, pane chrome and column headers. Keep
+// those structural surfaces independent of the established control palette:
+// FrameBg/Button/Text/muted and lineSoft also draw the execution toolbar.
+struct WorkbenchPalette {
+    ImVec4 panel, code, chrome, tableHeader, line, secondaryText;
+    ImVec4 readingText, faintText, linkText, stringText, codeSelection, byteText, commentText;
+    ImVec4 instructionText, callText, branchText, returnText, registerText, numberText;
+};
+
+static WorkbenchPalette WorkbenchFor(ThemeId id, const Palette& p) {
+    WorkbenchPalette w;
+    w.panel = p.child;
+    w.code = p.light ? p.child : p.bg0;
+    w.chrome = p.child;
+    w.tableHeader = mix(p.bg0, p.child, 0.50f);
+    w.line = mix(p.bg1, p.border, 0.60f);
+    w.secondaryText = p.muted;
+    w.readingText = p.text;
+    w.faintText = mix(p.muted, p.light ? p.text : p.bg0, 0.20f);
+    w.linkText = p.accent;
+    w.stringText = p.good;
+    w.codeSelection = V(p.accent.x, p.accent.y, p.accent.z, 0.15f);
+    w.byteText = p.muted;
+    w.commentText = p.muted;
+    w.instructionText = p.text;
+    w.callText = p.call;
+    w.branchText = p.branch;
+    w.returnText = p.bad;
+    w.registerText = p.call;
+    w.numberText = p.warn;
+    if (id == ThemeId::Midnight) {
+        // Sampled structural colors from DisasmStudio Binary View.dc.html.
+        // Semantic accents retain their existing meanings and contrast.
+        w.panel = V(15/255.f, 19/255.f, 27/255.f);
+        w.code = V(9/255.f, 12/255.f, 18/255.f);
+        w.chrome = w.panel;
+        w.tableHeader = V(12/255.f, 16/255.f, 22/255.f);
+        w.line = V(28/255.f, 35/255.f, 49/255.f);
+        w.secondaryText = V(140/255.f, 151/255.f, 169/255.f);
+        w.readingText = V(221/255.f, 228/255.f, 238/255.f);
+        w.faintText = V(91/255.f, 101/255.f, 117/255.f);
+        w.linkText = V(79/255.f, 163/255.f, 209/255.f);
+        w.stringText = V(127/255.f, 176/255.f, 105/255.f);
+        w.codeSelection = V(79/255.f, 163/255.f, 209/255.f, 0.15f);
+        w.byteText = V(65/255.f, 74/255.f, 89/255.f);
+        w.commentText = V(96/255.f, 107/255.f, 122/255.f);
+        w.instructionText = V(185/255.f, 194/255.f, 208/255.f);
+        w.callText = V(156/255.f, 140/255.f, 224/255.f);
+        w.branchText = V(224/255.f, 169/255.f, 74/255.f);
+        w.returnText = V(217/255.f, 115/255.f, 124/255.f);
+        w.registerText = V(174/255.f, 184/255.f, 198/255.f);
+        w.numberText = V(152/255.f, 162/255.f, 177/255.f);
+    }
+    return w;
+}
+
 // Current theme + its resolved palette. Initialized to the default so the col::*
 // helpers are valid even before ApplyTheme() is first called.
 static ThemeId g_theme   = ThemeId::Midnight;
 static Palette g_pal     = PaletteFor(ThemeId::Midnight);
+static WorkbenchPalette g_workbench = WorkbenchFor(ThemeId::Midnight, g_pal);
 static float   g_scale   = 1.0f;   // HiDPI UI scale (1.0 = 96 DPI)
 static int     g_zoomPercent = kDefaultUiZoomPercent;
 static Density g_density = Density::Compact;       // dense RE-workbench default
@@ -200,7 +257,7 @@ static void applyMetrics() {
     s.SeparatorTextAlign = ImVec2(0.0f, 0.5f);
 }
 
-static void applyColors(const Palette& p) {
+static void applyColors(const Palette& p, const WorkbenchPalette& w) {
     ImVec4* c = ImGui::GetStyle().Colors;
     const ImVec4 acc    = p.accent;
     const ImVec4 accDim = ImVec4(acc.x, acc.y, acc.z, 0.34f);
@@ -209,8 +266,8 @@ static void applyColors(const Palette& p) {
 
     c[ImGuiCol_Text]                  = p.text;
     c[ImGuiCol_TextDisabled]          = p.muted;
-    c[ImGuiCol_WindowBg]              = p.bg0;
-    c[ImGuiCol_ChildBg]               = p.child;
+    c[ImGuiCol_WindowBg]              = w.code;
+    c[ImGuiCol_ChildBg]               = w.panel;
     c[ImGuiCol_PopupBg]               = p.popup;
     c[ImGuiCol_Border]                = softBorder;
     c[ImGuiCol_BorderShadow]          = ImVec4(0, 0, 0, 0);
@@ -234,25 +291,25 @@ static void applyColors(const Palette& p) {
     c[ImGuiCol_Header]                = accSoft;
     c[ImGuiCol_HeaderHovered]         = mix(p.bg2, acc, 0.14f);
     c[ImGuiCol_HeaderActive]          = mix(p.bg2, acc, 0.25f);
-    c[ImGuiCol_Separator]             = softBorder;
+    c[ImGuiCol_Separator]             = w.line;
     c[ImGuiCol_SeparatorHovered]      = accDim;
     c[ImGuiCol_SeparatorActive]       = acc;
     c[ImGuiCol_ResizeGrip]            = mix(p.bg2, p.bg0, 0.30f);
     c[ImGuiCol_ResizeGripHovered]     = accDim;
     c[ImGuiCol_ResizeGripActive]      = acc;
-    c[ImGuiCol_Tab]                   = p.menubar;
-    c[ImGuiCol_TabHovered]            = mix(p.bg2, acc, 0.10f);
-    c[ImGuiCol_TabActive]             = mix(p.child, p.bg2, 0.35f);
+    c[ImGuiCol_Tab]                   = w.chrome;
+    c[ImGuiCol_TabHovered]            = mix(w.chrome, acc, p.light ? 0.12f : 0.09f);
+    c[ImGuiCol_TabActive]             = mix(w.chrome, acc, p.light ? 0.08f : 0.06f);
     c[ImGuiCol_TabSelectedOverline]   = acc;
-    c[ImGuiCol_TabUnfocused]          = p.bg0;
-    c[ImGuiCol_TabUnfocusedActive]    = p.bg1;
+    c[ImGuiCol_TabUnfocused]          = w.chrome;
+    c[ImGuiCol_TabUnfocusedActive]    = mix(w.chrome, p.muted, 0.05f);
     c[ImGuiCol_TabDimmedSelectedOverline] = mix(p.muted, acc, 0.35f);
-    c[ImGuiCol_TableHeaderBg]         = mix(p.menubar, p.bg2, 0.18f);
-    c[ImGuiCol_TableBorderStrong]     = softBorder;
-    c[ImGuiCol_TableBorderLight]      = mix(p.bg1, p.border, 0.30f);
+    c[ImGuiCol_TableHeaderBg]         = w.tableHeader;
+    c[ImGuiCol_TableBorderStrong]     = w.line;
+    c[ImGuiCol_TableBorderLight]      = mix(w.panel, w.line, 0.55f);
     c[ImGuiCol_TableRowBg]            = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt]         = p.light ? ImVec4(0, 0, 0, 0.020f)
-                                               : ImVec4(1, 1, 1, 0.018f);
+    c[ImGuiCol_TableRowBgAlt]         = p.light ? ImVec4(0, 0, 0, 0.016f)
+                                               : ImVec4(1, 1, 1, 0.012f);
     c[ImGuiCol_TextSelectedBg]        = accDim;
     c[ImGuiCol_DragDropTarget]        = p.warn;
     c[ImGuiCol_NavHighlight]          = acc;
@@ -272,11 +329,6 @@ static void applyColors(const Palette& p) {
         c[ImGuiCol_Header]            = V(19/255.f,38/255.f,60/255.f);
         c[ImGuiCol_HeaderHovered]     = V(23/255.f,43/255.f,65/255.f);
         c[ImGuiCol_HeaderActive]      = V(28/255.f,49/255.f,70/255.f);
-        c[ImGuiCol_TabHovered]        = p.bg2;
-        c[ImGuiCol_TabActive]         = p.bg2;
-        c[ImGuiCol_TabUnfocusedActive]= p.bg1;
-        c[ImGuiCol_TableHeaderBg]     = p.menubar;
-        c[ImGuiCol_TableRowBgAlt]     = ImVec4(1, 1, 1, 0.012f);
         c[ImGuiCol_TextSelectedBg]    = ImVec4(acc.x, acc.y, acc.z, 0.26f);
     }
 }
@@ -287,8 +339,9 @@ void ApplyTheme(ThemeId id) {
     if (id < ThemeId::Midnight || id >= ThemeId::Count) id = ThemeId::Midnight;
     g_theme = id;
     g_pal   = PaletteFor(id);
+    g_workbench = WorkbenchFor(id, g_pal);
     applyMetrics();
-    applyColors(g_pal);
+    applyColors(g_pal, g_workbench);
 }
 
 void ApplyTheme() { ApplyTheme(g_theme); }
@@ -343,11 +396,28 @@ namespace col {
     ImVec4 jump()      { return g_pal.jump; }
     ImVec4 selection() { return ImVec4(g_pal.accent.x, g_pal.accent.y, g_pal.accent.z, 1.0f); }
     ImVec4 menubar()   { return g_pal.menubar; }
-    ImVec4 windowBg()  { return g_pal.bg0; }
+    ImVec4 windowBg()  { return g_workbench.code; }
 
-    ImVec4 panel()       { return g_pal.child; }
+    ImVec4 panel()       { return g_workbench.panel; }
     ImVec4 panelHeader() { return g_pal.menubar; }
-    ImVec4 code()        { return g_theme == ThemeId::Axiom ? g_pal.bg0 : g_pal.child; }
+    ImVec4 code()        { return g_workbench.code; }
+    ImVec4 chrome()      { return g_workbench.chrome; }
+    ImVec4 tableHeader() { return g_workbench.tableHeader; }
+    ImVec4 paneLine()    { return g_workbench.line; }
+    ImVec4 secondaryText() { return g_workbench.secondaryText; }
+    ImVec4 readingText() { return g_workbench.readingText; }
+    ImVec4 faintText() { return g_workbench.faintText; }
+    ImVec4 linkText() { return g_workbench.linkText; }
+    ImVec4 stringText() { return g_workbench.stringText; }
+    ImVec4 codeSelection() { return g_workbench.codeSelection; }
+    ImVec4 byteText() { return g_workbench.byteText; }
+    ImVec4 commentText() { return g_workbench.commentText; }
+    ImVec4 instructionText() { return g_workbench.instructionText; }
+    ImVec4 callText() { return g_workbench.callText; }
+    ImVec4 branchText() { return g_workbench.branchText; }
+    ImVec4 returnText() { return g_workbench.returnText; }
+    ImVec4 registerText() { return g_workbench.registerText; }
+    ImVec4 numberText() { return g_workbench.numberText; }
     ImVec4 breakpointFill() { return g_theme == ThemeId::Axiom
         ? V(44/255.f,22/255.f,28/255.f) : mix(g_pal.child, g_pal.bad, 0.12f); }
     ImVec4 breakpointOutline() { return g_theme == ThemeId::Axiom

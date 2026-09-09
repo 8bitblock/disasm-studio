@@ -105,6 +105,31 @@ static void checkNavigatorRefinement(const std::string& path) {
     f.ctx.invalidateStaticDebugImageIdentity();
     f.tab->setStaticCursor(4);
 
+    // The visible category chips filter actual function provenance without
+    // changing the selected FILE location or losing the unfiltered inventory.
+    auto activateCategory = [&](const char* child, const char* label, int category) {
+        ImGuiWindow* owner = releaseWindow(child);
+        CHECK(owner != nullptr);
+        if (owner) {
+            ImGui::FocusWindow(owner);
+            ImGui::ActivateItemByID(ImHashStr(label, 0, owner->GetID(category)));
+        }
+        settle();
+    };
+    f.tab->names_[16] = "Analyst read";
+    ++f.tab->namesGen_;
+    settle();
+    activateCategory("navigator_functions", "USR", 1);
+    CHECK(f.tab->fnCategory_ == 1 && f.tab->fnVisible_ == std::vector<int>{1});
+    CHECK(f.tab->cursorValid_ && !f.tab->cursorLive_ && f.tab->cursorVA_ == 4);
+    activateCategory("navigator_functions", "SYM", 2);
+    CHECK(f.tab->fnCategory_ == 2 && f.tab->fnVisible_ == (std::vector<int>{0, 2}));
+    activateCategory("navigator_functions", "ALL", 0);
+    CHECK(f.tab->fnCategory_ == 0 && f.tab->fnVisible_.size() == 3);
+    f.tab->names_.erase(16);
+    ++f.tab->namesGen_;
+    settle();
+
     auto checkFeedback = [&](const char* expected, bool rows, bool partial = false) {
         settle();
         ImGuiWindow* strings = releaseWindow("navigator_strings");
@@ -202,6 +227,19 @@ static void checkNavigatorRefinement(const std::string& path) {
     CHECK(f.tab->strVisible_.size() == 2);
     ImGui::ClearActiveID();
 
+    // Encoding chips use the published string encoding, while the shared text
+    // filter and inventory stay intact when moving between ASCII and UTF-16.
+    f.tab->strings_[1].wide = true;
+    ++f.tab->stringsGen_;
+    settle();
+    activateCategory("navigator_strings", "ASCII", 1);
+    CHECK(f.tab->strEncoding_ == 1 && f.tab->strVisible_ == std::vector<int>{0});
+    activateCategory("navigator_strings", "UTF-16", 2);
+    CHECK(f.tab->strEncoding_ == 2 && f.tab->strVisible_ == std::vector<int>{1});
+    activateCategory("navigator_strings", "ALL", 0);
+    CHECK(f.tab->strEncoding_ == 0 && f.tab->strVisible_.size() == 2);
+    CHECK(f.tab->strFilter_[0] == 0);
+
     // Counts retain the full result set while production draw work stays clipped.
     constexpr size_t manyStrings = 16384;
     f.tab->strings_.clear();
@@ -232,9 +270,18 @@ static void checkNavigatorRefinement(const std::string& path) {
     f.tab->byteSearchStatus_ =
         "2 match(es); 4.0 of 8.0 MiB read; partial coverage (1 short, 1 unreadable chunk)";
     const std::string retainedSearchStatus = f.tab->byteSearchStatus_;
+    size = ImVec2(640, 620);
     settle();
+    releaseActivate(releaseWindow("navigator_functions"), "...##function_tools");
+    settle();
+    ImGuiWindow* toolsMenu = ImGui::GetCurrentContext()->OpenPopupStack.empty()
+        ? nullptr : ImGui::GetCurrentContext()->OpenPopupStack.back().Window;
+    releaseActivate(toolsMenu, "Navigator tools and analysis queue");
+    settle();
+    CHECK(releaseWindow("navigator_optional") != nullptr);
     paint(true);
     CHECK(visibleText.find(retainedSearchStatus) != std::string::npos);
     settle();
     CHECK(f.tab->byteSearchStatus_ == retainedSearchStatus);
+    ImGui::ClosePopupsOverWindow(nullptr, false);
 }

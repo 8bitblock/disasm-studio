@@ -2,6 +2,7 @@
 #include "BinaryFile.h"
 #include "../Disasm/IDisassembler.h"
 #include "InstructionReference.h"   // instrDataRef/instrImmRef: referenced data addresses
+#include "StringActionEvidence.h"
 
 #include <algorithm>
 #include <cctype>
@@ -1122,6 +1123,30 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
         return g;
     }
 
+    // 9) An affirmative action message corroborated by a typed, non-stack
+    // stored operation in the same short basic block. Keep all stronger naming
+    // evidence above; message semantics remain explicitly a candidate.
+    if (e.instrCount > 0 && e.instrCount <= 192 && e.callCount <= 8) {
+        std::string agreedName, reason;
+        bool conflict = false;
+        for (const auto& action : e.stringActions) {
+            if (!action.sameBlock || action.storedAddition == action.storedSubtraction) continue;
+            const std::string name = StringActionSuggestedName(action.text,
+                action.storedAddition ? StringActionKind::Add : StringActionKind::Subtract);
+            if (name.empty()) continue;
+            if (!agreedName.empty() && agreedName != name) { conflict = true; break; }
+            agreedName = name;
+            char location[112];
+            std::snprintf(location, sizeof(location), " at 0x%llX; string reference at 0x%llX",
+                static_cast<unsigned long long>(action.instructionVA),
+                static_cast<unsigned long long>(action.stringRefVA));
+            reason = "candidate from \"" + action.text.substr(0, 160) + "\" and typed stored " +
+                (action.storedAddition ? "addition" : "subtraction") + location +
+                "; same basic block; field meaning and execution remain unproved";
+        }
+        if (!conflict && !agreedName.empty()) { set(std::move(agreedName), std::move(reason)); return g; }
+    }
+
     return g;   // no confident guess; caller keeps sub_<addr>
 }
 
@@ -1308,6 +1333,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
             }
         };
         std::unordered_set<std::string> apiSeen, strSeen;
+        std::vector<std::pair<uint64_t, std::string>> actionStrings;
         for (const auto& in : insns) {
             if ((e.instrCount & 0x3Fu) == 0 && stopped()) return {};
             ++e.instrCount;
@@ -1406,6 +1432,8 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                 if (!hasDataRef) hasDataRef = TryGetInstrImmRef(in, d); // x86-32 offset string, VA 0 valid
                 if (hasDataRef && stringRefFor) {
                     std::string s = stringRefFor(d);
+                    if (!s.empty() && s.size() <= 2048 && actionStrings.size() < 64)
+                        actionStrings.emplace_back(in.address, s);
                     if (!s.empty() && e.strings.size() < 32 && strSeen.insert(s).second)
                         e.strings.push_back(s);
                 }
@@ -1416,6 +1444,52 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         e.retOnly = (e.callCount == 0 && retCount == 1 && !hasControlBranch && meaningful <= 1);
         e.retZero = (e.callCount == 0 && retCount == 1 && !hasControlBranch &&
                      allReturnsZero && meaningful <= 4);
+
+        if (!actionStrings.empty() && e.instrCount <= 192 && e.callCount <= 8 &&
+            (bin.machine() == MachineArch::X86 || bin.machine() == MachineArch::X64 ||
+             bin.machine() == MachineArch::Unknown)) {
+            std::unordered_set<uint64_t> leaders;
+            for (const auto& in : insns) {
+                uint64_t target = 0;
+                if (!InstructionIsCall(in) && TryGetDirectTarget(in, target)) leaders.insert(target);
+            }
+            // Split at transfers and incoming branch targets, preserving the
+            // streaming pass's bounded body rather than constructing a new CFG.
+            std::vector<Instruction> block;
+            const auto collect = [&] {
+                if (block.empty() || e.stringActions.size() >= 16) return;
+                const auto mutations = FindStringActionMutations(block,
+                    bin.machine() == MachineArch::X86 ? Arch::X86 : Arch::X64);
+                for (const auto& mutation : mutations) {
+                    if (mutation.kind == StringActionKind::Write) continue;
+                    auto operation = std::find_if(block.begin(), block.end(), [&](const auto& in) {
+                        return in.address == mutation.instructionVA;
+                    });
+                    for (const auto& reference : actionStrings) {
+                        auto literal = std::find_if(block.begin(), block.end(), [&](const auto& in) {
+                            return in.address == reference.first;
+                        });
+                        if (literal == block.end() || operation == block.end() ||
+                            std::abs(std::distance(literal, operation)) > 48) continue;
+                        if (e.stringActions.size() >= 16) return;
+                        e.stringActions.push_back({reference.second, mutation.instructionVA,
+                            reference.first, mutation.kind == StringActionKind::Add,
+                            mutation.kind == StringActionKind::Subtract, true});
+                    }
+                }
+            };
+            for (const auto& in : insns) {
+                if (stopped()) return {};
+                if (!block.empty() && (leaders.count(in.address) ||
+                    block.back().address > (std::numeric_limits<uint64_t>::max)() - block.back().length ||
+                    block.back().address + block.back().length != in.address)) {
+                    collect(); block.clear();
+                }
+                block.push_back(in);
+                if (InstructionEndsBlock(in)) { collect(); block.clear(); }
+            }
+            collect();
+        }
 
         GuessedName g = GuessFromEvidence(e);
         if (!g.guessed) continue;

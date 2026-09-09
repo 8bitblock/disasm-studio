@@ -370,6 +370,35 @@ int main() {
     { FuncEvidence e; e.instrCount = 20; e.strings = {"%s: error %d\n", "ok"};  // not identifier-like
       CHECK(!GuessFromEvidence(e).guessed); }
 
+    // String-linked operation names require both a typed stored action and a
+    // short, same-block reference. Stronger established evidence still wins.
+    {
+        FuncEvidence e; e.instrCount = 8; e.strings = {"added!"};
+        CHECK(!GuessFromEvidence(e).guessed);
+        e.stringActions.push_back({"added!", 0x1234, 0x1238, true, false, true});
+        auto named = GuessFromEvidence(e);
+        CHECK_EQ(named.name, "add_value_candidate"); CHECK(named.guessed);
+        CHECK(named.reason.find("0x1234") != std::string::npos);
+        CHECK(named.reason.find("unproved") != std::string::npos);
+        e.stringActions[0].text = "point added!";
+        CHECK_EQ(GuessFromEvidence(e).name, "add_points_candidate");
+        e.stringActions[0].sameBlock = false;
+        CHECK(!GuessFromEvidence(e).guessed);
+        e.stringActions[0].sameBlock = true;
+        e.stringActions[0].text = "point was not added!";
+        CHECK(!GuessFromEvidence(e).guessed);
+        e.stringActions[0].text = "added!";
+        e.apis = {"ReadFile"}; e.callCount = 1;
+        CHECK_EQ(GuessFromEvidence(e).name, "read_file");
+        e.apis.clear(); e.strings = {"RealWorkerName"};
+        CHECK_EQ(GuessFromEvidence(e).name, "RealWorkerName");
+        e.strings.clear(); e.instrCount = 300;
+        CHECK(!GuessFromEvidence(e).guessed);
+        e.instrCount = 8;
+        e.stringActions.push_back({"points removed!", 0x1240, 0x1248, false, true, true});
+        CHECK(!GuessFromEvidence(e).guessed); // conflicting action messages
+    }
+
     // ---- nothing to go on -> no guess -------------------------------------
     { FuncEvidence e; e.instrCount = 40; e.callCount = 0;
       CHECK(!GuessFromEvidence(e).guessed); }

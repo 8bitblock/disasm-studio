@@ -1,6 +1,7 @@
 #pragma once
 #include "ITab.h"
 #include "BinaryViewValueOrigin.h"
+#include "BinaryViewStringTrace.h"
 #include "../Core/ProcessManager.h"    // ModuleInfo (Functions sub-tab)
 #include "../Core/SymbolService.h"     // asynchronous DbgHelp / PDB ownership
 #include "../Core/DocumentContext.h"   // one bounded navigation history per document
@@ -134,7 +135,7 @@ private:
     struct ListRow;
     void renderWelcome(AppContext& ctx);
     void applyWorkflow(AppContext& ctx, int preset);
-    void renderWorkflowContext(AppContext& ctx);
+    void renderWorkflowContext(AppContext& ctx, bool compact = false);
     void renderEvidenceInspector(AppContext& ctx, bool collapsed, bool widthConstrained = false);
     void renderEvidenceInspectorContent(AppContext& ctx, bool popup = false);
     ValueOriginViewState valueOrigin_;
@@ -143,6 +144,13 @@ private:
     void adoptValueOriginResult(AppContext& ctx, const AnalysisResult& result);
     void requestValueOrigin(AppContext& ctx, const std::string& registerName);
     void renderValueOriginInspector(AppContext& ctx);
+    StringTraceViewState stringTrace_;
+    bool stringTraceCurrent(AppContext& ctx) const;
+    void requestStringActionTrace(AppContext& ctx, uint64_t va, const std::string& text, bool live);
+    void advanceStringActionTrace(AppContext& ctx);
+    void queueStringActionDependencies(AppContext& ctx, uint32_t kinds);
+    void adoptStringActionTraceResult(AppContext& ctx, const AnalysisResult& result);
+    void renderStringActionTrace(AppContext& ctx);
     void selectRepresentation(AppContext& ctx, int view);
     void renderTypeWorkbench(AppContext& ctx);
     void renderTypedLocation(AppContext& ctx, uint64_t va);
@@ -426,7 +434,7 @@ private:
     uint32_t navigatorOptionalMask_ = 0;
     bool     analysisQueueCollapsed_ = false;
     bool     evidenceInspectorCollapsed_ = false;
-    float    evidenceInspectorW_ = 300.0f;
+    float    evidenceInspectorW_ = 252.0f;
     TypeDefinition typeDraft_;
     uint64_t typeDraftImage_ = 0;
     uint64_t typeDraftGeneration_ = 0;
@@ -451,7 +459,7 @@ private:
     float    layoutScale_     = 0.0f;    // physical scale currently applied to retained dimensions
     float    inspectorW_  = 0.0f;        // 0 = choose a viewport-relative 72/28-ish default
     bool     inspectorUserSized_ = false; // keep the 72/28 default responsive until the splitter is dragged
-    float    bottomDockH_ = 220.0f;      // expanded full-width tool-drawer height
+    float    bottomDockH_ = 168.0f;      // compact mockup detail drawer
     bool     lowerDockCollapsed_ = false; // retain tab-bar-only state per document view
     bool     sideAdvancedMode_ = false;  // primary navigator tabs vs. secondary image tools
     bool     sideTabsInitialized_ = false; // select Functions on the first primary render
@@ -733,6 +741,8 @@ private:
         std::vector<char>(kRegisterEditMaxInputBytes + 1, '\0');
     bool      regEditFocus_ = false;
     bool      focusRegistersTab_ = false; // compact register-box edit handoff
+    bool      focusBreakpointsTab_ = false;
+    bool      listingHeaderRendered_ = false;
     DebugTargetIdentity regEditOwner_{};
     uint32_t regEditTid_ = 0;
     uint64_t regEditRip_ = 0;
@@ -783,6 +793,7 @@ private:
     std::vector<Instruction>         liveInsns_;        // cached decode of the current window
     std::unordered_map<uint64_t,int> liveIdxOf_;        // address -> index within liveInsns_
     std::unordered_set<uint64_t>     liveFuncSet_;      // divider addresses (runtime VAs)
+    std::vector<uint64_t>            liveDecodeBoundaries_; // committed in-window boundaries, retained on refresh
     uint64_t                         liveCacheStart_ = 0;
     uint64_t                         liveCacheFocusVA_ = 0;
     uint64_t                         liveCacheSig_   = ~0ull;
@@ -1307,6 +1318,8 @@ private:
     std::string           fnSummary_;
     char                  fnFilter_[128] = "";
     char                  strFilter_[64] = "";
+    int                   fnCategory_ = 0;
+    int                   strEncoding_ = 0;
     // Filtered row indices for the side lists, clipper-rendered (these lists can hold
     // thousands of entries; rendering all of them was wasteful). Rebuilt ONLY when the
     // filter text or the underlying data changes — not every frame — since the rebuild

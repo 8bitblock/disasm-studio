@@ -126,8 +126,18 @@ struct Fixture {
 
     bool clickRow(uint64_t address, bool gutter, ImGuiMouseButton button = ImGuiMouseButton_Left) {
         for (int i = 0; i < 4; ++i) assemblyFrame();
+        ImGuiWindow* window = ImGui::FindWindowByName("Listing integration");
+        ImGuiTable* table = window ? ImGui::GetCurrentContext()->Tables.GetByKey(
+            window->GetID(tab->asmFullProgram_ ? "asm_full" : "asm")) : nullptr;
+        CHECK(table != nullptr);
+        if (!table) return false;
+        // Flow now sits beside the decoded instruction. Hit the requested
+        // native column instead of treating arrow anchors as input geometry.
+        const ImGuiTableColumn& column = table->Columns[gutter ? 0 : 2];
+        CHECK(column.IsEnabled && column.WorkMaxX > column.WorkMinX);
+        if (!column.IsEnabled || column.WorkMaxX <= column.WorkMinX) return false;
         for (const auto& row : tab->asmFlow_) if (row.addr == address) {
-            const float x = gutter ? tab->asmLaneX_ - 12 : tab->asmAddrX_ + 48;
+            const float x = (column.WorkMinX + column.WorkMaxX) * 0.5f;
             const float y = row.y;
             ImGui::GetIO().AddMousePosEvent(x, y);
             assemblyFrame();
@@ -158,6 +168,7 @@ struct Fixture {
 #include "seven_improvements_fixture.inc"
 #include "notes_editor_fixture.inc"
 #include "value_origin_ui_fixture.inc"
+#include "string_trace_ui_fixture.inc"
 #include "memory_value_hints_fixture.inc"
 #include "instruction_copy_fixture.inc"
 #include "release_workbench_fixture.inc"
@@ -924,8 +935,10 @@ static void workbenchChord(App& app, ImVec2 size, ImGuiKey key) {
 }
 
 static void checkWorkbenchBounds(ImVec2 size) {
-    const char* bands[] = {"##MainMenuBar", "##document-strip", "##tabstrip",
+    const char* bands[] = {"##MainMenuBar", "##tabstrip",
                           "##debugbar", "##main", "##status"};
+    ImGuiWindow* documents = ImGui::FindWindowByName("##document-strip");
+    CHECK(!documents || documents->LastFrameActive != ImGui::GetFrameCount());
     float previousBottom = 0.0f;
     for (const char* name : bands) {
         ImGuiWindow* window = ImGui::FindWindowByName(name);
@@ -988,7 +1001,7 @@ static void checkWorkbenchShell() {
                 if (blocker) {
                     const int blockerOrder = ImGui::FindWindowDisplayIndex(blocker);
                     CHECK(ImGui::FindWindowDisplayIndex(paletteWindow) > blockerOrder);
-                    for (const char* name : {"##MainMenuBar", "##document-strip", "##tabstrip",
+                    for (const char* name : {"##MainMenuBar", "##tabstrip",
                                              "##debugbar", "##main", "##status"}) {
                         ImGuiWindow* underlying = ImGui::FindWindowByName(name);
                         CHECK(underlying && ImGui::FindWindowDisplayIndex(underlying) < blockerOrder);
@@ -1252,6 +1265,7 @@ int main() {
         checkTypesClosePrompt(path);
         checkNotesEditorBoundaries();
         checkValueOriginWorkbench(path);
+        checkStringTraceWorkbench(path);
         checkMemoryValueHints(path);
         checkInstructionCopy(path);
         checkContextActionDispatcher(path);

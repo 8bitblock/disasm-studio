@@ -22,7 +22,6 @@ struct AxiomShellTestAccess {
     static void shell(App& app, const DbgSnapshot& snap) {
         app.ctx_.frameDebugSnapshot = &snap;
         app.renderMenuBar();
-        app.renderDocumentStrip();
         app.renderTabCardStrip(snap);
         app.renderDebugToolbar(snap);
         app.renderStatusBar(snap);
@@ -140,20 +139,45 @@ static void checkAxiomShellReference() {
                     ImGui::Render();
                 }
                 ImGuiWindow* toolbar = ImGui::FindWindowByName("##debugbar");
-                CHECK(toolbar);
+                ImGuiWindow* header = ImGui::FindWindowByName("##MainMenuBar");
+                ImGuiWindow* tabs = ImGui::FindWindowByName("##tabstrip");
+                ImGuiWindow* documents = ImGui::FindWindowByName("##document-strip");
+                CHECK(toolbar && header && tabs);
+                CHECK(!documents || documents->LastFrameActive != ImGui::GetFrameCount());
+                const float scale = theme::UiScale();
+                const float textHeight = ImGui::GetTextLineHeight();
+                if (header && tabs && toolbar) {
+                    CHECK(std::abs(header->Size.y - std::max(32.0f * scale, textHeight + 8.0f * scale)) <= 1.0f);
+                    CHECK(std::abs(tabs->Size.y - std::max(30.0f * scale, textHeight + 12.0f * scale)) <= 1.0f);
+                    const float commandHeight = std::max({30.0f * scale, ImGui::GetFrameHeight(),
+                        textHeight * 2.0f + 4.0f * scale});
+                    CHECK(std::abs(toolbar->Size.y - commandHeight - 10.0f * scale) <= 1.0f);
+                    CHECK(std::abs(tabs->Pos.y - header->Pos.y - header->Size.y) <= 1.0f);
+                    CHECK(std::abs(toolbar->Pos.y - tabs->Pos.y - tabs->Size.y) <= 1.0f);
+                    CHECK(header->DC.CursorMaxPos.x <= header->Pos.x + header->Size.x + 1.0f);
+                }
                 if (toolbar) {
+                    if (toolbar->ScrollMax.x > 1.0f || toolbar->ScrollMax.y > 1.0f)
+                        std::printf("[shell bounds] theme=%s density=%d viewport=%.0fx%.0f scroll=%.1f,%.1f bar=%.1fx%.1f cursor=%.1f,%.1f content=%.1f,%.1f padding=%.1f,%.1f\n",
+                            theme::ThemeName(static_cast<theme::ThemeId>(palette)), static_cast<int>(density),
+                            size.x, size.y, toolbar->ScrollMax.x, toolbar->ScrollMax.y,
+                            toolbar->Size.x, toolbar->Size.y,
+                            toolbar->DC.CursorMaxPos.x - toolbar->Pos.x,
+                            toolbar->DC.CursorMaxPos.y - toolbar->Pos.y,
+                            toolbar->ContentSize.x, toolbar->ContentSize.y,
+                            toolbar->WindowPadding.x, toolbar->WindowPadding.y);
                     CHECK(toolbar->ScrollMax.x <= 1.0f && toolbar->ScrollMax.y <= 1.0f);
                     CHECK(toolbar->DC.CursorMaxPos.x <= toolbar->Pos.x + toolbar->Size.x + 1.0f);
                 }
                 CHECK(GImGui->ErrorCountCurrentFrame == 0);
             }
         }
-        // Activating the production toolbar's status item must open the checked
-        // popup in every palette, including ones that formerly omitted it.
+        // State lives in the header. Activating the real toolbar thread capsule
+        // still opens the checked stop/session popup in every palette.
         ImGuiWindow* toolbar = ImGui::FindWindowByName("##debugbar");
         CHECK(toolbar);
         if (toolbar) {
-            const ImGuiID statusId = ImHashStr("##toolbar_debug_status", 0, toolbar->ID);
+            const ImGuiID statusId = ImHashStr("##toolbar_thread", 0, toolbar->ID);
             const ImGuiID popupId = ImHashStr("##toolbar_session_popup", 0, toolbar->ID);
             ImGui::NewFrame();
             GImGui->NavActivateId = statusId;

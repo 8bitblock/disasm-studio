@@ -129,10 +129,28 @@ static void checkShellKeyboardNavigation() {
         io.AddKeyEvent(ImGuiKey_Space, false); workbenchFrame(app, size);
         checkWorkbenchDestination("Projects");
     }
-    // The document inventory has no native-button fallback. Check that ImGui
-    // now recognizes its custom hit target as a navigable item.
+    // The document inventory is now a title-bar capsule. Its custom hit target
+    // must remain on the menu navigation layer and open the same real inventory.
+    ImGuiWindow* header = ImGui::FindWindowByName("##MainMenuBar");
+    CHECK(header && (header->DC.NavLayersActiveMask & (1 << ImGuiNavLayer_Menu)) != 0);
     ImGuiWindow* documents = ImGui::FindWindowByName("##document-strip");
-    CHECK(documents && (documents->DC.NavLayersActiveMask & 1) != 0);
+    CHECK(!documents || documents->LastFrameActive != ImGui::GetFrameCount());
+    if (header) {
+        // ImGui 1.91.9 BeginMenuBar pushes this case-sensitive native ID scope.
+        const ImGuiID menuScope = ImHashStr("##MenuBar", 0, header->ID);
+        const ImGuiID documentButton = ImHashStr("##document_list", 0, menuScope);
+        const ImGuiID inventoryPopup = ImHashStr("##all_documents", 0, menuScope);
+        io.DisplaySize = size;
+        ImGui::NewFrame();
+        GImGui->NavActivateId = documentButton;
+        GImGui->NavActivateDownId = documentButton;
+        GImGui->NavActivatePressedId = documentButton;
+        app.render();
+        CHECK(ImGui::IsPopupOpen(inventoryPopup, ImGuiPopupFlags_AnyPopupLevel));
+        ImGui::Render();
+        CHECK(header->DC.CursorMaxPos.x <= header->Pos.x + header->Size.x + 1.0f);
+        ImGui::ClosePopupsOverWindow(nullptr, false);
+    }
     ImGuiWindow* status = ImGui::FindWindowByName("##status");
     CHECK(status && (status->DC.NavLayersActiveMask & 1) != 0);
     io.ConfigFlags = savedConfig;

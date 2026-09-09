@@ -6,6 +6,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -27,6 +28,14 @@ void BinaryViewTab::refreshFunctionFilter(bool lower) {
     visible.reserve(functions_.size());
     for (size_t i = 0; i < functions_.size(); ++i) {
         const Func& function = functions_[i];
+        if (!lower && fnCategory_) {
+            const auto named = names_.find(function.address);
+            const bool user = named != names_.end() && !named->second.empty();
+            const bool guessed = function.guessed && !user;
+            const bool generic = !user && !guessed && function.name.rfind("sub_", 0) == 0;
+            const int category = user ? 1 : guessed ? 3 : generic ? 4 : 2;
+            if (category != fnCategory_) continue;
+        }
         if (!filter.empty()) {
             const auto renamed = names_.find(function.address);
             const std::string_view displayName = renamed != names_.end() && !renamed->second.empty()
@@ -109,7 +118,7 @@ void BinaryViewTab::applyWorkflow(AppContext& ctx, int preset) {
     } else ctx.requestedTab = "Binary Diff";
 }
 
-void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
+void BinaryViewTab::renderWorkflowContext(AppContext& ctx, bool compactMenu) {
     const float scale = theme::UiScale();
     if (viewPinsImage_ != investigationImageSerial_) {
         for (auto& pin : viewPins_) pin = {};
@@ -124,6 +133,17 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
         ctx.requestedTypeWorkbench = false;
         focusTypesTab_ = lowerAdvancedMode_ = true;
         lowerDockCollapsed_ = false;
+    }
+    if (compactMenu) {
+        if (ImGui::SmallButton("Workspace###binary_workspace"))
+            ImGui::OpenPopup("binary_workspace_tools");
+        ui::ItemTooltip("Presets, navigator tools, analysis queue, registers and location pinning.");
+        const ImVec2 viewportSize = ImGui::GetMainViewport()->WorkSize;
+        const ImVec2 popupMax(std::max(1.0f, viewportSize.x - 16.0f * scale),
+                             std::max(1.0f, viewportSize.y - 16.0f * scale));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), popupMax);
+        ImGui::SetNextWindowSize(ImVec2(std::min(560.0f * scale, popupMax.x), 0), ImGuiCond_Appearing);
+        if (!ImGui::BeginPopup("binary_workspace_tools")) return;
     }
     const char* labels[] = {"Analyze", "Debug", "Memory", "Compare"};
     const char* hints[] = {
@@ -228,14 +248,16 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
     else std::snprintf(addressText, sizeof(addressText), "Select a location");
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-    const float padding = 4.0f * scale;
+    const float padding = 6.0f * scale;
     const float gap = 10.0f * scale;
     const float lineHeight = ImGui::GetTextLineHeight();
-    const float sourceWidth = ImGui::CalcTextSize(source).x;
+    const float sourcePadding = 4.0f * scale;
+    const float sourceWidth = ImGui::CalcTextSize(source).x + sourcePadding * 2.0f;
+    const float sourceHeight = lineHeight + 4.0f * scale;
     const float rightWidth = ImGui::CalcTextSize(addressText).x;
     // At exceptionally narrow widths keep the address on its own second line.
     const bool twoLines = width < sourceWidth + rightWidth + gap + padding * 2.0f;
-    const float height = lineHeight * (twoLines ? 2.0f : 1.0f) + padding * 2.0f;
+    const float height = sourceHeight + (twoLines ? lineHeight + 3.0f * scale : 0.0f) + padding * 2.0f;
     ImGui::BeginDisabled(!valid);
     const bool copied = ImGui::InvisibleButton("##location_breadcrumb", ImVec2(width, height),
                                                ImGuiButtonFlags_EnableNav);
@@ -243,28 +265,41 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
     const bool hovered = ImGui::IsItemHovered();
     const bool focused = ImGui::IsItemFocused();
     ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height),
+                        ImGui::GetColorU32(theme::col::chrome()), 3.0f * scale);
+    draw->AddLine(ImVec2(origin.x, origin.y + height),
+                  ImVec2(origin.x + width, origin.y + height),
+                  ImGui::GetColorU32(theme::col::paneLine()), std::max(1.0f, std::round(scale)));
     if (hovered || focused) {
+        ImVec4 hover = theme::col::accent(); hover.w = 0.04f;
         draw->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height),
-                            ImGui::GetColorU32(theme::col::panelHeader()), 2.0f * scale);
+                            ImGui::GetColorU32(hover), 3.0f * scale);
         if (focused) draw->AddRect(origin, ImVec2(origin.x + width, origin.y + height),
-                                   ImGui::GetColorU32(theme::col::accent()), 2.0f * scale);
+                                   ImGui::GetColorU32(theme::col::accent()), 3.0f * scale);
     }
-    const ImVec2 textOrigin(origin.x + padding, origin.y + padding);
+    const ImVec2 textOrigin(origin.x + padding, origin.y + padding + 2.0f * scale);
     const float right = origin.x + width - padding;
     const float addressX = twoLines ? textOrigin.x : right - rightWidth;
     const float contextLeft = textOrigin.x + sourceWidth + gap;
     const float contextRight = twoLines ? right : addressX - gap;
     draw->PushClipRect(origin, ImVec2(origin.x + width, origin.y + height), true);
-    const ImU32 sourceColor = ImGui::GetColorU32(live ? theme::col::warn() : theme::col::accent());
-    draw->AddText(textOrigin, sourceColor, source);
+    const ImVec4 sourceTint = live ? theme::col::warn() : theme::col::accent();
+    const ImU32 sourceColor = ImGui::GetColorU32(sourceTint);
+    ImVec4 sourceFill = sourceTint; sourceFill.w = 0.12f;
+    ImVec4 sourceBorder = sourceTint; sourceBorder.w = 0.30f;
+    const ImVec2 sourceMin(textOrigin.x, origin.y + padding);
+    const ImVec2 sourceMax(sourceMin.x + sourceWidth, sourceMin.y + sourceHeight);
+    draw->AddRectFilled(sourceMin, sourceMax, ImGui::GetColorU32(sourceFill), sourceHeight * 0.5f);
+    draw->AddRect(sourceMin, sourceMax, ImGui::GetColorU32(sourceBorder), sourceHeight * 0.5f);
+    draw->AddText(ImVec2(textOrigin.x + sourcePadding, textOrigin.y), sourceColor, source);
     if (contextRight > contextLeft) {
-        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::muted());
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::col::secondaryText());
         ImGui::RenderTextEllipsis(draw, ImVec2(contextLeft, textOrigin.y),
             ImVec2(contextRight, textOrigin.y + lineHeight), contextRight, contextRight,
             detail.c_str(), detail.c_str() + detail.size(), nullptr);
         ImGui::PopStyleColor();
     }
-    draw->AddText(ImVec2(addressX, textOrigin.y + (twoLines ? lineHeight : 0.0f)),
+    draw->AddText(ImVec2(addressX, twoLines ? sourceMax.y + 3.0f * scale : textOrigin.y),
                   sourceColor, addressText);
     draw->PopClipRect();
     const std::string hint = std::string(source) + " / " + detail + " / " + addressText +
@@ -277,6 +312,7 @@ void BinaryViewTab::renderWorkflowContext(AppContext& ctx) {
         ImGui::SetClipboardText(copy);
         ui::Toast(ui::ToastKind::Success, std::string("Copied ") + copy);
     }
+    if (compactMenu) ImGui::EndPopup();
 }
 
 } // namespace ds

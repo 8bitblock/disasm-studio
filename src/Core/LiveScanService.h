@@ -60,14 +60,26 @@ struct LiveScanResult {
     std::vector<StrResult> strings;   // Strings
     std::vector<uint64_t>  hits;      // Xref instruction addresses / Pattern match addresses
     std::vector<uint8_t>   image;     // ReadImage (the module's mapped bytes)
-    uint64_t attemptedBytes = 0;      // Pattern: uniquely-owned candidate bytes visited
-    uint64_t scannedBytes = 0;        // Pattern: uniquely-owned bytes actually read
-    size_t unreadableChunks = 0;      // Pattern: reads which returned no bytes
-    size_t partialChunks = 0;         // Pattern: reads shorter than requested
+    uint64_t attemptedBytes = 0;      // Pattern/Xref: candidate bytes requested within the budget
+    uint64_t scannedBytes = 0;        // Pattern/Xref: bytes actually read (Pattern excludes overlap)
+    size_t unreadableChunks = 0;      // Pattern/Xref: reads which returned no bytes
+    size_t partialChunks = 0;         // Pattern/Xref: nonempty reads shorter than requested
     bool truncated = false;           // hit a cap (strings/hits/bytes)
     bool complete = false;            // false means error describes a failed job
     std::string error;
+    std::string scopeWarning;         // Xref: incomplete source memory-region inventory
+
+    // Job completion does not prove an exhaustive search. Partial results stay
+    // useful, but omitted ranges or unreadable bytes cannot prove no references.
+    bool coverageComplete() const {
+        return (kind == LiveKind::Pattern || kind == LiveKind::Xref) &&
+            complete && !truncated && !unreadableChunks && !partialChunks && scopeWarning.empty();
+    }
 };
+
+// Preserve successful partial hits while distinguishing absence from unknown
+// coverage. Shared with the UI so worker regressions verify the actual wording.
+std::string FormatLiveXrefStatus(const LiveScanResult& result);
 
 // Lightweight progress for the status-bar bar (lock-free atomic reads).
 struct LiveProgress {
@@ -101,10 +113,14 @@ public:
                             size_t byteCap = 256ull * 1024 * 1024);
     uint64_t requestXref(std::vector<LiveRange> ranges, uint64_t target, Engine engine, Arch arch,
                          MemReader reader, uint64_t epoch,
-                         size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024);
+                         size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024,
+                         std::string scopeWarning = {});
+    // Pass every executable range, without pre-truncating the list: the worker
+    // applies byteCap and records any omitted scope in the result.
     uint64_t requestXref(std::vector<LiveRange> ranges, uint64_t target,
                          const DecoderConfig& decoder, MemReader reader, uint64_t epoch,
-                         size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024);
+                         size_t hitCap = 3000, size_t byteCap = 64ull * 1024 * 1024,
+                         std::string scopeWarning = {});
     uint64_t requestReadImage(uint64_t base, uint64_t size, uint64_t moduleBase,
                               MemReader reader, uint64_t epoch);
     // Scan readable ranges for a masked byte pattern in bounded chunks. A zero
@@ -155,6 +171,7 @@ private:
         uint64_t  token = 0;
         MemReader reader;
         SigPattern pattern;
+        std::string scopeWarning;
     };
 
     uint64_t enqueue(Job&& j);

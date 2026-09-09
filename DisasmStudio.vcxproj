@@ -159,6 +159,7 @@
     <ClCompile Include="src\Core\Decompiler.cpp" />
     <ClCompile Include="src\Core\DataFlow.cpp" />
     <ClCompile Include="src\Core\ValueOrigin.cpp" />
+    <ClCompile Include="src\Core\StringActionTrace.cpp" />
     <ClCompile Include="src\Core\SignatureLibrary.cpp" />
     <ClCompile Include="src\Core\TechScan.cpp" />
     <ClCompile Include="src\Core\ResourceDecode.cpp" />
@@ -234,6 +235,7 @@
     <ClCompile Include="src\Tabs\BinaryViewWorkflow.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewTypes.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewValueOrigin.cpp" />
+    <ClCompile Include="src\Tabs\BinaryViewStringTrace.cpp" />
     <ClCompile Include="src\Tabs\BinaryViewGml.cpp" />
     <ClCompile Include="src\Tabs\MemoryToolsTab.cpp" />
     <ClCompile Include="src\Tabs\BinaryDiffTab.cpp" />
@@ -315,8 +317,11 @@
     <ClInclude Include="src\Core\Decompiler.h" />
     <ClInclude Include="src\Core\DataFlow.h" />
     <ClInclude Include="src\Core\ValueOrigin.h" />
+    <ClInclude Include="src\Core\StringActionTrace.h" />
+    <ClInclude Include="src\Core\StringActionEvidence.h" />
     <ClInclude Include="src\Core\SignatureLibrary.h" />
     <ClInclude Include="src\Tabs\BinaryViewValueOrigin.h" />
+    <ClInclude Include="src\Tabs\BinaryViewStringTrace.h" />
     <ClInclude Include="src\Core\TechScan.h" />
     <ClInclude Include="src\Core\JavaScan.h" />
     <ClInclude Include="src\Core\Inflate.h" />

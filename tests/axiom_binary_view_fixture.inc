@@ -691,10 +691,16 @@ static void checkAxiomBinaryView(const std::string& path) {
         ImGuiWindow* center = releaseWindow("##analysis_viewport");
         ImGuiWindow* evidence = releaseWindow("##evidence_inspector");
         CHECK(functions && strings && center && evidence);
-        if (functions && strings) CHECK(functions->Pos.y + functions->Size.y <= strings->Pos.y + 1);
+        CHECK(releaseWindow("##binary_command_band") == nullptr);
+        CHECK(releaseWindow("navigator_analysis_queue") == nullptr);
+        if (functions && strings) {
+            CHECK(functions->Pos.y + functions->Size.y <= strings->Pos.y + 1);
+            CHECK(functions->Size.y > strings->Size.y && functions->Size.y < strings->Size.y * 1.2f);
+        }
         if (center && evidence) {
             CHECK(center->Pos.x + center->Size.x <= evidence->Pos.x);
             CHECK(evidence->Pos.x + evidence->Size.x <= size.x + 1);
+            CHECK(std::fabs(evidence->Size.x - 252.0f * theme::UiScale()) <= 1.0f);
         }
     }
     // An authored, exact retained snapshot enables the LIVE tab without an
@@ -874,6 +880,30 @@ static void captureAxiomBinaryView(const std::string&, const std::string& captur
         CHECK(!ui::ToastsActive());
         CHECK(theme::CurrentTheme() == theme::ThemeId::Axiom);
         capture("binary-shell-axiom-1440");
+        theme::ApplyTheme(theme::ThemeId::Midnight);
+        for (int i = 0; i < 3; ++i) workbenchFrame(app, ImVec2(1440, 900));
+        CHECK(!ui::ToastsActive());
+        CHECK(theme::CurrentTheme() == theme::ThemeId::Midnight);
+        auto checkCapturedFonts = [&] {
+            CHECK(ui::gUiFont && ui::gMonoFont);
+            if (!ui::gUiFont) return;
+            const float expected = ui::gUiFont->FontSize * ImGui::GetIO().FontGlobalScale * 0.76f;
+            for (const char* fragment : {"navigator_functions", "navigator_strings",
+                                         "##evidence_inspector", "##bottom_tool_drawer"}) {
+                ImGuiWindow* child = releaseWindow(fragment);
+                CHECK(child != nullptr);
+                if (!child) continue;
+                std::printf("[capture-font] %s actual=%.2f expected=%.2f own=%.3f parents=%.3f\n",
+                    fragment, child->FontRefSize, expected, child->FontWindowScale, child->FontWindowScaleParents);
+                CHECK(std::fabs(child->FontRefSize - expected) <= 0.1f);
+            }
+        };
+        checkCapturedFonts();
+        capture("binary-shell-midnight-1440");
+        for (int i = 0; i < 3; ++i) workbenchFrame(app, ImVec2(900, 900));
+        checkCapturedFonts();
+        capture("binary-shell-midnight-900");
+        theme::ApplyTheme(theme::ThemeId::Axiom);
         ctx.staticAnalysis().cancelAndWaitIdle();
         ctx.staticProject().hash = 0;
     }

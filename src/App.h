@@ -126,6 +126,7 @@ struct AppContext {
     bool                           workbenchPrefsDirty = false;
     bool                           requestedTypeWorkbench = false;
     bool                           requestedLiveAssembly = false;
+    bool                           requestedBreakpoints = false;
     bool                           requestedCrackmeTriage = false;
     TriageWorkspaceView            requestedTriageView = TriageWorkspaceView::StartHere;
     // Opaque producer-stable identity used to focus one complete authorization
@@ -792,13 +793,13 @@ public:
     }
 
 private:
-    void renderDocumentStrip();
+    void renderDocumentStrip(float width = 240.0f, float height = 24.0f);
     void applyPendingDocumentCommand();
     void retireActiveDocumentRequests();
     void renderMenuBar();
     void renderDebugToolbar(const DbgSnapshot& snap);
     void renderDebugSessionControls(const DbgSnapshot& snap, float availableWidth,
-                                    float height, bool executionRequested);
+                                    float height, bool executionRequested, bool threadOnly = false);
     bool selectDebugToolbarThread(const DbgSnapshot& snap, uint32_t tid);
     void pollExit();
     void resolveWorkbenchNavigation();                 // apply requests/shortcuts before drawing the strip

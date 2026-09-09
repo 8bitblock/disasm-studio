@@ -48,6 +48,12 @@ void Badge(const char* text, const ImVec4& color);
 // and never changes the current ID scope or creates a separately scrolling pane.
 void PanelHeader(const char* title, const char* detail = nullptr);
 
+// Mockup pane heading: compact uppercase label, adjacent count capsule and
+// optional trailing context. The supplied title remains available to ImGui's
+// native text log. A negative count omits the capsule; context clips to fit.
+void PaneHeading(const char* title, const char* detail = nullptr, int count = -1,
+                 const ImVec4* countColor = nullptr);
+
 // Shared data-list presentation: subdued headers, horizontal hairlines and
 // palette-aware rows. IDs, columns, sizing and saved settings stay caller-owned.
 // Call EndDataTable only when BeginDataTable/BeginDataTableEx returned true.
@@ -84,7 +90,8 @@ bool Pill(const char* id, const char* text, const ImVec4* valueCol = nullptr,
 // mono detail ("PAUSED  pid 4312  rip 7FF6..."), right of the state word.
 void StatePill(const char* state, const ImVec4& stateCol, const char* detail = nullptr);
 
-// Compact native tab strip with overflow scrolling and a tab-list menu. The
+// Flat native tab strip with a bottom selection underline, overflow scrolling
+// and a tab-list menu. The
 // caller owns selection; disabled destinations remain visible but unavailable.
 // Returns the (possibly changed) active index.
 // `enabled` (optional, length `count`) grays out and ignores clicks per tab.
