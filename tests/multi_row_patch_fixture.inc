@@ -29,6 +29,20 @@ static bool multiRowPatchTextPoint(Fixture& f, uint64_t address, int column,
         window->GetID(f.tab->asmFullProgram_ ? "asm_full" : "asm")) : nullptr;
     CHECK(table != nullptr);
     if (!table) return false;
+    // Bytes is deliberately hidden by default in the mockup layout. A test
+    // beginning its drag in Bytes must request the same native visibility
+    // transition as the Display menu before resolving the text hit point.
+    if (column == 3 && !table->Columns[column].IsUserEnabled) {
+        CHECK(!table->Columns[column].IsEnabled);
+        table->Columns[column].IsUserEnabledNextFrame = true;
+        for (int i = 0; i < 4; ++i) f.assemblyFrame();
+        table = ImGui::GetCurrentContext()->Tables.GetByKey(
+            window->GetID(f.tab->asmFullProgram_ ? "asm_full" : "asm"));
+        CHECK(table != nullptr);
+        if (!table) return false;
+    }
+    CHECK(table->Columns[column].IsUserEnabled && table->Columns[column].IsEnabled);
+    if (!table->Columns[column].IsEnabled) return false;
     for (const auto& row : f.tab->asmFlow_) if (row.addr == address) {
         point = ImVec2(table->Columns[column].WorkMinX + 4.0f, row.y);
         return true;

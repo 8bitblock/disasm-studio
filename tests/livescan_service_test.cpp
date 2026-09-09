@@ -588,6 +588,72 @@ int main() {
         CHECK(hit, "live xref found the call referencing the target at +0x40");
         CHECK(got.target == kCallTarget, "xref result echoes the target");
         CHECK(got.complete && got.error.empty(), "successful xref is explicitly complete");
+        CHECK(got.coverageComplete() && got.scannedBytes == mem.size() &&
+              got.attemptedBytes == mem.size(), "xref reports complete byte coverage separately from job completion");
+        CHECK(FormatLiveXrefStatus(got).find("partial") == std::string::npos,
+              "complete xref scope does not show a partial warning");
+    }
+
+    // Keep the complete range inventory until the worker applies its byte
+    // budget. Exactly filling the budget is only partial if a real tail exists.
+    {
+        uint64_t tok = svc.requestXref({{imgBase, mem.size()}}, kCallTarget,
+            Engine::Zydis, Arch::X64, reader, svc.epoch(), 3000, mem.size());
+        LiveScanResult got;
+        CHECK(collect(3000, tok, got), "exact-byte-budget xref produced a result");
+        CHECK(got.coverageComplete(), "exact-byte-budget xref has no omitted scope");
+
+        tok = svc.requestXref({{imgBase, mem.size()}, {imgBase + mem.size(), 32}},
+            kCallTarget, Engine::Zydis, Arch::X64, reader, svc.epoch(), 3000, mem.size());
+        CHECK(collect(3000, tok, got), "range-tail-capped xref produced a result");
+        CHECK(got.complete && got.truncated && !got.coverageComplete() &&
+              got.scannedBytes == mem.size() && got.attemptedBytes == mem.size() &&
+              got.hits == std::vector<uint64_t>{imgBase + 0x40},
+              "omitted next range is partial without discarding useful references");
+        CHECK(FormatLiveXrefStatus(got).find("scan limit reached") != std::string::npos &&
+              FormatLiveXrefStatus(got).find("Missing references remain unknown") != std::string::npos,
+              "range-tail omission remains explicit in displayed xref status");
+
+        tok = svc.requestXref({{imgBase, mem.size()}}, kCallTarget,
+            Engine::Zydis, Arch::X64, reader, svc.epoch(), 3000, 0x60);
+        CHECK(collect(3000, tok, got), "within-range-capped xref produced a result");
+        CHECK(got.truncated && !got.coverageComplete() &&
+              got.attemptedBytes == 0x60 && got.scannedBytes == 0x60,
+              "omitted final range bytes are also partial scope");
+    }
+
+    // A successful worker can still have missing bytes. Preserve the read prefix
+    // and later ranges, but never turn an empty/partial read into no references.
+    {
+        uint64_t tok = svc.requestXref({{imgBase, mem.size() + 32},
+                                       {imgBase + 0x2000, 64}}, kCallTarget,
+            Engine::Zydis, Arch::X64, reader, svc.epoch());
+        LiveScanResult got;
+        CHECK(collect(3000, tok, got), "short-and-unreadable xref produced a result");
+        CHECK(got.complete && !got.truncated && !got.coverageComplete() &&
+              got.partialChunks == 1 && got.unreadableChunks == 1 &&
+              got.attemptedBytes == mem.size() + 96 && got.scannedBytes == mem.size() &&
+              got.hits == std::vector<uint64_t>{imgBase + 0x40},
+              "short and failed xref reads retain hits with exact missing-byte counts");
+        const std::string status = FormatLiveXrefStatus(got);
+        CHECK(status.find("1 short read(s), 1 unreadable range(s)") != std::string::npos &&
+              status.find("scan limit") == std::string::npos,
+              "read failures are not mislabeled as a hit/byte cap");
+
+        tok = svc.requestXref({{imgBase + 0x2000, 64}}, kCallTarget,
+            Engine::Zydis, Arch::X64, reader, svc.epoch());
+        CHECK(collect(3000, tok, got), "empty unreadable xref produced a result");
+        CHECK(got.hits.empty() && !got.coverageComplete() &&
+              FormatLiveXrefStatus(got).find("Missing references remain unknown") != std::string::npos,
+              "an unreadable zero-hit scan cannot imply the target is unused");
+
+        tok = svc.requestXref({{imgBase, mem.size()}}, kCallTarget,
+            Engine::Zydis, Arch::X64, reader, svc.epoch(), 3000, mem.size(),
+            "Region query stopped before the end of the address space.");
+        CHECK(collect(3000, tok, got), "partial-map xref produced a result");
+        CHECK(got.complete && !got.coverageComplete() && !got.truncated &&
+              FormatLiveXrefStatus(got).find("memory map partial: Region query stopped") != std::string::npos,
+              "caller memory-map provenance survives successful range reads");
     }
 
     // Full decoder configuration reaches the private worker decoder, and a
@@ -613,6 +679,9 @@ int main() {
               "failed decoder is not reported as an empty successful xref");
         CHECK(got.error.find("configured decoder unavailable") != std::string::npos,
               "failed decoder reason is preserved");
+        CHECK(!got.coverageComplete() &&
+              FormatLiveXrefStatus(got).find("failed: configured decoder unavailable") != std::string::npos,
+              "UI xref status retains decoder failures rather than displaying zero references");
     }
 
     // ---- ReadImage ----

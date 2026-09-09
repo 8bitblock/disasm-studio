@@ -10,6 +10,22 @@
 
 namespace ds {
 
+std::string FormatLiveXrefStatus(const LiveScanResult& result) {
+    if (!result.complete)
+        return result.error.empty() ? "Live reference search failed. Refresh to retry."
+                                    : "Live reference search failed: " + result.error;
+    std::string status = std::to_string(result.hits.size()) + " reference(s); " +
+        std::to_string(result.scannedBytes) + " of " +
+        std::to_string(result.attemptedBytes) + " requested byte(s) read";
+    if (result.truncated) status += "; partial coverage: scan limit reached";
+    if (result.partialChunks || result.unreadableChunks)
+        status += "; partial coverage: " + std::to_string(result.partialChunks) +
+            " short read(s), " + std::to_string(result.unreadableChunks) + " unreadable range(s)";
+    if (!result.scopeWarning.empty()) status += "; memory map partial: " + result.scopeWarning;
+    if (!result.coverageComplete()) status += ". Missing references remain unknown.";
+    return status;
+}
+
 LiveScanService::LiveScanService(DecoderFactory factory) : factory_(std::move(factory)) {
     unsigned hc = std::thread::hardware_concurrency();
     unsigned n  = hc > 3 ? hc - 2 : 1;
@@ -98,20 +114,22 @@ uint64_t LiveScanService::requestStrings(std::vector<LiveRange> ranges, MemReade
 
 uint64_t LiveScanService::requestXref(std::vector<LiveRange> ranges, uint64_t target,
                                       Engine engine, Arch arch, MemReader reader, uint64_t epoch,
-                                      size_t hitCap, size_t byteCap) {
+                                      size_t hitCap, size_t byteCap, std::string scopeWarning) {
     DecoderConfig decoder;
     decoder.engine = engine;
     decoder.arch = arch;
     return requestXref(std::move(ranges), target, decoder, std::move(reader), epoch,
-                       hitCap, byteCap);
+                       hitCap, byteCap, std::move(scopeWarning));
 }
 
 uint64_t LiveScanService::requestXref(std::vector<LiveRange> ranges, uint64_t target,
                                       const DecoderConfig& decoder, MemReader reader,
-                                      uint64_t epoch, size_t hitCap, size_t byteCap) {
+                                      uint64_t epoch, size_t hitCap, size_t byteCap,
+                                      std::string scopeWarning) {
     Job j; j.kind = LiveKind::Xref; j.ranges = std::move(ranges); j.target = target;
     j.decoder = decoder; j.reader = std::move(reader);
     j.epoch = epoch; j.hitCap = hitCap; j.byteCap = byteCap;
+    j.scopeWarning = std::move(scopeWarning);
     return enqueue(std::move(j));
 }
 
@@ -322,6 +340,7 @@ void LiveScanService::runJob(const Job& job) {
     LiveScanResult res;
     res.kind = job.kind; res.epoch = job.epoch; res.token = job.token;
     res.target = job.target; res.moduleBase = job.moduleBase;
+    res.scopeWarning = job.scopeWarning;
 
     auto publish = [&](LiveScanResult&& value) {
         if (epoch_.load(std::memory_order_acquire) != job.epoch) return;
@@ -474,17 +493,24 @@ void LiveScanService::runJob(const Job& job) {
         const LiveRange& rg = job.ranges[r];
         if (rg.size == 0) { progCur_.store((uint32_t)(r + 1), std::memory_order_relaxed); continue; }
 
-        size_t sz = (size_t)rg.size;
+        size_t sz = static_cast<size_t>((std::min)(rg.size,
+            static_cast<uint64_t>((std::numeric_limits<size_t>::max)())));
         if (job.kind != LiveKind::ReadImage) {          // honour the overall byte cap
             if (scanned >= job.byteCap) { res.truncated = true; break; }
-            if (scanned + sz > job.byteCap) {
+            if (rg.size > job.byteCap - scanned) {
                 sz = job.byteCap - scanned;
                 res.truncated = true; // the tail of this range will not be scanned
             }
         }
         buf.resize(sz);
-        size_t got = job.reader(rg.base, buf.data(), sz);
+        const size_t got = (std::min)(job.reader(rg.base, buf.data(), sz), sz);
         scanned += sz;
+        if (job.kind == LiveKind::Xref) {
+            res.attemptedBytes += sz;
+            res.scannedBytes += got;
+            if (!got) ++res.unreadableChunks;
+            else if (got < sz) ++res.partialChunks;
+        }
 
         if (got) {
             switch (job.kind) {

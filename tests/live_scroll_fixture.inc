@@ -15,10 +15,13 @@ static ImGuiTable* liveScrollTable() {
 static void checkLiveAssemblyScrolling(const std::string& path) {
     char enabled[8]{};
     char focused[8]{};
+    char diagnostics[8]{};
     const bool explicitlyEnabled =
         GetEnvironmentVariableA("DS_LIVE_SCROLL_TEST", enabled, sizeof(enabled)) && enabled[0] == '1';
     const bool focusedRun =
         GetEnvironmentVariableA("DS_LIVE_SCROLL_ONLY", focused, sizeof(focused)) && focused[0] == '1';
+    const bool diagnosticOutput = GetEnvironmentVariableA(
+        "DS_LIVE_SCROLL_DIAGNOSTICS", diagnostics, sizeof(diagnostics)) && diagnostics[0] == '1';
     if (!explicitlyEnabled && !focusedRun) {
         std::printf("SKIP live assembly scrolling (set DS_LIVE_SCROLL_TEST=1)\n");
         return;
@@ -72,6 +75,9 @@ static void checkLiveAssemblyScrolling(const std::string& path) {
     image[sourceOffset + 7] = 0x90;
     const char text[] = "Live scrolling string reference";
     std::memcpy(image.data() + (stringAddress - scratch), text, sizeof(text));
+    const uint64_t prefixBoundary = scratch + 0x30000;
+    std::fill(image.begin() + 0x2FE00, image.begin() + 0x30000, 0x66);
+    std::fill(image.begin() + 0x30000, image.begin() + 0x30200, 0x90);
     CHECK(f.ctx.debug.writeMemoryForSession(owner.pid, owner.sessionGeneration,
         scratch, image.data(), image.size()) == image.size());
 
@@ -255,6 +261,139 @@ static void checkLiveAssemblyScrolling(const std::string& path) {
         page(ImGuiKey_PageUp);
     CHECK(f.tab->liveCacheStart_ + 1024 <= pageUpStart);
 
+    // Real wheel streams do not insert four quiet frames between events.
+    // Refill/correction frames must continue accepting the same gesture, with
+    // a bounded cache even after browsing far beyond its original extent.
+    auto continuousWheel = [&](float amount) {
+        const uint64_t before = f.tab->liveCacheStart_;
+        uint64_t previous = before;
+        for (int i = 0; i < 96; ++i) {
+            ImGui::GetIO().AddMouseWheelEvent(0, amount);
+            render();
+            CHECK(f.tab->liveInsns_.size() <= 256);
+            CHECK(amount > 0 ? f.tab->liveCacheStart_ <= previous
+                             : f.tab->liveCacheStart_ >= previous);
+            previous = f.tab->liveCacheStart_;
+        }
+        for (int i = 0; i < 4; ++i) render();
+        CHECK(amount > 0 ? f.tab->liveCacheStart_ + 4096 <= before
+                         : f.tab->liveCacheStart_ >= before + 4096);
+        retained();
+    };
+    continuousWheel(20);
+    continuousWheel(-20);
+
+    auto inputDiagnostic = [&](const char* gesture, bool upward, int inputFrame) {
+        if (!diagnosticOutput) return;
+        ImGuiTable* current = liveScrollTable();
+        if (!current || !current->InnerWindow) return;
+        ImGuiWindow* window = current->InnerWindow;
+        const ImGuiIO& io = ImGui::GetIO();
+        const ImRect track = ImGui::GetWindowScrollbarRect(window, ImGuiAxis_Y);
+        std::printf("[live input] %s %s frame=%d active=%08X native-scrollbar=%08X table-scrollbar=%08X "
+                    "down=%d mouse=(%.1f,%.1f) track=(%.1f,%.1f)-(%.1f,%.1f) scroll=%.1f/%.1f "
+                    "target=%.1f direction=%d start=%llX browse=%llX browse-valid=%d follow=%d pan=%d settle=%u sample=%d\n",
+            gesture, upward ? "up" : "down", inputFrame, ImGui::GetActiveID(),
+            ImGui::GetWindowScrollbarID(window, ImGuiAxis_Y),
+            ImHashStr("#SCROLLY", 0, current->ID), io.MouseDown[0],
+            io.MousePos.x, io.MousePos.y, track.Min.x, track.Min.y, track.Max.x, track.Max.y,
+            window->Scroll.y, window->ScrollMax.y,
+            window->ScrollTarget.y == FLT_MAX ? -1.0f : window->ScrollTarget.y,
+            static_cast<int>(f.tab->liveBrowseRefillDirection_),
+            static_cast<unsigned long long>(f.tab->liveCacheStart_),
+            static_cast<unsigned long long>(f.tab->liveBrowseVA_),
+            f.tab->liveBrowseValid_, f.tab->followLiveRip_, f.tab->liveWindowPanScrollValid_,
+            static_cast<unsigned>(f.tab->liveWindowScrollSettleFrames_),
+            f.tab->liveWindowScrollSampleValid_);
+    };
+
+    // Arrow navigation at the decoded extent used to cancel pan corrections
+    // without ever requesting another window. Start at the actual scroll edge
+    // and exercise the normal key-event path in each direction.
+    auto arrowAtEdge = [&](ImGuiKey key, bool upward) {
+        ImGuiWindow* window = liveScrollTable()->InnerWindow;
+        ImGui::FocusWindow(window);
+        // Establish an edge without generating the separate scrollbar-delta
+        // gesture under test below. Otherwise these setup frames can themselves
+        // refill and anchor the old edge midway through a replacement window.
+        const uint64_t setupStart = f.tab->liveCacheStart_;
+        int settledEdgeFrames = 0;
+        for (int i = 0; i < 8; ++i) {
+            // Admitting newly visible cells changes ImGui's measured content
+            // height (observed: 3550 -> 3551 -> 3632). Reapply the current edge
+            // while that layout settles, without generating a scroll gesture.
+            f.tab->liveWindowScrollSampleValid_ = false;
+            f.tab->liveWindowPanScrollValid_ = false;
+            f.tab->liveWindowScrollSettleFrames_ = 0;
+            window = liveScrollTable()->InnerWindow;
+            ImGui::SetScrollY(window, upward ? 0.0f : window->ScrollMax.y);
+            render();
+            inputDiagnostic("arrow setup", upward, i);
+            CHECK(f.tab->liveCacheStart_ == setupStart);
+            window = liveScrollTable()->InnerWindow;
+            const bool reachedEdge = upward ? window->Scroll.y <= 1.0f
+                : window->Scroll.y >= window->ScrollMax.y - 1.0f;
+            settledEdgeFrames = reachedEdge ? settledEdgeFrames + 1 : 0;
+            if (settledEdgeFrames >= 2) break;
+        }
+        window = liveScrollTable()->InnerWindow;
+        CHECK(upward ? window->Scroll.y <= 1.0f
+                     : window->Scroll.y >= window->ScrollMax.y - 1.0f);
+        const uint64_t before = f.tab->liveCacheStart_;
+        page(key);
+        inputDiagnostic("arrow result", upward, 0);
+        CHECK(upward ? f.tab->liveCacheStart_ < before
+                     : f.tab->liveCacheStart_ > before);
+    };
+    arrowAtEdge(ImGuiKey_UpArrow, true);
+    arrowAtEdge(ImGuiKey_DownArrow, false);
+
+    // Drag the real scrollbar thumb and keep holding it against the end of its
+    // track. Rebuilding the window invalidates old scroll-delta samples, so a
+    // held gesture must be recognized independently on every subsequent frame.
+    auto holdScrollbarAtEdge = [&](bool upward) {
+        ImGuiWindow* window = liveScrollTable()->InnerWindow;
+        ImGui::SetScrollY(window, window->ScrollMax.y * 0.5f);
+        for (int i = 0; i < 4; ++i) render();
+        window = liveScrollTable()->InnerWindow;
+        const ImRect track = ImGui::GetWindowScrollbarRect(window, ImGuiAxis_Y);
+        ImGui::GetIO().AddMousePosEvent(track.GetCenter().x, track.GetCenter().y);
+        render();
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        render();
+        CHECK(ImGui::GetActiveID() == ImGui::GetWindowScrollbarID(
+            liveScrollTable()->InnerWindow, ImGuiAxis_Y));
+        const uint64_t before = f.tab->liveCacheStart_;
+        inputDiagnostic("thumb grabbed", upward, -1);
+        ImGui::GetIO().AddMousePosEvent(track.GetCenter().x,
+            upward ? track.Min.y + 1.0f : track.Max.y - 1.0f);
+        constexpr uint64_t traversalBytes = 65536 + 4096;
+        for (int i = 0; i < 1024; ++i) {
+            render();
+            if (i < 8 || i == 20) inputDiagnostic("thumb held", upward, i);
+            CHECK(f.tab->liveInsns_.size() <= 256);
+            CHECK(f.tab->liveDecodeBoundaries_.size() <= 256);
+            const uint64_t current = f.tab->liveCacheStart_;
+            if (upward ? current < before && before - current >= traversalBytes
+                       : current > before && current - before >= traversalBytes)
+                break;
+        }
+        ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        for (int i = 0; i < 4; ++i) render();
+        CHECK(upward ? f.tab->liveCacheStart_ + traversalBytes <= before
+                     : f.tab->liveCacheStart_ >= before + traversalBytes);
+        std::printf("[live scroll] held scrollbar %s: %llu bytes\n",
+            upward ? "up" : "down", static_cast<unsigned long long>(
+                upward ? before - f.tab->liveCacheStart_ : f.tab->liveCacheStart_ - before));
+        retained();
+        window = liveScrollTable()->InnerWindow;
+        ImGui::GetIO().AddMousePosEvent(window->InnerClipRect.Min.x + 220,
+                                      window->InnerClipRect.Min.y + 180);
+        render();
+    };
+    holdScrollbarAtEdge(true);
+    holdScrollbarAtEdge(false);
+
     // Explicitly navigating to the same selected xref must reveal it again,
     // even though ordinary scrolling deliberately keeps that cursor selected.
     frame([&] { f.tab->liveNavigate(source); });
@@ -306,6 +445,41 @@ static void checkLiveAssemblyScrolling(const std::string& path) {
     for (int i = 0; i < 4; ++i) render();
     CHECK(f.tab->liveCacheStart_ == ripWindowStart);
     CHECK(std::fabs(liveScrollTable()->InnerWindow->Scroll.y - manualRipScroll) <= 0.5f);
+
+    // Every normal backward trial before this NOP consumes it as part of a
+    // prefixed instruction. The old alignment requirement therefore created an
+    // absolute wall despite fully readable memory. Preserve the committed NOP
+    // boundary, represent its incomplete preceding prefixes as db, and browse
+    // across both the ambiguous bytes and the earlier ordinary instructions.
+    frame([&] { f.tab->liveNavigate(prefixBoundary); });
+    for (int i = 0; i < 4; ++i) render();
+    CHECK(f.tab->liveCacheStart_ == prefixBoundary);
+    ImGui::GetIO().AddMouseWheelEvent(0, 20);
+    render();
+    for (int i = 0; i < 4; ++i) render();
+    CHECK(f.tab->liveCacheStart_ < prefixBoundary);
+    CHECK(f.tab->liveIdxOf_.count(prefixBoundary) != 0);
+    if (const auto found = f.tab->liveIdxOf_.find(prefixBoundary);
+        found != f.tab->liveIdxOf_.end()) {
+        const Instruction& committed = f.tab->liveInsns_[found->second];
+        CHECK(committed.mnemonic == "nop" && committed.length == 1);
+    }
+    CHECK(std::any_of(f.tab->liveInsns_.begin(), f.tab->liveInsns_.end(),
+        [&](const Instruction& in) { return in.address < prefixBoundary && in.mnemonic == "db"; }));
+    ++f.tab->liveGen_;
+    for (int i = 0; i < 4; ++i) render();
+    CHECK(f.tab->liveIdxOf_.count(prefixBoundary) != 0);
+    if (const auto found = f.tab->liveIdxOf_.find(prefixBoundary);
+        found != f.tab->liveIdxOf_.end())
+        CHECK(f.tab->liveInsns_[found->second].mnemonic == "nop" &&
+              f.tab->liveInsns_[found->second].length == 1);
+    for (int i = 0; i < 48; ++i) {
+        ImGui::GetIO().AddMouseWheelEvent(0, 20);
+        render();
+    }
+    for (int i = 0; i < 4; ++i) render();
+    CHECK(f.tab->liveCacheStart_ + 1024 < prefixBoundary);
+    CHECK(f.tab->cursorVA_ == prefixBoundary && !f.tab->followLiveRip_);
 
     // Give the child an explicit unreadable page, so downward refill cannot
     // advance. Retain the useful preceding rows on repeated attempts and quiet

@@ -2351,7 +2351,7 @@ void AnalysisService::requestBulkImpl(const BinaryFile* bin, const DecoderConfig
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (epoch != epoch_.load(std::memory_order_acquire) || quit_.load()) return;
-        constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin;
+        constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin | K_StringActionTrace;
         // Do not let whole-image dependencies delay a requested function even
         // when a caller supplied both kinds in one request.
         if ((kinds & kTargeted) && (kinds & ~kTargeted)) {
@@ -2401,12 +2401,38 @@ void AnalysisService::requestValueOrigin(const BinaryFile* bin, const DecoderCon
 }
 
 bool AnalysisService::interactive(const BulkJob& job) {
-    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin;
+    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin | K_StringActionTrace;
     return (job.kinds & kTargeted) != 0 || job.kinds == K_Listing;
 }
 
+void AnalysisService::requestStringActionTrace(const BinaryFile* bin, const DecoderConfig& decoder,
+    uint64_t epoch, std::shared_ptr<const StringActionTraceRequest> request,
+    std::shared_ptr<const std::vector<FuncResult>> functions) {
+    if (!request || !functions) return;
+    BulkJob job;
+    job.bin = bin;
+    job.decoder = bin ? DecoderConfigForImage(*bin, decoder) : decoder;
+    job.epoch = epoch;
+    job.kinds = K_StringActionTrace;
+    job.regionLo = request->stringVA;
+    job.regionValid = true;
+    job.stringActionTrace = std::move(request);
+    job.stringActionFunctions = std::move(functions);
+    std::vector<BulkJob> rejected;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (epoch != epoch_.load(std::memory_order_acquire) || quit_.load()) return;
+        enqueueLocked(std::move(job), rejected);
+        for (const auto& refused : rejected) finishModuleLocked(refused);
+        refreshPendingLocked();
+    }
+    for (const auto& refused : rejected)
+        publishFailure(refused, "analysis scheduler capacity reached; retry the request");
+    cv_.notify_all();
+}
+
 void AnalysisService::enqueueLocked(BulkJob job, std::vector<BulkJob>& rejected) {
-    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin;
+    constexpr uint32_t kTargeted = K_Synthesis | K_PathExplore | K_Decompile | K_ListingPrefix | K_ValueOrigin | K_StringActionTrace;
     for (BulkJob& queued : queue_) {
         if (queued.bin != job.bin || queued.modBase != job.modBase ||
             queued.epoch != job.epoch || queued.decoder != job.decoder ||
@@ -2555,6 +2581,7 @@ void AnalysisService::publishFailure(const BulkJob& job, const char* message) no
         failure.regionHi = job.regionHi;
         failure.regionValid = job.regionValid;
         if (job.valueOrigin) failure.valueOriginRequestId = job.valueOrigin->requestId;
+        if (job.stringActionTrace) failure.stringActionTraceRequestId = job.stringActionTrace->requestId;
         failure.listingRevision = job.listingRevision;
         failure.listingTopologyGeneration = job.listingTopologyGeneration;
         if (job.kinds & K_ListingPrefix) {
@@ -2693,6 +2720,7 @@ void AnalysisService::runJob(BulkJob& job) {
         if (r.pathValid) pass |= K_PathExplore;
         if (r.decompValid) pass |= K_Decompile;
         if (r.valueOrigin) pass |= K_ValueOrigin;
+        if (r.stringActionTrace) pass |= K_StringActionTrace;
         if (pass && (job.publishedKinds & pass) == pass) return;
         r.epoch   = job.epoch;
         r.kinds   = job.kinds;
@@ -2719,6 +2747,43 @@ void AnalysisService::runJob(BulkJob& job) {
             emit(std::move(result));
         }
         if (job.kinds == K_ValueOrigin) return;
+    }
+
+    if ((job.kinds & K_StringActionTrace) && job.stringActionTrace) {
+        auto request = *job.stringActionTrace;
+        auto cancelled = [&] {
+            return superseded() || (request.cancellation && request.cancellation->load(std::memory_order_acquire));
+        };
+        constexpr size_t kMaxFunctions = 100000;
+        const auto& functions = job.stringActionFunctions;
+        if (functions) {
+            request.functions.clear();
+            request.functions.reserve(std::min(functions->size(), kMaxFunctions));
+            for (size_t i = 0; i < std::min(functions->size(), kMaxFunctions); ++i) {
+                if (cancelled()) return;
+                const auto& f = (*functions)[i];
+                DiscoveredFunction next;
+                next.address = f.address; next.size = f.size; next.name = f.name;
+                next.isExport = f.isExport; next.noreturn = f.noreturn;
+                const size_t chunks = std::min<size_t>(f.chunks.size(), 256);
+                next.chunks.assign(f.chunks.begin(), f.chunks.begin() + chunks);
+                next.ownershipTruncated = f.ownershipTruncated || chunks != f.chunks.size();
+                next.seedKind = f.seedKind; next.boundaryConfidence = f.boundaryConfidence;
+                request.functions.push_back(std::move(next));
+            }
+        }
+        auto trace = BuildStringActionTrace(*job.bin, *dis, job.decoder.arch, request, cancelled);
+        if (functions && functions->size() > kMaxFunctions) {
+            trace.complete = false;
+            trace.limitations.push_back("Function inventory limited to 100,000 entries.");
+        }
+        if (!cancelled() && !trace.cancelled) {
+            AnalysisResult result;
+            result.stringActionTrace = std::make_shared<const StringActionTraceResult>(std::move(trace));
+            result.stringActionTraceRequestId = request.requestId;
+            emit(std::move(result));
+        }
+        if (job.kinds == K_StringActionTrace) return;
     }
 
     const uint64_t pristineHash = job.bin->contentHash();

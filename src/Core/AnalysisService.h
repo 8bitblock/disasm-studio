@@ -43,6 +43,7 @@
 #include "Synthesis.h"                  // SynthResult (K_Synthesis results)
 #include "PathExplore.h"                // PathTree (K_PathExplore results)
 #include "ValueOrigin.h"
+#include "StringActionTrace.h"
 #include "CrackmeTriage.h"              // CrackmeTriageReport (offline network trail)
 #include "../Disasm/IDisassembler.h"   // Engine, Arch, IDisassembler
 
@@ -71,7 +72,7 @@ class BinaryFile;
 enum BulkKind : uint32_t {
     K_Funcs = 1, K_Strings = 2, K_Listing = 4, K_Xref = 8, K_Intent = 16, K_CallGraph = 32,
     K_Synthesis = 64, K_PathExplore = 128, K_Decompile = 256, K_ListingPrefix = 512,
-    K_CrackmeTriage = 1024, K_ValueOrigin = 2048
+    K_CrackmeTriage = 1024, K_ValueOrigin = 2048, K_StringActionTrace = 4096
 };
 
 // Coarse "what is the pool doing right now" indicator for the progress bar.
@@ -138,6 +139,8 @@ struct AnalysisResult {
     uint64_t                decompContext = 0; // caller name generation; rejects stale renamed output
     std::shared_ptr<const ValueOriginResult> valueOrigin;
     uint64_t                valueOriginRequestId = 0;
+    std::shared_ptr<const StringActionTraceResult> stringActionTrace;
+    uint64_t                stringActionTraceRequestId = 0;
     uint64_t                regionLo = 0, regionHi = 0;                // the region these targeted
     bool                    regionValid = false; // a targeted region may begin at VA 0
 };
@@ -183,6 +186,9 @@ public:
     static unsigned globalWorkerLimit();
     void requestValueOrigin(const BinaryFile* bin, const DecoderConfig& decoder,
                             uint64_t epoch, std::shared_ptr<const ValueOriginRequest> request);
+    void requestStringActionTrace(const BinaryFile* bin, const DecoderConfig& decoder,
+        uint64_t epoch, std::shared_ptr<const StringActionTraceRequest> request,
+        std::shared_ptr<const std::vector<FuncResult>> functions);
 
     // Monotone cancellation token. A result is accepted by the consumer only when
     // result.epoch == epoch(); bumpEpoch() invalidates everything older.
@@ -306,6 +312,8 @@ private:
         bool              decompOwnershipTruncated = false;
         std::shared_ptr<const std::vector<uint64_t>> noreturnTargets;
         std::shared_ptr<const ValueOriginRequest> valueOrigin;
+        std::shared_ptr<const StringActionTraceRequest> stringActionTrace;
+        std::shared_ptr<const std::vector<FuncResult>> stringActionFunctions;
         std::shared_ptr<const ListingLayout> listingLayout;
         std::shared_ptr<const std::vector<StrResult>> listingStrings;
         std::shared_ptr<const CodeDataMap> listingCodeData;

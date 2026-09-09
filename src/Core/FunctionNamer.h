@@ -64,6 +64,17 @@ struct ApiResultUseEvidence {
     bool normalizedReturned = false; // SETcc + full-width normalization reaches RET
 };
 
+// A decoder-typed stored operation and one exact string reference in the same
+// short basic block. Merely having both somewhere in a function is insufficient.
+struct StringActionNameEvidence {
+    std::string text;
+    uint64_t instructionVA = 0;
+    uint64_t stringRefVA = 0;
+    bool storedAddition = false;
+    bool storedSubtraction = false;
+    bool sameBlock = false;
+};
+
 // Evidence gathered about one function body. Kept deliberately small and free of
 // engine types so the synthesis below is pure and testable.
 struct FuncEvidence {
@@ -73,6 +84,7 @@ struct FuncEvidence {
     std::vector<std::string> apiCallSequence; // bounded imported calls in body order (duplicates kept)
     std::vector<std::string> strings;   // referenced string literals (raw text)
     std::vector<ApiResultUseEvidence> apiResultUses; // ordered, de-duped by exact API key
+    std::vector<StringActionNameEvidence> stringActions; // bounded string + stored-operation evidence
     bool isThunk      = false;          // body is essentially one jmp to a single target
     std::string thunkApi;               // API a thunk tail-jumps to ("" if its target isn't an API)
     bool selfRecursive = false;

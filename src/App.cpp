@@ -3190,18 +3190,30 @@ void App::applyPendingDocumentCommand() {
 void App::renderMenuBar() {
     const float k = theme::UiScale();
     titleDragRegionValid_ = false;
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * k, 6.0f * k));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * k, 4.0f * k));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * k,
+        ((std::max)(32.0f * k, ImGui::GetTextLineHeight() + 8.0f * k) -
+            ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * k, 4.0f * k));
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg, theme::col::chrome());
     if (ImGui::BeginMainMenuBar()) {
-        // The reference treats the menu as app chrome: brand and menus share one
-        // compact row, with documents living in the browser strip beneath it.
-        if (ui::IconsLoaded()) {
-            ImGui::TextColored(theme::col::accent(), "%s", DS_ICON_CODE);
-            ImGui::SameLine(0.0f, 5.0f * k);
-        }
+        // Brand, menus, document identity and real debugger state share the
+        // reference's single compact title row.
+        const ImVec2 brandAt = ImGui::GetCursorScreenPos();
+        const float brandSize = 16.0f * k;
+        ImGui::Dummy(ImVec2(brandSize, ImGui::GetTextLineHeight()));
+        const float brandY = brandAt.y + (ImGui::GetTextLineHeight() - brandSize) * 0.5f;
+        ImVec4 brandFill = theme::col::accent(); brandFill.w = 0.22f;
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(brandAt.x, brandY),
+            ImVec2(brandAt.x + brandSize, brandY + brandSize),
+            ImGui::GetColorU32(brandFill), 5.0f * k);
+        const float brandFont = ImGui::GetFontSize() * 0.62f;
+        const ImVec2 brandText = ImGui::GetFont()->CalcTextSizeA(brandFont, FLT_MAX, 0, "DS");
+        ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), brandFont,
+            ImVec2(brandAt.x + (brandSize - brandText.x) * 0.5f,
+                brandY + (brandSize - brandText.y) * 0.5f),
+            ImGui::GetColorU32(theme::col::accent()), "DS");
+        ImGui::SameLine(0.0f, 8.0f * k);
         ImGui::TextUnformatted("DisasmStudio");
-        ImGui::SameLine(0.0f, 12.0f * k);
-        ImGui::Separator();
         ImGui::SameLine(0.0f, 12.0f * k);
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open Binary...", "Ctrl+O")) openFileDialog();
@@ -3261,6 +3273,30 @@ void App::renderMenuBar() {
             if (ImGui::MenuItem("Close Document", "Ctrl+W", false,
                                 ctx_.staticDocumentCount() != 0))
                 closeBinary();
+            if (ImGui::BeginMenu("Open documents", ctx_.staticDocumentCount() != 0)) {
+                const auto documents = ctx_.staticDocuments();
+                ImGui::BeginDisabled(ctx_.documentCommandPending() || palette_.isOpen());
+                for (const auto& document : documents) {
+                    ImGui::PushID(static_cast<int>(document.id.value));
+                    const std::string label = (document.mapped ? "[LIVE] " : "") +
+                        (document.title.empty() ? std::string("Untitled") : document.title) +
+                        (document.dirty ? " *" : "");
+                    if (ImGui::MenuItem(label.c_str(), nullptr, document.active) &&
+                        !ctx_.queueActivateStaticDocument(document.id))
+                        ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+                    if (ImGui::BeginPopupContextItem("##file_document_actions")) {
+                        if (!document.path.empty() && ImGui::MenuItem("Copy full path"))
+                            ImGui::SetClipboardText(document.path.c_str());
+                        if (ImGui::MenuItem("Close document") &&
+                            !ctx_.queueCloseStaticDocument(document.id))
+                            ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+                        ImGui::EndPopup();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndDisabled();
+                ImGui::EndMenu();
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
                 requestExit();
@@ -3464,53 +3500,64 @@ void App::renderMenuBar() {
         const float menusEndX = ImGui::GetCursorScreenPos().x;
         HWND mainHwnd = reinterpret_cast<HWND>(
             ImGui::GetMainViewport()->PlatformHandleRaw);
-        const float captionW = 46.0f * k;
-        const float captionStart = menuPos.x + menuSize.x - captionW * 3.0f;
+        const float captionW = 34.0f * k;
+        const float captionStart = menuPos.x + menuSize.x - (mainHwnd ? captionW * 3.0f : 0.0f);
         const float captionH = (std::max)(1.0f, menuSize.y - 1.0f);
         const bool maximized = mainHwnd && ::IsZoomed(mainHwnd);
 
-        // The same asynchronous Ctrl+K investigation is reachable from every
-        // workspace. Keep this input target outside the native drag region.
-        float dragEnd = captionStart - 4.0f * k;
-        const float searchWidth = (std::min)(280.0f * k,
-            captionStart - menusEndX - 52.0f * k);
-        if (searchWidth >= 160.0f * k) {
-            const ImVec2 searchAt(captionStart - searchWidth - 12.0f * k,
-                                  menuPos.y + 3.0f * k);
-            const ImVec2 searchSize(searchWidth, captionH - 6.0f * k);
-            ImGui::SetCursorScreenPos(searchAt);
-            const bool otherPopup = ImGui::IsPopupOpen(nullptr,
-                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-            ImGui::BeginDisabled(otherPopup);
-            const bool searchClicked = ImGui::InvisibleButton("##global_search", searchSize,
-                ImGuiButtonFlags_EnableNav);
-            const bool searchHovered = ImGui::IsItemHovered();
-            const bool searchFocused = ImGui::IsItemFocused();
-            const float searchRadius = ImGui::GetStyle().FrameRounding;
-            const ImVec4 searchFill = searchHovered || searchFocused
-                ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered) : theme::col::panel();
-            dl->AddRectFilled(searchAt,
-                ImVec2(searchAt.x + searchSize.x, searchAt.y + searchSize.y),
-                ImGui::GetColorU32(searchFill), searchRadius);
-            dl->AddRect(searchAt,
-                ImVec2(searchAt.x + searchSize.x, searchAt.y + searchSize.y),
-                ImGui::GetColorU32(searchHovered || searchFocused
-                    ? theme::col::accent() : theme::col::lineSoft()), searchRadius);
-            const char* searchLabel = searchWidth >= 230.0f * k
-                ? "Search anything" : "Search";
-            const float textY = searchAt.y + (searchSize.y - ImGui::GetTextLineHeight()) * 0.5f;
-            dl->AddText(ImVec2(searchAt.x + 10.0f * k, textY),
-                ImGui::GetColorU32(theme::col::muted()), searchLabel);
-            const float keyWidth = ImGui::CalcTextSize("Ctrl+K").x;
-            dl->AddText(ImVec2(searchAt.x + searchSize.x - keyWidth - 10.0f * k, textY),
-                ImGui::GetColorU32(theme::col::muted()), "Ctrl+K");
-            ui::ItemTooltip("Search commands, addresses, functions, strings, imports, references, and recent investigations.");
-            ImGui::EndDisabled();
-            if (searchClicked && ctx_.frameDebugSnapshot) {
-                if (palette_.isOpen()) palette_.close();
-                else openCommandPalette(*ctx_.frameDebugSnapshot);
+        const auto lifecycle = ctx_.debug.lifecycleSnapshot();
+        const DbgSnapshot* debug = ctx_.frameDebugSnapshot;
+        const char* state = lifecycle.busy
+            ? (lifecycle.state == DbgLifecycleState::Stopping ? "STOPPING" : "STARTING")
+            : debug && debug->cleanupOnly ? "CLEANUP"
+            : debug && debug->state == DbgState::Paused ? "PAUSED"
+            : debug && debug->state == DbgState::Running ? "RUNNING"
+            : debug && debug->state == DbgState::Terminated ? "EXITED" : "DETACHED";
+        const ImVec4 stateColor = lifecycle.busy || (debug && (debug->cleanupOnly || debug->state == DbgState::Paused))
+            ? theme::col::warn() : debug && debug->state == DbgState::Running
+                ? theme::col::good() : theme::col::secondaryText();
+        const float capsuleH = captionH - 8.0f * k;
+        const float stateW = ImGui::CalcTextSize(state).x + 32.0f * k;
+        const float stateX = captionStart - stateW - 8.0f * k;
+        const float documentW = (std::min)(300.0f * k,
+            (std::max)(0.0f, stateX - menusEndX - 32.0f * k));
+        float dragEnd = stateX - 8.0f * k;
+        if (documentW >= 80.0f * k) {
+            const float documentX = stateX - documentW - 8.0f * k;
+            ImGui::SetCursorScreenPos(ImVec2(documentX, menuPos.y + 4.0f * k));
+            renderDocumentStrip(documentW, capsuleH);
+            dragEnd = documentX - 8.0f * k;
+        }
+        if (stateX >= menusEndX + 6.0f * k) {
+            const ImVec2 at(stateX, menuPos.y + 4.0f * k);
+            ImGui::SetCursorScreenPos(at);
+            ImGui::InvisibleButton("##header_debug_state", ImVec2(stateW, capsuleH));
+            ImVec4 fill = stateColor; fill.w = 0.10f;
+            ImVec4 border = stateColor; border.w = 0.30f;
+            dl->AddRectFilled(at, ImVec2(at.x + stateW, at.y + capsuleH), ImGui::GetColorU32(fill), capsuleH * 0.5f);
+            dl->AddRect(at, ImVec2(at.x + stateW, at.y + capsuleH), ImGui::GetColorU32(border), capsuleH * 0.5f);
+            dl->AddCircleFilled(ImVec2(at.x + 11.0f * k, at.y + capsuleH * 0.5f), 3.0f * k,
+                ImGui::GetColorU32(stateColor));
+            dl->AddText(ImVec2(at.x + 21.0f * k, at.y + (capsuleH - ImGui::GetTextLineHeight()) * 0.5f),
+                ImGui::GetColorU32(stateColor), state);
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextColored(stateColor, "%s", state);
+                if (debug && !debug->lastEvent.empty()) ImGui::TextWrapped("%s", debug->lastEvent.c_str());
+                if (!lifecycle.error.empty()) ImGui::TextWrapped("%s", lifecycle.error.c_str());
+                ImGui::EndTooltip();
             }
-            dragEnd = searchAt.x - 8.0f * k;
+        }
+        // Search remains a compact, keyboard-addressable command when the title
+        // row has room; Help and Ctrl+K always retain the complete investigation.
+        if (dragEnd - menusEndX >= 105.0f * k) {
+            const ImVec2 at(menusEndX + 8.0f * k, menuPos.y + 4.0f * k);
+            ImGui::SetCursorScreenPos(at);
+            if (ImGui::InvisibleButton("##global_search", ImVec2(78.0f * k, capsuleH), ImGuiButtonFlags_EnableNav) && debug)
+                openCommandPalette(*debug);
+            dl->AddText(ImVec2(at.x + 8.0f * k, at.y + (capsuleH - ImGui::GetTextLineHeight()) * 0.5f),
+                ImGui::GetColorU32(theme::col::secondaryText()), "Search");
+            ui::ItemTooltip("Search commands, addresses, functions and references (Ctrl+K).");
         }
 
         enum class CaptionGlyph { Minimize, Maximize, Close };
@@ -3573,7 +3620,7 @@ void App::renderMenuBar() {
                               CaptionGlyph::Close, "Close"))
                 ::PostMessageW(mainHwnd, WM_CLOSE, 0, 0);
 
-            titleDragMinX_ = menusEndX + 8.0f * k;
+            titleDragMinX_ = menusEndX + (dragEnd - menusEndX >= 105.0f * k ? 94.0f : 8.0f) * k;
             titleDragMinY_ = menuPos.y;
             titleDragMaxX_ = dragEnd;
             titleDragMaxY_ = menuPos.y + captionH;
@@ -3586,6 +3633,7 @@ void App::renderMenuBar() {
             ImGui::GetColorU32(theme::col::line()));
         ImGui::EndMainMenuBar();
     }
+    ImGui::PopStyleColor();
     ImGui::PopStyleVar(2);
 }
 
@@ -4448,30 +4496,9 @@ void App::renderPassiveDumpPopup() {
     ImGui::EndPopup();
 }
 
-// Compact shell bands. The toolbar still has room for the existing 30px controls,
-// while the document and workbench strips use local, denser tab metrics.
-static float DocumentStripHeight() {
-    const float k = theme::UiScale();
-    const float h = 36.0f * k;
-    const float m = ImGui::GetFrameHeight() + 10.0f * k;
-    return h > m ? h : m;
-}
-
-// Use the actual font metrics to decide whether the address/mode controls need
-// their own row. Execution controls retain text labels even at compact widths.
-static bool ToolbarUsesTwoRows() {
-    const float k = theme::UiScale();
-    float commandLabels = 0.0f;
-    for (const char* label : {"Launch & Debug", "Step Into", "Step Over",
-                              "Step Out", "Step Back", "Run to cursor", "Trace", "Record", "Detach"})
-        commandLabels += ImGui::CalcTextSize(label).x;
-    const float iconWidth = ui::IconsLoaded()
-        ? ImGui::CalcTextSize(DS_ICON_PLAY).x : ImGui::CalcTextSize(">>").x;
-    const float sessionWidth = 320.0f * k;
-    const float preferredWidth = commandLabels + 9.0f * (18.0f * k + iconWidth + 6.0f * k)
-        + 98.0f * k + 222.0f * k + 109.0f * k + sessionWidth;
-    return ImGui::GetMainViewport()->WorkSize.x < preferredWidth;
-}
+// Documents are selected in the title capsule; only one navigation band and
+// one execution band consume workspace height.
+static float DocumentStripHeight() { return 0.0f; }
 
 static float ToolbarRowHeight() {
     const float k = theme::UiScale();
@@ -4482,321 +4509,132 @@ static float ToolbarRowHeight() {
 static float ToolbarHeight() {
     const float k = theme::UiScale();
     const float row = ToolbarRowHeight();
-    return ToolbarUsesTwoRows()
-        ? row * 2.0f + 18.0f * k : row + 14.0f * k;
+    return row + 10.0f * k;
 }
 
 // One flat label row, roughly one third shorter than the former two-line cards.
 static float TabStripHeight() {
     const float k = theme::UiScale();
-    const float h = 34.0f * k;
-    const float m = ImGui::GetFrameHeight() + 8.0f * k;
-    return std::max({h, m, ImGui::GetStyle().WindowMinSize.y});
+    return (std::max)(30.0f * k, ImGui::GetTextLineHeight() + 12.0f * k);
 }
 
 static float StatusStripHeight() {
     const float k = theme::UiScale();
-    const float h = 30.0f * k;
-    const float m = ImGui::GetFrameHeight() + 4.0f * k;
-    return std::max({h, m, ImGui::GetStyle().WindowMinSize.y});
+    return (std::max)(24.0f * k, ImGui::GetTextLineHeight() + 8.0f * k);
 }
 
-void App::renderDocumentStrip() {
+void App::renderDocumentStrip(float width, float height) {
     const float k = theme::UiScale();
-    const float stripH = DocumentStripHeight();
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, stripH));
-    const ImGuiWindowFlags windowFlags =
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-        ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panelHeader());
-    if (ImGui::Begin("##document-strip", nullptr, windowFlags)) {
-        std::optional<DocumentId> activate;
-        std::optional<DocumentId> close;
-        const std::vector<AppContext::StaticDocumentSummary> documents =
-            ctx_.staticDocuments();
-        // The strip's own context menu must remain interactive on subsequent
-        // frames. Other editors still keep ownership of the active document.
-        bool documentMenuOpen = false;
-        documentMenuOpen |= ImGui::IsPopupOpen("##all_documents");
-        for (const auto& document : documents) {
-            ImGui::PushID((int)document.id.value);
-            documentMenuOpen |= ImGui::IsPopupOpen("##document_context");
-            ImGui::PopID();
+    const auto documents = ctx_.staticDocuments();
+    const auto active = std::find_if(documents.begin(), documents.end(),
+        [](const auto& document) { return document.active; });
+    const bool documentMenuOpen = ImGui::IsPopupOpen("##all_documents") ||
+        ImGui::IsPopupOpen("##document_context");
+    const bool topologyBlocked = ctx_.documentCommandPending() || palette_.isOpen() ||
+        (!documentMenuOpen && ImGui::IsPopupOpen(nullptr,
+            ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel));
+    std::optional<DocumentId> activate, close;
+    std::string title = active != documents.end()
+        ? (active->title.empty() ? "Untitled" : active->title) : "Open binary";
+    if (active != documents.end() && active->mapped && title.rfind("[LIVE]", 0) != 0)
+        title = "[LIVE] " + title;
+    if (active != documents.end() && active->dirty) title += " *";
+    const DbgSnapshot* debug = ctx_.frameDebugSnapshot;
+    std::string pid;
+    if (debug && debug->attached()) pid = "  /  pid " + std::to_string(debug->pid);
+    const float pidWidth = ImGui::CalcTextSize(pid.c_str()).x;
+    const bool showPid = width > pidWidth + 100.0f * k;
+    const float labelRoom = (std::max)(1.0f, width - 34.0f * k - (showPid ? pidWidth : 0));
+    std::string shown = title;
+    while (shown.size() > 1 && ImGui::CalcTextSize(shown.c_str()).x > labelRoom) {
+        size_t last = shown.size() - 1;
+        while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
+        shown.resize(last);
+    }
+    if (shown != title) {
+        while (shown.size() > 1 && ImGui::CalcTextSize((shown + "...").c_str()).x > labelRoom) {
+            size_t last = shown.size() - 1;
+            while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
+            shown.resize(last);
         }
-        const bool topologyBlocked = ctx_.documentCommandPending() ||
-            palette_.isOpen() || (!documentMenuOpen &&
-            ImGui::IsPopupOpen(nullptr,
-                ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel));
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 win = ImGui::GetWindowPos();
-        const ImVec4 accent = theme::col::accent();
-        const float sidePad = 8.0f * k;
-        const float topPad = 4.0f * k;
-        const float tabH = stripH - topPad;
-        const float addW = 80.0f * k;
-        const float usableW = (std::max)(1.0f,
-            vp->WorkSize.x - sidePad * 2.0f - addW);
-
-        dl->AddLine(ImVec2(win.x, win.y + stripH - 1.0f),
-                    ImVec2(win.x + vp->WorkSize.x, win.y + stripH - 1.0f),
-                    ImGui::GetColorU32(theme::col::line()));
-
-        std::vector<float> naturalWidths;
-        naturalWidths.reserve(documents.size());
-        float naturalTotal = 0.0f;
-        for (const auto& document : documents) {
-            std::string visible = document.title.empty() ? "Untitled" : document.title;
-            if (document.mapped && visible.rfind("[LIVE]", 0) != 0)
-                visible = "[LIVE] " + visible;
-            const float width = (std::min)(230.0f * k, (std::max)(
-                150.0f * k, ImGui::CalcTextSize(visible.c_str()).x + 70.0f * k));
-            naturalWidths.push_back(width);
-            naturalTotal += width;
+        shown += "...";
+    }
+    const ImVec2 at = ImGui::GetCursorScreenPos();
+    ImGui::BeginDisabled(topologyBlocked);
+    if (ImGui::InvisibleButton("##document_list", ImVec2(width, height),
+                              ImGuiButtonFlags_EnableNav)) ImGui::OpenPopup("##all_documents");
+    const bool hovered = ImGui::IsItemHovered(), focused = ImGui::IsItemFocused();
+    if (hovered && active != documents.end() && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
+        close = active->id;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float radius = height * 0.5f;
+    draw->AddRectFilled(at, ImVec2(at.x + width, at.y + height),
+        ImGui::GetColorU32(hovered || focused ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), radius);
+    draw->AddRect(at, ImVec2(at.x + width, at.y + height),
+        ImGui::GetColorU32(focused ? theme::col::accent() : theme::col::paneLine()), radius);
+    const float textY = at.y + (height - ImGui::GetTextLineHeight()) * 0.5f;
+    const ImVec4 clip(at.x + 10.0f * k, at.y, at.x + width - 23.0f * k, at.y + height);
+    draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(at.x + 10.0f * k, textY),
+        ImGui::GetColorU32(theme::col::secondaryText()), shown.c_str(), nullptr, 0, &clip);
+    if (showPid) draw->AddText(ImVec2(at.x + width - 24.0f * k - pidWidth, textY),
+        ImGui::GetColorU32(theme::col::secondaryText()), pid.c_str());
+    const float cx = at.x + width - 12.0f * k, cy = at.y + height * 0.5f;
+    const ImU32 ink = ImGui::GetColorU32(theme::col::secondaryText());
+    draw->AddLine(ImVec2(cx - 3.0f * k, cy - k), ImVec2(cx, cy + 2.0f * k), ink, k);
+    draw->AddLine(ImVec2(cx, cy + 2.0f * k), ImVec2(cx + 3.0f * k, cy - k), ink, k);
+    if (ImGui::BeginPopupContextItem("##document_context")) {
+        if (active != documents.end()) {
+            if (!active->path.empty() && ImGui::MenuItem("Copy full path"))
+                ImGui::SetClipboardText(active->path.c_str());
+            if (ImGui::MenuItem("Close document", "Ctrl+W")) close = active->id;
         }
-        const float fit = naturalTotal > usableW && naturalTotal > 0.0f
-                        ? usableW / naturalTotal : 1.0f;
-
-        ImGui::BeginDisabled(topologyBlocked);
-        float x = win.x + sidePad;
+        if (ImGui::MenuItem("Open another binary...", "Ctrl+O")) openFileDialog();
+        ImGui::EndPopup();
+    }
+    if (hovered) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(title.c_str());
+        if (active != documents.end() && !active->path.empty())
+            ImGui::TextWrapped("%s", active->path.c_str());
+        ImGui::TextDisabled("%zu / %u documents | Ctrl+Tab to switch | right-click for actions",
+            documents.size(), (unsigned)DocumentManager::kMaxDocuments);
+        ImGui::EndTooltip();
+    }
+    if (ImGui::BeginPopup("##all_documents")) {
+        ImGui::TextDisabled("Open documents (%zu / %u)", documents.size(),
+                            (unsigned)DocumentManager::kMaxDocuments);
+        ImGui::Separator();
         for (size_t i = 0; i < documents.size(); ++i) {
             const auto& document = documents[i];
-            std::string visible = document.title.empty() ? "Untitled" : document.title;
-            if (document.mapped && visible.rfind("[LIVE]", 0) != 0)
-                visible = "[LIVE] " + visible;
-            float tabW = naturalWidths[i] * fit;
-            if (fit < 1.0f && i + 1 == documents.size())
-                tabW = win.x + sidePad + usableW - x;
-            // All eight documents remain reachable even in a narrow HiDPI
-            // window. Full names and close actions also live in the list menu.
-            tabW = (std::max)(1.0f, tabW);
-            const bool compactDocument = tabW < 96.0f * k;
-            const ImVec2 a(x, win.y + topPad);
-            const ImVec2 b(x + tabW, win.y + stripH);
-
             ImGui::PushID((int)document.id.value);
-            ImGui::SetCursorScreenPos(a);
-            // The close button is drawn inside this hit area. Let that later
-            // item receive the pointer instead of the full tab swallowing it.
-            ImGui::SetNextItemAllowOverlap();
-            const bool clicked = ImGui::InvisibleButton("##document", ImVec2(tabW, tabH),
-                ImGuiButtonFlags_EnableNav);
-            const bool hovered = ImGui::IsItemHovered();
-            const bool documentTooltipReady = hovered && ImGui::IsItemHovered(
-                ImGuiHoveredFlags_DelayNormal |
-                ImGuiHoveredFlags_NoSharedDelay |
-                ImGuiHoveredFlags_AllowWhenDisabled);
-            const bool focused = ImGui::IsItemFocused();
-            const bool held = ImGui::IsItemActive();
-            if (clicked && !document.active) activate = document.id;
-            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
-                close = document.id;
-            if (ImGui::BeginPopupContextItem("##document_context")) {
-                if (!document.active && ImGui::MenuItem("Switch to document"))
-                    activate = document.id;
+            const std::string label = std::to_string(i + 1) + "  " +
+                (document.mapped ? "[LIVE] " : "") +
+                (document.title.empty() ? "Untitled" : document.title) + (document.dirty ? " *" : "");
+            if (ImGui::MenuItem(label.c_str(), nullptr, document.active)) activate = document.id;
+            if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) close = document.id;
+            if (ImGui::BeginPopupContextItem("##document_list_context")) {
                 if (!document.path.empty() && ImGui::MenuItem("Copy full path"))
                     ImGui::SetClipboardText(document.path.c_str());
-                if (ImGui::MenuItem("Close", "Ctrl+W")) close = document.id;
+                if (ImGui::MenuItem("Close document")) close = document.id;
                 ImGui::EndPopup();
             }
-
-            const ImVec4 body = hovered || focused || held
-                ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered)
-                : document.active ? theme::col::panel() : theme::col::panelHeader();
-            dl->AddRectFilled(a, b, ImGui::GetColorU32(body));
-            if (document.active)
-                dl->AddLine(ImVec2(a.x, b.y - k), ImVec2(b.x, b.y - k),
-                    ImGui::GetColorU32(accent), 2.0f * k);
-            if (focused)
-                dl->AddRect(a, b, ImGui::GetColorU32(accent), 0.0f, 0, k);
-
-            const float iconW = ui::IconsLoaded() && !compactDocument ? 18.0f * k : 0.0f;
-            const float closeW = compactDocument ? 0.0f : 20.0f * k;
-            const float dirtyW = document.dirty ? 10.0f * k : 0.0f;
-            const float textLeft = a.x + 11.0f * k + iconW;
-            const float textRight = b.x - 8.0f * k - closeW - dirtyW;
-            const float textAvail = (std::max)(1.0f, textRight - textLeft);
-            if (ui::IconsLoaded() && !compactDocument) {
-                const char* glyph = document.mapped ? DS_ICON_NETWORK : DS_ICON_CODE;
-                const ImVec2 glyphSize = ImGui::CalcTextSize(glyph);
-                dl->AddText(ImVec2(a.x + 10.0f * k,
-                    a.y + (tabH - glyphSize.y) * 0.5f),
-                    ImGui::GetColorU32(document.active ? accent : theme::col::muted()),
-                    glyph);
-            }
-            std::string shown = compactDocument ? std::to_string(i + 1) : visible;
-            while (shown.size() > 1 &&
-                   ImGui::CalcTextSize((shown + "...").c_str()).x > textAvail) {
-                size_t last = shown.size() - 1;
-                while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
-                shown.resize(last);
-            }
-            if (!compactDocument && shown != visible) shown += "...";
-            const ImVec2 textSize = ImGui::CalcTextSize(shown.c_str());
-            dl->AddText(ImVec2(textLeft, a.y + (tabH - textSize.y) * 0.5f),
-                        ImGui::GetColorU32(document.active
-                            ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
-                            : theme::col::muted()), shown.c_str());
-
-            const float closeSize = 16.0f * k;
-            const ImVec2 closePos(b.x - 8.0f * k - closeSize,
-                                  a.y + (tabH - closeSize) * 0.5f);
-            // Once the close item owns hover, the overlapping document item is
-            // no longer hovered. Keep the close item present under the pointer
-            // so an inactive tab's button cannot blink away before release.
-            const bool pointerOverDocument = ImGui::IsWindowHovered(
-                ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
-                ImGui::IsMouseHoveringRect(a, b);
-            bool showClose = !compactDocument && (document.active || hovered || focused ||
-                                   pointerOverDocument);
-            bool closeHovered = false;
-            // Keep the target in keyboard navigation even while its glyph is
-            // hidden, then reveal it using the public item-focus query.
-            if (!compactDocument) {
-                ImGui::SetCursorScreenPos(closePos);
-                const bool closeClicked = ImGui::InvisibleButton(
-                    "##close", ImVec2(closeSize, closeSize), ImGuiButtonFlags_EnableNav);
-                closeHovered = ImGui::IsItemHovered();
-                const bool closeFocused = ImGui::IsItemFocused();
-                showClose = showClose || closeFocused;
-                if (closeHovered || closeFocused) {
-                    ImVec4 closeFill = theme::col::bad(); closeFill.w = 0.18f;
-                    dl->AddRectFilled(closePos, ImVec2(closePos.x + closeSize, closePos.y + closeSize),
-                                      ImGui::GetColorU32(closeFill), 5.0f * k);
-                }
-                const ImU32 closeCol = ImGui::GetColorU32(
-                    (closeHovered || closeFocused) ? theme::col::bad()
-                                                   : theme::col::muted());
-                const float inset = 4.0f * k;
-                if (showClose) {
-                    dl->AddLine(ImVec2(closePos.x + inset, closePos.y + inset),
-                                ImVec2(closePos.x + closeSize - inset,
-                                       closePos.y + closeSize - inset), closeCol, 1.4f * k);
-                    dl->AddLine(ImVec2(closePos.x + closeSize - inset, closePos.y + inset),
-                                ImVec2(closePos.x + inset,
-                                       closePos.y + closeSize - inset), closeCol, 1.4f * k);
-                }
-                if (closeClicked) close = document.id;
-            }
-            if (document.dirty) {
-                const float dirtyX = compactDocument ? b.x - 8.0f * k
-                    : showClose ? closePos.x - 4.0f * k : closePos.x + closeSize * 0.5f;
-                dl->AddCircleFilled(ImVec2(dirtyX, a.y + tabH * 0.5f),
-                                    2.5f * k, ImGui::GetColorU32(theme::col::warn()));
-            }
-
-            if (closeHovered) {
-                ui::ItemTooltip("Close document (Ctrl+W)", false);
-            } else if (documentTooltipReady) {
-                ImGui::BeginTooltip();
-                ImGui::TextUnformatted(visible.c_str());
-                if (!document.path.empty()) ImGui::TextWrapped("%s", document.path.c_str());
-                if (!document.format.empty())
-                    ImGui::TextDisabled("%s%s", document.format.c_str(),
-                                        document.dirty ? "  -  unsaved" : "");
-                ImGui::EndTooltip();
-            }
             ImGui::PopID();
-            x += tabW;
         }
-
-        const ImVec2 addA((std::min)(x + 5.0f * k,
-            win.x + vp->WorkSize.x - 78.0f * k), win.y + topPad);
-        const ImVec2 addB(addA.x + 34.0f * k, win.y + stripH);
-        ImGui::SetCursorScreenPos(addA);
-        const bool addClicked = ImGui::InvisibleButton(
-            "##open-document", ImVec2(addB.x - addA.x, tabH), ImGuiButtonFlags_EnableNav);
-        const bool addHovered = ImGui::IsItemHovered();
-        const bool addFocused = ImGui::IsItemFocused();
-        const bool addHeld = ImGui::IsItemActive();
-        const ImVec4 addBody = addHeld || addHovered || addFocused
-            ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered) : theme::col::menubar();
-        dl->AddRectFilled(addA, addB, ImGui::GetColorU32(addBody),
-            ImGui::GetStyle().FrameRounding);
-        if (addFocused || addHovered)
-            dl->AddRect(addA, addB, ImGui::GetColorU32(accent), 0.0f, 0, k);
-        const char* plus = ui::IconsLoaded() ? DS_ICON_ADD : "+";
-        const ImVec2 plusSize = ImGui::CalcTextSize(plus);
-        dl->AddText(ImVec2(addA.x + (addB.x - addA.x - plusSize.x) * 0.5f,
-                           addA.y + (tabH - plusSize.y) * 0.5f),
-                    ImGui::GetColorU32((addHovered || addFocused)
-                        ? accent : theme::col::muted()), plus);
-        if (addClicked) openFileDialog();
-        if (addHovered) {
-            char tip[96];
-            std::snprintf(tip, sizeof(tip),
-                          "Open another binary (up to %u documents)",
-                          (unsigned)DocumentManager::kMaxDocuments);
-            ui::ItemTooltip(tip, false);
-        }
-        ImGui::SetCursorScreenPos(ImVec2(win.x + vp->WorkSize.x - 36.0f * k,
-                                        win.y + topPad));
-        if (ImGui::InvisibleButton("##document_list", ImVec2(28.0f * k, tabH),
-                                  ImGuiButtonFlags_EnableNav))
-            ImGui::OpenPopup("##all_documents");
-        const bool listHovered = ImGui::IsItemHovered();
-        const bool listFocused = ImGui::IsItemFocused();
-        const ImVec2 listAt = ImGui::GetItemRectMin();
-        if (listHovered || listFocused)
-            dl->AddRectFilled(listAt, ImGui::GetItemRectMax(),
-                ImGui::GetColorU32(ImGuiCol_FrameBgHovered), ImGui::GetStyle().FrameRounding);
-        if (listFocused || listHovered)
-            dl->AddRect(listAt, ImGui::GetItemRectMax(), ImGui::GetColorU32(accent),
-                        ImGui::GetStyle().FrameRounding, 0, (std::max)(1.0f, std::round(k)));
-        const float listCx = listAt.x + 14.0f * k, listCy = listAt.y + tabH * 0.5f;
-        const ImU32 listInk = ImGui::GetColorU32(listHovered || listFocused
-            ? accent : theme::col::muted());
-        dl->AddLine(ImVec2(listCx - 4.0f * k, listCy - 2.0f * k),
-                    ImVec2(listCx, listCy + 2.0f * k), listInk, k);
-        dl->AddLine(ImVec2(listCx, listCy + 2.0f * k),
-                    ImVec2(listCx + 4.0f * k, listCy - 2.0f * k), listInk, k);
-        ui::ItemTooltip("Open documents: switch, close, or copy a path. Ctrl+Tab cycles documents.");
-        if (ImGui::BeginPopup("##all_documents")) {
-            ImGui::TextDisabled("Open documents (%zu / %u)", documents.size(),
-                                (unsigned)DocumentManager::kMaxDocuments);
-            ImGui::Separator();
-            for (size_t i = 0; i < documents.size(); ++i) {
-                const auto& document = documents[i];
-                ImGui::PushID((int)document.id.value);
-                const std::string name = std::to_string(i + 1) + "  " +
-                    (document.mapped ? "[LIVE] " : "") +
-                    (document.title.empty() ? "Untitled" : document.title);
-                if (ImGui::MenuItem(name.c_str(), nullptr, document.active)) activate = document.id;
-                if (ImGui::BeginPopupContextItem("##document_list_context")) {
-                    if (!document.path.empty() && ImGui::MenuItem("Copy full path"))
-                        ImGui::SetClipboardText(document.path.c_str());
-                    if (ImGui::MenuItem("Close document")) close = document.id;
-                    ImGui::EndPopup();
-                }
-                if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Middle))
-                    close = document.id;
-                ImGui::PopID();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Close active document", "Ctrl+W"))
-                for (const auto& document : documents) if (document.active) close = document.id;
-            ImGui::EndPopup();
-        }
-        ImGui::EndDisabled();
-
-        // A close wins over an activation generated by the same tab click. Both
-        // remain queued until the frame has released every rendered document.
-        if (close) {
-            if (!ctx_.queueCloseStaticDocument(*close))
-                ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
-        } else if (activate) {
-            if (!ctx_.queueActivateStaticDocument(*activate))
-                ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
-        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Open another binary...", "Ctrl+O")) openFileDialog();
+        if (ImGui::MenuItem("Open as Raw...")) openRawFileDialog();
+        if (ImGui::MenuItem("Close active document", "Ctrl+W", false, active != documents.end()))
+            close = active->id;
+        ImGui::EndPopup();
     }
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
+    ImGui::EndDisabled();
+    // Commit only after the frame releases every document borrower, as before.
+    if (close) {
+        if (!ctx_.queueCloseStaticDocument(*close))
+            ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+    } else if (activate && !ctx_.queueActivateStaticDocument(*activate)) {
+        ui::Toast(ui::ToastKind::Error, ctx_.documentCommandError());
+    }
 }
 
 bool App::startExecutionHistory(const DbgSnapshot& captured) {
@@ -4834,9 +4672,8 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
     const float barH = ToolbarHeight();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float toolbarY = vp->WorkPos.y + docH + TabStripHeight();
-    const bool twoRows = ToolbarUsesTwoRows();
     const float rowH = ToolbarRowHeight();
-    const float toolbarPaddingY = (barH - (twoRows ? rowH * 2.0f + 4.0f * k : rowH)) * 0.5f;
+    const float toolbarPaddingY = (barH - rowH) * 0.5f;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, toolbarY));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, barH));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -4845,14 +4682,14 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(8.0f * k, toolbarPaddingY));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panel());
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::tableHeader());
     if (ImGui::Begin("##debugbar", nullptr, flags)) {
         // Bottom border line (wireframe panel chrome).
         ImGui::GetWindowDrawList()->AddLine(
             ImVec2(vp->WorkPos.x, toolbarY + barH - 1.0f),
             ImVec2(vp->WorkPos.x + vp->WorkSize.x,
                    toolbarY + barH - 1.0f),
-            ImGui::GetColorU32(theme::col::lineSoft()));
+            ImGui::GetColorU32(theme::col::paneLine()));
 
         Debugger& d = ctx_.debug;
         const auto lifecycle = d.lifecycleSnapshot();
@@ -4967,28 +4804,6 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         };
         auto nextCommand = [&] { ImGui::SameLine(0.0f, 3.0f * k); };
 
-        auto executionModeControl = [&] {
-            ImGui::SetNextItemWidth(98.0f * k);
-            int executionMode = ctx_.gmlExecutionMode ? 1 : 0;
-            if (ImGui::Combo("##execution_mode", &executionMode, "Native\0GML\0"))
-                ctx_.gmlExecutionMode = executionMode == 1;
-            ui::ItemTooltip("Select native CPU instructions or verified GameMaker VM instructions for execution controls.");
-        };
-        ImVec2 addressRowStart;
-        if (twoRows) {
-            // Submit the selector first so a mode change also governs keyboard
-            // commands in this frame, while drawing it on the secondary row.
-            const ImVec2 executionRowStart = ImGui::GetCursorPos();
-            ImGui::SetCursorPos(ImVec2(8.0f * k, toolbarPaddingY + rowH + 4.0f * k));
-            executionModeControl();
-            nextGroup();
-            addressRowStart = ImGui::GetCursorPos();
-            ImGui::Dummy(ImVec2(0, 0)); // finish SameLine before returning to row one
-            ImGui::SetCursorPos(executionRowStart);
-        } else {
-            executionModeControl();
-            nextGroup();
-        }
         const bool modePaused = !s.cleanupOnly && !lifecycle.busy && (ctx_.gmlExecutionMode ? gmlPaused : paused && !gmlPaused);
         const bool modeRunning = !s.cleanupOnly && !lifecycle.busy && running && (!ctx_.gmlExecutionMode || (gmlTarget && gml.ready()));
 
@@ -5057,27 +4872,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
         const bool historyCurrent = DebugTargetIdentityMatches(executionHistory_.target, frameTarget);
         const bool canBrowseBack = !ctx_.gmlExecutionMode && historyCurrent &&
             !executionHistory_.recording && executionHistoryView_.canStepBack(executionHistory_);
-        nextCommand();
-        if (commandButton("##cmd_step_back", nullptr, "<",
-                          compactCommands ? "Back" : "Step Back",
-                          "Step Back - inspect the previous recorded instruction. Start Record before running to a breakpoint. The target stays at its real stop.",
-                          false, canBrowseBack)) executionHistoryView_.stepBack(executionHistory_);
-
         const bool runtimeCursorCurrent = ctx_.runtimeCursorTarget.valid() &&
             DebugTargetIdentityMatches(frameTarget, ctx_.runtimeCursorTarget);
         const bool canRunToCursor = modePaused && !ctx_.gmlExecutionMode &&
             ctx_.runtimeCursorVA && runtimeCursorCurrent;
-        nextCommand();
-        if (commandButton("##cmd_run_to_cursor", DS_ICON_PIN, "@",
-                          compactCommands ? "To cursor" : "Run to cursor",
-                          canRunToCursor
-                              ? "Run to cursor (Ctrl+F9) - continue to the selected live instruction"
-                              : "Run to cursor requires a paused native session and a selected instruction belonging to that session",
-                          false, canRunToCursor)) {
-            executionRequested = true;
-            d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
-        }
-
         const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
         const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) || s.traceOwnedSites != 0;
         uint64_t traceRuntimeBase = 0, traceRuntimeSize = 0;
@@ -5086,8 +4884,11 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                                       traceRuntimeBase, traceRuntimeSize);
         const bool traceStartEnabled = !s.cleanupOnly && (traceOn ||
             (modePaused && !ctx_.gmlExecutionMode && loaded && exactTraceImage));
-        nextGroup();
-        if (commandButton("##cmd_trace", DS_ICON_LIGHTNING, "tr", "Trace",
+        const bool showTrace = vp->WorkPos.x + vp->WorkSize.x - 8.0f * k - ImGui::GetItemRectMax().x >=
+            commandWidth(DS_ICON_LIGHTNING, "tr", "Trace") + 110.0f * k;
+        if (showTrace) {
+            nextGroup();
+            if (commandButton("##cmd_trace", DS_ICON_LIGHTNING, "tr", "Trace",
                           traceOn
                               ? "Stop Trace Coverage; collected coverage remains"
                               : exactTraceImage
@@ -5097,160 +4898,256 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
             ctx_.requestedTraceToggle = true;
             ctx_.requestedTraceTarget = frameTarget;
             ctx_.requestedTab = "Binary View";
+            }
         }
 
-        nextCommand();
-        if (commandButton("##cmd_record_path", nullptr, "", "Record",
-                          "Record execution path - single-step this native thread to a breakpoint, exception, Pause, or the 10,000-record limit. Slower than Continue; starts a fresh history.",
-                          historyCurrent && executionHistory_.recording,
-                          modePaused && !ctx_.gmlExecutionMode && !executionRequested))
-            executionRequested = startExecutionHistory(s);
+        // Secondary execution commands are available in More, leaving the
+        // primary command row at one fixed height on every window width.
+        const float trailingStart = ImGui::GetItemRectMax().x;
+        const float toolbarRight = vp->WorkPos.x + vp->WorkSize.x - 8.0f * k;
+        const float available = toolbarRight - trailingStart;
+        const bool showAddress = available >= 490.0f * k;
+        const bool showThread = available >= 270.0f * k;
+        const bool showDetach = attached && available >= 350.0f * k;
+        const bool showArmed = available >= 590.0f * k;
+        const size_t armedBreakpoints = attached ? static_cast<size_t>(std::count_if(
+            s.breakpoints.begin(), s.breakpoints.end(),
+            [](const auto& breakpoint) { return breakpoint.enabled && breakpoint.armed; })) : 0;
+        auto openBreakpoints = [&] {
+            ctx_.requestedBreakpoints = true;
+            ctx_.requestedTab = "Binary View";
+        };
+        if (showArmed) {
+            nextGroup();
+            char count[32];
+            std::snprintf(count, sizeof(count), "%zu", armedBreakpoints);
+            const float countW = (std::max)(20.0f * k, ImGui::CalcTextSize(count).x + 12.0f * k);
+            const float labelW = ImGui::CalcTextSize("Armed").x;
+            const float width = labelW + countW + 28.0f * k;
+            const ImVec2 at = ImGui::GetCursorScreenPos();
+            if (ImGui::InvisibleButton("##toolbar_armed", ImVec2(width, rowH),
+                                      ImGuiButtonFlags_EnableNav)) openBreakpoints();
+            ImVec4 tint = theme::col::bad(); tint.w = ImGui::IsItemHovered() ? 0.18f : 0.10f;
+            ImVec4 edge = theme::col::bad(); edge.w = ImGui::IsItemFocused() ? 1.0f : 0.28f;
+            dl->AddRectFilled(at, ImVec2(at.x + width, at.y + rowH), ImGui::GetColorU32(tint), rowH * 0.5f);
+            dl->AddRect(at, ImVec2(at.x + width, at.y + rowH), ImGui::GetColorU32(edge), rowH * 0.5f);
+            const float textY = at.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
+            dl->AddText(ImVec2(at.x + 12.0f * k, textY), ImGui::GetColorU32(theme::col::bad()), "Armed");
+            const ImVec2 bubble(at.x + width - countW - 6.0f * k, at.y + (rowH - 20.0f * k) * 0.5f);
+            dl->AddRectFilled(bubble, ImVec2(bubble.x + countW, bubble.y + 20.0f * k),
+                ImGui::GetColorU32(theme::col::bad()), 10.0f * k);
+            dl->AddText(ImVec2(bubble.x + (countW - ImGui::CalcTextSize(count).x) * 0.5f, textY),
+                IM_COL32(255, 255, 255, 255), count);
+            ui::ItemTooltip("Physically armed, enabled software breakpoints in this native session. Open Breakpoints.");
+        }
+        auto renderAddressControl = [&](float addressWidth) {
+            bool mirrorValid = false;
+            bool mirrorLive = false;
+            uint64_t mirrorAddress = 0;
+            DebugTargetIdentity mirrorTarget{};
+            const bool cursorOwnerCurrent = !ctx_.cursorLive ||
+                (attached && ctx_.cursorTarget.valid() &&
+                 DebugTargetIdentityMatches(frameTarget, ctx_.cursorTarget));
+            if (ctx_.hasCursor && cursorOwnerCurrent) {
+                mirrorAddress = ctx_.cursorVA;
+                mirrorValid = true;
+                mirrorLive = ctx_.cursorLive;
+                if (mirrorLive) mirrorTarget = frameTarget;
+            } else if (loaded && ctx_.staticBinary().hasEntryPoint()) {
+                mirrorAddress = ctx_.staticBinary().entryPointVA();
+                mirrorValid = true;
+            } else if (loaded) {
+                mirrorAddress = ctx_.staticBinary().imageBase();
+                mirrorValid = true;
+            }
+            if (!toolbarAddressEditing_ &&
+                (mirrorValid != toolbarAddressMirrorValid_ ||
+                 (mirrorValid && (mirrorAddress != toolbarAddressMirror_ ||
+                                  mirrorLive != toolbarAddressMirrorLive_ ||
+                                  mirrorTarget.pid != toolbarAddressMirrorTarget_.pid ||
+                                  mirrorTarget.sessionGeneration !=
+                                      toolbarAddressMirrorTarget_.sessionGeneration)))) {
+                if (mirrorValid)
+                    std::snprintf(toolbarAddress_, sizeof(toolbarAddress_), "0x%llX",
+                                  (unsigned long long)mirrorAddress);
+                else
+                    toolbarAddress_[0] = 0;
+                toolbarAddressMirror_ = mirrorAddress;
+                toolbarAddressMirrorValid_ = mirrorValid;
+                toolbarAddressMirrorLive_ = mirrorValid && mirrorLive;
+                toolbarAddressMirrorTarget_ = toolbarAddressMirrorLive_
+                    ? mirrorTarget : DebugTargetIdentity{};
+            }
 
-        if (twoRows) {
-            ImGui::SetCursorPos(addressRowStart);
-        }
-        else nextGroup();
-        bool mirrorValid = false;
-        bool mirrorLive = false;
-        uint64_t mirrorAddress = 0;
-        DebugTargetIdentity mirrorTarget{};
-        const bool cursorOwnerCurrent = !ctx_.cursorLive ||
-            (attached && ctx_.cursorTarget.valid() &&
-             DebugTargetIdentityMatches(frameTarget, ctx_.cursorTarget));
-        if (ctx_.hasCursor && cursorOwnerCurrent) {
-            mirrorAddress = ctx_.cursorVA;
-            mirrorValid = true;
-            mirrorLive = ctx_.cursorLive;
-            if (mirrorLive) mirrorTarget = frameTarget;
-        } else if (loaded && ctx_.staticBinary().hasEntryPoint()) {
-            mirrorAddress = ctx_.staticBinary().entryPointVA();
-            mirrorValid = true;
-        } else if (loaded) {
-            mirrorAddress = ctx_.staticBinary().imageBase();
-            mirrorValid = true;
-        }
-        if (!toolbarAddressEditing_ &&
-            (mirrorValid != toolbarAddressMirrorValid_ ||
-             (mirrorValid && (mirrorAddress != toolbarAddressMirror_ ||
-                              mirrorLive != toolbarAddressMirrorLive_ ||
-                              mirrorTarget.pid != toolbarAddressMirrorTarget_.pid ||
-                              mirrorTarget.sessionGeneration !=
-                                  toolbarAddressMirrorTarget_.sessionGeneration)))) {
-            if (mirrorValid)
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, commandRadius);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                                ImVec2(10.0f * k, (rowH - ImGui::GetTextLineHeight()) * 0.5f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::col::panelHeader());
+            ImGui::PushStyleColor(ImGuiCol_Border, theme::col::lineSoft());
+            ImGui::SetNextItemWidth(addressWidth);
+            const bool gotoSubmitted = ImGui::InputTextWithHint(
+                "##toolbar_address", "goto address", toolbarAddress_,
+                sizeof(toolbarAddress_),
+                ImGuiInputTextFlags_EnterReturnsTrue |
+                ImGuiInputTextFlags_AutoSelectAll);
+            toolbarAddressEditing_ = ImGui::IsItemActive();
+            ui::ItemTooltip(toolbarAddressMirrorLive_
+                                ? "Go to this live runtime address (Enter); editing it creates a static FILE-address request"
+                                : "Go to a static virtual address (Enter)",
+                            false);
+            if (gotoSubmitted) {
+                uint64_t address = 0;
+                if (parseHexU64(toolbarAddress_, address)) {
+                    const bool submitLive = toolbarAddressMirrorValid_ &&
+                        toolbarAddressMirrorLive_ && address == toolbarAddressMirror_ &&
+                        attached && toolbarAddressMirrorTarget_.valid() &&
+                        DebugTargetIdentityMatches(frameTarget,
+                                                   toolbarAddressMirrorTarget_);
+                    toolbarAddressMirror_ = address;
+                    toolbarAddressMirrorValid_ = true;
+                    toolbarAddressMirrorLive_ = submitLive;
+                    toolbarAddressMirrorTarget_ = submitLive
+                        ? frameTarget : DebugTargetIdentity{};
+                    if (submitLive) ctx_.gotoAddressLive(address, frameTarget);
+                    else            ctx_.gotoAddress(address);
+                } else {
+                    ui::Toast(ui::ToastKind::Error,
+                              "The command-bar address must be hexadecimal.");
+                }
+            }
+            ImGui::SameLine(0.0f, 0.0f);
+            if (ImGui::ArrowButton("##toolbar_address_presets", ImGuiDir_Down))
+                ImGui::OpenPopup("##toolbar_address_popup");
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(3);
+
+            auto chooseAddress = [&](const char* label, uint64_t address, bool live) {
+                if (!ImGui::MenuItem(label)) return;
                 std::snprintf(toolbarAddress_, sizeof(toolbarAddress_), "0x%llX",
-                              (unsigned long long)mirrorAddress);
-            else
-                toolbarAddress_[0] = 0;
-            toolbarAddressMirror_ = mirrorAddress;
-            toolbarAddressMirrorValid_ = mirrorValid;
-            toolbarAddressMirrorLive_ = mirrorValid && mirrorLive;
-            toolbarAddressMirrorTarget_ = toolbarAddressMirrorLive_
-                ? mirrorTarget : DebugTargetIdentity{};
-        }
-
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, commandRadius);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                            ImVec2(10.0f * k, 6.0f * k));
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::col::panelHeader());
-        ImGui::PushStyleColor(ImGuiCol_Border, theme::col::lineSoft());
-        float trailingReserve = 0.0f;
-        if (attached) {
-            trailingReserve = 12.0f * k + commandWidth(
-                DS_ICON_STOP, "X", "Detach");
-        } else if (loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
-            trailingReserve = ImGui::CalcTextSize("Break on JVM init").x +
-                              ImGui::GetFrameHeight() + 18.0f * k;
-        }
-        // Retain the full status/thread pair when it fits; its own compact
-        // popup keeps the same information reachable below that width.
-        trailingReserve += 300.0f * k;
-        const float addressWidth = (std::min)(190.0f * k, (std::max)(
-            82.0f * k, ImGui::GetContentRegionAvail().x - trailingReserve -
-                         ImGui::GetFrameHeight() - 8.0f * k));
-        ImGui::SetNextItemWidth(addressWidth);
-        const bool gotoSubmitted = ImGui::InputTextWithHint(
-            "##toolbar_address", "address (hex)", toolbarAddress_,
-            sizeof(toolbarAddress_),
-            ImGuiInputTextFlags_EnterReturnsTrue |
-            ImGuiInputTextFlags_AutoSelectAll);
-        toolbarAddressEditing_ = ImGui::IsItemActive();
-        ui::ItemTooltip(toolbarAddressMirrorLive_
-                            ? "Go to this live runtime address (Enter); editing it creates a static FILE-address request"
-                            : "Go to a static virtual address (Enter)",
-                        false);
-        if (gotoSubmitted) {
-            uint64_t address = 0;
-            if (parseHexU64(toolbarAddress_, address)) {
-                const bool submitLive = toolbarAddressMirrorValid_ &&
-                    toolbarAddressMirrorLive_ && address == toolbarAddressMirror_ &&
-                    attached && toolbarAddressMirrorTarget_.valid() &&
-                    DebugTargetIdentityMatches(frameTarget,
-                                               toolbarAddressMirrorTarget_);
+                              (unsigned long long)address);
                 toolbarAddressMirror_ = address;
                 toolbarAddressMirrorValid_ = true;
-                toolbarAddressMirrorLive_ = submitLive;
-                toolbarAddressMirrorTarget_ = submitLive
+                toolbarAddressMirrorLive_ = live;
+                toolbarAddressMirrorTarget_ = live
                     ? frameTarget : DebugTargetIdentity{};
-                if (submitLive) ctx_.gotoAddressLive(address, frameTarget);
-                else            ctx_.gotoAddress(address);
-            } else {
-                ui::Toast(ui::ToastKind::Error,
-                          "The command-bar address must be hexadecimal.");
+                if (live) ctx_.gotoAddressLive(address, frameTarget);
+                else ctx_.gotoAddress(address);
+            };
+            if (ImGui::BeginPopup("##toolbar_address_popup")) {
+                char label[96];
+                if (ctx_.hasCursor && cursorOwnerCurrent) {
+                    std::snprintf(label, sizeof(label), "Cursor   0x%llX",
+                                  (unsigned long long)ctx_.cursorVA);
+                    chooseAddress(label, ctx_.cursorVA, ctx_.cursorLive);
+                }
+                if (loaded && ctx_.staticBinary().hasEntryPoint()) {
+                    std::snprintf(label, sizeof(label), "Entry point   0x%llX",
+                                  (unsigned long long)ctx_.staticBinary().entryPointVA());
+                    chooseAddress(label, ctx_.staticBinary().entryPointVA(), false);
+                }
+                if (loaded) {
+                    std::snprintf(label, sizeof(label), "Image base   0x%llX",
+                                  (unsigned long long)ctx_.staticBinary().imageBase());
+                    chooseAddress(label, ctx_.staticBinary().imageBase(), false);
+                }
+                if (attached) {
+                    std::snprintf(label, sizeof(label), "Live RIP   0x%llX",
+                                  (unsigned long long)s.regs.rip);
+                    chooseAddress(label, s.regs.rip, true);
+                    std::snprintf(label, sizeof(label), "Inspect RIP in Memory Tools   0x%llX",
+                                  (unsigned long long)s.regs.rip);
+                    if (ImGui::MenuItem(label))
+                        ctx_.openMemoryToolsAt(s.regs.rip, s.pid,
+                                               s.sessionGeneration);
+                }
+                ImGui::EndPopup();
             }
-        }
-        ImGui::SameLine(0.0f, 0.0f);
-        if (ImGui::ArrowButton("##toolbar_address_presets", ImGuiDir_Down))
-            ImGui::OpenPopup("##toolbar_address_popup");
-        ImGui::PopStyleColor(2);
-        ImGui::PopStyleVar(3);
-
-        auto chooseAddress = [&](const char* label, uint64_t address, bool live) {
-            if (!ImGui::MenuItem(label)) return;
-            std::snprintf(toolbarAddress_, sizeof(toolbarAddress_), "0x%llX",
-                          (unsigned long long)address);
-            toolbarAddressMirror_ = address;
-            toolbarAddressMirrorValid_ = true;
-            toolbarAddressMirrorLive_ = live;
-            toolbarAddressMirrorTarget_ = live
-                ? frameTarget : DebugTargetIdentity{};
-            if (live) ctx_.gotoAddressLive(address, frameTarget);
-            else ctx_.gotoAddress(address);
         };
-        if (ImGui::BeginPopup("##toolbar_address_popup")) {
-            char label[96];
-            if (ctx_.hasCursor && cursorOwnerCurrent) {
-                std::snprintf(label, sizeof(label), "Cursor   0x%llX",
-                              (unsigned long long)ctx_.cursorVA);
-                chooseAddress(label, ctx_.cursorVA, ctx_.cursorLive);
+        if (showAddress) {
+            nextGroup();
+            renderAddressControl(132.0f * k);
+        }
+
+        // Keep the thread and Detach group against the right edge, as in the
+        // reference. Their popup retains the debugger's checked stop identity.
+        char threadLabel[48];
+        std::snprintf(threadLabel, sizeof(threadLabel), s.activeTid ? "Thread %u" : "Threads", s.activeTid);
+        const float threadW = ImGui::CalcTextSize(threadLabel).x + 46.0f * k;
+        const float detachW = showDetach ? commandWidth(DS_ICON_STOP, "X", "Detach") : 0.0f;
+        const float moreW = ImGui::CalcTextSize("More").x + 28.0f * k;
+        const float rightGroupW = moreW + (showThread ? threadW + 8.0f * k : 0.0f) +
+            (showDetach ? detachW + 8.0f * k : 0.0f);
+        ImGui::SameLine(0.0f, 8.0f * k);
+        ImGui::SetCursorScreenPos(ImVec2((std::max)(ImGui::GetCursorScreenPos().x,
+            toolbarRight - rightGroupW), toolbarY + toolbarPaddingY));
+        if (showThread) {
+            renderDebugSessionControls(s, threadW, rowH, executionRequested, true);
+            ImGui::SameLine(0.0f, 8.0f * k);
+        }
+        if (showDetach) {
+            if (commandButton("##cmd_detach", DS_ICON_STOP, "X", "Detach",
+                "Stop debugging and detach from the process", false, true)) d.requestDetach(frameTarget);
+            ImGui::SameLine(0.0f, 8.0f * k);
+        }
+        // The address editor establishes the row's taller text baseline. Match
+        // that baseline for this native button so ItemSize cannot add an extra
+        // invisible line-height offset below the otherwise fixed command band.
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+            ImVec2(ImGui::GetStyle().FramePadding.x,
+                (rowH - ImGui::GetTextLineHeight()) * 0.5f));
+        const bool openMore = ImGui::Button("More##toolbar_more", ImVec2(moreW, rowH));
+        ImGui::PopStyleVar();
+        if (openMore)
+            ImGui::OpenPopup("##toolbar_more_popup");
+        std::optional<bool> requestedExecutionMode;
+        if (ImGui::BeginPopup("##toolbar_more_popup")) {
+            if (!showTrace && ImGui::MenuItem(traceOn ? "Stop Trace Coverage" : "Trace Coverage",
+                                              nullptr, traceOn, traceStartEnabled)) {
+                ctx_.requestedTraceToggle = true;
+                ctx_.requestedTraceTarget = frameTarget;
+                ctx_.requestedTab = "Binary View";
             }
-            if (loaded && ctx_.staticBinary().hasEntryPoint()) {
-                std::snprintf(label, sizeof(label), "Entry point   0x%llX",
-                              (unsigned long long)ctx_.staticBinary().entryPointVA());
-                chooseAddress(label, ctx_.staticBinary().entryPointVA(), false);
+            if (ImGui::MenuItem("Step Back", nullptr, false, canBrowseBack))
+                executionHistoryView_.stepBack(executionHistory_);
+            if (ImGui::MenuItem("Run to cursor", "Ctrl+F9", false, canRunToCursor)) {
+                executionRequested = true;
+                d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
             }
-            if (loaded) {
-                std::snprintf(label, sizeof(label), "Image base   0x%llX",
-                              (unsigned long long)ctx_.staticBinary().imageBase());
-                chooseAddress(label, ctx_.staticBinary().imageBase(), false);
+            if (ImGui::MenuItem("Record execution path", nullptr,
+                historyCurrent && executionHistory_.recording,
+                modePaused && !ctx_.gmlExecutionMode && !executionRequested))
+                executionRequested = startExecutionHistory(s);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Breakpoints")) openBreakpoints();
+            if (!showAddress) {
+                ImGui::TextDisabled("Go to address");
+                renderAddressControl(180.0f * k);
             }
-            if (attached) {
-                std::snprintf(label, sizeof(label), "Live RIP   0x%llX",
-                              (unsigned long long)s.regs.rip);
-                chooseAddress(label, s.regs.rip, true);
-                std::snprintf(label, sizeof(label), "Inspect RIP in Memory Tools   0x%llX",
-                              (unsigned long long)s.regs.rip);
-                if (ImGui::MenuItem(label))
-                    ctx_.openMemoryToolsAt(s.regs.rip, s.pid,
-                                           s.sessionGeneration);
+            if (!showThread) renderDebugSessionControls(s, 280.0f * k, rowH, executionRequested);
+            if (attached && !showDetach && ImGui::MenuItem("Detach")) d.requestDetach(frameTarget);
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Execution mode")) {
+                if (ImGui::MenuItem("Native CPU instructions", nullptr, !ctx_.gmlExecutionMode))
+                    requestedExecutionMode = false;
+                if (ImGui::MenuItem("GameMaker VM instructions", nullptr, ctx_.gmlExecutionMode))
+                    requestedExecutionMode = true;
+                ImGui::EndMenu();
             }
+            if (!attached && loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
+                bool jvmInit = ctx_.debug.breakOnJvmInit();
+                if (ImGui::MenuItem("Break on JVM init", nullptr, jvmInit))
+                    ctx_.debug.setBreakOnJvmInit(!jvmInit);
+            }
+            if (ImGui::MenuItem("Search commands...", "Ctrl+K")) openCommandPalette(s);
             ImGui::EndPopup();
         }
 
         const bool shortcutOverlayOpen = palette_.isOpen() ||
             ImGui::IsPopupOpen(nullptr,
                 ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-        if (!ImGui::GetIO().WantTextInput && !shortcutOverlayOpen && attached) {
+        if (!ImGui::GetIO().WantTextInput && !shortcutOverlayOpen &&
+            !requestedExecutionMode.has_value() && attached) {
             if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
                 if (modeRunning) executionCommand(GmlControlCommand::Pause);
                 else if (modePaused) executionCommand(GmlControlCommand::Continue);
@@ -5265,30 +5162,7 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 d.runToCursorForSession(frameTarget, ctx_.runtimeCursorVA);
             }
         }
-
-        // Less-common controls stay at the end of the command band instead of
-        // displacing the stable Continue / Step / Trace / address composition.
-        if (attached) {
-            ImGui::SameLine(0.0f, 12.0f * k);
-            if (commandButton("##cmd_detach", DS_ICON_STOP, "X", "Detach",
-                              "Stop debugging and detach from the process",
-                              false, true)) d.requestDetach(frameTarget);
-        } else if (loaded && ctx_.staticJavaInfo().kind != JavaWrapKind::None) {
-            ImGui::SameLine(0.0f, 12.0f * k);
-            bool jvmInit = ctx_.debug.breakOnJvmInit();
-            if (ImGui::Checkbox("Break on JVM init", &jvmInit))
-                ctx_.debug.setBreakOnJvmInit(jvmInit);
-            if (ImGui::IsItemHovered()) {
-                char tip[192];
-                std::snprintf(tip, sizeof(tip),
-                              "Arm a one-shot breakpoint on jvm.dll!JNI_CreateJavaVM before launch (%s wrapper).",
-                              JavaWrapKindName(ctx_.staticJavaInfo().kind));
-                ui::ItemTooltip(tip, false);
-            }
-        }
-        ImGui::SameLine(0.0f, 10.0f * k);
-        renderDebugSessionControls(s, ImGui::GetContentRegionAvail().x, rowH,
-                                   executionRequested);
+        if (requestedExecutionMode.has_value()) ctx_.gmlExecutionMode = *requestedExecutionMode;
     }
     ImGui::End();
     ImGui::PopStyleColor();
@@ -5316,7 +5190,7 @@ bool App::selectDebugToolbarThread(const DbgSnapshot& captured, uint32_t tid) {
 }
 
 void App::renderDebugSessionControls(const DbgSnapshot& snap, float availableWidth,
-                                     float height, bool executionRequested) {
+                                     float height, bool executionRequested, bool threadOnly) {
     const float k = theme::UiScale();
     const float width = (std::max)(1.0f, availableWidth);
     const auto lifecycle = ctx_.debug.lifecycleSnapshot();
@@ -5335,7 +5209,7 @@ void App::renderDebugSessionControls(const DbgSnapshot& snap, float availableWid
     else std::snprintf(threadLabel, sizeof(threadLabel), "Threads");
     const float threadWidth = ImGui::CalcTextSize(threadLabel).x + 46.0f * k;
     const float minimumStatusWidth = ImGui::CalcTextSize(state).x + 33.0f * k;
-    const bool showThread = width >= threadWidth + minimumStatusWidth + 8.0f * k;
+    const bool showThread = threadOnly || width >= threadWidth + minimumStatusWidth + 8.0f * k;
     const float statusWidth = (std::min)(200.0f * k,
         showThread ? width - threadWidth - 8.0f * k : width);
     const float radius = height * 0.5f;
@@ -5348,68 +5222,69 @@ void App::renderDebugSessionControls(const DbgSnapshot& snap, float availableWid
         toolbarThreadPopupPaused_ = canSelect;
         ImGui::OpenPopup("##toolbar_session_popup");
     };
-    if (ImGui::InvisibleButton("##toolbar_debug_status", ImVec2(statusWidth, height),
-                              ImGuiButtonFlags_EnableNav)) openSessionPopup();
-    const bool focused = ImGui::IsItemFocused();
-    draw->AddRectFilled(origin, ImVec2(origin.x + statusWidth, origin.y + height),
-        ImGui::GetColorU32(paused ? theme::col::pauseSurface() : theme::col::panelHeader()), radius);
-    ImVec4 outline = stateColor;
-    outline.w = focused ? 1.0f : 0.45f;
-    draw->AddRect(origin, ImVec2(origin.x + statusWidth, origin.y + height),
-        ImGui::GetColorU32(outline), radius, 0, (std::max)(1.0f, std::round(k)));
-    draw->AddCircleFilled(ImVec2(origin.x + 11.0f * k, origin.y + height * 0.5f),
-        3.5f * k, ImGui::GetColorU32(stateColor));
+    if (!threadOnly) {
+        if (ImGui::InvisibleButton("##toolbar_debug_status", ImVec2(statusWidth, height),
+                                  ImGuiButtonFlags_EnableNav)) openSessionPopup();
+        const bool focused = ImGui::IsItemFocused();
+        draw->AddRectFilled(origin, ImVec2(origin.x + statusWidth, origin.y + height),
+            ImGui::GetColorU32(paused ? theme::col::pauseSurface() : theme::col::panelHeader()), radius);
+        ImVec4 outline = stateColor;
+        outline.w = focused ? 1.0f : 0.45f;
+        draw->AddRect(origin, ImVec2(origin.x + statusWidth, origin.y + height),
+            ImGui::GetColorU32(outline), radius, 0, (std::max)(1.0f, std::round(k)));
+        draw->AddCircleFilled(ImVec2(origin.x + 11.0f * k, origin.y + height * 0.5f),
+            3.5f * k, ImGui::GetColorU32(stateColor));
 
-    const float stateFontSize = ImGui::GetFontSize();
-    const float reasonFontSize = ImGui::GetFontSize();
-    const float textX = origin.x + 23.0f * k;
-    const float textRight = origin.x + statusWidth - (showThread ? 8.0f : 18.0f) * k;
-    const ImVec4 textClip(textX, origin.y, (std::max)(textX, textRight), origin.y + height);
-    auto abbreviated = [&](const std::string& value, float fontSize) {
-        const float room = (std::max)(0.0f, textRight - textX);
-        std::string shown = value;
-        if (ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0, shown.c_str()).x <= room)
-            return shown;
-        while (!shown.empty() && ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0,
-                (shown + "...").c_str()).x > room) {
-            size_t last = shown.size() - 1;
-            while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
-            shown.resize(last);
+        const float stateFontSize = ImGui::GetFontSize();
+        const float reasonFontSize = ImGui::GetFontSize();
+        const float textX = origin.x + 23.0f * k;
+        const float textRight = origin.x + statusWidth - (showThread ? 8.0f : 18.0f) * k;
+        const ImVec4 textClip(textX, origin.y, (std::max)(textX, textRight), origin.y + height);
+        auto abbreviated = [&](const std::string& value, float fontSize) {
+            const float room = (std::max)(0.0f, textRight - textX);
+            std::string shown = value;
+            if (ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0, shown.c_str()).x <= room)
+                return shown;
+            while (!shown.empty() && ImGui::GetFont()->CalcTextSizeA(fontSize, FLT_MAX, 0,
+                    (shown + "...").c_str()).x > room) {
+                size_t last = shown.size() - 1;
+                while (last > 0 && (static_cast<unsigned char>(shown[last]) & 0xC0) == 0x80) --last;
+                shown.resize(last);
+            }
+            return shown + "...";
+        };
+        // lastEvent is observation text from the debugger; never synthesize a stop
+        // explanation from the selected command or the reference image.
+        const std::string reason = abbreviated(snap.lastEvent, reasonFontSize);
+        const bool hasReason = !snap.lastEvent.empty();
+        const float blockH = stateFontSize + (hasReason ? reasonFontSize : 0.0f);
+        const float textY = origin.y + (height - blockH) * 0.5f;
+        draw->AddText(ImGui::GetFont(), stateFontSize, ImVec2(textX, textY),
+            ImGui::GetColorU32(stateColor), state, nullptr, 0, &textClip);
+        if (hasReason)
+            draw->AddText(ImGui::GetFont(), reasonFontSize, ImVec2(textX, textY + stateFontSize),
+                ImGui::GetColorU32(theme::col::muted()), reason.c_str(), nullptr, 0, &textClip);
+        if (!showThread) {
+            const float cx = origin.x + statusWidth - 10.0f * k, cy = origin.y + height * 0.5f;
+            draw->AddLine(ImVec2(cx - 3.0f * k, cy - k), ImVec2(cx, cy + 2.0f * k),
+                ImGui::GetColorU32(theme::col::muted()), k);
+            draw->AddLine(ImVec2(cx, cy + 2.0f * k), ImVec2(cx + 3.0f * k, cy - k),
+                ImGui::GetColorU32(theme::col::muted()), k);
         }
-        return shown + "...";
-    };
-    // lastEvent is observation text from the debugger; never synthesize a stop
-    // explanation from the selected command or the reference image.
-    const std::string reason = abbreviated(snap.lastEvent, reasonFontSize);
-    const bool hasReason = !snap.lastEvent.empty();
-    const float blockH = stateFontSize + (hasReason ? reasonFontSize : 0.0f);
-    const float textY = origin.y + (height - blockH) * 0.5f;
-    draw->AddText(ImGui::GetFont(), stateFontSize, ImVec2(textX, textY),
-        ImGui::GetColorU32(stateColor), state, nullptr, 0, &textClip);
-    if (hasReason)
-        draw->AddText(ImGui::GetFont(), reasonFontSize, ImVec2(textX, textY + stateFontSize),
-            ImGui::GetColorU32(theme::col::muted()), reason.c_str(), nullptr, 0, &textClip);
-    if (!showThread) {
-        const float cx = origin.x + statusWidth - 10.0f * k, cy = origin.y + height * 0.5f;
-        draw->AddLine(ImVec2(cx - 3.0f * k, cy - k), ImVec2(cx, cy + 2.0f * k),
-            ImGui::GetColorU32(theme::col::muted()), k);
-        draw->AddLine(ImVec2(cx, cy + 2.0f * k), ImVec2(cx + 3.0f * k, cy - k),
-            ImGui::GetColorU32(theme::col::muted()), k);
+        ui::ItemTooltip("Debugger status and full event reason. Open to inspect or select a native thread.", false);
     }
-    ui::ItemTooltip("Debugger status and full event reason. Open to inspect or select a native thread.", false);
-
     if (showThread) {
-        ImGui::SameLine(0.0f, 8.0f * k);
+        if (!threadOnly) ImGui::SameLine(0.0f, 8.0f * k);
         const ImVec2 at = ImGui::GetCursorScreenPos();
         if (ImGui::InvisibleButton("##toolbar_thread", ImVec2(threadWidth, height),
                                   ImGuiButtonFlags_EnableNav)) openSessionPopup();
         const bool hover = ImGui::IsItemHovered(), focus = ImGui::IsItemFocused();
         draw->AddRectFilled(at, ImVec2(at.x + threadWidth, at.y + height),
             ImGui::GetColorU32(hover || focus ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg),
-            ImGui::GetStyle().FrameRounding);
+            radius);
         draw->AddRect(at, ImVec2(at.x + threadWidth, at.y + height),
             ImGui::GetColorU32(focus ? theme::col::accent() : theme::col::lineSoft()),
-            ImGui::GetStyle().FrameRounding);
+            radius);
         const ImU32 ink = ImGui::GetColorU32(theme::col::muted());
         const float cy = at.y + height * 0.5f, ix = at.x + 12.0f * k;
         draw->AddCircle(ImVec2(ix, cy - 3.0f * k), 3.0f * k, ink, 0, k);
@@ -5520,15 +5395,16 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1, 1));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::panelHeader());
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::chrome());
     if (ImGui::Begin("##tabstrip", nullptr, flags)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 win = ImGui::GetWindowPos();
         // Workspaces precede their tools; one shared baseline keeps navigation calm.
         dl->AddLine(ImVec2(win.x, win.y + stripH - 1.0f),
                     ImVec2(win.x + vp->WorkSize.x, win.y + stripH - 1.0f),
-                    ImGui::GetColorU32(theme::col::lineSoft()));
+                    ImGui::GetColorU32(theme::col::paneLine()));
 
         // Binary View's tooltip carries the loaded basename; live tabs expose
         // their current state there as well.
@@ -5559,7 +5435,7 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
 
         const ImVec4 acc = theme::col::accent();
         const float sidePad = 8.0f * k;
-        const float hpad = 12.0f * k;
+        const float hpad = 10.0f * k;
         const float cardTop = win.y + 1.0f * k;
         const float cardH = (std::max)(1.0f, stripH - 2.0f * k);
         const float usableW = (std::max)(1.0f, vp->WorkSize.x - sidePad * 2.0f);
@@ -5624,7 +5500,7 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
             // small underline rather than a filled colour card.
             const ImVec4 bodyCol = hovered || focused || held
                 ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered)
-                : active ? theme::col::panel() : theme::col::panelHeader();
+                : active ? theme::col::panel() : theme::col::chrome();
             dl->AddRectFilled(a, b, ImGui::GetColorU32(bodyCol));
             if (active)
                 dl->AddRectFilled(ImVec2(a.x + 8.0f * k, b.y - 2.0f * k),
@@ -5702,7 +5578,7 @@ void App::renderTabCardStrip(const DbgSnapshot& dbg) {
     }
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);   // WindowRounding + WindowPadding
+    ImGui::PopStyleVar(3);   // WindowRounding + WindowPadding
 }
 
 void App::renderMainWindow(const DbgSnapshot& dbg) {
@@ -5754,10 +5630,13 @@ void App::renderStatusBar(const DbgSnapshot& d) {
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2(1, 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(ImGui::GetStyle().FramePadding.x, 2.0f * theme::UiScale()));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(12.0f * theme::UiScale(),
-                               (statusH - ImGui::GetFrameHeight()) * 0.5f));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::menubar());   // on-palette (incl. Light)
+                               (std::max)(0.0f, (statusH - ImGui::GetFrameHeight()) * 0.5f)));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, theme::col::chrome());   // on-palette (incl. Light)
     if (ImGui::Begin("##status", nullptr, flags)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 statusPos = ImGui::GetWindowPos();
@@ -6270,7 +6149,7 @@ void App::renderStatusBar(const DbgSnapshot& d) {
     }
     ImGui::End();
     ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
+    ImGui::PopStyleVar(4);
 }
 
 void App::renderRawLoadPopup() {
@@ -8144,7 +8023,6 @@ void App::render() {
     }
 
     renderMenuBar();
-    renderDocumentStrip();
     renderDebugToolbar(dbg);
     resolveWorkbenchNavigation();
     renderTabCardStrip(dbg);

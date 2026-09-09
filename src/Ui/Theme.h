@@ -75,8 +75,27 @@ namespace col {
     // Shared workbench surfaces and dividers. Semantic highlights above remain
     // independent of this deliberately subdued surrounding chrome.
     ImVec4 panel();        // panel body background (child bg)
-    ImVec4 panelHeader();  // panel tab-strip / toolbar background
+    ImVec4 panelHeader();  // established control / toolbar surface (button colors)
     ImVec4 code();         // recessed code / hex / preview canvas
+    // Structural chrome is independent of controls so adopting a workbench
+    // surface never silently recolors the existing execution buttons.
+    ImVec4 chrome();       // pane title / representation strip background
+    ImVec4 tableHeader();  // quiet data/code column header background
+    ImVec4 paneLine();     // structural pane/table divider
+    ImVec4 secondaryText();// pane headings and supporting metadata; not disabled controls
+    ImVec4 readingText();  // primary workbench text, separate from action-button labels
+    ImVec4 faintText();    // tertiary metadata, hints and section labels
+    ImVec4 linkText();     // quieter navigation/address blue used by the mockup
+    ImVec4 stringText();   // readable string evidence ink
+    ImVec4 codeSelection();// translucent workbench selection fill
+    ImVec4 byteText();     // raw instruction bytes, subordinate to decoded code
+    ImVec4 commentText();  // neutral explanatory instruction comments
+    ImVec4 instructionText(); // low-chroma decoded instruction ink
+    ImVec4 callText();        // call mnemonic, distinct from action button colors
+    ImVec4 branchText();      // branch mnemonic
+    ImVec4 returnText();      // return mnemonic
+    ImVec4 registerText();    // register operand
+    ImVec4 numberText();      // numeric operand
     ImVec4 breakpointFill();    // subdued breakpoint row background
     ImVec4 breakpointOutline(); // breakpoint row outline
     ImVec4 pauseSurface();      // amber capsule surface

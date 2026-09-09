@@ -707,6 +707,39 @@ int main(int argc, char** argv) {
         CHECK_EQ(r[4].name, "nullsub");
     }
 
+    // The actual collector preserves exact string-reference and memory-write
+    // locations, while untyped arithmetic and separate branches stay unknown.
+    {
+        const uint64_t worker = base + 0x900, phrase = base + 0xf80;
+        auto mutation = op(worker, "add", "dword ptr [rbx+0x17c], 1");
+        TypedOperand memory; memory.kind = OperandKind::Memory;
+        memory.access = OperandAccess::ReadWrite; memory.widthBits = 32;
+        memory.baseRegister = "rbx"; memory.displacement = 0x17c; memory.displacementValid = true;
+        TypedOperand one; one.kind = OperandKind::Immediate;
+        one.access = OperandAccess::Read; one.widthBits = 32; one.immediate = 1;
+        mutation.typedOperands = {memory, one};
+        const auto phraseAt = [&](uint64_t va) { return va == phrase ? std::string("points added!") : std::string(); };
+        dis.bodies[worker] = {mutation, dataRef(worker + 1, phrase), ret(worker + 2)};
+        const std::vector<NamerInput> funcs = {{worker, 8, false, "sub_100900"}};
+        FunctionNamer namer;
+        auto names = namer.name(bin, dis, funcs, 0, {}, phraseAt);
+        CHECK_EQ(names[0].name, "add_points_candidate"); CHECK(names[0].guessed);
+        auto userNamed = funcs; userNamed[0].name = "MyPointsWorker";
+        names = namer.name(bin, dis, userNamed, 0, {}, phraseAt);
+        CHECK_EQ(names[0].name, "MyPointsWorker"); CHECK(!names[0].guessed);
+        dis.bodies[worker][0].typedOperands.clear();
+        names = namer.name(bin, dis, funcs, 0, {}, phraseAt);
+        CHECK(!names[0].guessed);
+        dis.bodies[worker] = {mutation, jumpIf(worker + 1, "jz", worker + 4),
+                             dataRef(worker + 2, phrase), ret(worker + 3), ret(worker + 4)};
+        names = namer.name(bin, dis, funcs, 0, {}, phraseAt);
+        CHECK(!names[0].guessed);
+        mutation.typedOperands[0].baseRegister = "rsp";
+        dis.bodies[worker] = {mutation, dataRef(worker + 1, phrase), ret(worker + 2)};
+        names = namer.name(bin, dis, funcs, 0, {}, phraseAt);
+        CHECK(!names[0].guessed);
+    }
+
     const bool benchmark = argc > 1 && std::string(argv[1]) == "--benchmark";
     checkLargeNamingBatches(benchmark ? 16384 : 1024, benchmark);
 

@@ -1,5 +1,5 @@
 param([ValidateSet('Release')][string]$Configuration = 'Release', [switch]$CompileOnly,
-      [switch]$ReleaseWorkbenchOnly, [switch]$FeatureTabsOnly, [string]$ObjectRoot,
+      [switch]$ReleaseWorkbenchOnly, [switch]$FeatureTabsOnly, [switch]$LiveScrollOnly, [string]$ObjectRoot,
       [string]$DependencyRoot, [string]$OutputRoot)
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
@@ -66,6 +66,12 @@ if (!$CompileOnly) {
 if ($LASTEXITCODE) { Get-Content -LiteralPath $compileLog; throw 'Integration harness compilation failed.' }
 if ($CompileOnly) { Write-Host 'Integration harness compilation passed.'; return }
 $linkArguments = @('/NOLOGO', '/LTCG', '/INCREMENTAL:NO', '/OPT:REF', '/OPT:ICF', '/MACHINE:X64', '/SUBSYSTEM:CONSOLE', ('/OUT:"' + $executable + '"'), ('"' + $testObject + '"'))
+if ($LiveScrollOnly) {
+    # Retain the linker's checked code-generation cache for quick scroll
+    # regression retries. The executable still supports the complete suite.
+    $linkArguments[1] = '/LTCG:INCREMENTAL'
+    $linkArguments += ('/LTCGOUT:"' + (Join-Path $outputRoot 'live_scroll.iobj') + '"')
+}
     # MSVC encodes private/public access in decorated method names even though the
     # calling convention and object layout are identical. Alias only this fixture's
     # exposed tab references back to the unchanged private app symbols.
@@ -95,9 +101,11 @@ $responsePath = Join-Path $outputRoot 'link.rsp'
 if ($LASTEXITCODE) { Get-Content -LiteralPath $linkLog; throw 'Production-object integration linking failed.' }
 $priorAppData = $env:APPDATA
 $priorFixtureRoot = $env:DS_STATIC_LISTING_TEST_ROOT
+$priorLiveScrollOnly = $env:DS_LIVE_SCROLL_ONLY
 try {
     $env:APPDATA = Join-Path $outputRoot 'appdata'
     $env:DS_STATIC_LISTING_TEST_ROOT = $outputRoot
+    if ($LiveScrollOnly) { $env:DS_LIVE_SCROLL_ONLY = '1' }
     [IO.Directory]::CreateDirectory($env:APPDATA) | Out-Null
     Push-Location $taskRoot
     try { & $executable 2>&1 | Tee-Object -FilePath $runLog; $testExit = $LASTEXITCODE } finally { Pop-Location }
@@ -105,4 +113,5 @@ try {
 } finally {
     $env:APPDATA = $priorAppData
     $env:DS_STATIC_LISTING_TEST_ROOT = $priorFixtureRoot
+    $env:DS_LIVE_SCROLL_ONLY = $priorLiveScrollOnly
 }
