@@ -3448,6 +3448,10 @@ void App::renderMenuBar() {
                     !executionHistory_.recording && executionHistoryView_.canStepBack(executionHistory_)))
                 executionHistoryView_.stepBack(executionHistory_);
             if (ImGui::MenuItem("Execution History...")) executionHistoryView_.open = true;
+            if (ImGui::MenuItem("Backtrace / Call Stack")) {
+                ctx_.requestedBacktrace = true;
+                ctx_.requestedTab = "Binary View";
+            }
             ImGui::Separator();
             const TraceCoverageSnapshot* tr = ctx_.frameTraceCoverageSnapshot;
             const bool traceOn = ctx_.traceSeedPlanning || (tr && tr->active) ||
@@ -5120,6 +5124,10 @@ void App::renderDebugToolbar(const DbgSnapshot& s) {
                 executionRequested = startExecutionHistory(s);
             ImGui::Separator();
             if (ImGui::MenuItem("Breakpoints")) openBreakpoints();
+            if (ImGui::MenuItem("Backtrace / Call Stack")) {
+                ctx_.requestedBacktrace = true;
+                ctx_.requestedTab = "Binary View";
+            }
             if (!showAddress) {
                 ImGui::TextDisabled("Go to address");
                 renderAddressControl(180.0f * k);
@@ -7402,6 +7410,10 @@ void App::openCommandPalette(const DbgSnapshot& dbg) {
     add(DS_ICON_LIGHTNING, "Open Live Observation", "Communications / Server Watch", [this] {
         ctx_.openLiveObservation();
     });
+    add(nullptr, "Open Backtrace / Call Stack", "Where we came from / paused native thread", [this] {
+        ctx_.requestedBacktrace = true;
+        ctx_.requestedTab = "Binary View";
+    }, "backtrace back trace stack trace caller return frames where came from");
     add(nullptr, "Open GameMaker / GML connection", "Communications", [this] {
         ctx_.requestedGameMakerConnection = true;
         ctx_.requestedTab = "Communications";

@@ -77,6 +77,7 @@ rem TEST|functionanalyzer_test|src\Core\FunctionAnalyzer.cpp src\Core\JumpTableR
 rem TEST|jump_table_resolver_test|src\Core\JumpTableResolver.cpp src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
 rem TEST|codedata_classifier_test|src\Core\CodeDataClassifier.cpp src\Core\JumpTableResolver.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
 rem TEST|function_namer_test|src\Core\FunctionNamer.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
+rem TEST|backtrace_test|
 rem TEST|function_namer_pipeline_test|src\Core\FunctionNamer.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
 rem TEST|string_action_trace_test|src\Core\StringActionTrace.cpp src\Core\CFG.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp
 rem TEST|analysis_cache_test|src\Core\AnalysisCache.cpp

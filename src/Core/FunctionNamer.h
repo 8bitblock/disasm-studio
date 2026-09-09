@@ -92,6 +92,7 @@ struct FuncEvidence {
     bool isRawStart   = false;          // analyst-selected base of a raw mapping
     bool retOnly      = false;          // body is just ret / leave;ret / nop*;ret  (no calls)
     bool retZero      = false;          // sets eax/rax=0 then returns, no calls
+    bool bodySampled  = false;          // bounded window omitted reachable/remaining body bytes
     // Strong connectivity predicates are named only when their Boolean result
     // has an observable predicate-shaped use.  These are deliberately separate
     // from generic API-set evidence so socket/HTTP workers never become checks.

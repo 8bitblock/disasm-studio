@@ -127,6 +127,7 @@ struct AppContext {
     bool                           requestedTypeWorkbench = false;
     bool                           requestedLiveAssembly = false;
     bool                           requestedBreakpoints = false;
+    bool                           requestedBacktrace = false;
     bool                           requestedCrackmeTriage = false;
     TriageWorkspaceView            requestedTriageView = TriageWorkspaceView::StartHere;
     // Opaque producer-stable identity used to focus one complete authorization

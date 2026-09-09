@@ -583,7 +583,7 @@ GuessedName contextualSemanticGuess(const FuncEvidence& e) {
     const SubjectEvidence subject = contextualSubject(e.strings);
     constexpr int kMaxContextInstructions = 128;
     constexpr int kMaxContextCalls = 12;
-    if (subject.ambiguous || subject.subject == SemanticSubject::None ||
+    if (e.bodySampled || subject.ambiguous || subject.subject == SemanticSubject::None ||
         e.instrCount <= 0 || e.callCount <= 0 ||
         e.instrCount > kMaxContextInstructions || e.callCount > kMaxContextCalls ||
         hasContextualVetoApi(e.apis))
@@ -667,116 +667,136 @@ GuessedName contextualSemanticGuess(const FuncEvidence& e) {
 // e.g. reads a file *and* memcpys gets "read_file" rather than "copy_memory".
 // Returns "" when nothing recognizable is called.
 std::string semanticName(const std::vector<std::string>& apis) {
-    std::vector<std::string> N;
-    for (const auto& a : apis) N.push_back(norm(a));
-    auto has = [&](const char* t) {
-        for (const auto& n : N) if (n.find(t) != std::string::npos) return true;
+    // Never infer behavior from a substring in an unknown vendor export. Keep
+    // punctuation inside the API name significant, and normalize only real
+    // import/calling-convention decoration. ANSI/Wide variants are admitted for
+    // the Windows families explicitly listed below, not arbitrary CRT names.
+    std::unordered_set<std::string> keys;
+    for (const auto& api : apis) keys.insert(nameKey(undecoratedImportName(api)));
+    const auto exact = [&](std::initializer_list<const char*> names) {
+        for (const char* name : names) if (keys.count(name)) return true;
         return false;
     };
-    // Exact match (insensitive to a trailing ANSI/Wide A/W) so "send" can't match
-    // "SendMessage" or "connect" match "InternetConnect".
-    auto eq = [&](const char* t) {
-        const std::string s = t;
-        for (const auto& n : N) {
-            std::string m = n;
-            if (m.size() >= 2 && (m.back() == 'a' || m.back() == 'w')) m.pop_back();
-            if (n == s || m == s) return true;
+    const auto win = [&](std::initializer_list<const char*> names) {
+        for (const char* name : names) {
+            const std::string base = name;
+            if (keys.count(base) || keys.count(base + "a") || keys.count(base + "w"))
+                return true;
         }
         return false;
     };
 
     // --- code injection / process manipulation (high RE signal) ---
-    if (has("writeprocessmemory") && (has("virtualallocex") || has("createremotethread") ||
-                                      has("ntcreatethreadex") || has("queueuserapc")))
+    if (exact({"writeprocessmemory"}) && exact({"virtualallocex", "virtualallocexnuma",
+            "createremotethread", "createremotethreadex", "ntcreatethreadex", "queueuserapc"}))
         return "inject_code";
-    if (has("createremotethread") || has("ntcreatethreadex") || has("rtlcreateuserthread"))
+    if (exact({"createremotethread", "createremotethreadex", "ntcreatethreadex", "rtlcreateuserthread"}))
         return "inject_thread";
-    if (has("writeprocessmemory"))      return "write_process_memory";
-    if (has("readprocessmemory"))       return "read_process_memory";
-    if (has("virtualallocex"))          return "alloc_remote_memory";
-    if (has("virtualprotect") && has("virtualalloc")) return "alloc_exec_memory";
-    if (has("virtualalloc"))            return "allocate_memory";
-    if (has("virtualprotect"))          return "change_protection";
+    if (exact({"writeprocessmemory", "ntwritevirtualmemory", "zwwritevirtualmemory"})) return "write_process_memory";
+    if (exact({"readprocessmemory", "ntreadvirtualmemory", "zwreadvirtualmemory"})) return "read_process_memory";
+    if (exact({"virtualallocex", "virtualallocexnuma"})) return "alloc_remote_memory";
+    // Allocation/protection API names do not establish executable permissions.
+    if (exact({"virtualprotect", "virtualprotectex"}) && exact({"virtualalloc", "virtualalloc2"}))
+        return "allocate_protected_memory";
+    if (exact({"virtualalloc", "virtualalloc2", "virtualalloc2fromapp"})) return "allocate_memory";
+    if (exact({"virtualprotect", "virtualprotectex", "virtualprotectfromapp", "mprotect"})) return "change_protection";
 
     // --- anti-analysis / privilege / enumeration ---
-    if (has("isdebuggerpresent") || has("checkremotedebugger")) return "check_debugger";
-    if (has("createtoolhelp32snapshot") || has("process32"))    return "enumerate_processes";
-    if (has("module32"))                                        return "enumerate_modules";
-    if (has("adjusttokenprivileges") || has("lookupprivilege") || has("openprocesstoken"))
-        return "adjust_privileges";
+    if (exact({"isdebuggerpresent", "checkremotedebuggerpresent"})) return "check_debugger";
+    if (win({"process32first", "process32next"}) || exact({"enumprocesses", "k32enumprocesses"})) return "enumerate_processes";
+    if (win({"module32first", "module32next"}) || exact({"enumprocessmodules", "enumprocessmodulesex", "k32enumprocessmodules", "k32enumprocessmodulesex"})) return "enumerate_modules";
+    if (exact({"thread32first", "thread32next"})) return "enumerate_threads";
+    if (exact({"createtoolhelp32snapshot"})) return "create_system_snapshot";
+    if (exact({"adjusttokenprivileges"})) return "adjust_privileges";
+    if (win({"lookupprivilegevalue", "lookupprivilegename", "lookupprivilegedisplayname"})) return "lookup_privilege";
+    if (exact({"openprocesstoken", "openthreadtoken"})) return "open_access_token";
 
     // --- cryptography ---
-    if (has("cryptencrypt") || has("bcryptencrypt"))            return "encrypt_data";
-    if (has("cryptdecrypt") || has("bcryptdecrypt"))            return "decrypt_data";
-    if (has("crypthashdata") || has("cryptcreatehash") || has("bcrypthash")) return "hash_data";
-    if (has("cryptgenkey") || has("cryptacquirecontext") || has("cryptimportkey") ||
-        has("bcryptopenalgorithm"))                            return "crypto_init";
+    if (exact({"cryptencrypt", "bcryptencrypt", "evp_encryptupdate", "evp_encryptfinal_ex"})) return "encrypt_data";
+    if (exact({"cryptdecrypt", "bcryptdecrypt", "evp_decryptupdate", "evp_decryptfinal_ex"})) return "decrypt_data";
+    if (exact({"crypthashdata", "cryptcreatehash", "bcryptcreatehash", "bcrypthashdata", "bcryptfinishhash", "bcrypthash",
+               "evp_digest", "evp_digestupdate", "evp_digestfinal_ex", "sha1", "sha256", "sha512", "md5"})) return "hash_data";
+    if (win({"cryptacquirecontext"}) || exact({"cryptgenkey", "cryptimportkey", "bcryptopenalgorithmprovider"})) return "crypto_init";
 
     // --- network ---
-    if (has("urldownloadtofile"))                              return "download_file";
-    if (has("internetreadfile") || has("winhttpreaddata"))    return "http_read";
-    if (has("httpsendrequest") || has("winhttpsendrequest"))  return "http_request";
-    if (has("internetopen") || has("winhttpopen") || has("internetconnect")) return "http_connect";
+    if (win({"urldownloadtofile"})) return "download_file";
+    if (win({"internetreadfile", "internetreadfileex"}) || exact({"winhttpreaddata", "winhttpreaddataex"})) return "http_read";
+    if (win({"httpsendrequest", "httpsendrequestex"}) || exact({"winhttpsendrequest"})) return "http_request";
+    if (win({"internetopen", "internetopenurl", "internetconnect", "httpopenrequest"}) || exact({"winhttpopen", "winhttpopenrequest", "winhttpconnect"})) return "http_connect";
     {
-        bool snd = eq("send") || eq("sendto") || has("wsasend");
-        bool rcv = eq("recv") || eq("recvfrom") || has("wsarecv");
+        const bool snd = exact({"send", "sendto", "sendmsg", "wsasend", "wsasendto", "wsasendmsg"});
+        const bool rcv = exact({"recv", "recvfrom", "recvmsg", "wsarecv", "wsarecvfrom", "wsarecvmsg", "wsarecvex"});
         if (snd && rcv) return "net_transfer";
         if (snd)        return "net_send";
         if (rcv)        return "net_recv";
-        if (eq("connect"))                                    return "net_connect";
-        if (eq("socket") || has("wsastartup") || eq("bind") || eq("listen") || eq("accept"))
+        if (exact({"connect", "wsaconnect", "connectex"})) return "net_connect";
+        if (win({"wsasocket"}) || exact({"socket", "wsastartup", "bind", "listen", "accept", "acceptex", "wsaaccept"}))
             return "socket_setup";
     }
 
     // --- registry ---
-    if (has("regsetvalue") || has("regcreatekey"))            return "write_registry";
-    if (has("regdeletekey") || has("regdeletevalue"))         return "delete_registry";
-    if (has("regopenkey") || has("regqueryvalue") || has("reggetvalue") ||
-        has("regenumkey") || has("regenumvalue"))            return "read_registry";
+    const bool registryRead = win({"regqueryvalue", "regqueryvalueex", "reggetvalue", "regquerymultiplevalues"});
+    const bool registryWrite = win({"regsetvalue", "regsetvalueex", "regsetkeyvalue"});
+    if (registryRead && registryWrite) return "read_write_registry";
+    if (registryWrite || win({"regcreatekey", "regcreatekeyex", "regcreatekeytransacted"})) return "write_registry";
+    if (win({"regdeletekey", "regdeletekeyex", "regdeletekeytransacted", "regdeletevalue", "regdeletekeyvalue", "regdeletetree"})) return "delete_registry";
+    if (registryRead || win({"regopenkey", "regopenkeyex", "regopenkeytransacted", "regenumkey", "regenumkeyex", "regenumvalue"})) return "read_registry";
 
     // --- process launch ---
-    if (has("createprocess") || has("shellexecute") || has("winexec") || eq("system"))
+    if (win({"createprocess", "createprocessasuser", "createprocesswithlogon", "createprocesswithtoken", "shellexecute", "shellexecuteex"}) || exact({"winexec", "system", "posix_spawn", "posix_spawnp", "execve", "execv", "execvp", "execl", "execlp", "execle"}))
         return "launch_process";
 
     // --- service control ---
-    if (has("createservice") || has("openscmanager") || has("startservice") || has("controlservice"))
+    if (win({"createservice", "openscmanager", "startservice", "controlserviceex"}) || exact({"controlservice"}))
         return "manage_service";
 
     // --- filesystem ---
-    if (has("writefile") || eq("fwrite"))                     return "write_file";
-    if (has("readfile") || eq("fread"))                       return "read_file";
-    if (has("deletefile") || eq("unlink") || eq("remove"))    return "delete_file";
-    if (has("copyfile"))                                      return "copy_file";
-    if (has("movefile") || eq("rename"))                      return "move_file";
-    if (has("findfirstfile") || has("findnextfile"))          return "enumerate_files";
-    if (has("createfile") || eq("fopen") || has("createfilemapping")) return "open_file";
+    const bool fileWrite = exact({"writefile", "writefileex", "writefilegather", "ntwritefile", "zwwritefile", "fwrite", "fwrite_s"});
+    const bool fileRead = exact({"readfile", "readfileex", "readfilescatter", "ntreadfile", "zwreadfile", "fread", "fread_s"});
+    if (fileRead && fileWrite) return "read_write_file";
+    if (fileWrite) return "write_file";
+    if (fileRead) return "read_file";
+    // POSIX descriptors can also be sockets or pipes: the name must retain
+    // that uncertainty instead of assuming every read()/write() is a file.
+    const bool descriptorRead = exact({"read", "pread", "pread64", "readv", "preadv", "preadv2"});
+    const bool descriptorWrite = exact({"write", "pwrite", "pwrite64", "writev", "pwritev", "pwritev2"});
+    if (descriptorRead && descriptorWrite) return "read_write_descriptor";
+    if (descriptorRead) return "read_descriptor";
+    if (descriptorWrite) return "write_descriptor";
+    if (win({"deletefile", "deletefiletransacted"}) || exact({"unlink", "unlinkat", "remove"})) return "delete_file";
+    if (win({"copyfile", "copyfileex", "copyfiletransacted"}) || exact({"copyfile2"})) return "copy_file";
+    if (win({"movefile", "movefileex", "movefiletransacted", "movefilewithprogress"}) || exact({"rename", "renameat", "renameat2"})) return "move_file";
+    if (win({"findfirstfile", "findfirstfileex", "findfirstfiletransacted", "findnextfile"}) || exact({"readdir", "readdir64", "scandir", "scandir64"})) return "enumerate_files";
+    if (win({"createfilemapping", "createfilemappingnuma", "openfilemapping"}) || exact({"mapviewoffile", "mapviewoffileex", "mmap", "mmap64"})) return "map_memory";
+    if (win({"createfile", "createfiletransacted"}) || exact({"createfile2", "ntcreatefile", "ntopenfile", "zwcreatefile", "zwopenfile", "fopen", "fopen_s", "wfopen", "wfopen_s", "freopen", "open", "open64", "openat", "openat64", "creat"})) return "open_file";
 
     // --- synchronization / library / ui / lifecycle ---
-    if (has("createmutex") || has("openmutex"))               return "create_mutex";
-    if (has("createevent"))                                   return "create_event";
-    if (has("loadlibrary") && has("getprocaddress"))          return "resolve_imports";
-    if (has("loadlibrary"))                                   return "load_library";
-    if (has("getprocaddress"))                                return "resolve_proc";
-    if (has("messagebox"))                                    return "show_message";
-    if (has("exitprocess") || has("terminateprocess") || eq("exit") || eq("abort") || eq("_exit"))
-        return "exit_process";
-    if (has("outputdebugstring"))                             return "debug_print";
-    if (has("getenvironmentvariable") || eq("getenv"))        return "read_env";
-    if (has("setenvironmentvariable"))                        return "set_env";
+    if (win({"createmutex", "createmutexex", "openmutex"})) return "create_mutex";
+    if (win({"createevent", "createeventex"})) return "create_event";
+    const bool loadLibrary = win({"loadlibrary", "loadlibraryex"}) || exact({"dlopen", "dlmopen"});
+    const bool resolveProc = exact({"getprocaddress", "dlsym", "dlvsym"});
+    if (loadLibrary && resolveProc) return "resolve_imports";
+    if (loadLibrary) return "load_library";
+    if (resolveProc) return "resolve_proc";
+    if (win({"messagebox", "messageboxex", "messageboxindirect"})) return "show_message";
+    if (exact({"exitprocess", "terminateprocess", "exit", "abort", "quick_exit"})) return "exit_process";
+    if (win({"outputdebugstring"})) return "debug_print";
+    if (win({"getenvironmentvariable"}) || exact({"getenv", "getenv_s", "secure_getenv"})) return "read_env";
+    if (win({"setenvironmentvariable"}) || exact({"setenv", "putenv", "unsetenv"})) return "set_env";
 
     // --- weaker, generic helpers (only reached if nothing above matched) ---
-    if (has("sprintf") || has("wsprintf") || has("printf") || has("vsnprintf")) return "format_string";
-    if (has("strcpy") || has("wcscpy") || has("lstrcpy") || eq("strncpy"))      return "copy_string";
-    if (has("strcat") || has("lstrcat"))                                        return "concat_string";
-    if (has("strlen") || has("lstrlen") || eq("wcslen"))                        return "string_length";
-    if (has("strcmp") || has("wcscmp") || has("memcmp") || has("strncmp"))      return "compare_buffer";
-    if (has("memcpy") || has("memmove"))                                        return "copy_memory";
-    if (has("memset") || has("zeromemory"))                                     return "fill_memory";
-    if (has("malloc") || has("calloc") || has("heapalloc") || has("localalloc") ||
-        has("globalalloc") || has("realloc"))                                   return "allocate_buffer";
+    if (win({"wsprintf", "wvsprintf"}) || exact({"sprintf", "sprintf_s", "snprintf", "snprintf_s", "swprintf", "swprintf_s", "vsprintf", "vsprintf_s", "vsnprintf", "vsnprintf_s", "vswprintf", "vswprintf_s"})) return "format_string";
+    if (exact({"printf", "printf_s", "fprintf", "fprintf_s", "vprintf", "vfprintf", "wprintf", "fwprintf", "puts", "fputs"})) return "print_output";
+    if (win({"lstrcpy", "lstrcpyn"}) || exact({"strcpy", "strcpy_s", "strncpy", "strncpy_s", "wcscpy", "wcscpy_s", "wcsncpy", "wcsncpy_s", "strlcpy"})) return "copy_string";
+    if (win({"lstrcat"}) || exact({"strcat", "strcat_s", "strncat", "strncat_s", "wcscat", "wcscat_s", "wcsncat", "wcsncat_s", "strlcat"})) return "concat_string";
+    if (win({"lstrlen"}) || exact({"strlen", "strnlen", "strnlen_s", "wcslen", "wcsnlen", "wcsnlen_s"})) return "string_length";
+    if (win({"lstrcmp", "lstrcmpi"}) || exact({"strcmp", "strncmp", "stricmp", "strnicmp", "strcasecmp", "strncasecmp", "wcscmp", "wcsncmp", "wcsicmp", "wcsnicmp", "memcmp", "wmemcmp"})) return "compare_buffer";
+    if (exact({"memcpy", "memcpy_s", "memmove", "memmove_s", "wmemcpy", "wmemmove", "rtlmovememory", "rtlcopymemory"})) return "copy_memory";
+    if (exact({"memset", "memset_s", "wmemset", "bzero", "explicit_bzero", "zeromemory", "rtlzeromemory", "rtlsecurezeromemory"})) return "fill_memory";
+    if (exact({"malloc", "calloc", "realloc", "reallocarray", "heapalloc", "heaprealloc", "rtlallocateheap", "localalloc", "localrealloc", "globalalloc", "globalrealloc", "aligned_alloc", "aligned_malloc", "posix_memalign"})) return "allocate_buffer";
     // Exact `free`: substring matching misclassified FreeLibrary/VirtualFree as
     // CRT buffer releases (their thin-wrapper names are more truthful).
-    if (eq("free") || has("heapfree") || has("localfree") || has("globalfree")) return "free_buffer";
+    if (exact({"free", "heapfree", "rtlfreeheap", "localfree", "globalfree", "aligned_free"})) return "free_buffer";
     return "";
 }
 
@@ -877,7 +897,9 @@ std::vector<std::string> compactOperands(const Instruction& in) {
 }
 
 bool isAbiAccumulator(const std::string& value) {
-    return value == "eax" || value == "rax" || value == "al" ||
+    // Imported BOOL/int/status APIs return at least 32 bits. A low-byte test
+    // can report zero when the full return is nonzero (for example 0x100).
+    return value == "eax" || value == "rax" ||
            value == "r0" || value == "w0" || value == "x0" ||
            value == "v0" || value == "$v0" || value == "$2" ||
            value == "r3" || value == "a0" || value == "x10";
@@ -980,8 +1002,10 @@ bool isReturnValueTransparentFrameOp(const Instruction& in) {
     const std::string dst = o.substr(0, comma);
     if (m == "add" && (dst == "rsp" || dst == "esp")) return true;
     if (m == "mov" && (o == "rsp,rbp" || o == "esp,ebp")) return true;
-    if (m == "pop" && o != "rax" && o != "eax" && o != "ax" &&
-        o != "al" && o != "ah") return true;
+    if (m == "pop" && (o == "rbx" || o == "ebx" || o == "rcx" || o == "ecx" ||
+        o == "rdx" || o == "edx" || o == "rsi" || o == "esi" || o == "rdi" || o == "edi" ||
+        o == "r8" || o == "r9" || o == "r10" || o == "r11" || o == "r12" ||
+        o == "r13" || o == "r14" || o == "r15")) return true;
     return m == "lea" && (dst == "rsp" || dst == "esp");
 }
 
@@ -999,13 +1023,22 @@ bool zeroesAccumulator(const Instruction& in) {
 // Conservative x86 accumulator-clobber tracking for ret_zero.  False negatives
 // are preferable to claiming "returns 0" after a later write made that untrue.
 bool writesAccumulator(const Instruction& in) {
+    const auto accumulator = [](const std::string& reg) {
+        return reg == "rax" || reg == "eax" || reg == "ax" || reg == "al" || reg == "ah";
+    };
+    for (const auto& operand : in.typedOperands)
+        if (operand.kind == OperandKind::Register && OperandWrites(operand.access) &&
+            accumulator(nameKey(operand.registerName))) return true;
+    for (const auto& reg : in.registersWritten)
+        if (accumulator(nameKey(reg))) return true;
     const std::string m = nameKey(in.mnemonic);
     const std::string o = compactLower(in.operands);
     size_t comma = o.find(',');
     const std::string dst = o.substr(0, comma);
-    const bool explicitAcc = dst == "rax" || dst == "eax" || dst == "ax" ||
-                             dst == "al"  || dst == "ah";
+    const bool explicitAcc = accumulator(dst);
     if (explicitAcc && m != "cmp" && m != "test" && m != "bt" && m != "push") return true;
+    if ((m == "xchg" || m == "xadd") && comma != std::string::npos &&
+        accumulator(o.substr(comma + 1))) return true;
     return m == "mul" || (m == "imul" && comma == std::string::npos) ||
            m == "div" || m == "idiv" ||
            m == "cpuid" || m == "rdtsc" || m == "rdtscp" || m == "xgetbv" ||
@@ -1065,8 +1098,8 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
     }
 
     // 3) Trivial stubs.
-    if (e.retOnly && e.callCount == 0) { set("nullsub", "empty stub (returns immediately)"); return g; }
-    if (e.retZero && e.callCount == 0) { set("ret_zero", "returns 0"); return g; }
+    if (!e.bodySampled && e.retOnly && e.callCount == 0) { set("nullsub", "empty stub (returns immediately)"); return g; }
+    if (!e.bodySampled && e.retZero && e.callCount == 0) { set("ret_zero", "returns 0"); return g; }
 
     // 4) Subject + operation synthesis.  This is more specific than the generic
     // API-set verbs below, but it is allowed only when two independent evidence
@@ -1084,7 +1117,7 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
                                   e.connectivityResultReturned;
         constexpr int kMaxConnectivityInstructions = 96;
         constexpr int kMaxConnectivityCalls = 4;
-        if (!connectivityApi.empty() && predicateUse &&
+        if (!e.bodySampled && !connectivityApi.empty() && predicateUse &&
             e.instrCount > 0 && e.callCount > 0 &&
             e.instrCount <= kMaxConnectivityInstructions &&
             e.callCount <= kMaxConnectivityCalls &&
@@ -1109,7 +1142,7 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
             return g;
         }
         // 7) Thin wrapper around exactly one notable API.
-        if (e.apis.size() == 1 && e.callCount <= 2 && e.instrCount <= 24) {
+        if (!e.bodySampled && e.apis.size() == 1 && e.callCount <= 2 && e.instrCount <= 24) {
             if (std::string name = ToSnakeIdentifier(e.apis[0]); !name.empty()) {
                 set(std::move(name), "wrapper around " + e.apis[0]);
                 return g;
@@ -1126,7 +1159,7 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
     // 9) An affirmative action message corroborated by a typed, non-stack
     // stored operation in the same short basic block. Keep all stronger naming
     // evidence above; message semantics remain explicitly a candidate.
-    if (e.instrCount > 0 && e.instrCount <= 192 && e.callCount <= 8) {
+    if (!e.bodySampled && e.instrCount > 0 && e.instrCount <= 192 && e.callCount <= 8) {
         std::string agreedName, reason;
         bool conflict = false;
         for (const auto& action : e.stringActions) {
@@ -1186,7 +1219,8 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     // an IAT slot referenced through memory). "" when it isn't an import.
     auto resolveTargetApi = [&](const Instruction& in) -> std::string {
         std::string nm;
-        if (HasBranchTarget(in) && importNameFor) nm = importNameFor(in.branchTarget);
+        uint64_t target = 0;
+        if (TryGetDirectTarget(in, target) && importNameFor) nm = importNameFor(target);
         if (nm.empty()) {
             uint64_t mem = 0;
             if (TryGetInstrDataRef(in, mem) && importNameFor)    // call/jmp [iat]
@@ -1198,11 +1232,21 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
     // The thunk pass needs only the first non-padding instruction. Retaining
     // 512 rich Instructions for every function can exhaust memory on a large
     // image, so probe the prefix, then stream full bodies during synthesis.
+    std::vector<uint64_t> functionStarts;
+    functionStarts.reserve(funcs.size());
+    for (const auto& function : funcs) {
+        if (stopped()) return {};
+        functionStarts.push_back(function.address);
+    }
+    std::sort(functionStarts.begin(), functionStarts.end());
     auto bodyBytes = [&](const NamerInput& f, size_t& win) {
         size_t avail = 0;
         const uint8_t* p = bin.ptrFromVA(f.address, avail);
         win = f.size ? std::min<size_t>(avail, f.size) : std::min<size_t>(avail, 2048);
         win = std::min<size_t>(win, 8192);
+        const auto next = std::upper_bound(functionStarts.begin(), functionStarts.end(), f.address);
+        if (next != functionStarts.end())
+            win = static_cast<size_t>(std::min<uint64_t>(win, *next - f.address));
         return p;
     };
 
@@ -1233,8 +1277,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
             if (in.mnemonic == "jmp") {                          // unconditional -> tail call
                 t.isThunk = true;
                 t.api    = bareApi(resolveTargetApi(in));
-                t.target = in.branchTarget;
-                t.targetValid = HasBranchTarget(in);
+                t.targetValid = TryGetDirectTarget(in, t.target);
             }
             break;                                               // only the first real instruction matters
         }
@@ -1290,9 +1333,83 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
 
         size_t win = 0;
         const uint8_t* p = bodyBytes(f, win);
-        const auto insns = p ? dis.disassemble(p, win, f.address, 512)
-                             : std::vector<Instruction>{};
+        auto insns = p ? dis.disassemble(p, win, f.address, 512)
+                       : std::vector<Instruction>{};
         if (stopped()) return {};
+        // Keep decoder output within this function's bounded window. A size
+        // estimate must never let the next declared function donate evidence.
+        insns.erase(std::remove_if(insns.begin(), insns.end(), [&](const auto& in) {
+            return !in.length || in.address < f.address || in.address - f.address >= win ||
+                   in.length > win - (in.address - f.address);
+        }), insns.end());
+        e.bodySampled = insns.size() >= 512 || (f.size && win < f.size);
+
+        // A bounded entry-reachability walk excludes post-RET data, skipped
+        // blocks, and neighboring fallthroughs without another CFG/decode pass.
+        // Delay slots execute before the transfer; include them but do not
+        // invent their own fallthrough edge into the skipped block.
+        std::unordered_map<uint64_t, size_t> instructionAt;
+        for (size_t j = 0; j < insns.size(); ++j) instructionAt.emplace(insns[j].address, j);
+        std::vector<bool> reachable(insns.size());
+        std::vector<size_t> pending;
+        std::unordered_set<uint64_t> leaders;
+        const auto enqueue = [&](uint64_t address, bool branchTarget) {
+            if (branchTarget) leaders.insert(address);
+            const auto found = instructionAt.find(address);
+            if (found == instructionAt.end()) { e.bodySampled = true; return; }
+            if (!reachable[found->second]) {
+                reachable[found->second] = true;
+                pending.push_back(found->second);
+            }
+        };
+        enqueue(f.address, false);
+        for (size_t cursor = 0; cursor < pending.size(); ++cursor) {
+            if ((cursor & 0x3Fu) == 0 && stopped()) return {};
+            const size_t index = pending[cursor];
+            const auto& in = insns[index];
+            if (in.address > (std::numeric_limits<uint64_t>::max)() - in.length) {
+                // A final-byte return needs no representable successor.
+                if (!InstructionIsReturn(in) || in.flow.delaySlots) e.bodySampled = true;
+                continue;
+            }
+            uint64_t next = in.address + in.length;
+            for (size_t slot = 0; slot < in.flow.delaySlots; ++slot) {
+                const auto found = instructionAt.find(next);
+                if (found == instructionAt.end()) { e.bodySampled = true; break; }
+                reachable[found->second] = true;
+                if (next > (std::numeric_limits<uint64_t>::max)() - insns[found->second].length) {
+                    e.bodySampled = true; break;
+                }
+                next += insns[found->second].length;
+            }
+            if (InstructionIsReturn(in) || InstructionIsSubroutineReturn(in)) continue;
+            if (!InstructionIsCall(in) && InstructionEndsBlock(in)) {
+                uint64_t target = 0;
+                bool hasSuccessor = false;
+                if (TryGetDirectTarget(in, target)) { enqueue(target, true); hasSuccessor = true; }
+                if (in.switchInfo.defaultTargetValid) enqueue(in.switchInfo.defaultTarget, true);
+                size_t edges = 0;
+                for (const auto& item : in.switchInfo.cases) {
+                    if (++edges > 512) { e.bodySampled = true; break; }
+                    if (item.targetValid) { enqueue(item.target, true); hasSuccessor = true; }
+                    else e.bodySampled = true;
+                }
+                for (const uint64_t extra : in.extraTargets) {
+                    if (++edges > 512) { e.bodySampled = true; break; }
+                    enqueue(extra, true); hasSuccessor = true;
+                }
+                if (!hasSuccessor && !in.switchInfo.defaultTargetValid) e.bodySampled = true;
+                if (!isConditionalBranch(in) && !InstructionIsSubroutineCall(in)) continue;
+            }
+            enqueue(next, false);
+        }
+        size_t retained = 0;
+        for (size_t j = 0; j < insns.size(); ++j)
+            if (reachable[j]) {
+                if (j != retained) insns[retained] = std::move(insns[j]);
+                ++retained;
+            }
+        insns.resize(retained);
         int meaningful = 0;     // instrs that aren't padding/frame noise
         int retCount = 0;
         bool accKnownZero = false, allReturnsZero = true, hasControlBranch = false;
@@ -1334,9 +1451,18 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         };
         std::unordered_set<std::string> apiSeen, strSeen;
         std::vector<std::pair<uint64_t, std::string>> actionStrings;
+        uint64_t previousEnd = f.address;
         for (const auto& in : insns) {
             if ((e.instrCount & 0x3Fu) == 0 && stopped()) return {};
             ++e.instrCount;
+            // Linear adjacency is insufficient at a merge: another predecessor
+            // may have supplied a different accumulator or flags value.
+            if (in.address != previousEnd || leaders.count(in.address)) {
+                clearResultFlow();
+                accKnownZero = false;
+            }
+            previousEnd = in.address <= (std::numeric_limits<uint64_t>::max)() - in.length
+                ? in.address + in.length : in.address;
             bool noise = isFrameNoise(in, retCount != 0);
             if (!noise) ++meaningful;
             const bool instructionCall = InstructionIsCall(in);
@@ -1360,9 +1486,10 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
                 accKnownZero = false;                                // x86 calls return through eax/rax
                 clearResultFlow();
                 std::string nm = resolveTargetApi(in);
-                if (nm.empty() && HasBranchTarget(in)) {             // call to another local fn?
-                    if (in.branchTarget == f.address) e.selfRecursive = true;
-                    else if (auto it = thunks.find(in.branchTarget); it != thunks.end() && !it->second.api.empty())
+                uint64_t target = 0;
+                if (nm.empty() && TryGetDirectTarget(in, target)) {   // call to another local fn?
+                    if (target == f.address) e.selfRecursive = true;
+                    else if (auto it = thunks.find(target); it != thunks.end() && !it->second.api.empty())
                         nm = it->second.api;                          // call to a thunk -> its API
                 }
                 std::string bare = bareApi(nm);
@@ -1493,6 +1620,8 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
 
         GuessedName g = GuessFromEvidence(e);
         if (!g.guessed) continue;
+        if (e.bodySampled && !(e.isThunk && !e.thunkApi.empty()) && !e.isEntry && !e.isRawStart)
+            g.reason += "; bounded body sample; remaining instructions not inspected";
         synthesized[i] = std::move(g);
     }
 

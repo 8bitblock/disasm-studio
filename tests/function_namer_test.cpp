@@ -79,13 +79,49 @@ int main() {
     CHECK_EQ(GuessFromEvidence(apis({"WSAStartup","socket","bind","listen"})).name,  "socket_setup");
     CHECK_EQ(GuessFromEvidence(apis({"VirtualAllocEx","WriteProcessMemory","CreateRemoteThread"})).name, "inject_code");
     CHECK_EQ(GuessFromEvidence(apis({"CreateRemoteThread"})).name,                    "inject_thread");
-    CHECK_EQ(GuessFromEvidence(apis({"VirtualAlloc","VirtualProtect"})).name,         "alloc_exec_memory");
+    CHECK_EQ(GuessFromEvidence(apis({"VirtualAlloc","VirtualProtect"})).name,         "allocate_protected_memory");
     CHECK_EQ(GuessFromEvidence(apis({"CreateProcessW"})).name,                        "launch_process");
     CHECK_EQ(GuessFromEvidence(apis({"LoadLibraryA","GetProcAddress"})).name,         "resolve_imports");
     CHECK_EQ(GuessFromEvidence(apis({"CryptEncrypt"})).name,                          "encrypt_data");
     CHECK_EQ(GuessFromEvidence(apis({"URLDownloadToFileW"})).name,                    "download_file");
     CHECK_EQ(GuessFromEvidence(apis({"IsDebuggerPresent"})).name,                     "check_debugger");
     CHECK_EQ(GuessFromEvidence(apis({"ExitProcess"})).name,                           "exit_process");
+
+    // Generic classification uses exact, normalized API families too. Preserve
+    // recognized Win32 variants/CRT decorations without guessing vendor exports
+    // merely because their names contain an operation's spelling.
+    for (const char* name : {"MyReadFile", "ReadFileFake", "VirtualAllocLog",
+             "CreateProcessData", "strcmpIgnoreSuffix", "MyCryptHashDataHelper",
+             "RegOpenKeyExWrapper", "SendMessageW", "ConnectNamedPipe",
+             "Get_Proc_Address", "memcpy_checked_by_vendor"}) {
+        CHECK(!GuessFromEvidence(apis({name}, 80, 1)).guessed);
+    }
+    CHECK_EQ(GuessFromEvidence(apis({"vendor.ReadFileFake"}, 8, 1)).name, "read_file_fake");
+    CHECK_EQ(GuessFromEvidence(apis({"WS2_32.__imp__send@16"})).name, "net_send");
+    CHECK_EQ(GuessFromEvidence(apis({"kernel32.dll!__imp__ReadFile@20"})).name, "read_file");
+    CHECK_EQ(GuessFromEvidence(apis({"__imp__snprintf_s"})).name, "format_string");
+    CHECK_EQ(GuessFromEvidence(apis({"ReadFileEx", "WriteFileGather"})).name, "read_write_file");
+    CHECK_EQ(GuessFromEvidence(apis({"ntdll.NtReadFile", "ntdll.NtWriteFile"})).name, "read_write_file");
+    CHECK_EQ(GuessFromEvidence(apis({"RegQueryValueExW", "RegSetValueExW"})).name, "read_write_registry");
+    CHECK_EQ(GuessFromEvidence(apis({"CreateToolhelp32Snapshot", "Module32FirstW"})).name, "enumerate_modules");
+    CHECK_EQ(GuessFromEvidence(apis({"CreateToolhelp32Snapshot", "Thread32First"})).name, "enumerate_threads");
+    CHECK_EQ(GuessFromEvidence(apis({"CreateToolhelp32Snapshot"})).name, "create_system_snapshot");
+    CHECK_EQ(GuessFromEvidence(apis({"OpenProcessToken"})).name, "open_access_token");
+    CHECK_EQ(GuessFromEvidence(apis({"CreateFileMappingW", "MapViewOfFile"})).name, "map_memory");
+    CHECK_EQ(GuessFromEvidence(apis({"read", "write"})).name, "read_write_descriptor");
+    CHECK_EQ(GuessFromEvidence(apis({"pread64"})).name, "read_descriptor");
+    CHECK_EQ(GuessFromEvidence(apis({"pwritev"})).name, "write_descriptor");
+    CHECK_EQ(GuessFromEvidence(apis({"dlopen", "dlsym"})).name, "resolve_imports");
+    CHECK_EQ(GuessFromEvidence(apis({"printf"})).name, "print_output");
+    CHECK_EQ(GuessFromEvidence(apis({"mmap"})).name, "map_memory");
+    CHECK_EQ(GuessFromEvidence(apis({"EVP_DigestUpdate"})).name, "hash_data");
+    {
+        FuncEvidence e = apis({"InternetGetConnectedState"}, 4, 1);
+        e.connectivityResultReturned = true; e.bodySampled = true;
+        CHECK(!GuessFromEvidence(e).guessed); // omitted work can invalidate a narrow wrapper
+        e = {}; e.retZero = true; e.bodySampled = true;
+        CHECK(!GuessFromEvidence(e).guessed);
+    }
 
     // Connectivity predicates earn the analyst-facing WifiCheck name only when
     // the function immediately returns their result or branches on it. Merely

@@ -16,6 +16,7 @@
 #include "../Core/MemoryValueHint.h"  // decoder-width numeric memory observations
 #include "../Core/LivePatchOriginal.h" // session-only live-patch rollback bytes
 #include "../Core/RegisterEdit.h"      // bounded register value/text editor input
+#include "../Core/Backtrace.h"         // exact paused stack ownership and caller evidence
 #include "../Core/InvestigationIndex.h" // immutable unified-omnibox snapshots
 #include "../Core/BinaryOverview.h" // bounded, evidence-bearing investigation starts
 #include "../Core/ListingVirtualIndex.h" // 64-bit Fenwick virtual-row mapper
@@ -61,6 +62,7 @@ public:
     const char* name() const override { return "Binary View"; }
     void render(AppContext& ctx) override;
     DocumentId documentId() const { return documentId_; }
+    void showBacktrace();
 
     // Symbol entries exposed to the command palette: address + display name +
     // a pre-lowercased copy for fuzzy matching. Backed by the signature-cached
@@ -295,6 +297,8 @@ private:
     void renderCallStack(AppContext& ctx);
     void renderStackTab(AppContext& ctx);   // annotated live stack dump (RSP/RBP, symbols, strings)
     void computeCallStack(AppContext& ctx, const struct DbgSnapshot& snap);
+    bool navigateCallFrame(AppContext& ctx, size_t index, bool callCandidate = false);
+    std::string copyBacktrace(const struct DbgSnapshot& snap) const;
     void renderGotoPopup(AppContext& ctx);
     void buildSymbolIndex(AppContext& ctx);
     void startTextSearch(AppContext& ctx);                      // search disassembly text
@@ -418,7 +422,14 @@ private:
             return size && va >= address && va - address < size;
         }
     };
-    struct CallFrame { uint64_t pc; uint64_t frameSp; std::string name; };
+    struct CallFrame {
+        uint64_t pc = 0, frameSp = 0;
+        std::string name;
+        uint64_t stackPtr = 0;
+        BacktraceCallCandidate callCandidate;
+        bool candidate = false;
+        std::string module;
+    };
 
     uint64_t cursorVA_  = 0;     // current focus address (VA 0 is valid when cursorValid_)
     bool     cursorValid_ = false;
@@ -1124,7 +1135,13 @@ private:
     // else a heuristic RSP/RBP scan). Recomputed per stop.
     std::vector<CallFrame> callStack_;
     bool                   callStackReal_ = false;   // true = real unwind, false = heuristic
-    uint64_t               callStackSig_ = 0;
+    BacktraceStop          callStackStop_;
+    bool                   callStackCacheValid_ = false;
+    bool                   callStackScanRequested_ = false;
+    bool                   callStackScanLimited_ = false;
+    bool                   focusCallStackTab_ = false;
+    size_t                 callStackSelected_ = 0;
+    std::string            callStackStatus_;
     int                    stackRows_ = 24;   // qwords shown in the live Stack tab
 
     // Goto-by-name: symbol index (addr, "module.name") + the picker popup. `lower`

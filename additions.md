@@ -306,3 +306,20 @@ subject to Windows elevation/profile-policy constraints and reports those constr
 - Added real x64/WOW64 child-process regressions for chronological loops and calls/returns, captured code/registers, checked ownership, recording bounds, exception stops, unsupported transition guards and cleanup; the focused x64 history test and full WOW64 suite pass.
 - Verified the Release x64 build and helper resource, plus isolated production UI/captured-byte tests and visually checked normal/narrow DX11 captures. The broader x64 suite reports six WinINet Network Watch assertions after peer-suspension access denied; its history case passes. Exact evidence and limitations are recorded in docs/EXECUTION_HISTORY.md.
 - Verified the final 127-object production static-listing/UI integration suite with zero failures, including recorded-history controls, captured instruction decoding, viewport shrinking and existing all-theme compact shell checks (build/execution-history-ui-test.log).
+
+### Function-name accuracy and native backtrace — 2026-09-09
+
+- Replaced function-naming API substring matches with exact, decoration-normalized families; added combined file/registry operations, descriptor I/O, native memory/file calls, mapping, enumeration and library-resolution names while preserving user/export names and heuristic evidence.
+- Restricted naming to bounded reachable function bodies; guarded neighboring functions, dead instructions, partial decodes/control flow, delay slots, return widths, merge points and register clobbers. Allocation/protection and token names no longer overstate executable memory or privilege changes.
+- Added Debug/More/Ctrl+K access to the existing Call Stack drawer, with Current/Caller/Younger browsing, return continuations, module offsets, separately labelled possible CALLs and complete backtrace copying.
+- Added worker-backed Refresh without executing the target, explicit current-frame seeding and exact session/thread/revision ownership. Register and checked memory writes, module changes and concurrent edits retire stale unwinds.
+- Replaced automatic stack inference with an explicit bounded candidate scan; candidates retain uncertainty, disable caller-order controls and report partial/unreadable reads. Tables clip rendering and stale actions refuse changed owners.
+- Added pure, naming-pipeline, production UI and native nested-call regressions; details and verification are recorded in docs/FUNCTION_NAMES_AND_BACKTRACE.md.
+- Main-agent verification passed: final Release x64/helper build, six focused Core suites, 16,384-function benchmark, native seven-frame nested-call backtrace, isolated startup smoke and the full production UI suite with live scrolling/restoration enabled. Zero final test failures; all 129 production object snapshots match the build, and four Light/Midnight compact/desktop DX11 captures were visually reviewed. Final logs are under build/naming-backtrace-review/.
+
+### Peggle one-shot AOB console — 2026-09-09
+
+- Added the standalone `tools/peggle_zen` console and `build/peggle_zen/PeggleZen.exe`, with Give one Zen shot, Check game / rescan, and Exit choices plus explicit read-only check/file-verification and one-shot grant CLI modes.
+- Resolve three unique executable-memory AOBs for the app global, Board/Logic layout and Zen consumer, decode their operands, and reject missing/ambiguous matches, unsupported objects, invalid players and incomplete reads. No fixed-address fallback, DLL injection, game-function call or executable patch is used.
+- Add exactly one charge only with an aiming phase, verified loaded/held ball and no queued shot. Brief identity-checked thread suspension protects the four-byte verified data write; exception and console-close handling balance this tool's suspend counts.
+- Verified the recovered-file and live AOB matches, console menu, and live grant from 0 to 1. All 26 focused resolver/readiness/one-charge tests pass. The user was asked to fire the granted shot; gameplay confirmation is pending. Usage, signatures and test scope are in `tools/peggle_zen/README.md`, with logs under `build/peggle_zen/`.

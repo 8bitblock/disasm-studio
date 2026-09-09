@@ -1039,6 +1039,8 @@ static void checkExecutionHistoryFixture(const char* self) {
         failuresBefore == g_fail ? "pass" : "fail");
 }
 
+#include "backtrace_live_fixture.inc"
+
 int main() {
     char marker[8]{};
     if (GetEnvironmentVariableA("DS_X64_DEBUGGEE", marker,
@@ -1046,6 +1048,7 @@ int main() {
         return marker[0] == '2' ? crashingDebuggeeMain()
              : marker[0] == '3' ? fixtureDebuggeeMain()
              : marker[0] == '4' ? networkDebuggeeMain()
+             : marker[0] == '5' ? backtraceDebuggeeMain()
                                 : debuggeeMain();
 
     std::setvbuf(stdout, nullptr, _IONBF, 0); // retain useful diagnostics if a live check stalls
@@ -1085,6 +1088,13 @@ int main() {
 
     Debugger debugger;
     char historyOnly[2]{};
+    char backtraceOnly[2]{};
+    if (GetEnvironmentVariableA("DS_X64_BACKTRACE_ONLY", backtraceOnly, sizeof(backtraceOnly)) &&
+        backtraceOnly[0] == '1') {
+        checkBacktraceLiveFixture(self);
+        std::printf("x64_debug_test backtrace: %d failure(s)\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (GetEnvironmentVariableA("DS_X64_EXECUTION_HISTORY_ONLY", historyOnly, sizeof(historyOnly)) &&
         historyOnly[0] == '1') {
         checkExecutionHistoryFixture(self);
@@ -2242,6 +2252,7 @@ int main() {
 
     checkExecutionHistoryFixture(self);
     checkFailedDetachRecovery(self);
+    checkBacktraceLiveFixture(self);
 
     if (g_fail) {
         std::printf("%d CHECK(s) FAILED\n", g_fail);

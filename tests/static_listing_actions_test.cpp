@@ -182,6 +182,7 @@ struct Fixture {
 #include "live_scroll_fixture.inc"
 #include "trace_workflow_fixture.inc"
 #include "execution_history_fixture.inc"
+#include "backtrace_ui_fixture.inc"
 
 static void checkRetainedActions(const std::string& path) {
     Fixture f(path);
@@ -1278,6 +1279,7 @@ int main() {
         checkLiveAssemblyScrolling(path);
         checkTraceWorkflow(path);
         checkExecutionHistoryView();
+        checkBacktraceWorkbench(path);
         checkListingColumns(path);
         checkListingVisualSignals(path);
         checkGameMakerActions(temporary);

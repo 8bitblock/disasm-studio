@@ -304,6 +304,110 @@ int main(int argc, char** argv) {
         return {};
     };
 
+    // Only instructions reachable from this function's entry may donate names.
+    // Decoders can materialize dead bytes and the next function in a window;
+    // ScriptDisasm intentionally ignores the byte limit to test our own bounds.
+    {
+        const uint64_t at = base + 0xA00;
+        FunctionNamer n;
+        const auto nameBody = [&](std::vector<Instruction> body, uint32_t size = 32) {
+            dis.bodies[at] = std::move(body);
+            return n.name(bin, dis, {{at, size, false, "sub_100A00"}},
+                          0, importNameFor, stringRefFor).front();
+        };
+        CHECK_EQ(nameBody({ret(at), callMem(at + 1, iatRead), ret(at + 2)}).name, "nullsub");
+        CHECK(!nameBody({op(at, "mov", "ecx, edx"), jumpTo(at + 1, at + 4),
+                        callMem(at + 2, iatRead), ret(at + 3),
+                        op(at + 4, "mov", "eax, ecx"), ret(at + 5)}).guessed);
+
+        // MIPS-style delay slots execute on the transfer path. A referenced
+        // identifier in the slot remains evidence; dead fallthrough calls do not.
+        Instruction delayed = op(at, "b");
+        delayed.flow.kind = FlowKind::UnconditionalBranch;
+        delayed.flow.directTargetValid = true; delayed.flow.directTarget = at + 4;
+        delayed.flow.delaySlots = 1;
+        CHECK_EQ(nameBody({delayed, dataRef(at + 1, stringVA), callMem(at + 2, iatRead),
+                           ret(at + 3), ret(at + 4)}).name, "OpenConfig");
+
+        // The call's result cannot cross a merge with an alternate predecessor
+        // that never executed the call, even when the instructions are adjacent.
+        auto merged = nameBody({jumpIf(at, "jnz", at + 3), callMem(at + 1, iatConnectivity),
+                                op(at + 2, "nop"), ret(at + 3)});
+        CHECK_EQ(merged.name, "internet_get_connected_state");
+
+        // Testing AL loses high return bits and is not a zero test of the
+        // documented int/BOOL result. The generic operation remains useful.
+        auto lowByte = nameBody({dataRef(at, licenseKeyVA), callMem(at + 1, iatMemcmp),
+                                 op(at + 2, "test", "al, al"), jumpIf(at + 3, "jne", at + 5),
+                                 ret(at + 4), ret(at + 5)});
+        CHECK_EQ(lowByte.name, "compare_buffer");
+        CHECK(nameBody({callMem(at, iatConnectivity), op(at + 1, "test", "al, al"),
+                        jumpIf(at + 2, "jne", at + 4), ret(at + 3), ret(at + 4)}).name != "WifiCheck");
+        CHECK(nameBody({callMem(at, iatConnectivity), op(at + 1, "pop", "r0"),
+                        ret(at + 2)}).name != "WifiCheck");
+
+        // Accumulator writes are authoritative regardless of operand position
+        // or mnemonic spelling; xchg/xadd update their second register too.
+        CHECK(nameBody({op(at, "xor", "eax, eax"), op(at + 1, "xchg", "ecx, eax"),
+                        ret(at + 2)}).name != "ret_zero");
+        CHECK(nameBody({op(at, "xor", "eax, eax"), op(at + 1, "xadd", "ecx, eax"),
+                        ret(at + 2)}).name != "ret_zero");
+        Instruction typedClobber = op(at + 1, "opaque_op", "ecx");
+        TypedOperand written;
+        written.kind = OperandKind::Register; written.registerName = "eax";
+        written.access = OperandAccess::Write;
+        typedClobber.typedOperands.push_back(written);
+        CHECK(nameBody({op(at, "xor", "eax, eax"), typedClobber, ret(at + 2)}).name != "ret_zero");
+
+        // Missing control-flow successors and decode gaps make the bounded
+        // sample incomplete; absence of network work is then not established.
+        CHECK(!nameBody({callMem(at, iatConnectivity), op(at + 1, "test", "eax, eax"),
+                         jumpIf(at + 2, "jne", at + 100), ret(at + 3)}, 0).guessed);
+        CHECK(!nameBody({callMem(at, iatConnectivity), ret(at + 2)}, 0).guessed);
+        Instruction partialSwitch = op(at + 3, "switch");
+        partialSwitch.flow.kind = FlowKind::Switch;
+        partialSwitch.switchInfo.defaultTargetValid = true;
+        partialSwitch.switchInfo.defaultTarget = at + 4;
+        partialSwitch.switchInfo.cases.push_back({0, 0, false});
+        CHECK(!nameBody({callMem(at, iatConnectivity), op(at + 1, "test", "eax, eax"),
+                         jumpIf(at + 2, "jne", at + 3), partialSwitch, ret(at + 4)}).guessed);
+        auto sampledRead = nameBody({callMem(at, iatRead)}, 0);
+        CHECK_EQ(sampledRead.name, "read_file");
+        CHECK(sampledRead.reason.find("bounded body sample") != std::string::npos);
+
+        // A long-instruction window can hit its byte cap with fewer than 512
+        // instructions. It must still be partial, even for unknown body sizes.
+        Instruction longCall = callMem(at, iatConnectivity); longCall.length = 16;
+        std::vector<Instruction> longBody{longCall};
+        for (size_t offset = 16; offset < 2048; offset += 16) {
+            Instruction padding = op(at + offset, "nop"); padding.length = 16;
+            longBody.push_back(std::move(padding));
+        }
+        CHECK(!nameBody(std::move(longBody), 0).guessed);
+
+        // Modern FlowInfo targets win over stale legacy targets, both for
+        // imported calls and local thunk chains.
+        Instruction direct = op(at, "call");
+        direct.isCall = true; direct.isBranch = true;
+        direct.flow.kind = FlowKind::DirectCall;
+        direct.flow.directTargetValid = true; direct.flow.directTarget = iatRead;
+        direct.branchTarget = iatConnectivity;
+        CHECK_EQ(nameBody({direct, ret(at + 1)}).name, "read_file");
+        Instruction jump = jumpTo(at, iatConnectivity);
+        jump.flow.kind = FlowKind::UnconditionalBranch;
+        jump.flow.directTargetValid = true; jump.flow.directTarget = iatRead;
+        CHECK_EQ(nameBody({jump}).name, "j_ReadFile");
+
+        const uint64_t neighbor = at + 1;
+        dis.bodies[at] = {op(at, "mov", "eax, ecx"), callMem(neighbor, iatRead), ret(at + 2)};
+        dis.bodies[neighbor] = {callMem(neighbor, iatRead), ret(at + 2)};
+        auto bounded = n.name(bin, dis,
+            {{neighbor, 2, false, "sub_100A01"}, {at, 0, false, "sub_100A00"}},
+            0, importNameFor, stringRefFor);
+        CHECK_EQ(bounded[0].name, "read_file");
+        CHECK_EQ(bounded[1].name, "sub_100A00"); CHECK(!bounded[1].guessed);
+    }
+
     // An authoritative export is protected even when its real name happens to
     // have FunctionAnalyzer's anonymous sub_<hex> shape.
     {
@@ -628,7 +732,9 @@ int main(int argc, char** argv) {
         dis.bodies[mips] = prefix(mips);
         dis.bodies[mips].push_back(op(mips + 5, "bne", "v0, $zero, loc_bad"));
         dis.bodies[mips].back().isBranch = true;
+        dis.bodies[mips].back().branchTarget = mips + 7;
         dis.bodies[mips].push_back(ret(mips + 6));
+        dis.bodies[mips].push_back(ret(mips + 7));
 
         dis.bodies[ppc] = prefix(ppc);
         dis.bodies[ppc].push_back(op(ppc + 5, "cmpwi", "r3, 0"));
@@ -639,7 +745,9 @@ int main(int argc, char** argv) {
         dis.bodies[riscv] = prefix(riscv);
         dis.bodies[riscv].push_back(op(riscv + 5, "bne", "a0, zero, loc_bad"));
         dis.bodies[riscv].back().isBranch = true;
+        dis.bodies[riscv].back().branchTarget = riscv + 7;
         dis.bodies[riscv].push_back(ret(riscv + 6));
+        dis.bodies[riscv].push_back(ret(riscv + 7));
 
         std::vector<NamerInput> f = {
             { a64,   24, false, "sub_100800" },

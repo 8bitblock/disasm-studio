@@ -274,6 +274,9 @@ struct DbgSnapshot {
     std::vector<HwBreakpointInfo> hwBreakpoints;   // DR0-DR3 (address + kind + size)
     std::vector<ThreadInfo>  threads;
     std::vector<CallStackFrame> frames;             // real StackWalk64 unwind of the active thread
+    uint64_t stackRevision = 0;                    // changes for every attempted unwind
+    uint32_t stackTid = 0;                         // exact context used by the unwind
+    uint64_t stackRip = 0, stackRsp = 0, stackRbp = 0;
     std::vector<DbgModule>   modules;               // live module list (LOAD/UNLOAD_DLL events)
     std::vector<std::string> debugOutput;           // OutputDebugString capture (bounded ring)
     uint32_t                 activeTid = 0;
@@ -400,6 +403,9 @@ public:
     // Pick which thread the snapshot's registers/stack follow (while paused).
     void setActiveThread(uint32_t tid);
     bool setActiveThreadForSession(DebugTargetIdentity expected, uint32_t tid);
+    // Queue an unwind on the existing paused debug-event owner. The held event
+    // remains paused; this never executes an instruction or calls DbgHelp on UI.
+    bool refreshCallStackForSession(DebugTargetIdentity expected, uint32_t expectedTid);
 
     // Write the active thread's general-purpose registers (valid only while
     // Paused). Get-modify-Set preserves the unmodeled context (segment/FP/debug).
@@ -663,6 +669,7 @@ private:
     enum class Cmd {
         None,
         ServiceWrites, // wake the paused debug thread without resuming its held event
+        RefreshStack,  // refresh one checked paused thread without releasing the event
         GmlResume,
         Continue,
         StepInto,
@@ -881,6 +888,14 @@ private:
     std::vector<ThreadInfo>          threadList_;        // guarded snapshot for UI
     std::vector<std::pair<uint32_t, void*>> threadHandles_; // guarded tid -> HANDLE
     std::vector<CallStackFrame>      frames_;            // guarded: last StackWalk64 unwind
+    uint64_t stackRevision_ = 0;
+    uint32_t stackTid_ = 0;
+    uint64_t stackRip_ = 0, stackRsp_ = 0, stackRbp_ = 0;
+    void retireCallStackLocked() {
+        frames_.clear(); stackTid_ = 0;
+        ++stackRevision_;
+        if (!stackRevision_) ++stackRevision_;
+    }
     std::unordered_set<uint32_t>     suspended_;         // user-frozen tids (guarded by mtx_)
 
     struct SwBp { uint8_t orig = 0; std::string cond; CondProgram prog;

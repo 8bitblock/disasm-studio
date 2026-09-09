@@ -395,6 +395,7 @@
     <ClInclude Include="src\Core\ProcessMemorySession.h" />
     <ClInclude Include="src\Core\FunctionAnalyzer.h" />
     <ClInclude Include="src\Core\FunctionNamer.h" />
+    <ClInclude Include="src\Core\Backtrace.h" />
     <ClInclude Include="src\Core\FunctionFilter.h" />
     <ClInclude Include="src\Disasm\IDisassembler.h" />
     <ClInclude Include="src\Disasm\JvmDisassembler.h" />

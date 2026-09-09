@@ -1351,6 +1351,7 @@ void Debugger::setActiveThread(uint32_t tid) {
     if (!h) return;
     Registers r;
     if (!ctxReadFull(h, r)) return;
+    if (activeTid_ != tid) retireCallStackLocked();
     activeTid_ = tid;
     regs_ = r;
     // frames_ was unwound for the thread the debugger stopped on. Switching to a
@@ -1372,9 +1373,24 @@ bool Debugger::setActiveThreadForSession(DebugTargetIdentity expected, uint32_t 
     if (!h) return false;
     Registers r;
     if (!ctxReadFull(h, r)) return false;
+    if (activeTid_ != tid) retireCallStackLocked();
     activeTid_ = tid;
     regs_ = r;
     if (tid != tid_) frames_.clear();
+    return true;
+}
+
+bool Debugger::refreshCallStackForSession(DebugTargetIdentity expected, uint32_t expectedTid) {
+    if (!expected.valid() || !expectedTid) return false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (state_ != DbgState::Paused || cleanupOnly_ || gmlSnapshot_.stop ||
+            !DebugTargetIdentityMatches({pid_, sessionGeneration_}, expected) ||
+            activeTid_ != expectedTid || pendingCommand_.command != Cmd::None)
+            return false;
+        pendingCommand_ = {Cmd::RefreshStack, 0, controlEpoch_, expectedTid};
+    }
+    cmdCv_.notify_all();
     return true;
 }
 
@@ -1384,6 +1400,7 @@ bool Debugger::setRegisters(const Registers& r) {
     void* h = nullptr;
     for (auto& kv : threadHandles_) if (kv.first == activeTid_) { h = kv.second; break; }
     if (!h) return false;
+    retireCallStackLocked(); // any GPR can be an x64 unwind frame register
     if (!ctxWriteFull(h, r)) return false;             // get-modify-set (preserves seg/FP/debug)
     pendingInstructionRewinds_.erase(activeTid_); // explicit full-context edit supersedes pending rewind
     regs_ = r;                                          // reflect immediately in the next snapshot
@@ -1438,6 +1455,7 @@ bool Debugger::setRegisterForSession(uint32_t expectedPid,
     regs_ = r;
     if (expectedRip && r.rip != *expectedRip) return false;
     r.*f = value;
+    retireCallStackLocked();
     if (!ctxWriteFull(h, r)) return false;
     if (name == "rip") pendingInstructionRewinds_.erase(activeTid_);
     // Publish what the target actually received.  In particular, a WOW64
@@ -1557,6 +1575,7 @@ bool Debugger::setAccumulatorForSessionVerified(
 
     Registers requested = before;
     requested.rax = value;
+    retireCallStackLocked();
     if (!ctxWriteFull(thread, requested)) {
         Registers current;
         if (ctxReadFull(thread, current)) regs_ = current;
@@ -1751,6 +1770,7 @@ bool Debugger::setRegisterToBufferForSession(
 
     Registers updated = regs_;
     updated.*field = allocation;
+    retireCallStackLocked();
     if (!ctxWriteFull(thread, updated)) {
         discardFailedAllocation();
         return fail("Windows refused the register context write");
@@ -2393,6 +2413,9 @@ void Debugger::performMemoryWrite(const std::shared_ptr<MemoryWriteRequest>& req
                                  &restored) && restored == n && verify == before;
     };
 
+    // Any attempted target write can change a saved return address or unwind
+    // metadata, including a partially failed write. Retire the old observation.
+    retireCallStackLocked();
     SIZE_T put = 0;
     const bool wrote = WriteProcessMemory(h, reinterpret_cast<LPVOID>(va),
                                           physical.data(), n, &put) && put == n;
@@ -2837,7 +2860,14 @@ DbgSnapshot Debugger::snapshot() {
     for (auto& hs : hwSlots_) if (hs.used) s.hwBreakpoints.push_back({ hs.addr, hs.kind, hs.size });
     s.threads = threadList_;
     for (auto& t : s.threads) t.suspended = suspended_.count(t.tid) != 0;
-    s.frames = frames_;
+    // A displayed-thread switch or a stack/context register edit retires the
+    // old unwind immediately, even before the UI asks its worker to refresh.
+    s.stackRevision = stackRevision_;
+    s.stackTid = stackTid_;
+    s.stackRip = stackRip_; s.stackRsp = stackRsp_; s.stackRbp = stackRbp_;
+    if (state_ == DbgState::Paused && activeTid_ == stackTid_ &&
+        regs_.rip == stackRip_ && regs_.rsp == stackRsp_ && regs_.rbp == stackRbp_)
+        s.frames = frames_;
     s.modules = dbgModules_;
     s.debugOutput.assign(dbgOutput_.begin(), dbgOutput_.end());
     s.activeTid = activeTid_;
@@ -4055,10 +4085,27 @@ void Debugger::refreshThreadList() {
 // (SymFromAddr); the UI may re-resolve through its own heuristic namer.
 void Debugger::unwindStack(uint32_t tid) {
     std::vector<CallStackFrame> frames;
+    uint64_t seedRip = 0, seedRsp = 0, seedRbp = 0;
+    uint64_t startingRevision = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        startingRevision = stackRevision_;
+    }
+    auto publish = [&] {
+        std::lock_guard<std::mutex> lock(mtx_);
+        // Direct context edits can run while DbgHelp owns its separate lock.
+        // Never republish a walk across a retired context or memory observation.
+        if (stackRevision_ != startingRevision) return;
+        frames_.swap(frames);
+        ++stackRevision_;
+        if (!stackRevision_) ++stackRevision_;
+        stackTid_ = tid;
+        stackRip_ = seedRip; stackRsp_ = seedRsp; stackRbp_ = seedRbp;
+    };
     auto it = threads_.find(tid);
     HANDLE hProc = (HANDLE)hProcess_;
     if (it == threads_.end() || !hProc) {
-        std::lock_guard<std::mutex> lk(mtx_); frames_.swap(frames); return;
+        publish(); return;
     }
     HANDLE hThread = (HANDLE)it->second;
 
@@ -4075,7 +4122,7 @@ void Debugger::unwindStack(uint32_t tid) {
         machine = IMAGE_FILE_MACHINE_I386;
         ctx32.ContextFlags = WOW64_CONTEXT_FULL;
         if (!Wow64GetThreadContext(hThread, &ctx32)) {
-            std::lock_guard<std::mutex> lk(mtx_); frames_.swap(frames); return;
+            publish(); return;
         }
         sf.AddrPC.Offset    = ctx32.Eip;  sf.AddrPC.Mode    = AddrModeFlat;
         sf.AddrFrame.Offset = ctx32.Ebp;  sf.AddrFrame.Mode = AddrModeFlat;
@@ -4085,7 +4132,7 @@ void Debugger::unwindStack(uint32_t tid) {
         machine = IMAGE_FILE_MACHINE_AMD64;
         ctx64.ContextFlags = CONTEXT_FULL;
         if (!GetThreadContext(hThread, &ctx64)) {
-            std::lock_guard<std::mutex> lk(mtx_); frames_.swap(frames); return;
+            publish(); return;
         }
         sf.AddrPC.Offset    = ctx64.Rip; sf.AddrPC.Mode    = AddrModeFlat;
         sf.AddrFrame.Offset = ctx64.Rbp; sf.AddrFrame.Mode = AddrModeFlat;  // ignored by x64 walk, seeded anyway
@@ -4093,6 +4140,10 @@ void Debugger::unwindStack(uint32_t tid) {
         ctxPtr = &ctx64;
     }
 
+    seedRip = sf.AddrPC.Offset; seedRsp = sf.AddrStack.Offset; seedRbp = sf.AddrFrame.Offset;
+    // StackWalk64's first successful result differs across machines. Always
+    // retain the captured current instruction explicitly, even if unwind fails.
+    frames.push_back({seedRip, seedRbp, seedRsp, {}});
     const size_t kMaxFrames = 256;
     {
         // DbgHelp's Sym*/StackWalk64 are process-global single-threaded: serialize the
@@ -4116,7 +4167,7 @@ void Debugger::unwindStack(uint32_t tid) {
             dbgHelpSessionInited_ = SymInitialize(hProc, ".", TRUE) != FALSE;
         }
         if (dbgHelpSessionInited_) SymRefreshModuleList(hProc);
-    for (size_t n = 0; n < kMaxFrames; ++n) {
+    for (size_t n = 0; n < kMaxFrames && frames.size() < kMaxFrames; ++n) {
         if (!StackWalk64(machine, hProc, hThread, &sf, ctxPtr,
                          /*ReadMemoryRoutine*/        nullptr,  // null -> StackWalk64 uses ReadProcessMemory(hProc)
                          /*FunctionTableAccess*/      dbgHelpSessionInited_ ? SymFunctionTableAccess64 : nullptr,
@@ -4125,6 +4176,9 @@ void Debugger::unwindStack(uint32_t tid) {
             break;
         uint64_t pc = sf.AddrPC.Offset;
         if (!pc) break;   // unwound off the top of the stack
+        if (n == 0 && pc == seedRip && sf.AddrStack.Offset == seedRsp) continue;
+        if (!frames.empty() && frames.back().pc == pc &&
+            frames.back().stackPtr == sf.AddrStack.Offset) break;
 
         CallStackFrame f;
         f.pc       = pc;
@@ -4136,7 +4190,9 @@ void Debugger::unwindStack(uint32_t tid) {
         si->SizeOfStruct = sizeof(SYMBOL_INFO);
         si->MaxNameLen   = 255;
         DWORD64 disp = 0;
-        if (dbgHelpSessionInited_ && SymFromAddr(hProc, pc, &disp, si) && si->NameLen)
+        // Older PCs are continuations: use the byte before the continuation to
+        // identify the caller when the return lands exactly on a symbol boundary.
+        if (dbgHelpSessionInited_ && SymFromAddr(hProc, pc - 1, &disp, si) && si->NameLen)
             f.name.assign(si->Name, si->NameLen < si->MaxNameLen ? si->NameLen : si->MaxNameLen);
         frames.push_back(std::move(f));
 
@@ -4146,8 +4202,7 @@ void Debugger::unwindStack(uint32_t tid) {
     }
     }   // release DbgHelpMutex before taking mtx_
 
-    std::lock_guard<std::mutex> lk(mtx_);
-    frames_.swap(frames);
+    publish();
 }
 
 // Evaluate a breakpoint's condition for the stopped thread (debug thread).
@@ -6667,6 +6722,7 @@ ownerEventPump:
                     mainImagePath = main.path;
                     mainImageLoadGeneration = main.loadGeneration;
                     std::lock_guard<std::mutex> lk(mtx_);
+                    retireCallStackLocked();
                     if (dbgModules_.size() < kMaxDbgModules) dbgModules_.push_back(std::move(main));
                     // Async Attach completes only when the bitness and main
                     // mapping are ready; otherwise a WOW64 target could open a
@@ -6947,6 +7003,7 @@ ownerEventPump:
                                      modulePathTrusted);
                 {   // Publish to the UI-visible list (bounded against load/unload churn).
                     std::lock_guard<std::mutex> lk(mtx_);
+                    retireCallStackLocked();
                     if (dbgModules_.size() < kMaxDbgModules) dbgModules_.push_back(std::move(m));
                 }
                 break;
@@ -7076,6 +7133,7 @@ ownerEventPump:
                 retireAntiDebugImage(b);
                 retireNetworkModule(b, unloadedSize);
                 std::lock_guard<std::mutex> lk(mtx_);
+                retireCallStackLocked();
                 for (size_t i = 0; i < dbgModules_.size(); )
                     if (dbgModules_[i].base == b) dbgModules_.erase(dbgModules_.begin() + i);
                     else ++i;
@@ -8182,6 +8240,17 @@ ownerEventPump:
                 // event without any target writes so EXIT_PROCESS can drain.
                 if(hProcess_ && GetExitCodeProcess((HANDLE)hProcess_,&observedExit) && observedExit!=STILL_ACTIVE) {
                     processExitPending=true;break;
+                }
+                if (command.command == Cmd::RefreshStack) {
+                    bool owned = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        owned = state_ == DbgState::Paused && !cleanupOnly_ &&
+                            command.epoch == controlEpoch_ &&
+                            command.ownerTid && command.ownerTid == activeTid_;
+                    }
+                    if (owned) unwindStack(command.ownerTid);
+                    continue; // retain the exact held event and instruction
                 }
                 if (command.command != Cmd::ServiceWrites) break;
                 // Preserve submission order with breakpoint ownership changes,

@@ -11128,7 +11128,8 @@ void BinaryViewTab::retireChangedLiveSession(AppContext& ctx) {
     ptrDescCache_.clear(); strCmtCache_.clear();
     ptrDescCacheKey_ = strCmtCacheKey_ = 0;
     pseudoVA_ = 0; pseudoText_.clear();
-    callStack_.clear(); callStackSig_ = 0; callStackReal_ = false;
+    callStack_.clear(); callStackCacheValid_ = false; callStackReal_ = false;
+    callStackStop_ = {}; callStackStatus_.clear(); callStackScanRequested_ = false;
     lastScrolledRip_ = 0; lastScrolledRipValid_ = false;
     lastStopRip_ = 0; haveTwoStops_ = false;
     ctx.livescan.cancelPattern(liveFindPatternToken_);
@@ -15238,7 +15239,7 @@ void BinaryViewTab::invalidateNameDependentCaches() {
     annLru_.clear();
     annSig_ = ~0ull;
     callStack_.clear();
-    callStackSig_ = ~0ull;
+    callStackCacheValid_ = false;
 }
 
 void BinaryViewTab::renderRenamePopup(AppContext& ctx) {
@@ -16168,105 +16169,255 @@ std::string BinaryViewTab::symbolFor(AppContext& ctx, uint64_t addr, bool live) 
 }
 
 void BinaryViewTab::computeCallStack(AppContext& ctx, const DbgSnapshot& snap) {
-    const Registers& r = snap.regs;
-    uint64_t sig = r.rip ^ (r.rsp << 1) ^ ((uint64_t)snap.tid << 7) ^ (uint64_t)snap.state
-                 ^ ((uint64_t)snap.frames.size() << 13);
-    if (sig == callStackSig_) return;            // recompute only when the stop changes
-    callStackSig_ = sig;
+    const bool sameStop = BacktraceStopMatches(callStackStop_, snap);
+    if (sameStop && callStackCacheValid_) return;
+    if (!sameStop) {
+        callStackSelected_ = 0;
+        callStackScanRequested_ = false;
+        callStackStatus_.clear();
+    }
+    callStackStop_ = CaptureBacktraceStop(snap);
+    callStackCacheValid_ = true;
     callStack_.clear();
-    if (!snap.attached() || snap.state != DbgState::Paused) return;
-
-    // Prefer the debugger's real StackWalk64 unwind (proper .pdata-driven unwinding
-    // of the remote debuggee). The heuristic RSP/RBP scan below is the fallback only
-    // when the unwind produced nothing (e.g. a thread we couldn't walk).
-    if (!snap.frames.empty()) {
-        callStackReal_ = true;
-        for (const auto& fr : snap.frames) {
-            // Re-resolve the name through our own namer (heuristic guesses, user
-            // renames, analyzed functions) for parity with the listing; fall back to
-            // the debugger's best-effort DbgHelp name when we have nothing better.
-            std::string nm = symbolFor(ctx, fr.pc, true);
-            if (nm.empty()) nm = fr.name;
-            callStack_.push_back({ fr.pc, fr.frameSp, nm });
-        }
-        return;
-    }
     callStackReal_ = false;
+    callStackScanLimited_ = false;
+    if (!BacktracePaused(snap)) return;
 
-    const int slot = snap.is32 ? 4 : 8;                  // 32-bit (WOW64): 4-byte stack slots / return addrs
-    IDisassembler* dec = liveDecoder(ctx, snap.is32);    // decode return sites at the debuggee's bitness
-    if (!dec) return;
-
-    auto regions = ctx.debug.regions();
-    auto isExec = [&](uint64_t a) {
-        for (const auto& rg : regions)
-            if (rg.exec && rg.state == 0x1000 && a >= rg.base && a < rg.base + rg.size) return true;
-        return false;
+    const bool validUnwind = BacktraceUnwindCurrent(snap);
+    callStackReal_ = validUnwind && snap.frames.size() > 1;
+    IDisassembler* decoder = liveDecoder(ctx, snap.is32);
+    size_t prefixReads = 0;
+    constexpr size_t kPrefixReadBudget = 64;
+    auto callCandidate = [&](uint64_t returnAddress) {
+        BacktraceCallCandidate result;
+        if (!decoder || returnAddress < 15 || prefixReads >= kPrefixReadBudget) return result;
+        ++prefixReads;
+        uint8_t prefix[15]{};
+        if (ctx.debug.readMemoryMaskedForSession(snap.pid, snap.sessionGeneration,
+                returnAddress - sizeof(prefix), prefix, sizeof(prefix)) == sizeof(prefix))
+            result = FindBacktraceCallCandidate(*decoder, prefix, sizeof(prefix), returnAddress);
+        return result;
     };
-
-    // Frame 0: the current instruction.
-    callStack_.push_back({ r.rip, r.rsp, symbolFor(ctx, r.rip, true) });
-
-    // Walk up the stack: a qword that lands just past a `call` is a return address.
-    const size_t kMaxQ = 2048, kMaxFrames = 64;
-    std::vector<uint8_t> stk((size_t)kMaxQ * slot);
-    size_t got = ctx.debug.readMemory(r.rsp, stk.data(), stk.size());
-    size_t nq = got / slot;
-    for (size_t i = 0; i < nq && callStack_.size() < kMaxFrames; ++i) {
-        uint64_t val = 0; std::memcpy(&val, stk.data() + i * slot, slot);   // 4/8-byte slot, zero-extended
-        if (val < 0x10000 || !isExec(val)) continue;
-        uint8_t pre[16];
-        if (ctx.debug.readMemory(val - 16, pre, sizeof(pre)) != sizeof(pre)) continue;
-        bool isRet = false;
-        for (int len = 2; len <= 7 && !isRet; ++len) {     // a call ending exactly at val?
-            Instruction one;
-            if (dec->decodeOne(pre + (16 - len), (size_t)len, val - (uint64_t)len, one)
-                && one.length == (uint32_t)len && one.isCall)
-                isRet = true;
+    auto appendFrame = [&](uint64_t pc, uint64_t frameSp, uint64_t stackPtr,
+                           const std::string& fallbackName, bool candidate) {
+        const bool current = callStack_.empty();
+        const uint64_t nameAddress = !current && pc ? pc - 1 : pc;
+        std::string name = symbolFor(ctx, nameAddress, true);
+        if (name.empty()) name = fallbackName;
+        CallFrame frame{pc, frameSp, std::move(name), stackPtr};
+        frame.candidate = candidate;
+        frame.module = BacktraceModuleLabel(snap, nameAddress);
+        if (!current) frame.callCandidate = callCandidate(pc);
+        callStack_.push_back(std::move(frame));
+    };
+    if (validUnwind) {
+        for (const auto& frame : snap.frames) {
+            if (callStack_.size() == 256) break;
+            appendFrame(frame.pc, frame.frameSp, frame.stackPtr, frame.name, false);
         }
-        if (isRet) callStack_.push_back({ val, r.rsp + (uint64_t)i * slot, symbolFor(ctx, val, true) });
+    } else appendFrame(snap.regs.rip, snap.regs.rbp, snap.regs.rsp, {}, false);
+
+    // The fallback is explicitly requested and never presented as caller order.
+    // Bound reads as well as output; repeated values do not imply recursion.
+    if (!callStackReal_ && callStackScanRequested_ && decoder) {
+        const size_t slot = snap.is32 ? 4 : 8;
+        constexpr size_t kStackSlots = 256, kCandidateFrames = 32;
+        std::vector<uint8_t> stack(kStackSlots * slot);
+        const size_t got = ctx.debug.readMemoryForSession(snap.pid, snap.sessionGeneration,
+            snap.regs.rsp, stack.data(), stack.size());
+        if (!got) callStackStatus_ = "Stack memory is unreadable; no candidate search was completed.";
+        else if (got < stack.size()) callStackStatus_ = "Partial stack read: " +
+            std::to_string(got / slot) + " of " + std::to_string(kStackSlots) + " slots available.";
+        for (size_t i = 0; i < got / slot; ++i) {
+            if (callStack_.size() >= kCandidateFrames || prefixReads >= kPrefixReadBudget) {
+                callStackScanLimited_ = true; break;
+            }
+            uint64_t value = 0;
+            std::memcpy(&value, stack.data() + i * slot, slot);
+            if (!value || !BacktraceModuleAt(snap, value - 1)) continue;
+            const auto possibleCall = callCandidate(value);
+            if (!possibleCall.unique()) continue;
+            if (snap.regs.rsp > UINT64_MAX - i * slot) break;
+            // Do not repeat the prefix read that admitted this candidate.
+            const uint64_t nameAddress = value - 1;
+            CallFrame frame{value, 0, symbolFor(ctx, nameAddress, true), snap.regs.rsp + i * slot};
+            frame.callCandidate = possibleCall; frame.candidate = true;
+            frame.module = BacktraceModuleLabel(snap, nameAddress);
+            callStack_.push_back(std::move(frame));
+        }
+        callStackScanLimited_ = callStackScanLimited_ || got == stack.size();
+        // Reads are session-checked individually; discard their combination if
+        // a resume, thread edit, module replacement or write crossed the batch.
+        if (!BacktraceStopMatches(callStackStop_, ctx.debug.snapshot())) {
+            callStack_.resize(1);
+            callStackScanRequested_ = false;
+            callStackStatus_ = "Stack scan retired: the paused context changed.";
+        }
     }
+    if (prefixReads && !BacktraceStopMatches(callStackStop_, ctx.debug.snapshot()))
+        for (auto& frame : callStack_) frame.callCandidate = {};
+}
+
+void BinaryViewTab::showBacktrace() {
+    focusCallStackTab_ = true;
+    focusRegistersTab_ = focusBreakpointsTab_ = false;
+    lowerAdvancedMode_ = false;
+    lowerDockCollapsed_ = false;
+}
+
+bool BinaryViewTab::navigateCallFrame(AppContext& ctx, size_t index, bool callCandidate) {
+    if (index >= callStack_.size() ||
+        !BacktraceStopMatches(callStackStop_, ctx.debug.snapshot())) {
+        callStackStatus_ = "Navigation retired: refresh the current paused thread.";
+        return false;
+    }
+    const auto& frame = callStack_[index];
+    uint64_t destination = frame.pc;
+    if (callCandidate) {
+        if (!frame.callCandidate.unique() || frame.pc < 15) return false;
+        uint8_t prefix[15]{};
+        IDisassembler* decoder = liveDecoder(ctx, callStackStop_.is32);
+        if (!decoder || ctx.debug.readMemoryMaskedForSession(callStackStop_.target.pid,
+                callStackStop_.target.sessionGeneration, frame.pc - sizeof(prefix),
+                prefix, sizeof(prefix)) != sizeof(prefix)) return false;
+        const auto observed = FindBacktraceCallCandidate(*decoder, prefix, sizeof(prefix), frame.pc);
+        if (!observed.unique() || observed.address != frame.callCandidate.address ||
+            !BacktraceStopMatches(callStackStop_, ctx.debug.snapshot())) {
+            callStackStatus_ = "Possible CALL changed; refresh the backtrace.";
+            return false;
+        }
+        destination = observed.address;
+    }
+    callStackSelected_ = index;
+    liveNavigate(destination);
+    followLiveRip_ = false;
+    callStackStatus_.clear();
+    return true;
+}
+
+std::string BinaryViewTab::copyBacktrace(const DbgSnapshot& snap) const {
+    if (!BacktraceStopMatches(callStackStop_, snap)) return {};
+    std::string text = "LIVE backtrace | PID " + std::to_string(snap.pid) +
+        " | session " + std::to_string(snap.sessionGeneration) + " | TID " +
+        std::to_string(snap.activeTid) + (snap.is32 ? " | x86\n" : " | x64\n");
+    for (size_t i = 0; i < callStack_.size(); ++i) {
+        const auto& frame = callStack_[i];
+        char line[140]{};
+        std::snprintf(line, sizeof(line), "#%zu  %s  0x%llX  SP 0x%llX  ", i,
+            i == 0 ? "current" : frame.candidate ? "stack candidate" : "return continuation",
+            static_cast<unsigned long long>(frame.pc), static_cast<unsigned long long>(frame.stackPtr));
+        text += line;
+        text += frame.name.empty() ? "?" : frame.name;
+        text += "  [" + frame.module + "]\n";
+    }
+    if (callStackScanRequested_)
+        text += "Stack candidates are possible return addresses, not an unwound caller chain.\n";
+    text += "This is the paused thread's stack, not a recording of earlier execution.\n";
+    return text;
 }
 
 void BinaryViewTab::renderCallStack(AppContext& ctx) {
     const DbgSnapshot& snap = *frameSnap_;
-    if (!snap.attached()) { ui::EmptyState(nullptr, "No call stack", "Attach a process to view the call stack."); return; }
-    if (snap.state != DbgState::Paused) { ui::EmptyState(nullptr, "Call stack is unavailable", "Pause the process to walk the stack."); return; }
-
     computeCallStack(ctx, snap);
-    ui::Badge(callStackReal_ ? "Unwind" : "Heuristic", callStackReal_ ? theme::col::accent() : theme::col::warn());
-    ui::ItemTooltip(callStackReal_
-        ? "Click a frame to jump there. Frame 0 = current; frames from a real .pdata unwind."
-        : "Click a frame to jump there. Frame 0 = current; deeper frames are best-effort.");
+    if (!snap.attached()) { ui::EmptyState(nullptr, "No backtrace", "Attach and pause a process to see which calls led here. FILE references show possible callers."); return; }
+    if (!BacktracePaused(snap)) { ui::EmptyState(nullptr, "Backtrace is unavailable", "Pause the process to inspect the active thread's callers."); return; }
+
+    ui::Badge("LIVE", theme::col::accent());
     ImGui::SameLine();
-    ImGui::TextDisabled("TID %u / %zu frames", snap.tid, callStack_.size());
-    ui::SameLineIfFits(ImGui::CalcTextSize("Refresh").x + 2 * ImGui::GetStyle().FramePadding.x);
-    if (ImGui::SmallButton("Refresh")) callStackSig_ = 0;
+    ImGui::TextDisabled("Backtrace / TID %u / %s", snap.activeTid,
+        callStackReal_ ? "unwound callers" : callStackScanRequested_ ? "stack candidates" : "current frame only");
+    ui::ItemTooltip("Frame 0 is the paused instruction. Older unwound frames show return continuations.\n"
+                    "A backtrace shows calls still on this thread's stack; earlier completed calls require Record Execution Path.");
+    auto nextButton = [](const char* label) {
+        ui::SameLineIfFits(ImGui::CalcTextSize(label).x + 2 * ImGui::GetStyle().FramePadding.x);
+    };
+    nextButton("Refresh");
+    if (ImGui::SmallButton("Refresh")) {
+        callStackStatus_ = ctx.debug.refreshCallStackForSession(
+            {snap.pid, snap.sessionGeneration}, snap.activeTid)
+            ? "Refreshing this paused thread..." : "Refresh unavailable: the thread changed or another command is pending.";
+        ctx.wantContinuousRedraw = true;
+    }
+    ui::ItemTooltip("Ask the debugger worker to unwind this exact thread again while keeping the process paused.");
+    nextButton("Copy backtrace");
+    if (ImGui::SmallButton("Copy backtrace")) {
+        const auto text = copyBacktrace(ctx.debug.snapshot());
+        if (!text.empty()) ImGui::SetClipboardText(text.c_str());
+        else callStackStatus_ = "Copy retired: refresh the current paused thread.";
+    }
+    if (!callStackReal_) {
+        nextButton("Scan candidates");
+        if (ImGui::SmallButton("Scan candidates")) {
+            callStackScanRequested_ = true;
+            callStackCacheValid_ = false;
+            computeCallStack(ctx, snap);
+        }
+        ui::ItemTooltip("Inspect at most 256 stack slots and 64 CALL suffixes inside mapped modules.\n"
+                        "These values may be stale stack data; they do not prove caller order.");
+    }
+    if (!callStackStatus_.empty()) ImGui::TextWrapped("%s", callStackStatus_.c_str());
+    if (callStackScanRequested_) ImGui::TextWrapped("Possible return addresses / caller order unproved%s",
+        callStackScanLimited_ ? " / scan limit reached" : "");
+
+    ImGui::BeginDisabled(callStack_.empty());
+    if (ImGui::SmallButton("Current")) navigateCallFrame(ctx, 0);
+    nextButton("Younger");
+    ImGui::BeginDisabled(!callStackReal_ || !callStackSelected_);
+    if (ImGui::SmallButton("Younger")) navigateCallFrame(ctx, callStackSelected_ - 1);
+    ImGui::EndDisabled();
+    nextButton("Caller");
+    ImGui::BeginDisabled(!callStackReal_ || callStackSelected_ + 1 >= callStack_.size());
+    if (ImGui::SmallButton("Caller")) navigateCallFrame(ctx, callStackSelected_ + 1);
+    ImGui::EndDisabled();
+    nextButton("Possible CALL");
+    const bool possibleCall = callStackSelected_ < callStack_.size() &&
+        callStack_[callStackSelected_].callCandidate.unique();
+    ImGui::BeginDisabled(!possibleCall);
+    if (ImGui::SmallButton("Possible CALL")) navigateCallFrame(ctx, callStackSelected_, true);
+    ImGui::EndDisabled();
+    ui::ItemTooltip("Inspect the unique CALL ending at the selected return address.\n"
+                    "Backward decoding is a candidate instruction boundary, not proof that this call executed.");
+    ImGui::EndDisabled();
 
     ui::PushMono();
-    if (ui::BeginDataTable("callstack", 3,
+    if (ui::BeginDataTable("callstack", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("#",       ImGuiTableColumnFlags_WidthFixed, 28 * theme::UiScale());
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150 * theme::UiScale());
-        ImGui::TableSetupColumn("Function");
+        ImGui::TableSetupColumn("Frame", ImGuiTableColumnFlags_WidthFixed, 88 * theme::UiScale());
+        ImGui::TableSetupColumn("PC / return", ImGuiTableColumnFlags_WidthFixed, 130 * theme::UiScale());
+        ImGui::TableSetupColumn("Function / caller");
+        ImGui::TableSetupColumn("Module + offset");
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
-        for (int i = 0; i < (int)callStack_.size(); ++i) {
-            const auto& f = callStack_[i];
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(callStack_.size()));
+        while (clipper.Step()) for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            auto& f = callStack_[i];
+            const std::string currentName = symbolFor(ctx, i && f.pc ? f.pc - 1 : f.pc, true);
+            if (!currentName.empty()) f.name = currentName;
             ImGui::TableNextRow();
             ImGui::PushID(i);
-            ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%d", i);
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextDisabled("%d / %s", i, i == 0 ? "current" : f.candidate ? "candidate" : "return");
             ImGui::TableSetColumnIndex(1);
             char al[24]; std::snprintf(al, sizeof(al), "0x%llX", (unsigned long long)f.pc);
-            if (ImGui::Selectable(al, false, ImGuiSelectableFlags_SpanAllColumns) && f.pc) { liveNavigate(f.pc); followLiveRip_ = false; }
+            if (ImGui::Selectable(al, callStackSelected_ == static_cast<size_t>(i), ImGuiSelectableFlags_SpanAllColumns))
+                navigateCallFrame(ctx, static_cast<size_t>(i));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+                "%s\nStack pointer: 0x%llX\n%s", i == 0 ? "Current paused instruction" :
+                    f.candidate ? "Possible return address found in stack memory" : "Return continuation from the debugger unwind",
+                static_cast<unsigned long long>(f.stackPtr),
+                i == 0 ? "Select to inspect the current frame." : "Caller name/module use the byte before the continuation to preserve function boundaries.");
             if (ImGui::BeginPopupContextItem("csm")) {
-                if (ImGui::MenuItem("Go to") && f.pc) { liveNavigate(f.pc); followLiveRip_ = false; }
+                if (ImGui::MenuItem(i == 0 ? "Inspect current instruction" : "Inspect return continuation")) navigateCallFrame(ctx, i);
+                if (ImGui::MenuItem("Inspect possible CALL", nullptr, false, f.callCandidate.unique())) navigateCallFrame(ctx, i, true);
                 if (ImGui::MenuItem("Copy address")) { char c[24]; std::snprintf(c, sizeof(c), "0x%llX", (unsigned long long)f.pc); ImGui::SetClipboardText(c); }
                 if (ImGui::MenuItem("Copy function") && !f.name.empty()) ImGui::SetClipboardText(f.name.c_str());
                 ImGui::EndPopup();
             }
             ImGui::TableSetColumnIndex(2);
             ImGui::TextColored(i == 0 ? theme::col::good() : theme::col::accent(), "%s", f.name.empty() ? "?" : f.name.c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextDisabled("%s", f.module.c_str());
             ImGui::PopID();
         }
         ui::EndDataTable();
@@ -23604,7 +23755,9 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
             ImGui::EndTabItem();
         }
         if (lowerPrimary && beginDrawerTab(
-                "Call Stack", nullptr, ImGuiTabItemFlags_Leading)) {
+                "Call Stack", nullptr, ImGuiTabItemFlags_Leading |
+                    (focusCallStackTab_ ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None))) {
+            focusCallStackTab_ = false;
             renderCallStack(ctx);
             ImGui::EndTabItem();
         }
@@ -24251,7 +24404,8 @@ void BinaryViewTab::renderLowerTabs(AppContext& ctx, bool headerOnly) {
                     (focusRegistersTab_ ? ImGuiTabItemFlags_SetSelected
                                         : ImGuiTabItemFlags_None));
                 railItem("Threads", ImGuiTabItemFlags_Leading);
-                railItem("Call Stack", ImGuiTabItemFlags_Leading);
+                railItem("Call Stack", ImGuiTabItemFlags_Leading |
+                    (focusCallStackTab_ ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None));
                 railItem("Functions", ImGuiTabItemFlags_Leading);
                 railItem("Watch");
                 if (ctx.staticArch() == Arch::GML) railItem("GML");
@@ -25969,6 +26123,10 @@ void BinaryViewTab::render(AppContext& ctx) {
         focusBreakpointsTab_ = true;
         lowerAdvancedMode_ = false;
         lowerDockCollapsed_ = false;
+    }
+    if (ctx.requestedBacktrace) {
+        ctx.requestedBacktrace = false;
+        showBacktrace();
     }
 
     // Retained splitter positions are physical ImGui pixels. Apply the startup DPI

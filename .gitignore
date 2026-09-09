@@ -22,3 +22,18 @@ build_msbuild.log
 correctnress check/
 dissassembler/
 dissassembler_partupdate/
+
+# MSVC build artifacts (ad-hoc cl.exe test compiles drop these in the repo root
+# and tests/; they are never inputs to a build and broke clean CI checkouts).
+*.obj
+*.exe
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.res
+*.tlog
+
+# Accidentally committed nested checkout (was a gitlink with no .gitmodules,
+# which made every actions/checkout post-job cleanup fail with git exit 128).
+Rookspell.github.io/
