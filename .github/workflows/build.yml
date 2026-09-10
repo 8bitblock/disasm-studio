@@ -8,13 +8,41 @@ on:
     branches: [ main, master ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner image (both labels ship Visual Studio 2022 / v143).'
+        type: choice
+        default: windows-2022
+        options: [ windows-2022, windows-2025 ]
+      tests:
+        description: 'Verification depth after the package is uploaded.'
+        type: choice
+        default: full
+        options: [ full, core, none ]
+
+# A superseded PR push should not keep a 2-hour Windows runner busy. Branch
+# pushes are left to finish so their uploaded package matches the commit.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned vcpkg checkout (see the checkout step); also part of the cache key.
+  DS_VCPKG_REF: abb6dda5cc32914d2e64d7d72b974dc301d1fc8a
+  VCPKG_DISABLE_METRICS: '1'
+  # VCPKG_DEFAULT_BINARY_CACHE / VCPKG_BINARY_SOURCES are exported from the
+  # toolset step below: they need the runner's real workspace path, which is
+  # only reliably available once a step is executing.
 
 jobs:
   windows-build:
-    # DisasmStudio targets Visual Studio 2022; avoid the floating windows-latest
-    # label (which now follows the VS 2026 Windows 2025 image).
-    runs-on: windows-2022
-    timeout-minutes: 120
+    # DisasmStudio targets Visual Studio 2022 (v143). Avoid the floating
+    # windows-latest label: the VS 2026 images do not carry v143 and build.ps1
+    # correctly refuses them. windows-2022 and windows-2025 both ship VS 2022.
+    runs-on: ${{ inputs.runner || 'windows-2022' }}
+    # Cold cache = vcpkg dependency compile + a full C++20 application build +
+    # the cl-compiled verification suites. Warm cache runs finish far sooner.
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
@@ -27,16 +55,60 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: microsoft/vcpkg
-          ref: abb6dda5cc32914d2e64d7d72b974dc301d1fc8a
+          ref: ${{ env.DS_VCPKG_REF }}
           path: .vcpkg
           fetch-depth: 1
 
-      - name: Validate Core test manifest
+      # Resolve the toolset the build will actually use before anything heavy
+      # runs, so an image without v143 fails in seconds with a clear message
+      # instead of deep inside MSBuild. The version also keys the binary cache,
+      # which is what keeps this job inside its time budget: imgui + zydis +
+      # capstone (6 architectures) + keystone otherwise compile from source
+      # under x64-windows-static on every single run.
+      - name: Resolve Visual Studio 2022 toolset and dependency cache
         shell: pwsh
-        run: tests\validate_test_manifest.ps1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe not found on $env:ImageOS" }
+          $vs = & $vswhere -latest -version '[17.0,18.0)' -products * `
+            -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1
+          if (!$vs) {
+            throw "No Visual Studio 2022 C++ instance on runner image '$env:ImageOS'. " +
+                  'Dispatch this workflow with runner=windows-2022 or windows-2025.'
+          }
+          $marker = Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.v143.default.txt'
+          if (!(Test-Path -LiteralPath $marker)) { throw "Selected VS instance has no v143 default toolset: $vs" }
+          $toolset = (Get-Content -LiteralPath $marker -TotalCount 1).Trim()
+          $bincache = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_bincache'
+          New-Item -ItemType Directory -Force $bincache | Out-Null
+          Write-Host "Visual Studio : $vs"
+          Write-Host "v143 toolset  : $toolset"
+          Write-Host "Binary cache  : $bincache"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value @(
+            "DS_TOOLSET=$toolset"
+            "VCPKG_DEFAULT_BINARY_CACHE=$bincache"
+            "VCPKG_BINARY_SOURCES=clear;files,$bincache,readwrite"
+          )
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      # Restore/save are split so a build that fails or times out still keeps
+      # the dependencies it managed to compile. A cl upgrade changes vcpkg's ABI
+      # hash anyway; the toolset in the key just keeps stale entries out.
+      - name: Restore vcpkg binary cache
+        id: bincache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ inputs.runner || 'windows-2022' }}-${{ env.DS_TOOLSET }}-${{ env.DS_VCPKG_REF }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/**') }}
+          restore-keys: |
+            vcpkg-${{ inputs.runner || 'windows-2022' }}-${{ env.DS_TOOLSET }}-${{ env.DS_VCPKG_REF }}-
+            vcpkg-${{ inputs.runner || 'windows-2022' }}-${{ env.DS_TOOLSET }}-
 
       # Bootstrap the pinned checkout rather than the stale copy bundled with
       # the runner. The explicit VcpkgRoot below also prevents an existing
@@ -44,6 +116,7 @@ jobs:
       - name: Bootstrap and enable vcpkg MSBuild integration
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $baseline = (Get-Content -Raw 'vcpkg.json' | ConvertFrom-Json).'builtin-baseline'
           git -C "$PWD\.vcpkg" fetch --no-tags --depth=1 origin $baseline
           if ($LASTEXITCODE) { throw "vcpkg baseline fetch failed ($LASTEXITCODE)" }
@@ -63,65 +136,18 @@ jobs:
             -Verbosity minimal
           if ($LASTEXITCODE) { throw "Release build failed ($LASTEXITCODE)" }
 
-      - name: Run declared Core test suite
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        shell: pwsh
-        run: tests\run_core_tests.ps1 -Suite Core
-
-      # These link current production app objects. All three declarations must
-      # execute; they are deliberately excluded from the quick Core-only loop.
-      - name: Run app-object integration suites (static listing, release workbench, feature tabs)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        shell: pwsh
-        env:
-          DS_PATCH_RESTORATION_LIVE_TEST: '1'
-        run: tests\run_core_tests.ps1 -Suite Integration
-
-      # These stay hard-required (DS_REQUIRE_LIVE_DEBUG_TESTS=1) so a genuine
-      # debugger regression is still reported rather than silently skipped.
-      # They are NOT allowed to gate packaging: the suite drives live process
-      # suspension and local-loopback HTTP, which a shared, unelevated GitHub
-      # runner denies or starves for timing reasons (observed: "could not
-      # suspend peer ... (error 5)" and waitPaused timeouts). A failure here
-      # surfaces as a warning annotation, in the job summary, and in the
-      # uploaded verification logs, while release artifacts are still built.
-      - name: Run mandatory live debugger tests (x64, WOW64, authorization watch)
-        id: live_tests
-        continue-on-error: true
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        shell: pwsh
-        env:
-          DS_REQUIRE_LIVE_DEBUG_TESTS: '1'
-        run: tests\run_core_tests.ps1 -Suite Live
-
-      - name: Report live debugger suite outcome
-        if: ${{ !cancelled() && steps.live_tests.outcome != 'skipped' }}
-        shell: pwsh
-        run: |
-          $outcome = '${{ steps.live_tests.outcome }}'
-          if ($outcome -eq 'success') {
-            $line = 'Live debugger suite: passed.'
-          } else {
-            $line = "Live debugger suite: $outcome (non-blocking, environment-dependent). " +
-                    'See the DisasmStudio-verification artifact for run logs.'
-            Write-Host "::warning title=Live debugger suite $outcome::$line"
-          }
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $line
-
-      - name: Upload verification logs and summaries
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      # Empty primary key = the restore step never ran (toolset resolution
+      # failed), so there is no cache directory to save.
+      - name: Save vcpkg binary cache
+        if: always() && steps.bincache.outputs.cache-primary-key != '' && steps.bincache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          name: DisasmStudio-verification
-          path: |
-            build/test-results/**/*.log
-            build/test-results/**/summary.json
-          if-no-files-found: warn
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ steps.bincache.outputs.cache-primary-key }}
 
-      - name: Smoke launch Release executable
-        shell: pwsh
-        run: tests\smoke_run.ps1
-
+      # Packaging and upload run BEFORE verification: a produced executable is
+      # the point of the job, and the suites below cannot silently withhold it.
+      # Verification still decides the job's final status (see the gate step).
       - name: Assemble release package
         shell: pwsh
         run: |
@@ -270,3 +296,99 @@ jobs:
           name: DisasmStudio-x64-Release-symbols
           path: build/x64/Release/DisasmStudio.pdb
           if-no-files-found: error
+
+      # --- Verification -------------------------------------------------------
+      # Every suite records its outcome instead of aborting the job, so one
+      # failure cannot hide the results of the others or drop the logs. The gate
+      # step at the end fails the job for anything that is required.
+      - name: Validate Core test manifest
+        id: manifest
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.tests != 'none' }}
+        continue-on-error: true
+        shell: pwsh
+        run: tests\validate_test_manifest.ps1
+
+      - name: Run declared Core test suite
+        id: core_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && inputs.tests != 'none' }}
+        continue-on-error: true
+        shell: pwsh
+        run: tests\run_core_tests.ps1 -Suite Core
+
+      # These link current production app objects. All three declarations must
+      # execute; they are deliberately excluded from the quick Core-only loop.
+      - name: Run app-object integration suites (static listing, release workbench, feature tabs)
+        id: integration_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (inputs.tests || 'full') == 'full' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          DS_PATCH_RESTORATION_LIVE_TEST: '1'
+        run: tests\run_core_tests.ps1 -Suite Integration
+
+      # These stay hard-required (DS_REQUIRE_LIVE_DEBUG_TESTS=1) so a genuine
+      # debugger regression is still reported rather than silently skipped.
+      # They are NOT allowed to fail the job: the suite drives live process
+      # suspension and local-loopback HTTP, which a shared, unelevated GitHub
+      # runner denies or starves for timing reasons (observed: "could not
+      # suspend peer ... (error 5)" and waitPaused timeouts). A failure here
+      # surfaces as a warning annotation, in the job summary, and in the
+      # uploaded verification logs.
+      - name: Run mandatory live debugger tests (x64, WOW64, authorization watch)
+        id: live_tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (inputs.tests || 'full') == 'full' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          DS_REQUIRE_LIVE_DEBUG_TESTS: '1'
+        run: tests\run_core_tests.ps1 -Suite Live
+
+      # WARP is the runner's only D3D11 device; main.cpp falls back to it when
+      # no GPU is present, so this still exercises real startup.
+      - name: Smoke launch Release executable
+        id: smoke
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        shell: pwsh
+        run: tests\smoke_run.ps1
+
+      - name: Upload verification logs and summaries
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: DisasmStudio-verification
+          path: |
+            build/test-results/**/*.log
+            build/test-results/**/summary.json
+          if-no-files-found: warn
+
+      - name: Verification gate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $required = [ordered]@{
+            'Test manifest'      = '${{ steps.manifest.outcome }}'
+            'Core suite'         = '${{ steps.core_tests.outcome }}'
+            'Integration suites' = '${{ steps.integration_tests.outcome }}'
+            'Smoke launch'       = '${{ steps.smoke.outcome }}'
+          }
+          $advisory = [ordered]@{
+            'Live debugger suite' = '${{ steps.live_tests.outcome }}'
+          }
+          $failed = @()
+          $lines = @('| Check | Outcome | Gates the job |', '| --- | --- | --- |')
+          foreach ($entry in $required.GetEnumerator()) {
+            $lines += "| $($entry.Key) | $($entry.Value) | yes |"
+            if ($entry.Value -eq 'failure') { $failed += $entry.Key }
+          }
+          foreach ($entry in $advisory.GetEnumerator()) {
+            $lines += "| $($entry.Key) | $($entry.Value) | no (environment-dependent) |"
+            if ($entry.Value -eq 'failure') {
+              Write-Host ("::warning title=$($entry.Key) failed::" +
+                          'Non-blocking, environment-dependent. See the DisasmStudio-verification artifact.')
+            }
+          }
+          $lines += ''
+          $lines += 'Release package and symbols are uploaded before verification and are always available.'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")
+          if ($failed.Count) { throw ("Required verification failed: " + ($failed -join ', ')) }
