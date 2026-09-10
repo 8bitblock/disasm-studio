@@ -17,6 +17,8 @@
 //                                                           configDecryption, ...)
 //   - a single notable API call                         -> <api>_wrapper
 //   - a distinctive identifier-like referenced string   -> that string
+//   - a complete typed scalar leaf operation             -> read_field_1c,
+//                                                           is_field_1c_one, ...
 //
 // Two layers, so the interesting part is unit-testable without a disassembler:
 //   GuessFromEvidence()  - PURE: FuncEvidence -> a name + human-readable reason.
@@ -75,6 +77,21 @@ struct StringActionNameEvidence {
     bool sameBlock = false;
 };
 
+// An exact scalar operation from a short, completely inspected x86/x64 leaf.
+// Field offsets and register names describe the observed storage, not an
+// inferred class, Boolean declaration, or application meaning.
+enum class ScalarFunctionKind : uint8_t {
+    None, Getter, SetZero, SetOne, IsZero, IsNonzero, IsOne, IsNotOne
+};
+struct ScalarFunctionEvidence {
+    ScalarFunctionKind kind = ScalarFunctionKind::None;
+    std::string sourceIdentifier; // field_1c, global_401000, ecx
+    std::string sourceDescription; // exact typed storage, e.g. [rcx+0x1c]
+    uint16_t widthBits = 0;
+    uint64_t instructionVA = 0;
+    bool complete = false; // every reachable path and full return width checked
+};
+
 // Evidence gathered about one function body. Kept deliberately small and free of
 // engine types so the synthesis below is pure and testable.
 struct FuncEvidence {
@@ -85,6 +102,7 @@ struct FuncEvidence {
     std::vector<std::string> strings;   // referenced string literals (raw text)
     std::vector<ApiResultUseEvidence> apiResultUses; // ordered, de-duped by exact API key
     std::vector<StringActionNameEvidence> stringActions; // bounded string + stored-operation evidence
+    ScalarFunctionEvidence scalarFunction;
     bool isThunk      = false;          // body is essentially one jmp to a single target
     std::string thunkApi;               // API a thunk tail-jumps to ("" if its target isn't an API)
     bool selfRecursive = false;

@@ -1,5 +1,11 @@
 # DisasmStudio — project memory
 
+## September 2026 — state names and comments
+
+- FunctionNamer recognizes bounded complete typed native leaf getters, 0/1 writes and exact zero/nonzero/one/not-one predicates. Preserve return widths, clobber/side-effect checks, stronger names and unknown game-specific meaning; field-offset names do not alias object types. Analysis schema is 8.
+- FuncAnnotate adds source-valid State notes for comparisons, masks and direct 0/1 stores, with bounded same-block load provenance and exact branch alternatives. These feed the existing Notes/Annotations UI. Keep zero/nonzero distinct from exactly 1, partial-width checks explicit, and equality API contracts exact.
+- See `docs/STATE_NAMES_AND_COMMENTS.md` and the real-Zydis/Capstone `state_semantics_pipeline_test`, alongside the focused namer and FuncAnnotate regressions.
+
 ## September 2026 — closer mockup layout
 
 - The user's revised direction prioritizes the supplied `../Disassembler UI mockup/DisasmStudio Binary View.dc.html` layout over older presentation constraints. All top-level feature pages (including Cortex), commands and right-click actions remain accessible. Step Into, Step Over and Step Out retain their existing button design by explicit user confirmation.

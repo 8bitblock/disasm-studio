@@ -13,8 +13,8 @@ int failures = 0;
 }
 
 int main() {
-    CHECK(kAnalysisSchemaVersion == 7,
-          "exact API naming and bounded function evidence use analysis schema version 7");
+    CHECK(kAnalysisSchemaVersion == 8,
+          "state predicate naming and annotations use analysis schema version 8");
     // Patch history order is semantic: later overlapping writes win. The digest
     // must distinguish the same records in the opposite application order.
     PjPatch first{ 0x1000, { 0x10, 0x11 }, { 0xA0, 0xA1 } };

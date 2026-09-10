@@ -39,7 +39,8 @@ enum class NoteKind : uint8_t {
     VirtualCall,    // vtable-slot call pattern (obj -> vtable -> slot)
     Vtable,         // vtable pointer store (object construction?)
     RetUse,         // whether a call's return value is checked/used
-    Pattern         // suspicious/high-level pattern (sourceValid says instruction vs function scope)
+    Pattern,        // suspicious/high-level pattern (sourceValid says instruction vs function scope)
+    State           // exact zero/one/mask check or constant state store; role remains unknown
 };
 const char* NoteKindName(NoteKind k);
 

@@ -132,6 +132,7 @@ rem TEST|dataflow_decomp_test|src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\
 rem TEST|decompiler_tempname_test|src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp
 rem TEST|decompiler_folder_test|src\Core\CFG.cpp src\Core\Decompiler.cpp src\Core\DataFlow.cpp
 rem TEST|funcannotate_test|src\Core\FuncAnnotate.cpp src\Core\NetworkApiCatalog.cpp src\Core\ValidationApiCatalog.cpp src\Core\CFG.cpp
+rem TEST|state_semantics_pipeline_test|/MT /I vcpkg_installed\x64-windows-static\x64-windows-static\include src\Core\FunctionNamer.cpp src\Core\FuncAnnotate.cpp src\Core\NetworkApiCatalog.cpp src\Core\ValidationApiCatalog.cpp src\Core\CFG.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\GameMakerArchive.cpp src\Disasm\ZydisDisassembler.cpp src\Disasm\CapstoneDisassembler.cpp vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zydis.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\Zycore.lib vcpkg_installed\x64-windows-static\x64-windows-static\lib\capstone.lib
 rem TEST|cortex_test|src\Core\Cortex.cpp src\Core\NetworkApiCatalog.cpp src\Core\BinaryFile.cpp src\Core\JvmClass.cpp src\Core\AuthorizationAnalysis.cpp src\Core\PersistentStateCatalog.cpp src\Core\GameMakerArchive.cpp
 rem TEST|prism_test|src\Core\Prism.cpp
 

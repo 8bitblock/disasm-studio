@@ -28,7 +28,7 @@ struct ProjectAnalysisOverrides;
 
 // Bump whenever the meaning or serialization of a cached derived result changes.
 // This is intentionally independent of the on-disk project format version.
-inline constexpr uint32_t kAnalysisSchemaVersion = 7;
+inline constexpr uint32_t kAnalysisSchemaVersion = 8;
 
 enum class AnalysisCachePass : uint8_t {
     Strings = 0,

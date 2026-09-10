@@ -1047,6 +1047,302 @@ bool writesAccumulator(const Instruction& in) {
            m.rfind("lods", 0) == 0;
 }
 
+// Small typed leaf recognizer. This deliberately accepts only copies, exact
+// zero/one tests, equality SETcc/Jcc, and balanced frame mechanics. Every path
+// must finish, and unknown operations/calls/loops invalidate the whole result.
+// A general function containing a flag check is not itself named a predicate.
+std::string scalarRegisterFamily(const std::string& raw) {
+    const std::string reg = nameKey(raw);
+    if (reg == "rax" || reg == "eax" || reg == "ax" || reg == "al") return "rax";
+    if (reg == "rcx" || reg == "ecx" || reg == "cx" || reg == "cl") return "rcx";
+    if (reg == "rdx" || reg == "edx" || reg == "dx" || reg == "dl") return "rdx";
+    if (reg == "rbx" || reg == "ebx" || reg == "bx" || reg == "bl") return "rbx";
+    if (reg == "rsi" || reg == "esi" || reg == "si" || reg == "sil") return "rsi";
+    if (reg == "rdi" || reg == "edi" || reg == "di" || reg == "dil") return "rdi";
+    if (reg == "rbp" || reg == "ebp" || reg == "bp" || reg == "bpl") return "rbp";
+    if (reg == "rsp" || reg == "esp" || reg == "sp" || reg == "spl") return "rsp";
+    for (int i = 8; i <= 15; ++i) {
+        const std::string base = "r" + std::to_string(i);
+        if (reg == base || reg == base + "d" || reg == base + "w" || reg == base + "b")
+            return base;
+    }
+    return {};
+}
+
+struct ScalarValue {
+    enum class Kind { Unknown, Constant, Source, Predicate } kind = Kind::Unknown;
+    ScalarFunctionEvidence source;
+    uint64_t constant = 0; // comparison literal for Predicate
+    uint16_t width = 0; // actually defined register width, independent of source
+    bool unequal = false;
+};
+
+bool sameScalarSource(const ScalarValue& a, const ScalarValue& b) {
+    return a.source.sourceDescription == b.source.sourceDescription &&
+           a.source.widthBits == b.source.widthBits;
+}
+
+ScalarFunctionEvidence scalarLeafEvidence(const std::vector<Instruction>& body,
+                                           bool x64) {
+    if (body.empty() || body.size() > 24) return {};
+    std::unordered_map<uint64_t, size_t> at;
+    for (size_t i = 0; i < body.size(); ++i) {
+        if (!at.emplace(body[i].address, i).second || body[i].flow.delaySlots ||
+            !body[i].prefixes.empty() || body[i].isRepString ||
+            InstructionIsCall(body[i]) || !body[i].extraTargets.empty() ||
+            !body[i].switchInfo.cases.empty() || body[i].switchInfo.defaultTargetValid)
+            return {};
+    }
+    struct Path {
+        size_t index = 0;
+        std::unordered_map<std::string, ScalarValue> registers;
+        ScalarValue flags, condition;
+        ScalarFunctionEvidence store;
+        std::unordered_set<size_t> visited;
+        int memoryReads = 0;
+        int frame = 0; // 0 absent/restored, 1 pushed, 2 frame pointer established
+        bool branched = false;
+    };
+    struct Returned { ScalarValue value, condition; ScalarFunctionEvidence store; };
+    std::vector<Path> pending(1);
+    std::vector<Returned> returns;
+    while (!pending.empty()) {
+        Path path = std::move(pending.back()); pending.pop_back();
+        for (;;) {
+            if (path.index >= body.size() || !path.visited.insert(path.index).second)
+                return {}; // falling out of the body or a cycle is not a leaf proof
+            const Instruction& in = body[path.index];
+            const std::string m = nameKey(in.mnemonic);
+            const auto& operands = in.typedOperands;
+            const auto next = [&]() -> bool {
+                if (in.address > (std::numeric_limits<uint64_t>::max)() - in.length) return false;
+                const auto found = at.find(in.address + in.length);
+                if (found == at.end()) return false;
+                path.index = found->second;
+                return true;
+            };
+            const auto memorySource = [&](const TypedOperand& operand) -> ScalarFunctionEvidence {
+                if (operand.kind != OperandKind::Memory ||
+                    (operand.widthBits != 8 && operand.widthBits != 16 &&
+                     operand.widthBits != 32 && operand.widthBits != 64) ||
+                    !operand.indexRegister.empty()) return {};
+                const std::string segment = nameKey(operand.segmentRegister);
+                if (!segment.empty() && segment != "ds" && segment != "ss") return {};
+                ScalarFunctionEvidence source;
+                source.widthBits = operand.widthBits;
+                source.instructionVA = in.address;
+                uint64_t address = 0;
+                const std::string base = nameKey(operand.baseRegister);
+                if (base.empty() || base == "rip" || base == "eip") {
+                    if (!TryGetInstrDataRef(in, address)) return {};
+                    char text[48];
+                    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(address));
+                    source.sourceIdentifier = std::string("global_") + text;
+                    source.sourceDescription = std::string("[0x") + text + "]";
+                } else {
+                    const std::string family = scalarRegisterFamily(base);
+                    if (family.empty() || family == "rsp" || family == "rbp" ||
+                        path.registers.count(family) || operand.pcRelative ||
+                        (operand.displacement != 0 && !operand.displacementValid)) return {};
+                    const int64_t displacement = operand.displacement;
+                    // Negating INT64_MIN in signed arithmetic is undefined.
+                    const uint64_t magnitude = displacement < 0
+                        ? uint64_t(0) - static_cast<uint64_t>(displacement)
+                        : static_cast<uint64_t>(displacement);
+                    char text[48];
+                    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(magnitude));
+                    source.sourceIdentifier = std::string("field_") + (displacement < 0 ? "minus_" : "") + text;
+                    source.sourceDescription = "[" + base;
+                    if (displacement) source.sourceDescription += std::string(displacement < 0 ? "-0x" : "+0x") + text;
+                    source.sourceDescription += "]";
+                }
+                return source;
+            };
+            const auto read = [&](const TypedOperand& operand) -> ScalarValue {
+                ScalarValue value;
+                if (!OperandReads(operand.access)) return value;
+                value.width = operand.widthBits;
+                if (operand.kind == OperandKind::Immediate && !operand.pcRelative) {
+                    value.kind = ScalarValue::Kind::Constant; value.constant = operand.immediate;
+                } else if (operand.kind == OperandKind::Memory) {
+                    if (++path.memoryReads > 1 || path.store.kind != ScalarFunctionKind::None) return {};
+                    value.source = memorySource(operand);
+                    if (value.source.sourceIdentifier.empty()) return {};
+                    value.kind = ScalarValue::Kind::Source;
+                } else if (operand.kind == OperandKind::Register &&
+                           (operand.widthBits == 8 || operand.widthBits == 16 ||
+                            operand.widthBits == 32 || operand.widthBits == 64)) {
+                    const std::string family = scalarRegisterFamily(operand.registerName);
+                    if (family.empty() || family == "rsp" || family == "rbp") return {};
+                    if (const auto found = path.registers.find(family); found != path.registers.end()) {
+                        value = found->second;
+                        if (value.width != operand.widthBits) {
+                            // Known 0/1 values can be narrowed safely; a loaded
+                            // scalar cannot silently become a low-byte test.
+                            if (value.width < operand.widthBits ||
+                                (value.kind != ScalarValue::Kind::Predicate &&
+                                 !(value.kind == ScalarValue::Kind::Constant && value.constant <= 1))) return {};
+                            value.width = operand.widthBits;
+                        }
+                    } else {
+                        value.kind = ScalarValue::Kind::Source;
+                        value.source.sourceIdentifier = nameKey(operand.registerName);
+                        value.source.sourceDescription = value.source.sourceIdentifier;
+                        value.source.widthBits = operand.widthBits;
+                        value.source.instructionVA = in.address;
+                    }
+                }
+                return value;
+            };
+            const auto write = [&](const TypedOperand& operand, ScalarValue value) -> bool {
+                if (value.kind == ScalarValue::Kind::Unknown || operand.kind != OperandKind::Register ||
+                    !OperandWrites(operand.access)) return false;
+                const std::string family = scalarRegisterFamily(operand.registerName);
+                if (family != "rax" && family != "rcx" && family != "rdx" &&
+                    !(x64 && (family == "r8" || family == "r9" || family == "r10" || family == "r11")))
+                    return false; // no unbalanced callee-saved register writes
+                if (operand.widthBits != 8 && operand.widthBits != 16 &&
+                    operand.widthBits != 32 && operand.widthBits != 64) return false;
+                value.width = operand.widthBits;
+                if (operand.widthBits == 8 || operand.widthBits == 16) {
+                    const auto old = path.registers.find(family);
+                    if (old != path.registers.end() && old->second.width >= 32 &&
+                        old->second.kind == ScalarValue::Kind::Constant && old->second.constant == 0 &&
+                        (value.kind == ScalarValue::Kind::Predicate ||
+                         (value.kind == ScalarValue::Kind::Constant && value.constant <= 1)))
+                        value.width = old->second.width;
+                }
+                path.registers[family] = std::move(value);
+                return true;
+            };
+            if (InstructionIsReturn(in)) {
+                if (m != "ret" || path.frame != 0) return {};
+                ScalarValue result;
+                if (const auto found = path.registers.find("rax"); found != path.registers.end() &&
+                    found->second.width >= 32) result = found->second;
+                returns.push_back({result, path.condition, path.store});
+                if (returns.size() > 2) return {};
+                break;
+            }
+            if (isConditionalBranch(in)) {
+                if (!isZeroEqualityBranch(in) || m[0] != 'j' || path.branched ||
+                    path.flags.kind != ScalarValue::Kind::Predicate ||
+                    path.store.kind != ScalarFunctionKind::None) return {};
+                uint64_t target = 0;
+                if (!TryGetDirectTarget(in, target) || !at.count(target)) return {};
+                path.branched = true;
+                path.condition = path.flags;
+                path.condition.unequal = m == "jne" || m == "jnz";
+                Path taken = path; taken.index = at.at(target);
+                pending.push_back(std::move(taken));
+                path.condition.unequal = !path.condition.unequal;
+                path.flags = {};
+                if (!next()) return {};
+                continue;
+            }
+            if (InstructionEndsBlock(in)) {
+                uint64_t target = 0;
+                if (m != "jmp" || !TryGetDirectTarget(in, target) || !at.count(target)) return {};
+                path.index = at.at(target); continue;
+            }
+            if (m == "nop" || m == "endbr64" || m == "endbr32") {
+                if (!next()) return {};
+                continue;
+            }
+            const std::string text = compactLower(in.operands);
+            if (m == "push" && (text == "rbp" || text == "ebp") && path.frame == 0 &&
+                path.registers.empty() && path.memoryReads == 0 && !path.branched) {
+                path.frame = 1;
+            } else if (m == "mov" && (text == "rbp,rsp" || text == "ebp,esp") && path.frame == 1) {
+                path.frame = 2;
+            } else if ((m == "pop" && (text == "rbp" || text == "ebp") && path.frame != 0) ||
+                       (m == "leave" && path.frame == 2)) {
+                path.frame = 0;
+            } else if (m == "mov" || m == "movzx") {
+                if (operands.size() != 2) return {};
+                ScalarValue value = read(operands[1]);
+                if (operands[0].kind == OperandKind::Memory) {
+                    if (m != "mov" || !OperandWrites(operands[0].access) ||
+                        path.memoryReads || path.branched || path.store.kind != ScalarFunctionKind::None ||
+                        value.kind != ScalarValue::Kind::Constant || value.constant > 1) return {};
+                    path.store = memorySource(operands[0]);
+                    if (path.store.sourceIdentifier.empty()) return {};
+                    path.store.kind = value.constant ? ScalarFunctionKind::SetOne : ScalarFunctionKind::SetZero;
+                } else {
+                    if ((m == "mov" && operands[1].kind != OperandKind::Immediate &&
+                         operands[0].widthBits != operands[1].widthBits) ||
+                        (m == "movzx" && (operands[1].kind == OperandKind::Immediate ||
+                         operands[0].widthBits <= operands[1].widthBits)) ||
+                        !write(operands[0], std::move(value))) return {};
+                }
+            } else if (m == "xor" && operands.size() == 2 &&
+                       operands[0].kind == OperandKind::Register &&
+                       operands[1].kind == OperandKind::Register &&
+                       operands[0].registerName == operands[1].registerName &&
+                       operands[0].widthBits == operands[1].widthBits) {
+                ScalarValue zero; zero.kind = ScalarValue::Kind::Constant;
+                if (!write(operands[0], zero)) return {};
+                path.flags = {}; // a later SETcc must not use the prior CMP
+            } else if ((m == "cmp" || m == "test") && operands.size() == 2) {
+                if (path.store.kind != ScalarFunctionKind::None) return {};
+                ScalarValue source = read(operands[0]);
+                uint64_t literal = 0;
+                if (m == "test") {
+                    if (operands[0].kind != OperandKind::Register ||
+                        operands[1].kind != OperandKind::Register ||
+                        operands[0].registerName != operands[1].registerName ||
+                        operands[0].widthBits != operands[1].widthBits) return {};
+                } else {
+                    if (operands[1].kind != OperandKind::Immediate || operands[1].pcRelative ||
+                        operands[1].immediate > 1 || !OperandReads(operands[1].access)) return {};
+                    literal = operands[1].immediate;
+                }
+                if (source.kind != ScalarValue::Kind::Source) return {};
+                source.kind = ScalarValue::Kind::Predicate;
+                source.constant = literal; source.unequal = false;
+                path.flags = std::move(source);
+            } else if (m == "sete" || m == "setz" || m == "setne" || m == "setnz") {
+                if (operands.size() != 1 || operands[0].widthBits != 8 ||
+                    path.flags.kind != ScalarValue::Kind::Predicate) return {};
+                ScalarValue value = path.flags;
+                value.unequal = m == "setne" || m == "setnz";
+                if (!write(operands[0], value)) return {};
+            } else return {};
+            if (!next()) return {};
+        }
+    }
+    if (returns.empty()) return {};
+    if (returns.size() == 1 && returns[0].store.kind != ScalarFunctionKind::None) {
+        auto evidence = returns[0].store; evidence.complete = true; return evidence;
+    }
+    ScalarValue result = returns[0].value;
+    if (returns.size() == 2) {
+        const auto& first = returns[0]; const auto& second = returns[1];
+        if (first.store.kind != ScalarFunctionKind::None || second.store.kind != ScalarFunctionKind::None ||
+            first.value.kind != ScalarValue::Kind::Constant || second.value.kind != ScalarValue::Kind::Constant ||
+            first.value.constant > 1 || second.value.constant > 1 ||
+            first.value.constant == second.value.constant ||
+            first.condition.kind != ScalarValue::Kind::Predicate ||
+            second.condition.kind != ScalarValue::Kind::Predicate ||
+            !sameScalarSource(first.condition, second.condition) ||
+            first.condition.constant != second.condition.constant ||
+            first.condition.unequal == second.condition.unequal) return {};
+        result = first.condition;
+        if (!first.value.constant) result.unequal = !result.unequal;
+    }
+    ScalarFunctionEvidence evidence = result.source;
+    if (result.kind == ScalarValue::Kind::Predicate) {
+        evidence.kind = result.constant == 0
+            ? (result.unequal ? ScalarFunctionKind::IsNonzero : ScalarFunctionKind::IsZero)
+            : (result.unequal ? ScalarFunctionKind::IsNotOne : ScalarFunctionKind::IsOne);
+    } else if (result.kind == ScalarValue::Kind::Source &&
+               evidence.sourceDescription.find('[') != std::string::npos) {
+        evidence.kind = ScalarFunctionKind::Getter;
+    } else return {};
+    evidence.complete = true;
+    return evidence;
+}
+
 } // namespace
 
 std::string ToSnakeIdentifier(const std::string& api) {
@@ -1178,6 +1474,48 @@ GuessedName GuessFromEvidence(const FuncEvidence& e) {
                 "; same basic block; field meaning and execution remain unproved";
         }
         if (!conflict && !agreedName.empty()) { set(std::move(agreedName), std::move(reason)); return g; }
+    }
+
+    // 10) Typed leaf semantics supply useful names even in fully stripped
+    // code. No adjacent strings or bare 0/1 constants supply a game/domain label.
+    const auto& scalar = e.scalarFunction;
+    if (!e.bodySampled && e.callCount == 0 && e.instrCount > 0 && e.instrCount <= 24 &&
+        scalar.complete && isIdentifier(scalar.sourceIdentifier) &&
+        !scalar.sourceDescription.empty() &&
+        (scalar.widthBits == 8 || scalar.widthBits == 16 || scalar.widthBits == 32 || scalar.widthBits == 64)) {
+        std::string name, reason;
+        const std::string source = std::to_string(scalar.widthBits) + "-bit " + scalar.sourceDescription;
+        switch (scalar.kind) {
+        case ScalarFunctionKind::Getter:
+            name = "read_" + scalar.sourceIdentifier;
+            reason = "returns the value read from " + source;
+            break;
+        case ScalarFunctionKind::SetZero:
+        case ScalarFunctionKind::SetOne: {
+            const bool one = scalar.kind == ScalarFunctionKind::SetOne;
+            name = "write_" + scalar.sourceIdentifier + (one ? "_one" : "_zero");
+            reason = std::string("writes ") + (one ? "1" : "0") + " to " + source;
+            break;
+        }
+        case ScalarFunctionKind::IsZero:
+        case ScalarFunctionKind::IsNonzero:
+        case ScalarFunctionKind::IsOne:
+        case ScalarFunctionKind::IsNotOne: {
+            const bool one = scalar.kind == ScalarFunctionKind::IsOne || scalar.kind == ScalarFunctionKind::IsNotOne;
+            const bool unequal = scalar.kind == ScalarFunctionKind::IsNonzero || scalar.kind == ScalarFunctionKind::IsNotOne;
+            name = "is_" + scalar.sourceIdentifier + (one ? (unequal ? "_not_one" : "_one") : (unequal ? "_nonzero" : "_zero"));
+            reason = "returns 1 exactly when " + source + (unequal ? " != " : " == ") + (one ? "1" : "0") + "; returns 0 otherwise";
+            break;
+        }
+        default: break;
+        }
+        if (!name.empty()) {
+            char location[48];
+            std::snprintf(location, sizeof(location), "0x%llX", static_cast<unsigned long long>(scalar.instructionVA));
+            set(std::move(name), reason + "; typed source at " + location +
+                "; complete leaf body; application meaning remains unknown");
+            return g;
+        }
     }
 
     return g;   // no confident guess; caller keeps sub_<addr>
@@ -1413,6 +1751,7 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         int meaningful = 0;     // instrs that aren't padding/frame noise
         int retCount = 0;
         bool accKnownZero = false, allReturnsZero = true, hasControlBranch = false;
+        bool trivialZeroBody = true;
         // Track the first local use of any imported API's accumulator result.
         // The old connectivity-only state could prove WifiCheck but could not
         // tell a checked memcmp from a checked CryptHashData status.
@@ -1467,6 +1806,8 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
             if (!noise) ++meaningful;
             const bool instructionCall = InstructionIsCall(in);
             const bool instructionReturn = InstructionIsReturn(in);
+            if (!instructionReturn && !noise && !zeroesAccumulator(in))
+                trivialZeroBody = false;
             if (instructionReturn) {
                 if (!resultNormalizedAccumulatorApi.empty())
                     recordResultUse(resultNormalizedAccumulatorApi, false, true, true);
@@ -1570,7 +1911,12 @@ FunctionNamer::name(const BinaryFile& bin, IDisassembler& dis,
         }
         e.retOnly = (e.callCount == 0 && retCount == 1 && !hasControlBranch && meaningful <= 1);
         e.retZero = (e.callCount == 0 && retCount == 1 && !hasControlBranch &&
-                     allReturnsZero && meaningful <= 4);
+                     allReturnsZero && trivialZeroBody && meaningful <= 4);
+
+        if (!e.bodySampled && e.callCount == 0 &&
+            (bin.machine() == MachineArch::X86 || bin.machine() == MachineArch::X64 ||
+             bin.machine() == MachineArch::Unknown))
+            e.scalarFunction = scalarLeafEvidence(insns, bin.machine() == MachineArch::X64);
 
         if (!actionStrings.empty() && e.instrCount <= 192 && e.callCount <= 8 &&
             (bin.machine() == MachineArch::X86 || bin.machine() == MachineArch::X64 ||

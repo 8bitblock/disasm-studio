@@ -98,6 +98,144 @@ static Instruction ret(uint64_t va) {
     return in;
 }
 
+static TypedOperand scalarReg(const char* name, uint16_t bits, OperandAccess access = OperandAccess::Read) {
+    TypedOperand operand; operand.kind = OperandKind::Register;
+    operand.registerName = name; operand.widthBits = bits; operand.access = access;
+    return operand;
+}
+
+static TypedOperand scalarImm(uint64_t value) {
+    TypedOperand operand; operand.kind = OperandKind::Immediate;
+    operand.immediate = value; operand.widthBits = 8; operand.access = OperandAccess::Read;
+    return operand;
+}
+
+static TypedOperand scalarMem(const char* base, int64_t displacement, uint16_t bits = 32,
+                              OperandAccess access = OperandAccess::Read) {
+    TypedOperand operand; operand.kind = OperandKind::Memory;
+    operand.baseRegister = base; operand.widthBits = bits; operand.access = access;
+    operand.displacement = displacement; operand.displacementValid = true;
+    return operand;
+}
+
+static Instruction scalarOp(uint64_t va, const char* mnemonic,
+                             std::initializer_list<TypedOperand> operands) {
+    Instruction instruction = op(va, mnemonic);
+    instruction.typedOperands = operands;
+    return instruction;
+}
+
+static void checkScalarLeafNames(const BinaryFile& bin, uint64_t base) {
+    const uint64_t address = base + 0xB00;
+    ScriptDisasm dis;
+    const auto eax = scalarReg("eax", 32, OperandAccess::Write);
+    const auto al = scalarReg("al", 8, OperandAccess::Write);
+    const auto ecx = scalarReg("ecx", 32);
+    const auto field = scalarMem("rcx", 0x1c);
+    const auto normalize = [&](uint64_t va) {
+        return scalarOp(va, "movzx", {eax, scalarReg("al", 8)});
+    };
+    const auto check = [&](std::vector<Instruction> body, const char* name) {
+        dis.bodies[address] = std::move(body);
+        FunctionNamer namer;
+        auto result = namer.name(bin, dis, {{address, 32, false, "sub_100B00"}}, 0, {}, {});
+        CHECK(result.size() == 1);
+        CHECK_EQ(result[0].name, name ? name : "sub_100B00");
+        CHECK(result[0].guessed == (name != nullptr));
+        return result[0];
+    };
+    const auto predicate = [&](const char* set, uint64_t constant) {
+        return std::vector<Instruction>{scalarOp(address, "cmp", {field, scalarImm(constant)}),
+            scalarOp(address + 1, set, {al}), normalize(address + 2), ret(address + 3)};
+    };
+    auto exact = check(predicate("sete", 1), "is_field_1c_one");
+    CHECK(exact.reason.find("32-bit [rcx+0x1c] == 1") != std::string::npos);
+    check(predicate("setne", 1), "is_field_1c_not_one");
+    check(predicate("setne", 0), "is_field_1c_nonzero");
+    check(predicate("sete", 0), "is_field_1c_zero");
+    check({scalarOp(address, "mov", {eax, field}), ret(address + 1)}, "read_field_1c");
+    auto byteField = field; byteField.widthBits = 8;
+    auto byteRead = check({scalarOp(address, "movzx", {eax, byteField}), ret(address + 1)}, "read_field_1c");
+    CHECK(byteRead.reason.find("8-bit") != std::string::npos);
+    auto store = field; store.access = OperandAccess::Write;
+    check({scalarOp(address, "mov", {store, scalarImm(1)}), ret(address + 1)}, "write_field_1c_one");
+    check({scalarOp(address, "mov", {store, scalarImm(0)}), ret(address + 1)}, "write_field_1c_zero");
+    auto zeroReturn = scalarOp(address + 1, "xor", {eax, scalarReg("eax", 32)});
+    zeroReturn.operands = "eax, eax";
+    check({scalarOp(address, "mov", {store, scalarImm(1)}), zeroReturn, ret(address + 2)}, "write_field_1c_one");
+
+    // Follow a loaded scalar through a temporary register, preserving its field
+    // provenance and the actual compared width instead of naming the register.
+    check({scalarOp(address, "mov", {scalarReg("edx", 32, OperandAccess::Write), field}),
+           scalarOp(address + 1, "test", {scalarReg("edx", 32), scalarReg("edx", 32)}),
+           scalarOp(address + 2, "setne", {al}), normalize(address + 3), ret(address + 4)}, "is_field_1c_nonzero");
+    check({scalarOp(address, "cmp", {ecx, scalarImm(1)}),
+           scalarOp(address + 1, "sete", {al}), normalize(address + 2), ret(address + 3)}, "is_ecx_one");
+
+    // Zeroing EAX before the comparison establishes a full-width SETcc result.
+    // Doing it after CMP destroys the flags; returning AL alone leaves EAX stale.
+    check({scalarOp(address, "xor", {eax, scalarReg("eax", 32)}),
+           scalarOp(address + 1, "cmp", {field, scalarImm(1)}),
+           scalarOp(address + 2, "sete", {al}), ret(address + 3)}, "is_field_1c_one");
+    check({scalarOp(address, "cmp", {field, scalarImm(1)}),
+           scalarOp(address + 1, "xor", {eax, scalarReg("eax", 32)}),
+           scalarOp(address + 2, "sete", {al}), normalize(address + 3), ret(address + 4)}, nullptr);
+    check({scalarOp(address, "cmp", {field, scalarImm(1)}),
+           scalarOp(address + 1, "sete", {al}), ret(address + 2)}, nullptr);
+
+    // Both return paths must agree on one exact predicate; reversed polarity
+    // reverses the name. Shared epilogues via direct JMP are supported too.
+    auto split = std::vector<Instruction>{scalarOp(address, "cmp", {field, scalarImm(1)}),
+        jumpIf(address + 1, "jne", address + 4),
+        scalarOp(address + 2, "mov", {eax, scalarImm(1)}), ret(address + 3),
+        scalarOp(address + 4, "mov", {eax, scalarImm(0)}), ret(address + 5)};
+    check(split, "is_field_1c_one");
+    split[1].mnemonic = "je";
+    check(split, "is_field_1c_not_one");
+    split[3] = jumpTo(address + 3, address + 5);
+    check(split, "is_field_1c_not_one");
+    split[4].typedOperands[1].immediate = 2;
+    check(split, nullptr);
+
+    // Absolute globals retain their actual address, including VA zero.
+    auto global = scalarMem("", 0);
+    check({scalarOp(address, "mov", {eax, global}), ret(address + 1)}, "read_global_0");
+    global.baseRegister = "rip"; global.pcRelative = true; global.displacement = 0x20;
+    auto rip = check({scalarOp(address, "mov", {eax, global}), ret(address + 1)}, "read_global_100b21");
+    CHECK(rip.reason.find("[0x100b21]") != std::string::npos);
+    auto negativeField = field; negativeField.displacement = -8;
+    check({scalarOp(address, "mov", {eax, negativeField}), ret(address + 1)}, "read_field_minus_8");
+
+    auto bad = predicate("sete", 1);
+    bad[0].typedOperands.clear(); check(bad, nullptr); // display text is never substituted for decoder proof
+    bad = predicate("sete", 1); bad[0].typedOperands[0].widthBits = 0; check(bad, nullptr);
+    bad = predicate("setg", 1); check(bad, nullptr); // unsupported signed relation
+    bad = predicate("sete", 2); check(bad, nullptr); // arbitrary enums need a separate model
+    bad = predicate("sete", 1); bad[0].typedOperands[0].baseRegister = "rsp"; check(bad, nullptr);
+    bad[0].typedOperands[0].baseRegister = "rbp"; check(bad, nullptr);
+    bad = predicate("sete", 1); bad[0].typedOperands[0].segmentRegister = "fs"; check(bad, nullptr);
+    bad = predicate("sete", 1); bad[0].typedOperands[0].indexRegister = "rdx"; check(bad, nullptr);
+    bad = predicate("sete", 1); bad[0].prefixes = {InstructionPrefix::Lock}; check(bad, nullptr);
+    bad = predicate("sete", 1); bad.pop_back(); check(bad, nullptr); // incomplete reachable path
+    bad = predicate("sete", 1); bad[3] = jumpTo(address + 3, address); check(bad, nullptr); // loop
+    bad = predicate("sete", 1); bad[3] = callMem(address + 3, base + 0xFF0);
+    bad.push_back(ret(address + 4)); check(bad, nullptr); // unknown call
+    check({scalarOp(address, "mov", {eax, field}),
+           scalarOp(address + 1, "cmp", {scalarReg("al", 8), scalarImm(1)}),
+           scalarOp(address + 2, "sete", {al}), normalize(address + 3), ret(address + 4)}, nullptr);
+    check({scalarOp(address, "mov", {eax, field}),
+           scalarOp(address + 1, "mov", {store, scalarImm(1)}), ret(address + 2)}, nullptr); // mixed read/write
+    check({scalarOp(address, "mov", {eax, field}),
+           scalarOp(address + 1, "mov", {eax, scalarMem("rdx", 0x20)}), ret(address + 2)}, nullptr); // unrelated extra read
+    check({scalarOp(address, "mov", {scalarReg("ecx", 32, OperandAccess::Write), scalarImm(1)}),
+           scalarOp(address + 1, "mov", {eax, field}), ret(address + 2)}, nullptr); // changed object root
+
+    // Only canonical balanced frame mechanics are omitted from leaf semantics.
+    check({op(address, "push", "rbp"), op(address + 1, "mov", "rbp, rsp"),
+           scalarOp(address + 2, "mov", {eax, field}), op(address + 3, "pop", "rbp"), ret(address + 4)}, "read_field_1c");
+    check({op(address, "push", "rbp"), scalarOp(address + 1, "mov", {eax, field}), ret(address + 2)}, nullptr);
+}
+
 // Observe the actual decode/evidence schedule, without timing or allocator
 // assumptions. Full-body decoding must never run ahead of evidence processing;
 // previously all function bodies were materialized before the first callback.
@@ -284,6 +422,7 @@ int main(int argc, char** argv) {
     CHECK(bin.loadRaw(path, base));
 
     checkStreamingAndCancellation(bin, base);
+    checkScalarLeafNames(bin, base);
     ScriptDisasm dis;
     auto importNameFor = [&](uint64_t va) -> std::string {
         if (va == iatCreate)  return "KERNEL32.CreateFileW";

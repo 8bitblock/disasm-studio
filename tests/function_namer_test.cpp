@@ -67,6 +67,40 @@ int main() {
     { FuncEvidence e; e.retZero = true; e.callCount = 0; e.instrCount = 2;
       CHECK_EQ(GuessFromEvidence(e).name, "ret_zero"); }
 
+    // Bare scalar checks have exact storage-oriented names. In particular,
+    // equals-one and nonzero are different predicates, and no Boolean type or
+    // Zen-ball meaning follows from seeing the constants 0/1.
+    {
+        FuncEvidence e; e.instrCount = 4;
+        e.scalarFunction = {ScalarFunctionKind::IsOne, "field_1c", "[rcx+0x1c]", 32, 0x401000, true};
+        auto guess = GuessFromEvidence(e);
+        CHECK_EQ(guess.name, "is_field_1c_one");
+        CHECK(guess.reason.find("32-bit [rcx+0x1c] == 1") != std::string::npos);
+        CHECK(guess.reason.find("returns 0 otherwise") != std::string::npos);
+        CHECK(guess.reason.find("application meaning remains unknown") != std::string::npos);
+        CHECK(guess.name.find("zen") == std::string::npos);
+        e.scalarFunction.kind = ScalarFunctionKind::IsNonzero;
+        CHECK_EQ(GuessFromEvidence(e).name, "is_field_1c_nonzero");
+        e.scalarFunction.kind = ScalarFunctionKind::IsNotOne;
+        CHECK_EQ(GuessFromEvidence(e).name, "is_field_1c_not_one");
+        e.scalarFunction.kind = ScalarFunctionKind::IsZero;
+        CHECK_EQ(GuessFromEvidence(e).name, "is_field_1c_zero");
+        e.scalarFunction.kind = ScalarFunctionKind::Getter;
+        CHECK_EQ(GuessFromEvidence(e).name, "read_field_1c");
+        e.scalarFunction.kind = ScalarFunctionKind::SetOne;
+        CHECK_EQ(GuessFromEvidence(e).name, "write_field_1c_one");
+        e.scalarFunction.kind = ScalarFunctionKind::SetZero;
+        CHECK_EQ(GuessFromEvidence(e).name, "write_field_1c_zero");
+        e.bodySampled = true; CHECK(!GuessFromEvidence(e).guessed);
+        e.bodySampled = false; e.callCount = 1; CHECK(!GuessFromEvidence(e).guessed);
+        e.callCount = 0; e.scalarFunction.complete = false; CHECK(!GuessFromEvidence(e).guessed);
+        e.scalarFunction.complete = true; e.scalarFunction.widthBits = 0; CHECK(!GuessFromEvidence(e).guessed);
+        e.scalarFunction.widthBits = 32; e.strings = {"IsZenBall"};
+        CHECK_EQ(GuessFromEvidence(e).name, "IsZenBall"); // real identifier evidence keeps priority
+        e.strings = {"zen ball"};
+        CHECK_EQ(GuessFromEvidence(e).name, "write_field_1c_zero"); // nearby text is not an exact field binding
+    }
+
     // ---- semantic names from API sets -------------------------------------
     CHECK_EQ(GuessFromEvidence(apis({"CreateFileW","ReadFile","CloseHandle"})).name,  "read_file");
     CHECK_EQ(GuessFromEvidence(apis({"CreateFileW","WriteFile","CloseHandle"})).name, "write_file");

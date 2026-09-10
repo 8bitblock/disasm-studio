@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -140,7 +141,160 @@ static const DirectCallFormalBindingObservation* findFormalBinding(
     return nullptr;
 }
 
+static void stateCommentTests() {
+    AnnotateOptions x86;
+    x86.x64 = false;
+    // Decoder operands win over stale/opaque text, and VA zero is a real note.
+    Instruction compare = mk(0, 4, "cmp", "byte ptr [wrong + 9], 0");
+    compare.typedOperands = { memOp("ecx", 0x44, OperandAccess::Read, 8), immOp(1, 8) };
+    Instruction branch = mk(4, 2, "je", "0x10", true, false, 0x10);
+    auto equality = annotate({ compare, branch,
+        mk(6, 1, "ret", "", true, true), mk(0x10, 1, "ret", "", true, true) }, x86);
+    const FnNote* check = findNote(equality, NoteKind::State);
+    CHECK(check && check->sourceValid && check->va == 0);
+    if (check) {
+        CHECK(check->text == "state check: 8-bit value at [ecx + 0x44] equals 1 versus any other value");
+        CHECK(!has(check->text, "wrong"));
+        CHECK(!has(check->text, "active") && !has(check->text, "Zen"));
+        CHECK(has(check->evidence, "not established"));
+    }
+    const FnNote* decision = findNote(equality, NoteKind::Branch);
+    CHECK(decision && has(decision->text, "jumps to 0x10 if 8-bit value at [ecx + 0x44] equals 1"));
+    CHECK(decision && has(decision->text, "otherwise falls through (8-bit value at [ecx + 0x44] is not 1)"));
+    branch.mnemonic = "jne";
+    auto inequality = annotate({ compare, branch,
+        mk(6, 1, "ret", "", true, true), mk(0x10, 1, "ret", "", true, true) }, x86);
+    decision = findNote(inequality, NoteKind::Branch);
+    CHECK(decision && has(decision->text, "is not 1; otherwise falls through"));
+    CHECK(decision && has(decision->text, "falls through (8-bit value at [ecx + 0x44] equals 1)"));
+    auto materialized = annotateCompleteBlock({ compare, mk(4, 3, "setne", "al"),
+        mk(7, 1, "ret", "", true, true) }, x86);
+    const FnNote* booleanResult = findNote(materialized, NoteKind::State, "boolean result:");
+    CHECK(booleanResult && booleanResult->text ==
+        "boolean result: al = 1 if 8-bit value at [ecx + 0x44] is not 1; otherwise al = 0");
+
+    // MOV preserves flags but replaces the compared register. The branch and
+    // SETcc still consume the earlier comparison, not the new zero in EAX.
+    for (const char* jump : {"je", "jne"}) {
+        auto priorValue = annotate({ mk(0x8000, 3, "cmp", "eax, 1"),
+            mk(0x8003, 5, "mov", "eax, 0"),
+            mk(0x8008, 2, jump, "0x8010", true, false, 0x8010),
+            mk(0x800A, 1, "ret", "", true, true), mk(0x8010, 1, "ret", "", true, true) });
+        decision = findNote(priorValue, NoteKind::Branch);
+        CHECK(decision && has(decision->text, "value checked at 0x8000 (eax)"));
+        CHECK(decision && !has(decision->text, "if eax "));
+        CHECK(decision && has(decision->text, "otherwise falls through (value checked at 0x8000 (eax)"));
+    }
+    auto priorBoolean = annotateCompleteBlock({ mk(0x8100, 2, "test", "eax, eax"),
+        mk(0x8102, 5, "mov", "eax, 0"), mk(0x8107, 3, "setne", "al"),
+        mk(0x810A, 1, "ret", "", true, true) });
+    booleanResult = findNote(priorBoolean, NoteKind::State, "boolean result:");
+    CHECK(booleanResult && booleanResult->text ==
+        "boolean result: al = 1 if value checked at 0x8100 (eax) is nonzero; otherwise al = 0");
+
+    Instruction load = mk(0x1000, 4, "movzx", "eax, byte ptr [ecx + 0x44]");
+    load.typedOperands = { regOp("eax", OperandAccess::Write, 32), memOp("ecx", 0x44, OperandAccess::Read, 8) };
+    Instruction zeroTest = mk(0x1004, 2, "test", "eax, eax");
+    zeroTest.typedOperands = { regOp("eax", OperandAccess::Read, 32), regOp("eax", OperandAccess::Read, 32) };
+    auto zero = annotate({ load, zeroTest, mk(0x1006, 2, "jne", "0x1010", true, false, 0x1010),
+        mk(0x1008, 1, "ret", "", true, true), mk(0x1010, 1, "ret", "", true, true) }, x86);
+    check = findNote(zero, NoteKind::State);
+    CHECK(check && check->text == "state check: 8-bit value loaded from [ecx + 0x44] is zero versus nonzero");
+    CHECK(check && has(check->evidence, "source loaded") && has(check->evidence, "0x1000"));
+    decision = findNote(zero, NoteKind::Branch);
+    CHECK(decision && has(decision->text, "is nonzero; otherwise falls through"));
+    CHECK(decision && !has(decision->text, "equals 1"));
+
+    // A copied low byte describes a projection of the loaded word, not the
+    // whole word. Partial overwrites, calls, unknown operations and high-byte
+    // reads must not inherit the earlier field identity.
+    for (const auto& [middle, testRegister, expectSource, expectLowByte] :
+         std::vector<std::tuple<Instruction, const char*, bool, bool>>{
+            {mk(0x1004, 2, "mov", "edx, eax"), "dl", true, true},
+            {mk(0x1004, 2, "mov", "al, 7"), "eax", false, false},
+            {mk(0x1004, 2, "call", "0x2000", true, false, 0x2000), "eax", false, false},
+            {mk(0x1004, 2, "mystery", "eax"), "eax", false, false},
+            {mk(0x1004, 2, "nop", ""), "ah", false, false},
+         }) {
+        Instruction wordLoad = mk(0x1000, 4, "mov", "eax, dword ptr [ecx + 0x44]");
+        const std::string operands = std::string(testRegister) + ", " + testRegister;
+        auto result = annotateCompleteBlock({ wordLoad, middle,
+            mk(0x1006, 2, "test", operands.c_str()), mk(0x1008, 1, "ret", "", true, true) }, x86);
+        check = findNote(result, NoteKind::State);
+        CHECK(check != nullptr);
+        CHECK(check && has(check->text, "loaded from") == expectSource);
+        CHECK(check && has(check->text, "low 8 bits") == expectLowByte);
+    }
+
+    for (unsigned mask : {1u, 4u, 3u}) {
+        Instruction test = mk(0x2000, 3, "test", "<opaque>");
+        test.typedOperands = { memOp("rbx", -8, OperandAccess::Read, 32), immOp(mask) };
+        auto masked = annotate({ test, mk(0x2003, 2, "jz", "0x2010", true, false, 0x2010),
+            mk(0x2005, 1, "ret", "", true, true), mk(0x2010, 1, "ret", "", true, true) });
+        check = findNote(masked, NoteKind::State);
+        CHECK(check && has(check->text, "flag check:"));
+        CHECK(check && has(check->text, "[rbx - 0x8]"));
+        CHECK(check && has(check->text, mask == 3 ? "any set versus all clear" : mask == 1 ? "bit 0" : "bit 2"));
+        decision = findNote(masked, NoteKind::Branch);
+        CHECK(decision && has(decision->text, mask == 3 ? "are clear" : "is clear"));
+        CHECK(decision && has(decision->text, mask == 3 ? "at least one" : "is set"));
+    }
+    // TEST's sign condition is not equivalent to any bit being set.
+    auto signedMask = annotate({ mk(0x3000, 3, "test", "eax, 0x80"),
+        mk(0x3003, 2, "js", "0x3010", true, false, 0x3010),
+        mk(0x3005, 1, "ret", "", true, true), mk(0x3010, 1, "ret", "", true, true) });
+    decision = findNote(signedMask, NoteKind::Branch);
+    CHECK(decision && has(decision->text, "(eax & 0x80) < 0 (signed)"));
+    CHECK(decision && !has(decision->text, "!= 0"));
+
+    // Do not reuse a comparison across an unmodelled flags write.
+    for (const char* clobber : {"sahf", "popfd", "mystery"}) {
+        auto stale = annotate({ mk(0x4000, 3, "cmp", "eax, 1"),
+            mk(0x4003, 1, clobber, ""),
+            mk(0x4004, 2, "je", "0x4010", true, false, 0x4010),
+            mk(0x4006, 1, "ret", "", true, true), mk(0x4010, 1, "ret", "", true, true) });
+        CHECK(findNote(stale, NoteKind::State) != nullptr);
+        CHECK(findNote(stale, NoteKind::Branch) == nullptr);
+    }
+    // Constant writes are not silently called enable/disable operations.
+    for (unsigned value : {0u, 1u, 2u}) {
+        Instruction store = mk(0x5000, 4, "mov", "<opaque>");
+        store.typedOperands = { memOp("ecx", 0x44, OperandAccess::Write, 8), immOp(value, 8) };
+        auto stored = annotateCompleteBlock({ store, mk(0x5004, 1, "ret", "", true, true) }, x86);
+        check = findNote(stored, NoteKind::State);
+        CHECK((check != nullptr) == (value <= 1));
+        if (check) {
+            CHECK(has(check->text, "state write: 8-bit value at [ecx + 0x44] = "));
+            CHECK(!has(check->text, "enable") && !has(check->text, "disable"));
+        }
+    }
+    // A bare equality to another enum value or a degenerate zero mask is not
+    // promoted into a binary-state finding.
+    auto otherConstant = annotateCompleteBlock({ mk(0x5100, 3, "cmp", "eax, 2"),
+        mk(0x5103, 3, "test", "eax, 0"), mk(0x5106, 1, "ret", "", true, true) });
+    CHECK(findNote(otherConstant, NoteKind::State) == nullptr);
+
+    // Names alone cannot turn a return check into string equality. CompareString
+    // uses 2 for equality, and even strcmp only supports that wording at zero.
+    for (const auto& [name, compared, equalContents] :
+         std::vector<std::tuple<const char*, const char*, bool>>{
+            {"game.compareStringMode", "eax, 0", false},
+            {"msvcrt.strcmp", "eax, 1", false},
+            {"kernel32.CompareStringA", "eax, 0", false},
+            {"kernel32.CompareStringA", "eax, 2", true},
+         }) {
+        AnnotateOptions options;
+        options.nameFor = [name](uint64_t) { return std::string(name); };
+        auto result = annotate({ mk(0x6000, 5, "call", "0x7000", true, false, 0x7000),
+            mk(0x6005, 3, "cmp", compared), mk(0x6008, 2, "je", "0x6010", true, false, 0x6010),
+            mk(0x600A, 1, "ret", "", true, true), mk(0x6010, 1, "ret", "", true, true) }, options);
+        decision = findNote(result, NoteKind::Branch);
+        CHECK(decision && has(decision->text, "contents equal") == equalContents);
+    }
+}
+
 int main() {
+    stateCommentTests();
     // Static branch comments describe alternatives, never a live outcome.
     {
         Instruction branch = mk(0x1000, 2, "jne", "0x1010", true, false, 0x1010);
@@ -499,7 +653,7 @@ int main() {
         const FnNote* n = findNote(a, NoteKind::Loop, "jumps to");
         if (n) CHECK(has(n->text, "otherwise falls through"));
         CHECK(n != nullptr);
-        if (n) CHECK(has(n->text, "rax != 0"));
+        if (n) CHECK(has(n->text, "rax is nonzero"));
     }
 
     // 8) Indirect + virtual call patterns.
@@ -2018,7 +2172,7 @@ int main() {
     }
 
     // 22) Enum display names cover every kind with a non-fallback label.
-    for (int k = 0; k <= (int)NoteKind::Pattern; ++k)
+    for (int k = 0; k <= (int)NoteKind::State; ++k)
         CHECK(std::string(NoteKindName((NoteKind)k)) != "?");
     for (int k = 0; k <= (int)FunctionReturnKind::ForwardedCall; ++k)
         CHECK(std::string(FunctionReturnKindName((FunctionReturnKind)k)) != "unknown" ||

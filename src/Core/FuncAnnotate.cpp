@@ -42,6 +42,7 @@ const char* NoteKindName(NoteKind k) {
         case NoteKind::Vtable:       return "vtable";
         case NoteKind::RetUse:       return "result use";
         case NoteKind::Pattern:      return "pattern";
+        case NoteKind::State:        return "state";
     }
     return "?";
 }
@@ -751,6 +752,211 @@ bool checkedAddSigned(int64_t left, int64_t right, int64_t& result) {
     return true;
 }
 
+// State notes describe the machine value, not a guessed game/application role.
+// Keep decoder operands authoritative even when their display text is opaque.
+struct StateOperand {
+    OperandKind kind = OperandKind::Invalid;
+    std::string expression;
+    std::string reg;
+    uint16_t width = 0;
+    uint64_t immediate = 0;
+};
+
+StateOperand stateOperand(const Instruction& in, size_t index, bool x64) {
+    StateOperand out;
+    if (!in.typedOperands.empty()) {
+        if (index >= in.typedOperands.size()) return out;
+        const TypedOperand& operand = in.typedOperands[index];
+        out.kind = operand.kind;
+        out.width = operand.widthBits;
+        if (operand.kind == OperandKind::Register) {
+            out.reg = toLower(operand.registerName);
+            out.expression = out.reg;
+            if (!out.width) out.width = registerWidthBits(out.reg, x64);
+        } else if (operand.kind == OperandKind::Immediate) {
+            out.immediate = operand.immediate;
+        } else if (operand.kind == OperandKind::Memory) {
+            std::string address = toLower(operand.baseRegister);
+            if (address.empty() && operand.pcRelative) address = x64 ? "rip" : "eip";
+            if (!operand.indexRegister.empty()) {
+                if (!address.empty()) address += " + ";
+                address += toLower(operand.indexRegister);
+                if (operand.scale > 1) address += "*" + std::to_string(operand.scale);
+            }
+            if (operand.displacementValid && (operand.displacement || address.empty())) {
+                const uint64_t magnitude = operand.displacement < 0
+                    ? static_cast<uint64_t>(-(operand.displacement + 1)) + 1
+                    : static_cast<uint64_t>(operand.displacement);
+                if (!address.empty()) address += operand.displacement < 0 ? " - " : " + ";
+                else if (operand.displacement < 0) address += "-";
+                address += vaHex(magnitude);
+            }
+            if (address.empty()) { out.kind = OperandKind::Invalid; return out; }
+            out.expression = (operand.segmentRegister.empty() ? std::string()
+                              : toLower(operand.segmentRegister) + ":") + "[" + address + "]";
+        }
+    } else {
+        const std::vector<std::string> operands = splitOps(in.operands);
+        if (index >= operands.size()) return out;
+        out.expression = operands[index];
+        out.reg = toLower(operands[index]);
+        if (!canonReg(out.reg).empty()) {
+            out.kind = OperandKind::Register;
+            out.width = registerWidthBits(out.reg, x64);
+        } else if (operands[index].find('[') != std::string::npos) {
+            out.kind = OperandKind::Memory;
+            out.width = textMemoryWidthBits(operands[index]);
+            const size_t bracket = operands[index].find('[');
+            out.expression = operands[index].substr(bracket);
+            const size_t segment = operands[index].rfind(':', bracket);
+            if (segment != std::string::npos && segment >= 2)
+                out.expression = operands[index].substr(segment - 2);
+        } else {
+            int64_t immediate = 0;
+            if (parseImm(operands[index], immediate)) {
+                out.kind = OperandKind::Immediate;
+                out.immediate = static_cast<uint64_t>(immediate);
+            }
+        }
+    }
+    return out;
+}
+
+std::string stateValueName(const StateOperand& operand) {
+    if (operand.kind != OperandKind::Memory) return operand.expression;
+    return (operand.width ? std::to_string(operand.width) + "-bit value at "
+                          : "value at ") + operand.expression;
+}
+
+bool preservesConditionFlags(const Instruction& instruction) {
+    if (instruction.flagsWritten || InstructionIsCall(instruction) ||
+        InstructionIsReturn(instruction)) return false;
+    const std::string& m = instruction.mnemonic;
+    return m == "mov" || m == "movzx" || m == "movsx" || m == "movsxd" ||
+           m == "movabs" || m == "lea" || m == "nop" || m == "push" ||
+           m == "pop" || m == "xchg" || m == "bswap" || m == "endbr32" ||
+           m == "endbr64" || m.rfind("set", 0) == 0 || m.rfind("cmov", 0) == 0;
+}
+
+std::string stateValueSource(const BasicBlock& block, size_t before,
+                             StateOperand value, bool x64, std::string& evidence) {
+    const std::string original = stateValueName(value);
+    if (value.kind != OperandKind::Register || !value.width ||
+        isHighByteRegister(value.reg)) return original;
+    size_t remaining = 12;
+    while (before && remaining--) {
+        const Instruction& prior = block.insns[--before];
+        if (InstructionIsCall(prior) || InstructionIsReturn(prior) ||
+            (!preservesConditionFlags(prior) && !isFlagSetter(prior))) break;
+        const RW effects = classifyRW(prior);
+        const std::string family = canonReg(value.reg);
+        if (std::find(effects.writes.begin(), effects.writes.end(), family) ==
+            effects.writes.end()) continue;
+        const StateOperand destination = stateOperand(prior, 0, x64);
+        const StateOperand source = stateOperand(prior, 1, x64);
+        if ((prior.mnemonic != "mov" && prior.mnemonic != "movzx") ||
+            destination.kind != OperandKind::Register ||
+            canonReg(destination.reg) != family || destination.width < value.width ||
+            isHighByteRegister(destination.reg) || !source.width ||
+            (prior.mnemonic == "mov" && source.width < value.width)) break;
+        if (source.kind == OperandKind::Memory) {
+            evidence += "; source loaded by `" + instructionText(prior) + "` at " +
+                        vaHex(prior.address) + " through unchanged register values in this block";
+            const std::string projection = value.width < source.width
+                ? "low " + std::to_string(value.width) + " bits of " : std::string();
+            return projection + std::to_string(source.width) + "-bit value loaded from " +
+                   source.expression;
+        }
+        if (source.kind != OperandKind::Register || isHighByteRegister(source.reg)) break;
+        const uint16_t observedWidth = (std::min)(value.width, source.width);
+        value = source;
+        value.width = observedWidth;
+    }
+    return original;
+}
+
+struct StateCheck {
+    std::string text;
+    std::string subject;
+    std::string equalCondition;    // ZF set
+    std::string unequalCondition;  // ZF clear
+    std::string evidence;
+};
+
+StateCheck describeStateCheck(const BasicBlock& block, size_t index, bool x64) {
+    const Instruction& in = block.insns[index];
+    StateCheck out;
+    if (in.mnemonic != "cmp" && in.mnemonic != "test") return out;
+    const StateOperand first = stateOperand(in, 0, x64);
+    const StateOperand second = stateOperand(in, 1, x64);
+    if (first.kind != OperandKind::Register && first.kind != OperandKind::Memory) return out;
+    const bool sameRegister = first.kind == OperandKind::Register &&
+        second.kind == OperandKind::Register && first.reg == second.reg &&
+        first.width == second.width && first.width != 0;
+    if (in.mnemonic == "test" ? (!sameRegister && second.kind != OperandKind::Immediate)
+                              : second.kind != OperandKind::Immediate) return out;
+    if (in.mnemonic == "cmp" && second.immediate > 1) return out;
+    if (!first.width || first.width > 64) return out;
+    out.evidence = "`" + instructionText(in) + "` at " + vaHex(in.address) +
+        (in.typedOperands.empty() ? " (legacy operand text)" : " (decoder operands)");
+    const std::string subject = stateValueSource(block, index, first, x64, out.evidence);
+    out.subject = subject;
+    if ((in.mnemonic == "cmp" && second.immediate == 0) || sameRegister) {
+        out.text = "state check: " + subject + " is zero versus nonzero";
+        out.equalCondition = subject + " is zero";
+        out.unequalCondition = subject + " is nonzero";
+        out.evidence += "; this tests zero against any nonzero value, not specifically 1";
+    } else if (in.mnemonic == "cmp") {
+        out.text = "state check: " + subject + " equals 1 versus any other value";
+        out.equalCondition = subject + " equals 1";
+        out.unequalCondition = subject + " is not 1";
+        out.evidence += "; an equality check for exactly 1; the other path includes 0 and values above 1";
+    } else {
+        const uint64_t mask = second.immediate & (first.width == 64
+            ? (std::numeric_limits<uint64_t>::max)() : (uint64_t{1} << first.width) - 1);
+        if (!mask) return {};
+        if ((mask & (mask - 1)) == 0) {
+            unsigned bit = 0;
+            for (uint64_t shifted = mask; shifted > 1; shifted >>= 1) ++bit;
+            const std::string flag = "bit " + std::to_string(bit) + " of " + subject;
+            out.text = "flag check: " + flag + " is set versus clear";
+            out.equalCondition = flag + " is clear";
+            out.unequalCondition = flag + " is set";
+        } else {
+            const std::string bits = "bits in mask " + vaHex(mask) + " of " + subject;
+            out.text = "flag check: " + bits + "; any set versus all clear";
+            out.equalCondition = "all " + bits + " are clear";
+            out.unequalCondition = "at least one of the " + bits + " is set";
+        }
+        out.evidence += "; TEST masks the value without changing it; nonzero means any selected bit, not all bits";
+    }
+    out.evidence += "; application meaning (such as active or a named mode) is not established by the constant";
+    return out;
+}
+
+// Flags can outlive the register value that produced them. Only qualify that
+// uncommon case: ordinary adjacent checks retain their compact wording.
+std::string stateConditionAtUse(const StateCheck& check, bool equal,
+                                const BasicBlock& block, size_t comparisonIndex,
+                                size_t useIndex, bool x64) {
+    std::string condition = equal ? check.equalCondition : check.unequalCondition;
+    const Instruction& comparison = block.insns[comparisonIndex];
+    const StateOperand tested = stateOperand(comparison, 0, x64);
+    if (tested.kind != OperandKind::Register || check.subject.empty()) return condition;
+    const std::string family = canonReg(tested.reg);
+    for (size_t index = comparisonIndex + 1; index < useIndex; ++index) {
+        const RW effects = classifyRW(block.insns[index]);
+        if (std::find(effects.writes.begin(), effects.writes.end(), family) ==
+            effects.writes.end()) continue;
+        const size_t subjectAt = condition.find(check.subject);
+        if (subjectAt != std::string::npos)
+            condition.replace(subjectAt, check.subject.size(),
+                "value checked at " + vaHex(comparison.address) + " (" + check.subject + ")");
+        break;
+    }
+    return condition;
+}
+
 // One flat, address-ordered view over the CFG with block boundaries kept.
 struct FlatInsn {
     const Instruction* in;
@@ -1110,6 +1316,58 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
                  "loop start (back edge from " + vaHex(term.address) + ")",
                  "block at " + vaHex(h.start) + " is re-entered from " + vaHex(b.start) +
                  " (address-order back edge; natural-loop approximation)", 0.7f);
+        }
+    }
+
+    // State descriptions are local and bounded, including in a partial CFG.
+    // They intentionally do not imply the two observed values are the only
+    // legal values, or that a bare 1 means a particular game mode is active.
+    std::unordered_map<uint64_t, StateCheck> stateChecks;
+    for (int bi : order) {
+        const BasicBlock& block = g.blocks[bi];
+        for (size_t index = 0; index < block.insns.size(); ++index) {
+            const Instruction& instruction = block.insns[index];
+            StateCheck check = describeStateCheck(block, index, x64);
+            if (!check.text.empty()) {
+                note(instruction.address, NoteKind::State, check.text, check.evidence, 0.9f);
+                stateChecks.emplace(instruction.address, std::move(check));
+            }
+            const bool setEqual = instruction.mnemonic == "sete" || instruction.mnemonic == "setz";
+            const bool setUnequal = instruction.mnemonic == "setne" || instruction.mnemonic == "setnz";
+            if (setEqual || setUnequal) {
+                const StateOperand destination = stateOperand(instruction, 0, x64);
+                if (destination.width == 8 && (destination.kind == OperandKind::Register ||
+                                              destination.kind == OperandKind::Memory)) {
+                    for (size_t prior = index; prior-- > 0 && index - prior <= 12;) {
+                        const Instruction& producer = block.insns[prior];
+                        const auto condition = stateChecks.find(producer.address);
+                        if (condition != stateChecks.end()) {
+                            const std::string value = stateValueName(destination);
+                            note(instruction.address, NoteKind::State,
+                                 "boolean result: " + value + " = 1 if " +
+                                 stateConditionAtUse(condition->second, setEqual,
+                                     block, prior, index, x64) +
+                                 "; otherwise " + value + " = 0",
+                                 "`" + instructionText(instruction) + "` materializes the zero flag from " +
+                                 vaHex(producer.address) + "; " + condition->second.evidence, 0.9f);
+                            break;
+                        }
+                        if (!preservesConditionFlags(producer)) break;
+                    }
+                }
+            }
+            if (instruction.mnemonic != "mov") continue;
+            const StateOperand destination = stateOperand(instruction, 0, x64);
+            const StateOperand source = stateOperand(instruction, 1, x64);
+            if (destination.kind != OperandKind::Memory || !destination.width ||
+                destination.width > 64 || source.kind != OperandKind::Immediate ||
+                source.immediate > 1 || !writesMemFirstOp(instruction)) continue;
+            note(instruction.address, NoteKind::State,
+                 "state write: " + stateValueName(destination) + " = " +
+                 std::to_string(source.immediate) + (source.immediate ? " (one)" : " (zero)"),
+                 "`" + instructionText(instruction) + "` writes the exact constant " +
+                 std::to_string(source.immediate) +
+                 "; this may store a flag, counter, or mode; its application role is not established", 0.9f);
         }
     }
 
@@ -1699,8 +1957,11 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
                 // Find the flag setter scanning backwards in this block.
                 const Instruction* fs = nullptr;
                 for (size_t j = k; j-- > 0;) {
+                    if (InstructionIsCall(b.insns[j]) || InstructionIsReturn(b.insns[j])) break;
                     if (isFlagSetter(b.insns[j])) { fs = &b.insns[j]; break; }
-                    if (InstructionIsCall(b.insns[j])) break;   // a call clobbers flags
+                    // Unknown instructions, calls and POPF/SAHF must not let
+                    // a stale comparison masquerade as the branch producer.
+                    if (!preservesConditionFlags(b.insns[j])) break;
                 }
                 bool sgn = false, uns = false;
                 const char* op = jccExprOp(in.mnemonic, sgn, uns);
@@ -1709,14 +1970,15 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
                     std::vector<std::string> fo = splitOps(fs->operands);
                     std::string A = fo.size() > 0 ? fo[0] : "";
                     std::string Bp = fo.size() > 1 ? fo[1] : "";
-                    if (fs->mnemonic == "test" && fo.size() == 2 && A == Bp) {
-                        if (!std::strcmp(op, "==")) cond = A + " == 0";
-                        else if (!std::strcmp(op, "!=")) cond = A + " != 0";
-                        else if (!std::strcmp(op, "s"))  cond = A + " < 0";
-                        else if (!std::strcmp(op, "ns")) cond = A + " >= 0";
-                        else cond = A + " " + op + " 0";
-                    } else if (fs->mnemonic == "test") {
-                        cond = "(" + A + " & " + Bp + ") " + (std::strcmp(op, "==") ? "!= 0" : "== 0");
+                    if (fs->mnemonic == "test") {
+                        const std::string result = A == Bp ? A : "(" + A + " & " + Bp + ")";
+                        if (!std::strcmp(op, "s")) cond = result + " < 0 (signed)";
+                        else if (!std::strcmp(op, "ns")) cond = result + " >= 0 (signed)";
+                        else if (uns && !std::strcmp(op, "<")) cond = "false (TEST clears carry)";
+                        else if (uns && !std::strcmp(op, ">=")) cond = "true (TEST clears carry)";
+                        else if (uns && !std::strcmp(op, ">")) cond = result + " != 0";
+                        else if (uns && !std::strcmp(op, "<=")) cond = result + " == 0";
+                        else cond = result + " " + op + " 0" + (sgn ? " (signed)" : "");
                     } else if (fs->mnemonic == "cmp") {
                         if (!std::strcmp(op, "s"))      cond = A + " - " + Bp + " < 0";
                         else if (!std::strcmp(op, "ns")) cond = A + " - " + Bp + " >= 0";
@@ -1748,16 +2010,40 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
                     uint64_t branchTarget = 0;
                     const bool targetValid = TryGetDirectTarget(in, branchTarget);
                     const std::string targetText = targetValid ? vaHex(branchTarget) : std::string();
-                    if (!calleeNm.empty() && nameLooksLikeCompare(calleeNm)) {
+                    const auto stateCheck = stateChecks.find(fs->address);
+                    const bool equalityBranch = !std::strcmp(op, "==") || !std::strcmp(op, "!=");
+                    if (equalityBranch && stateCheck != stateChecks.end()) {
+                        const bool equal = !std::strcmp(op, "==");
+                        cond = stateConditionAtUse(stateCheck->second, equal, b,
+                            static_cast<size_t>(fs - b.insns.data()), k, x64);
+                        ev += "; " + stateCheck->second.evidence;
+                    }
+                    const auto compareContract = exactEqualityCompareForName(calleeNm);
+                    const StateOperand comparedValue = stateOperand(*fs, 0, x64);
+                    const StateOperand comparedConstant = stateOperand(*fs, 1, x64);
+                    const bool exactReturnComparison = comparedValue.kind == OperandKind::Register &&
+                        canonReg(comparedValue.reg) == "rax" && comparedValue.width >= 32 &&
+                        ((fs->mnemonic == "cmp" && comparedConstant.kind == OperandKind::Immediate &&
+                          compareContract && comparedConstant.immediate ==
+                              static_cast<uint64_t>(compareContract->equalityResult)) ||
+                         (fs->mnemonic == "test" && compareContract && compareContract->equalityResult == 0 &&
+                          comparedConstant.kind == OperandKind::Register &&
+                          comparedConstant.reg == comparedValue.reg));
+                    if (compareContract && exactReturnComparison && equalityBranch) {
                         bool jumpOnNonZero = !std::strcmp(op, "!=");
                         bool jumpOnZero    = !std::strcmp(op, "==");
                         if (jumpOnNonZero)
                             txt = ConditionalBranchComment(calleeNm +
-                                  " result is non-zero (strings/memory differ)", targetText);
+                                  (compareContract->equalityResult == 0
+                                    ? " result is non-zero (strings/memory differ)"
+                                    : " result is not 2 (not equal, or comparison failed)"), targetText);
                         else if (jumpOnZero)
                             txt = ConditionalBranchComment(calleeNm +
-                                  " result is zero (contents equal)", targetText);
-                        if (!txt.empty()) ev += "; " + calleeNm + " returns 0 on equality";
+                                  (compareContract->equalityResult == 0
+                                    ? " result is zero (contents equal)"
+                                    : " result is 2 (contents equal)"), targetText);
+                        if (!txt.empty()) ev += "; " + calleeNm + " returns " +
+                            std::to_string(compareContract->equalityResult) + " on equality";
                     }
                     if (txt.empty()) {
                         txt = ConditionalBranchComment(cond, targetText);
@@ -1765,6 +2051,12 @@ FuncAnnotations AnnotateFunction(const ControlFlowGraph& g, const AnnotateOption
                             txt += " — return value of " + calleeNm + " controls this branch";
                             ev += "; value comes from " + calleeNm;
                         }
+                    }
+                    if (equalityBranch && stateCheck != stateChecks.end() &&
+                        !(compareContract && exactReturnComparison)) {
+                        txt += " (" + stateConditionAtUse(stateCheck->second,
+                            std::strcmp(op, "==") != 0, b,
+                            static_cast<size_t>(fs - b.insns.data()), k, x64) + ")";
                     }
                     if (loopTermVAs.count(in.address)) {
                         txt = "loop: " + txt;
